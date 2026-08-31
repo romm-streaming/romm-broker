@@ -7,6 +7,7 @@ gate, and playlist-driven disc swapping.
 import json
 import logging
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -375,6 +376,30 @@ class TestResumeGate:
 
         assert emulator._playlist is None
 
+    def test_a_platform_without_an_override_uses_the_default_settle(
+        self, tmp_path: Path, _stub_launch: list[tuple[Any, ...]]
+    ) -> None:
+        """A platform with no resume_settle entry keeps the module default."""
+        emu = self._launch(tmp_path, 0)
+
+        assert emu._resume_settle == retroarch.RESUME_LOAD_SETTLE
+
+    def test_a_platform_override_replaces_the_default_settle(
+        self, tmp_path: Path, _stub_launch: list[tuple[Any, ...]]
+    ) -> None:
+        """PPSSPP's slower HLE boot needs longer than the default settle before a load.
+
+        A load issued before the core finishes registering its HLE event
+        table corrupts the resume instead of restoring it, so psp asks for
+        a longer wait via its platform table entry.
+        """
+        emu = retroarch.Retroarch()
+        emu.platform = "psp"
+        emu.launch(tmp_path / "game.iso", 0)
+
+        assert emu._resume_settle == retroarch.PLATFORMS["psp"]["resume_settle"]
+        assert emu._resume_settle != retroarch.RESUME_LOAD_SETTLE
+
 
 class TestPlaylistPreference:
     """A folder holding a playlist and its discs boots the playlist.
@@ -731,7 +756,7 @@ class TestSwapDisc:
         landing inside a swap's tray-settle window is the collision it
         guards against, and the same holds in reverse.
         """
-        monkeypatch.setattr(retroarch, "RESUME_LOAD_SETTLE", 0)
+        emulator._resume_settle = 0
         entered_lock = threading.Event()
         release_resume = threading.Event()
 
@@ -933,3 +958,107 @@ class TestClearWorkingSlot:
         assert not (state_dir / "Game.state").exists()
         assert "could not clear stale state thumbnail" in caplog.text
         assert "could not clear stale state Game.state:" not in caplog.text
+
+
+class TestWaitForStateFile:
+    """Confirming a save-state write actually produced bytes, not just a file."""
+
+    @pytest.fixture
+    def state_dir(self, tmp_path: Path) -> Path:
+        """A throwaway savestate directory."""
+        states = tmp_path / "states"
+        states.mkdir()
+        return states
+
+    def test_a_state_stuck_at_zero_bytes_is_never_confirmed(self, state_dir: Path) -> None:
+        """A .state file that stays empty is a write that produced nothing, not a save."""
+        before = retroarch._state_snapshot(state_dir, "Game")
+        (state_dir / "Game.state").write_bytes(b"")
+
+        settled = retroarch._wait_for_state_file(before, state_dir, "Game", 0, 0.9)
+
+        assert settled is False
+
+    def test_a_state_that_becomes_non_empty_and_holds_is_confirmed(self, state_dir: Path) -> None:
+        """A .state file that lands with real bytes and stops changing is reported as saved."""
+        before = retroarch._state_snapshot(state_dir, "Game")
+        (state_dir / "Game.state").write_bytes(b"savedata")
+
+        settled = retroarch._wait_for_state_file(before, state_dir, "Game", 0, 5.0)
+
+        assert settled is True
+
+
+def _write_after(path: Path, data: bytes, delay: float) -> None:
+    """Write `data` to `path` after `delay` seconds, from a background thread.
+
+    Args:
+        path: The file to write.
+        data: The bytes to write.
+        delay: Seconds to sleep before writing, simulating an emulator that
+            produces the file some time after the save was triggered.
+    """
+    time.sleep(delay)
+    path.write_bytes(data)
+
+
+class TestSaveStateThumbnail:
+    """Waiting for the paired save thumbnail alongside the state file."""
+
+    @pytest.fixture
+    def emulator(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> retroarch.Retroarch:
+        """A Retroarch that looks alive, skips slot homing, and drops commands silently.
+
+        Args:
+            tmp_path: Backs the savestate directory.
+            monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            A Retroarch ready to have `save_state` called on it, with
+            `STATE_DIR` pointed at a throwaway directory and enough time on
+            `STATE_CONFIRM_WAIT` for both waits to settle.
+        """
+        states = tmp_path / "states"
+        states.mkdir()
+        monkeypatch.setattr(retroarch, "STATE_DIR", states)
+        monkeypatch.setattr(retroarch, "STATE_CONFIRM_WAIT", 2.5)
+        emulator = retroarch.Retroarch()
+        emulator.platform = "gc"
+        emulator._rom_base = "Game"
+        emulator._slot_homed = True
+        emulator._thumbnail_enabled = True
+        monkeypatch.setattr(emulator, "alive", lambda: True)
+        monkeypatch.setattr(emulator, "_write_cmd", lambda cmd: True)
+        return emulator
+
+    def test_a_thumbnail_written_after_the_state_is_still_waited_for(
+        self, emulator: retroarch.Retroarch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A thumbnail that lands after the state file is still confirmed, not skipped."""
+        threading.Thread(
+            target=_write_after, args=(retroarch.STATE_DIR / "Game.state", b"savedata", 0.05), daemon=True
+        ).start()
+        threading.Thread(
+            target=_write_after, args=(retroarch.STATE_DIR / "Game.state.png", b"thumb", 0.7), daemon=True
+        ).start()
+
+        with caplog.at_level(logging.WARNING):
+            assert emulator.save_state(0) is True
+
+        assert "save thumbnail" not in caplog.text
+        assert (retroarch.STATE_DIR / "Game.state.png").exists()
+
+    def test_a_missing_thumbnail_does_not_fail_the_save(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No .png ever lands; the state save itself still reports success, with a warning logged."""
+        monkeypatch.setattr(retroarch, "STATE_CONFIRM_WAIT", 1.0)
+        threading.Thread(
+            target=_write_after, args=(retroarch.STATE_DIR / "Game.state", b"savedata", 0.05), daemon=True
+        ).start()
+
+        with caplog.at_level(logging.WARNING):
+            assert emulator.save_state(0) is True
+
+        assert "save thumbnail" in caplog.text
+        assert "Game.state.png" in caplog.text

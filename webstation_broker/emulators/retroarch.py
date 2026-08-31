@@ -563,31 +563,31 @@ def _state_snapshot(dir_path: Path, base: str) -> dict[Path, tuple[int, float]]:
     return snap
 
 
-def _wait_for_state_file(
-    before: dict[Path, tuple[int, float]], dir_path: Path, base: str, slot: int, timeout: float
-) -> bool:
-    """Poll until `slot`'s state file is rewritten and its size is stable.
+def _stable_file_wait(
+    before: dict[Path, tuple[int, float]], dir_path: Path, base: str, target_name: str, deadline: float
+) -> Optional[int]:
+    """Poll until `target_name` is rewritten and holds a stable, non-empty size.
 
-    That is the only reliable confirmation a save-state landed. The name has
-    to match `slot` exactly: accepting any state file would let a save that
-    landed on the wrong slot pass as a save of the requested one.
+    Shared by the state-file wait and the thumbnail wait: both confirm a
+    write landed the same way, a changed mtime since `before` followed by a
+    non-zero size holding steady, only the watched filename and stop time
+    differ. Zero bytes never counts as stable: a file RetroArch created but
+    stalled on before writing anything would otherwise pass as complete.
 
     Args:
-        before: The `_state_snapshot` taken before the save was sent.
+        before: The `_state_snapshot` taken before the write was triggered.
         dir_path: The savestate directory to watch.
         base: The content basename of the loaded game.
-        slot: The slot whose file has to change.
-        timeout: Seconds to keep polling.
+        target_name: The exact filename to watch for.
+        deadline: A `time.monotonic()` value to stop polling at.
 
     Returns:
-        True once the slot's file has changed since `before` and held a
-        stable size for half a second; False on timeout, with a warning that
-        names any other state files that changed instead.
+        The file's final size once it has changed since `before`, is
+        non-empty, and has held that size for half a second; None once
+        `deadline` passes first.
     """
     STABLE = 0.5
     POLL = 0.1
-    target_name = _state_name(base, slot)
-    deadline = time.monotonic() + timeout
     last_size: Optional[int] = None
     stable_since: Optional[float] = None
     seen_change = False
@@ -608,10 +608,38 @@ def _wait_for_state_file(
         if last_size is None or cur[0] != last_size:
             last_size = cur[0]
             stable_since = time.monotonic()
-        elif time.monotonic() - stable_since >= STABLE:
-            log.info("retroarch: save state write complete: %s (%d bytes)", cur_path.name, last_size)
-            return True
+        elif last_size > 0 and time.monotonic() - stable_since >= STABLE:
+            return last_size
         time.sleep(POLL)
+    return None
+
+
+def _wait_for_state_file(
+    before: dict[Path, tuple[int, float]], dir_path: Path, base: str, slot: int, timeout: float
+) -> bool:
+    """Poll until `slot`'s state file is rewritten and its size is stable and non-empty.
+
+    That is the only reliable confirmation a save-state landed. The name has
+    to match `slot` exactly: accepting any state file would let a save that
+    landed on the wrong slot pass as a save of the requested one.
+
+    Args:
+        before: The `_state_snapshot` taken before the save was sent.
+        dir_path: The savestate directory to watch.
+        base: The content basename of the loaded game.
+        slot: The slot whose file has to change.
+        timeout: Seconds to keep polling.
+
+    Returns:
+        True once the slot's file has changed since `before`, is non-empty,
+        and held a stable size for half a second; False on timeout, with a
+        warning that names any other state files that changed instead.
+    """
+    target_name = _state_name(base, slot)
+    size = _stable_file_wait(before, dir_path, base, target_name, time.monotonic() + timeout)
+    if size is not None:
+        log.info("retroarch: save state write complete: %s (%d bytes)", target_name, size)
+        return True
     stray = sorted(
         p.name
         for p, meta in _state_snapshot(dir_path, base).items()
@@ -852,6 +880,10 @@ class Retroarch(Emulator):
         """Whether the current slot has been parked on `STATE_SLOT` since launch."""
         self._launch_seq = 0
         """Launch generation, bumped on every launch and stop so stale background waits bail out."""
+        self._thumbnail_enabled = True
+        """Whether the loaded platform writes a save thumbnail; set from the platform table at launch."""
+        self._resume_settle = RESUME_LOAD_SETTLE
+        """Seconds between PLAYING and a deferred resume load; set from the platform table at launch."""
         self._stdout_buf = bytearray()
         """Replies read off RetroArch's stdout and not yet consumed."""
         self._stdout_lock = threading.Lock()
@@ -1123,7 +1155,9 @@ class Retroarch(Emulator):
             )
         core = _ensure_core(info["core"], info.get("core_source"))
         _ensure_core_assets(info.get("assets", {}))
-        cfg_path = _write_broker_cfg(info.get("thumbnail", True))
+        self._thumbnail_enabled = info.get("thumbnail", True)
+        self._resume_settle = info.get("resume_settle", RESUME_LOAD_SETTLE)
+        cfg_path = _write_broker_cfg(self._thumbnail_enabled)
 
         env = base_launch_env()
         binary = os.environ.get("RETROARCH_BIN", "retroarch")
@@ -1176,8 +1210,12 @@ class Retroarch(Emulator):
         """Load `slot` once RetroArch reports the content PLAYING.
 
         Cores with no game running yet (Dolphin boot screen) reject loads, so
-        this polls `GET_STATUS` first, then waits out `RESUME_LOAD_SETTLE` and
-        for the slot to hold a state file before loading.
+        this polls `GET_STATUS` first, then waits out `_resume_settle` and
+        for the slot to hold a state file before loading. `_resume_settle`
+        defaults to `RESUME_LOAD_SETTLE` but a platform can ask for longer:
+        PPSSPP keeps loading and registering HLE module state well after
+        RetroArch reports PLAYING, and a load attempted too early corrupts
+        the core's HLE event table instead of restoring the game.
 
         Args:
             slot: The slot to load.
@@ -1196,7 +1234,7 @@ class Retroarch(Emulator):
                 with self._disc_lock:
                     if self._launch_seq != seq or not self.alive():
                         return
-                    time.sleep(RESUME_LOAD_SETTLE)
+                    time.sleep(self._resume_settle)
                     if not self.wait_for_state(deadline):
                         log.warning("resume: slot %d never got a state file", slot)
                         return
@@ -1356,14 +1394,40 @@ class Retroarch(Emulator):
     def _try_save(self) -> bool:
         """Send `SAVE_STATE` once and confirm the file landed in `STATE_SLOT`.
 
+        When the platform writes thumbnails, the sibling `.png` is also
+        waited on (within what is left of the same deadline) once the state
+        file itself is confirmed. A thumbnail that never lands is only logged:
+        the state file is already good, and losing a preview should not read
+        as losing the save.
+
         Returns:
-            True when the slot's file changed on disk within
-            `STATE_CONFIRM_WAIT`.
+            True when the slot's state file changed on disk, is non-empty,
+            and held a stable size within `STATE_CONFIRM_WAIT`.
         """
         before = _state_snapshot(STATE_DIR, self._rom_base)
         if not self._write_cmd("SAVE_STATE"):
             return False
-        return _wait_for_state_file(before, STATE_DIR, self._rom_base, STATE_SLOT, STATE_CONFIRM_WAIT)
+        deadline = time.monotonic() + STATE_CONFIRM_WAIT
+        if not _wait_for_state_file(before, STATE_DIR, self._rom_base, STATE_SLOT, STATE_CONFIRM_WAIT):
+            return False
+        if self._thumbnail_enabled:
+            self._wait_for_state_thumbnail(before, deadline)
+        return True
+
+    def _wait_for_state_thumbnail(self, before: dict[Path, tuple[int, float]], deadline: float) -> None:
+        """Wait for the working slot's save thumbnail, without failing the save on a miss.
+
+        Args:
+            before: The `_state_snapshot` taken before `SAVE_STATE` was sent.
+            deadline: A `time.monotonic()` value shared with the state-file
+                wait, not a fresh window of its own.
+        """
+        target_name = _state_name(self._rom_base, STATE_SLOT) + ".png"
+        if _stable_file_wait(before, STATE_DIR, self._rom_base, target_name, deadline) is None:
+            log.warning(
+                "retroarch: save thumbnail %s not confirmed on disk (platform=%s, rom=%s)",
+                target_name, self.platform, self._rom_base,
+            )
 
     def save_state(self, slot: int) -> bool:
         """Save the running game into `STATE_SLOT`.
