@@ -59,7 +59,11 @@ def _is_blank_marker(path: Path, card: Path, marker: Optional[str]) -> bool:
         return False
     try:
         return path.stat().st_size == 0
-    except OSError:
+    except OSError as exc:
+        # Not the blank marker as far as this can tell, so the card counts as
+        # real and build_archive goes on to fail on the file rather than
+        # quietly reporting an empty slot RomM is free to wipe.
+        log.warning("memcard: could not stat the marker at %s: %s", path, exc)
         return False
 
 
@@ -112,8 +116,8 @@ def build_archive(card: Path, marker: Optional[str] = None) -> Optional[Union[by
     for p in files:
         try:
             total += p.stat().st_size
-        except OSError:
-            continue
+        except OSError as exc:
+            log.warning("memcard: could not size %s, leaving it out of the total: %s", p, exc)
     if total > SAVE_FILE_MAX_BYTES:
         log.warning("memcard: card exceeds size limit (%d bytes)", total)
         return "memory card exceeds size limit"
