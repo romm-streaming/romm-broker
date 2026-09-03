@@ -1197,6 +1197,32 @@ def _state_snapshot(serial: Optional[str]) -> dict:
     return snap
 
 
+def _all_state_files() -> dict[Path, tuple[int, float]]:
+    """Every savestate currently under SSTATE_ROOT, keyed by path.
+
+    A boot target whose title id only PINE can supply reaches
+    `Rpcs3.clear_working_slot` with nothing to scope a clear to, so by the
+    time the id is known the title's dir can hold both a previous session's
+    leftovers and this session's restored states. A snapshot taken before the
+    restore ran is what tells the two apart.
+
+    Returns:
+        Path to (size, mtime) for every state file, empty when SSTATE_ROOT
+        does not exist or cannot be listed.
+    """
+    snap: dict[Path, tuple[int, float]] = {}
+    if not SSTATE_ROOT.is_dir():
+        return snap
+    try:
+        title_dirs = [d for d in SSTATE_ROOT.iterdir() if d.is_dir()]
+    except OSError as exc:
+        log.warning("rpcs3: could not list %s to record leftover savestates: %s", SSTATE_ROOT, exc)
+        return snap
+    for d in title_dirs:
+        snap.update(_state_snapshot(d.name))
+    return snap
+
+
 def _newest_state(serial: Optional[str]) -> Optional[Path]:
     """Newest state file for `serial`.
 
@@ -1221,17 +1247,127 @@ def _changed_state(serial: Optional[str], before: dict) -> Optional[Path]:
     return best[1] if best is not None else None
 
 
-def _wait_for_state_write(serial: Optional[str], before: dict, deadline: float) -> Optional[Path]:
+def _clear_leftover_states(title_id: str, before: dict) -> None:
+    """Drop savestates that predate a deferred clear's pre-restore snapshot.
+
+    clear_working_slot could not scope its clear to `title_id` because the
+    id was not readable from the boot target's path, so whatever the
+    archive restore just wrote and whatever a stale, never-cleared previous
+    session left behind now sit in the same dir. Anything still matching an
+    entry in `before` unchanged was never touched by the restore and is
+    dropped; anything new or changed is the restore's (or this session's
+    own) and stays.
+
+    Args:
+        title_id: The title id now known for this session.
+        before: The pre-restore snapshot from `_all_state_files`.
+    """
+    for p, stamp in _state_snapshot(title_id).items():
+        if before.get(p) != stamp:
+            continue
+        try:
+            p.unlink()
+        except OSError as exc:
+            log.warning("rpcs3: could not clear leftover savestate %s: %s", p, exc)
+        else:
+            log.debug("rpcs3: cleared leftover savestate %s for %s", p, title_id)
+
+
+def _launch_pids(pid: Optional[int]) -> list[int]:
+    """Every pid in the launch `pid` leads, itself included.
+
+    RPCS3_BIN is the AppImage's AppRun wrapper and the emulator runs as a
+    child of it, so the handle the broker holds is not the process that
+    writes a savestate and its own descriptor list says nothing about the
+    write. `_spawn` starts the wrapper in a session of its own, which makes
+    the process group the way to name the whole launch.
+
+    Args:
+        pid: The process group leader, or None when the broker holds no
+            handle on it.
+
+    Returns:
+        The pids sharing `pid`'s process group, or just `pid` when /proc
+        cannot be scanned.
+    """
+    if pid is None:
+        return []
+    try:
+        pgid = os.getpgid(pid)
+        found = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            candidate = int(entry.name)
+            try:
+                if os.getpgid(candidate) == pgid:
+                    found.append(candidate)
+            except OSError:
+                continue
+    except OSError as exc:
+        log.debug("rpcs3: could not scan /proc for the process group of pid %s: %s", pid, exc)
+        return [pid]
+    return found or [pid]
+
+
+def _holds_open(pid: Optional[int], path: Path) -> bool:
+    """Tell whether the launch `pid` leads still has `path` open.
+
+    A file the writer has not closed yet is a write still in flight, however
+    long its size happens to sit still: RPCS3 compresses a state as it writes
+    it, and a busy or stalled host can leave the file the same size for a
+    full poll window mid-write.
+
+    Args:
+        pid: The emulator process, or None when the broker holds no handle on it.
+        path: The state file being watched.
+
+    Returns:
+        True only when the descriptor is confirmed open. No pid, a `/proc`
+        that cannot be read, and a process already gone all read as False, so
+        the size test stays the answer where this one cannot contribute.
+    """
+    target = os.path.realpath(path)
+    for candidate in _launch_pids(pid):
+        try:
+            for fd in Path(f"/proc/{candidate}/fd").iterdir():
+                try:
+                    if os.path.realpath(fd) == target:
+                        return True
+                except OSError:
+                    continue
+        except OSError as exc:
+            log.debug(
+                "rpcs3: could not read the open files of pid %s for %s: %s", candidate, path, exc
+            )
+    return False
+
+
+def _wait_for_state_write(
+    serial: Optional[str],
+    before: dict,
+    deadline: float,
+    pid: Optional[int] = None,
+) -> Optional[Path]:
     """Poll until the title's savestate write stabilizes, or the deadline passes.
 
-    A new/changed file's size must hold steady for STABLE_SECS to count as
-    finished.
+    A write counts as finished once the file is non-empty, rpcs3 has closed
+    it, and its size has held steady for STABLE_SECS. RPCS3 exiting is not
+    itself proof the write finished: the hotkey ends the process once the
+    state is captured, but nothing here can tell whether compression to disk
+    still trails that. Size alone is not proof either, since an emulator
+    stalled mid-write holds a steady size over a truncated file, and a state
+    that has only been created is zero bytes of nothing.
 
-    RPCS3 exiting is not itself proof the write finished: the hotkey ends
-    the process once the state is captured, but nothing here can tell
-    whether compression to disk still trails that. Polling the file's own
-    size is the only confirmation there is, the same as every other
-    emulator's write-confirmation loop.
+    Args:
+        serial: Title id scoping the state dir to watch.
+        before: Snapshot from `_state_snapshot` taken before the hotkey was sent.
+        deadline: `time.monotonic` value to give up at.
+        pid: The running rpcs3 process, whose open descriptors say whether the
+            write has finished; None falls back to the size test alone.
+
+    Returns:
+        The settled state file, or None on timeout.
     """
     STABLE_SECS = 0.5
     POLL_SECS = 0.2
@@ -1252,12 +1388,22 @@ def _wait_for_state_write(serial: Optional[str], before: dict, deadline: float) 
             target, last_size, stable_since = p, size, time.monotonic()
         elif size != last_size:
             last_size, stable_since = size, time.monotonic()
-        elif stable_since is not None and time.monotonic() - stable_since >= STABLE_SECS:
+        elif (
+            stable_since is not None
+            and time.monotonic() - stable_since >= STABLE_SECS
+            and last_size
+            and not _holds_open(pid, target)
+        ):
             log.info("save state write complete: %s (%d bytes)", target.name, last_size)
             return target
         time.sleep(POLL_SECS)
     if target is not None:
-        log.warning("save state write never stabilized within timeout: %s", target)
+        log.warning(
+            "save state write never settled before the deadline: %s (%s bytes, pid %s)",
+            target,
+            last_size,
+            pid,
+        )
     return None
 
 
@@ -1367,6 +1513,13 @@ class Rpcs3(Emulator):
     about to boot.
     """
     _session_serial: Optional[str] = None
+    _leftover_snapshot: Optional[dict] = None
+    """Pre-restore savestate snapshot from clear_working_slot, or None.
+
+    Only set when clear_working_slot ran without a title id to scope its
+    clear to (a bare .iso or an archive). Consumed and cleared the moment
+    this session's title id becomes known, by _clear_leftover_states.
+    """
     _session_start: Optional[float] = None
     """Wall clock at launch, or None when nothing has been launched in this process.
 
@@ -1421,9 +1574,11 @@ class Rpcs3(Emulator):
         """
         _ensure_sstate_link()
         self._restoring = True
+        self._leftover_snapshot = None
         rom = self._pending_rom
         title_id = _rom_title_id(rom) if rom is not None else None
         if title_id is None:
+            self._leftover_snapshot = _all_state_files()
             log.info(
                 "rpcs3: no title id for %s, leaving savestates untouched",
                 rom.name if rom is not None else "an unresolved rom",
@@ -1584,6 +1739,10 @@ class Rpcs3(Emulator):
         else:
             self._session_serial = None
 
+        if self._session_serial and self._leftover_snapshot is not None:
+            _clear_leftover_states(self._session_serial, self._leftover_snapshot)
+            self._leftover_snapshot = None
+
         # RPCS3 has no boot-time state-load flag of its own, but it detects a
         # savestate by magic bytes regardless of what is passed as the boot
         # target, so pointing it at the state file IS the boot-time load.
@@ -1640,6 +1799,9 @@ class Rpcs3(Emulator):
                     if title:
                         self._session_serial = title
                         log.info("boot watchdog: resolved title id %s via PINE", title)
+                        if self._leftover_snapshot is not None:
+                            _clear_leftover_states(title, self._leftover_snapshot)
+                            self._leftover_snapshot = None
                 return
             time.sleep(1.0)
 
@@ -1675,7 +1837,10 @@ class Rpcs3(Emulator):
                     log.warning("save-and-exit: could not send the save-state hotkey")
                 else:
                     p = _wait_for_state_write(
-                        self._session_serial, before, time.monotonic() + STATE_WAIT
+                        self._session_serial,
+                        before,
+                        time.monotonic() + STATE_WAIT,
+                        self._proc.pid if self._proc is not None else None,
                     )
                     if p is None:
                         log.warning("save-and-exit: no new state file appeared")
