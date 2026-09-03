@@ -903,20 +903,26 @@ class Xemu(Emulator):
 
         Returns:
             The absolute partition paths to extract, empty when the title has
-            simply never saved, or None when neither top level save directory
-            can be read, which is the image failing to answer rather than an
-            empty save set.
+            simply never saved or its title id could not be determined, or
+            None when neither top level save directory can be read, which is
+            the image failing to answer rather than an empty save set.
         """
         tops = [top for top in ("UDATA", "TDATA") if _fatx_isdir(fs, f"/{top}")]
         if not tops:
             log.error("neither /UDATA nor /TDATA could be read on %s; treating this "
                       "as a failed read, not as a title with no saves", self.hdd_image)
             return None
+        if not self._title_id:
+            # A disc whose title id could not be parsed must not fall back to
+            # scoping every title on the drive: that would archive and later
+            # restore every installed title's save data into this session,
+            # not just the one that is actually running.
+            log.warning("no disc title id for %s; refusing to scope saves to every "
+                        "title on the drive, nothing will be archived or restored "
+                        "this session", self.hdd_image)
+            return []
         roots = []
         for top in tops:
-            if not self._title_id:
-                roots.append(f"/{top}")
-                continue
             src = _fatx_find_dir(fs, f"/{top}", self._title_id)
             if src is None:
                 log.info("no /%s/%s on the HDD image", top, self._title_id)
@@ -1007,7 +1013,7 @@ class Xemu(Emulator):
 
         Files land carrying fresh mtimes, so that baseline filter ships all of
         them: the archive is the title's complete save set, not a delta.
-        Without a title id every title's UDATA and TDATA is extracted.
+        Without a title id nothing is extracted; see `_save_roots`.
 
         Returns:
             The number of files staged, or None when the image could not be
@@ -1101,8 +1107,8 @@ class Xemu(Emulator):
         if self._title_id:
             log.info("disc title id: %s", self._title_id)
         else:
-            log.warning("no title id for %s; the exit dump will carry every "
-                        "title on the disk", rom_path)
+            log.warning("no title id for %s; this session will not archive or "
+                        "restore any save data", rom_path)
 
         if self._restore_pending:
             self._restore_pending = False
@@ -1148,11 +1154,11 @@ class Xemu(Emulator):
                 log.error("post-close: could not read saves out of %s for title %s; "
                           "the staging dir keeps what this session restored so the "
                           "dump does not ship an empty archive",
-                          self.hdd_image, self._title_id or "<all>")
+                          self.hdd_image, self._title_id or "<unknown>")
             else:
                 extracted = staged
                 log.info("post-close: staged %d save file(s) for title %s",
-                         extracted, self._title_id or "<all>")
+                         extracted, self._title_id or "<unknown>")
         return {
             "state_saved": None,
             "state_slot": None,

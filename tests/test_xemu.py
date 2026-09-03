@@ -6,6 +6,7 @@ inject and extract hooks have to get right.
 """
 
 import gc
+import logging
 import os
 import signal
 import struct
@@ -765,13 +766,23 @@ def test_extract_covers_both_udata_and_tdata(emulator: xemu.Xemu) -> None:
     assert emulator._extract_saves() == 2
 
 
-def test_extract_without_a_title_id_takes_every_title(emulator: xemu.Xemu) -> None:
-    """Extraction with no title id known copies every title's saves."""
+def test_extract_without_a_title_id_extracts_nothing(
+    emulator: xemu.Xemu, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Extraction with no title id known copies nothing, not every title's saves.
+
+    Regression: an unparseable disc used to fall back to scoping every
+    installed title's UDATA and TDATA, leaking other titles' saves into this
+    session's archive.
+    """
     _seed(emulator.hdd_image, "/UDATA/4D530064/a.dat", b"one")
     _seed(emulator.hdd_image, "/UDATA/DEADBEEF/b.dat", b"two")
     emulator._title_id = None
 
-    assert emulator._extract_saves() == 2
+    with caplog.at_level(logging.WARNING):
+        assert emulator._extract_saves() == 0
+    assert not any(emulator.staging_dir.rglob("*"))
+    assert any("no disc title id" in r.message for r in caplog.records)
 
 
 def test_extract_is_empty_when_the_title_never_saved(emulator: xemu.Xemu) -> None:
@@ -782,18 +793,24 @@ def test_extract_is_empty_when_the_title_never_saved(emulator: xemu.Xemu) -> Non
     assert emulator._extract_saves() == 0
 
 
-def test_extract_skips_a_save_path_that_escapes_the_staging_dir(emulator: xemu.Xemu) -> None:
-    """Extraction skips a save path that escapes the staging directory.
+def test_extract_into_skips_a_save_path_that_escapes_the_dest_dir(
+    emulator: xemu.Xemu, tmp_path: Path,
+) -> None:
+    """`_extract_into` skips a save path that escapes the destination directory.
 
     libfatx does not reserve ".." as a directory name, so a save partition can carry a literal ".."
     entry that fs.walk() reports as-is; reassembled into a path and resolved on the staging side, that
-    walks straight back out of staging_dir unless the extractor catches it first.
+    walks straight back out of dest unless the extractor catches it first. Exercised directly against
+    `_extract_into` (rather than through `_extract_saves`) so it covers this defense regardless of how
+    the caller picked its roots.
     """
     _seed(emulator.hdd_image, "/UDATA/../../evil.dat", b"stolen")
-    emulator._title_id = None
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    fs = _fatx(emulator.hdd_image)
 
-    assert emulator._extract_saves() == 0
-    assert not (emulator.staging_dir.parent / "evil.dat").exists()
+    assert emulator._extract_into(fs, ["/UDATA"], dest) == 0
+    assert not (tmp_path / "evil.dat").exists()
 
 
 def test_inject_writes_staged_files_into_the_image(emulator: xemu.Xemu) -> None:
