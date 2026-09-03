@@ -1349,11 +1349,11 @@ def test_a_second_activate_arriving_mid_launch_is_refused(
     409 gate and the session it has not written yet, which is the whole window
     in which two emulators can end up sharing one screen.
     """
-    assert api._ACTIVATE_LOCK.acquire(blocking=False)
+    assert api._SESSION_LOCK.acquire(blocking=False)
     try:
         response = _activate(client, broker_dirs)
     finally:
-        api._ACTIVATE_LOCK.release()
+        api._SESSION_LOCK.release()
 
     assert response.status_code == 409
     assert fake_emulator == []
@@ -1635,3 +1635,179 @@ def test_an_oversized_card_push_is_refused_without_keeping_the_body(
 
     assert response.status_code == 413
     assert list(broker_dirs["imports"].iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "kwargs"),
+    [
+        ("post", "session/save-state", {"json": {"slot": 0}}),
+        ("post", "session/load-state", {"json": {"slot": 0}}),
+        ("post", "session/exit", {}),
+        ("get", "session/state-file", {}),
+        ("put", "session/state-file", {"params": {"filename": "GAME.03.p2s"}, "content": b"x"}),
+    ],
+)
+def test_a_save_route_arriving_mid_teardown_is_refused(
+    method: str,
+    path: str,
+    kwargs: dict[str, Any],
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    tmp_path: Path,
+) -> None:
+    """No route touching the save data runs while another one is part way through.
+
+    Holding the lock stands in for an exit somewhere between the state it is
+    writing and the archive it is about to build, which is the window in which
+    a second route archives a half-written file or publishes over the state the
+    exit just captured.
+    """
+    _activate(client, broker_dirs)
+    fake_emulator[0].state_file = tmp_path / "GAME.03.p2s"
+    fake_emulator[0].state_file.write_bytes(b"captured")
+    assert api._SESSION_LOCK.acquire(blocking=False)
+    try:
+        response = getattr(client, method)(f"{API}/{path}", **kwargs)
+    finally:
+        api._SESSION_LOCK.release()
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "another session operation is in progress"
+    assert fake_emulator[0].saved_slots == []
+    assert fake_emulator[0].loaded_slots == []
+    assert fake_emulator[0].exit_slots == []
+    assert fake_emulator[0].state_file.read_bytes() == b"captured"
+    assert session.SESSION is not None
+
+
+@pytest.mark.parametrize("method", ["get", "put"])
+def test_a_card_route_stands_off_a_launch_it_cannot_see_yet(
+    method: str, client: TestClient, broker_dirs: dict[str, Path]
+) -> None:
+    """Neither card route runs while a launch is in flight, session or no session.
+
+    The active-session check only covers a launch that already wrote its
+    session; holding the lock stands in for the rest of the launch, where the
+    emulator is about to open the very card being read or written.
+    """
+    params = {"emulator": "pcsx2"}
+    assert api._SESSION_LOCK.acquire(blocking=False)
+    try:
+        if method == "get":
+            response = client.get(f"{API}/session/memory-card", params=params)
+        else:
+            response = client.put(
+                f"{API}/session/memory-card", params=params, content=_zip({"a": b"x"})
+            )
+    finally:
+        api._SESSION_LOCK.release()
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "another session operation is in progress"
+    assert list(broker_dirs["imports"].iterdir()) == []
+
+
+def test_the_lock_is_released_once_a_save_route_is_done(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A route that took the lock hands it back, so the next one is not refused forever."""
+    _activate(client, broker_dirs)
+
+    assert client.post(f"{API}/session/save-state", json={"slot": 0}).status_code == 200
+    assert client.post(f"{API}/session/save-state", json={"slot": 0}).status_code == 200
+    assert api._SESSION_LOCK.acquire(blocking=False)
+    api._SESSION_LOCK.release()
+
+
+def test_an_emulator_that_blows_up_on_exit_still_dumps_its_saves(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A driver that raises on the way out loses its state, not the player's save data.
+
+    The saves are already on disk, so letting the exception out would drop the
+    dump and leave the session marked active with a dead emulator behind it.
+    """
+    monkeypatch.setattr(settings, "DEV_MODE", True)
+    _activate(client, broker_dirs)
+    _write_save_after_launch(fake_emulator[0].save_root / "saves" / "card.bin", b"played")
+
+    def _blow_up(slot: Optional[int]) -> dict[str, Any]:
+        """Fail the way a driver whose state write raised would.
+
+        Args:
+            slot: The slot the exit asked for; never reached.
+
+        Raises:
+            RuntimeError: Always.
+        """
+        raise RuntimeError("pine socket died mid-save")
+
+    monkeypatch.setattr(fake_emulator[0], "save_and_exit", _blow_up)
+
+    body = client.post(f"{API}/session/exit").json()
+
+    assert body["exit_error"] == "pine socket died mid-save"
+    assert body["state_saved"] is False
+    assert [f["path"] for f in body["save_dump"]["files"]] == ["saves/card.bin"]
+    # Stopped before the dump walked the tree, so nothing was still writing into it.
+    assert fake_emulator[0].running is False
+    assert session.SESSION is None
+
+
+def test_an_archive_that_cannot_be_kept_still_finishes_the_teardown(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed upload whose fallback copy cannot be written still retires the session.
+
+    Raising here would leave the session active forever, with its stream tokens
+    live and every later activate refused.
+    """
+    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
+    _activate(client, broker_dirs)
+    _write_save_after_launch(fake_emulator[0].save_root / "saves" / "card.bin", b"played")
+
+    async def _refuse_upload(
+        cb: Optional[dict[str, Any]], zip_bytes: bytes, filename: str, sess: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Report an upload the parent would not take.
+
+        Args:
+            cb: The session's callback block.
+            zip_bytes: The archive body.
+            filename: The archive name.
+            sess: The session the archive belongs to.
+
+        Returns:
+            A failed upload report.
+        """
+        return {"mode": "failed", "ok": False, "error": "connection refused"}
+
+    def _no_room(zip_bytes: bytes, name: str) -> str:
+        """Fail the way a full export volume would.
+
+        Args:
+            zip_bytes: The archive body.
+            name: The filename it would be written as.
+
+        Raises:
+            OSError: Always.
+        """
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(callback, "push_save_archive", _refuse_upload)
+    monkeypatch.setattr(saves, "write_export", _no_room)
+
+    response = client.post(f"{API}/session/exit")
+    body = response.json()
+
+    assert response.status_code == 200
+    assert body["upload"]["ok"] is False
+    assert body["upload"]["archive_path"] is None
+    assert session.SESSION is None

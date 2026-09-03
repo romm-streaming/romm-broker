@@ -13,6 +13,8 @@ import os
 import secrets
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit
@@ -37,14 +39,42 @@ Selkies errors on a connected client whose token vanished, so browsers are
 given this long to tear the stream iframe down before the token set empties.
 """
 
-_ACTIVATE_LOCK = threading.Lock()
-"""Held for the whole of activate, so two launches never end up sharing one screen.
+_SESSION_LOCK = threading.Lock()
+"""Held for the whole of any operation that touches the emulator or its save data.
 
-The 409 gate reads `session.SESSION`, but every step between that read and
-`new_session` awaits, so without this two callers both pass the gate and both
-launch an emulator. Taken without blocking: a second caller is told to come
-back rather than queued behind a launch that can take a minute.
+Activate, exit, the state routes and the memory-card routes all work on the one
+emulator, the one working slot and the one save tree, and every one of them
+awaits part way through. Two of them in flight together is one archiving what
+the other is still writing: an exit dumping the save tree while a save-state
+rewrites it, a state push landing on the slot the exit just captured, or a
+launch clearing the slot a card operation is reading. Taken without blocking, so
+a second caller is told to come back rather than queued behind a launch or a
+teardown that can take a minute.
 """
+
+
+@contextmanager
+def _session_operation(operation: str) -> Iterator[None]:
+    """Run the caller's block under `_SESSION_LOCK`, refusing it if another op holds it.
+
+    Args:
+        operation: What the caller is doing, named in the refusal log.
+
+    Yields:
+        Nothing; the caller's block runs with the lock held.
+
+    Raises:
+        HTTPException: 409 when another session operation is already in flight.
+    """
+    if not _SESSION_LOCK.acquire(blocking=False):
+        log.warning("%s refused: another session operation is in progress", operation)
+        raise HTTPException(
+            status_code=409, detail="another session operation is in progress"
+        )
+    try:
+        yield
+    finally:
+        _SESSION_LOCK.release()
 
 
 class SaveIn(BaseModel):
@@ -409,8 +439,10 @@ async def activate(
 ) -> dict[str, Any]:
     """Start a session: restore save data, launch the emulator and mint the controller seat.
 
-    Serialized on `_ACTIVATE_LOCK`, so a second caller arriving mid-launch is
-    refused rather than left to start an emulator over the top of the first.
+    Serialized on `_SESSION_LOCK`, so a second caller arriving mid-launch is
+    refused rather than left to start an emulator over the top of the first,
+    and a launch never clears the working slot under an exit or a card
+    operation that is still reading it.
 
     Args:
         body: The launch request: emulator, rom, save data, callback and the multiplayer flag.
@@ -422,22 +454,16 @@ async def activate(
 
     Raises:
         HTTPException: 403 on a bad secret; 409 when a session is already active
-            or another activate is still running; everything else `_start_session` raises.
+            or another session operation is still running; everything else
+            `_start_session` raises.
     """
     _check_secret(x_broker_secret)
-    if not _ACTIVATE_LOCK.acquire(blocking=False):
-        log.warning("activate refused: another activate is still in progress")
-        raise HTTPException(
-            status_code=409, detail="another activate is already in progress"
-        )
-    try:
+    with _session_operation("activate"):
         return await _start_session(body, request)
-    finally:
-        _ACTIVATE_LOCK.release()
 
 
 async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
-    """Do the launch itself, with the activate lock already held.
+    """Do the launch itself, with the session lock already held.
 
     Any emulator left behind by an earlier broker process is reaped first. The
     save archive is located and read before the working slot is emptied, so a
@@ -737,16 +763,66 @@ def _exit_outcomes(
     return public, detail
 
 
+async def _stop_after_failed_exit(emulator: Emulator, session_id: str) -> None:
+    """Put down an emulator whose `save_and_exit` raised part way through.
+
+    The save dump that follows walks the tree the emulator writes its saves
+    into, so a process still running through it would be dumped mid-write.
+
+    Args:
+        emulator: The emulator that failed to exit.
+        session_id: The session being torn down, named in the failure log.
+    """
+    try:
+        await anyio.to_thread.run_sync(emulator.stop)
+    except Exception:
+        log.error(
+            "session %s: could not stop the emulator after a failed exit",
+            session_id,
+            exc_info=True,
+        )
+
+
+async def _keep_archive(zip_bytes: bytes, name: str, session_id: str) -> Optional[str]:
+    """Write the exit archive to EXPORT_DIR, reporting rather than raising on failure.
+
+    The export is the fallback copy of the save data, so failing to write it
+    must not take the rest of the teardown with it: an exit that raised here
+    would leave the session marked active forever, with its stream tokens live
+    and every later activate refused.
+
+    Args:
+        zip_bytes: The archive body.
+        name: The filename to write it as.
+        session_id: The session the archive belongs to, named in the failure log.
+
+    Returns:
+        The path written, or None when it could not be written.
+    """
+    try:
+        return await anyio.to_thread.run_sync(saves.write_export, zip_bytes, name)
+    except OSError as exc:
+        log.error(
+            "session %s: could not keep the save archive %s on disk: %s",
+            session_id,
+            name,
+            exc,
+        )
+        return None
+
+
 async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
     """Save state, stop the emulator, dump the save delta, and report.
 
     A `save_slot` of None exits without writing a state. The save dump still
-    runs: the game's own save data belongs to the player either way. In dev
-    mode nothing is uploaded and the archive is written to EXPORT_DIR instead;
-    a failed push also keeps the archive on disk so save data is never lost.
-    The room is told the outcome in a broker chat message, and the controller
-    gets a second one carrying the paths and errors the rest of the room has no
-    business seeing, before the tokens are cleared and the session retired.
+    runs: the game's own save data belongs to the player either way, so an
+    emulator that failed outright on the state is stopped and dumped anyway
+    rather than allowed to abort the teardown. In dev mode nothing is uploaded
+    and the archive is written to EXPORT_DIR instead; a failed push also keeps
+    the archive on disk so save data is never lost. The room is told the
+    outcome in a broker chat message, and the controller gets a second one
+    carrying the paths and errors the rest of the room has no business seeing,
+    before the tokens are cleared and the session retired.
 
     Args:
         save_slot: The state slot to save into before exiting, or None to skip the state.
@@ -754,7 +830,8 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
     Returns:
         The exit report: `status`, `session_id`, `rom`, the emulator's own exit
         fields, a `save_dump` block, an `upload` block describing what happened
-        to the archive, and `selkies_tokens_cleared`.
+        to the archive, and `selkies_tokens_cleared`. `exit_error` is added when
+        the emulator's own teardown raised.
 
     Raises:
         HTTPException: 409 when no session is active.
@@ -764,7 +841,21 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="no active session")
 
     emulator = sess["emulator_obj"]
-    exit_report = await anyio.to_thread.run_sync(emulator.save_and_exit, save_slot)
+    try:
+        exit_report = await anyio.to_thread.run_sync(emulator.save_and_exit, save_slot)
+    except Exception as exc:
+        log.error(
+            "session %s: the emulator's exit failed, dumping its saves anyway",
+            sess["id"],
+            exc_info=True,
+        )
+        await _stop_after_failed_exit(emulator, sess["id"])
+        exit_report = {
+            "state_saved": False,
+            "state_slot": None,
+            "state_file": None,
+            "exit_error": str(exc),
+        }
 
     dump_subtrees, _ = _archive_subtrees(
         emulator, bool((sess.get("save") or {}).get("memory_card_synced"))
@@ -796,7 +887,7 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
         }
     elif settings.DEV_MODE:
         if dump.get("zip_bytes"):
-            archive_path = await anyio.to_thread.run_sync(saves.write_export, dump["zip_bytes"], archive_name)
+            archive_path = await _keep_archive(dump["zip_bytes"], archive_name, sess["id"])
         upload = {
             "mode": "report-only",
             "note": "dev mode: nothing was uploaded",
@@ -815,7 +906,7 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
         )
         if not upload["ok"]:
             # Keep the archive on disk so a failed push never loses save data.
-            archive_path = await anyio.to_thread.run_sync(saves.write_export, dump["zip_bytes"], archive_name)
+            archive_path = await _keep_archive(dump["zip_bytes"], archive_name, sess["id"])
             upload["archive_path"] = archive_path
 
     report = {
@@ -894,13 +985,15 @@ async def exit_session(
         The exit report from `_do_exit`.
 
     Raises:
-        HTTPException: 403 when neither credential is accepted; 409 when no session is active.
+        HTTPException: 403 when neither credential is accepted; 409 when no
+            session is active or another session operation is in flight.
     """
     sess = session.SESSION
     is_controller = bool(sess and token and _ct_eq(token, sess["controller_token"]))
     if not is_controller:
         _check_secret(x_broker_secret)
-    return await _do_exit(slot if save else None)
+    with _session_operation("exit"):
+        return await _do_exit(slot if save else None)
 
 
 def _state_emulator() -> Emulator:
@@ -988,13 +1081,15 @@ async def save_state(body: StateIn, x_broker_secret: Optional[str] = Header(defa
         A dict with `status` (`saved` or `failed`), the `slot` used and a `saved` flag.
 
     Raises:
-        HTTPException: 403 on a bad secret; 409 when no session is active or the
-            emulator is not running; 400 when the emulator has no save states.
+        HTTPException: 403 on a bad secret; 409 when no session is active, the
+            emulator is not running, or another session operation is in flight;
+            400 when the emulator has no save states.
     """
     _check_secret(x_broker_secret)
-    emulator = _state_emulator()
-    saved = await anyio.to_thread.run_sync(emulator.save_state, body.slot)
-    slot = emulator.state_slot
+    with _session_operation("save-state"):
+        emulator = _state_emulator()
+        saved = await anyio.to_thread.run_sync(emulator.save_state, body.slot)
+        slot = emulator.state_slot
     log.info("save state slot %d: %s", slot, "ok" if saved else "failed")
     return {"status": "saved" if saved else "failed", "slot": slot, "saved": saved}
 
@@ -1014,13 +1109,15 @@ async def load_state(body: StateIn, x_broker_secret: Optional[str] = Header(defa
         A dict with `status` (`loaded` or `failed`), the `slot` used and a `loaded` flag.
 
     Raises:
-        HTTPException: 403 on a bad secret; 409 when no session is active or the
-            emulator is not running; 400 when the emulator has no save states.
+        HTTPException: 403 on a bad secret; 409 when no session is active, the
+            emulator is not running, or another session operation is in flight;
+            400 when the emulator has no save states.
     """
     _check_secret(x_broker_secret)
-    emulator = _state_emulator()
-    loaded = await anyio.to_thread.run_sync(emulator.load_state, body.slot)
-    slot = emulator.state_slot
+    with _session_operation("load-state"):
+        emulator = _state_emulator()
+        loaded = await anyio.to_thread.run_sync(emulator.load_state, body.slot)
+        slot = emulator.state_slot
     log.info("load state slot %d: %s", slot, "ok" if loaded else "failed")
     return {
         "status": "loaded" if loaded else "failed",
@@ -1041,26 +1138,28 @@ async def swap_disc(body: DiscIn, x_broker_secret: Optional[str] = Header(defaul
         A dict with `status` and the resolved disc `path`.
 
     Raises:
-        HTTPException: 403 on a bad secret; 409 when no session is active or the
-            emulator is not running; 400 when the emulator cannot swap discs,
-            the path cannot be resolved or it lies outside ROM_ROOT; 404 when
-            the disc does not exist; 502 when the emulator refuses the swap.
+        HTTPException: 403 on a bad secret; 409 when no session is active, the
+            emulator is not running, or another session operation is in flight;
+            400 when the emulator cannot swap discs, the path cannot be resolved
+            or it lies outside ROM_ROOT; 404 when the disc does not exist; 502
+            when the emulator refuses the swap.
     """
     _check_secret(x_broker_secret)
-    emulator = _swap_emulator()
-    try:
-        disc_path = Path(body.path).resolve()
-    except OSError:
-        raise HTTPException(status_code=400, detail="invalid disc path")
-    rom_root = settings.rom_root()
-    if not disc_path.is_relative_to(rom_root):
-        raise HTTPException(
-            status_code=400, detail=f"disc path must live under {rom_root}"
-        )
-    if not disc_path.exists():
-        raise HTTPException(status_code=404, detail="disc path does not exist")
+    with _session_operation("swap-disc"):
+        emulator = _swap_emulator()
+        try:
+            disc_path = Path(body.path).resolve()
+        except OSError:
+            raise HTTPException(status_code=400, detail="invalid disc path")
+        rom_root = settings.rom_root()
+        if not disc_path.is_relative_to(rom_root):
+            raise HTTPException(
+                status_code=400, detail=f"disc path must live under {rom_root}"
+            )
+        if not disc_path.exists():
+            raise HTTPException(status_code=404, detail="disc path does not exist")
 
-    swapped = await anyio.to_thread.run_sync(emulator.swap_disc, disc_path)
+        swapped = await anyio.to_thread.run_sync(emulator.swap_disc, disc_path)
     if not swapped:
         raise HTTPException(status_code=502, detail="emulator refused the disc swap")
     log.info("disc swapped to %s", disc_path.name)
@@ -1103,30 +1202,35 @@ async def get_state_file(x_broker_secret: Optional[str] = Header(default=None)) 
 
     Raises:
         HTTPException: 403 on a bad secret; 409 when there is no session to
-            read from; 404 when the slot has no state file; 500 when the file
-            cannot be read; 413 when it exceeds STATE_FILE_MAX_BYTES.
+            read from or another session operation is in flight; 404 when the
+            slot has no state file; 500 when the file cannot be read; 413 when
+            it exceeds STATE_FILE_MAX_BYTES.
     """
     _check_secret(x_broker_secret)
-    emulator = _readable_emulator()
-    path = await anyio.to_thread.run_sync(emulator.state_path)
-    if path is None:
-        raise HTTPException(status_code=404, detail="no state file for slot")
-    try:
-        size = path.stat().st_size
-    except OSError as exc:
-        log.warning("state-file: could not stat %s: %s", path, exc)
-        raise HTTPException(status_code=500, detail="could not read state file")
-    if size > settings.STATE_FILE_MAX_BYTES:
-        raise HTTPException(status_code=413, detail="state file exceeds size limit")
-    log.info("state-file: serving %s (%d bytes)", path.name, size)
-    return FileResponse(
-        path,
-        media_type="application/octet-stream",
-        headers={
-            "X-State-Filename": _header_token(path.name, "state"),
-            "X-State-Slot": str(emulator.state_slot),
-        },
-    )
+    # Under the session lock so the read never starts on a slot an exit or a
+    # push is part way through writing: half a state serves as a whole one, and
+    # RomM would file it over the state the player actually has.
+    with _session_operation("state-file read"):
+        emulator = _readable_emulator()
+        path = await anyio.to_thread.run_sync(emulator.state_path)
+        if path is None:
+            raise HTTPException(status_code=404, detail="no state file for slot")
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            log.warning("state-file: could not stat %s: %s", path, exc)
+            raise HTTPException(status_code=500, detail="could not read state file")
+        if size > settings.STATE_FILE_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="state file exceeds size limit")
+        log.info("state-file: serving %s (%d bytes)", path.name, size)
+        return FileResponse(
+            path,
+            media_type="application/octet-stream",
+            headers={
+                "X-State-Filename": _header_token(path.name, "state"),
+                "X-State-Slot": str(emulator.state_slot),
+            },
+        )
 
 
 @router.get("/api/session/state-screenshot")
@@ -1147,23 +1251,25 @@ async def get_state_screenshot(x_broker_secret: Optional[str] = Header(default=N
 
     Raises:
         HTTPException: 403 on a bad secret; 409 when there is no session to
-            read from; 404 when the slot has no screenshot file; 500 when the
-            file cannot be read; 413 when it exceeds STATE_SCREENSHOT_MAX_BYTES.
+            read from or another session operation is in flight; 404 when the
+            slot has no screenshot file; 500 when the file cannot be read; 413
+            when it exceeds STATE_SCREENSHOT_MAX_BYTES.
     """
     _check_secret(x_broker_secret)
-    emulator = _readable_emulator()
-    path = await anyio.to_thread.run_sync(emulator.state_screenshot_path)
-    if path is None:
-        raise HTTPException(status_code=404, detail="no state screenshot for slot")
-    try:
-        size = path.stat().st_size
-    except OSError as exc:
-        log.warning("state-screenshot: could not stat %s: %s", path, exc)
-        raise HTTPException(status_code=500, detail="could not read screenshot")
-    if size > settings.STATE_SCREENSHOT_MAX_BYTES:
-        raise HTTPException(status_code=413, detail="screenshot exceeds size limit")
-    log.info("state-screenshot: serving %s (%d bytes)", path.name, size)
-    return FileResponse(path, media_type="image/png")
+    with _session_operation("state-screenshot read"):
+        emulator = _readable_emulator()
+        path = await anyio.to_thread.run_sync(emulator.state_screenshot_path)
+        if path is None:
+            raise HTTPException(status_code=404, detail="no state screenshot for slot")
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            log.warning("state-screenshot: could not stat %s: %s", path, exc)
+            raise HTTPException(status_code=500, detail="could not read screenshot")
+        if size > settings.STATE_SCREENSHOT_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="screenshot exceeds size limit")
+        log.info("state-screenshot: serving %s (%d bytes)", path.name, size)
+        return FileResponse(path, media_type="image/png")
 
 
 def _unlink_best_effort(path: Path) -> None:
@@ -1202,47 +1308,51 @@ async def put_state_file(
         A dict with `status`, the `filename` it was stored under and the `slot`.
 
     Raises:
-        HTTPException: 403 on a bad secret; 409 when no session is active or
-            the emulator is not running; 400 when the emulator has no save
-            states, the name is not one it would write, or the body is empty;
-            413 when the body exceeds STATE_FILE_MAX_BYTES; 500 when the file
-            cannot be written.
+        HTTPException: 403 on a bad secret; 409 when no session is active, the
+            emulator is not running, or another session operation is in flight;
+            400 when the emulator has no save states, the name is not one it
+            would write, or the body is empty; 413 when the body exceeds
+            STATE_FILE_MAX_BYTES; 500 when the file cannot be written.
     """
     _check_secret(x_broker_secret)
-    emulator = _state_emulator()
-    name = Path(filename).name
-    target = emulator.state_target(name)
-    if target is None:
-        raise HTTPException(status_code=400, detail="filename is not a state this emulator would write")
+    # Held across the upload, not just the rename: the slot this publishes into
+    # is the one an exit captures and serves, so a push landing over the top of
+    # a teardown hands RomM back a different state than the one it just took.
+    with _session_operation("state-file push"):
+        emulator = _state_emulator()
+        name = Path(filename).name
+        target = emulator.state_target(name)
+        if target is None:
+            raise HTTPException(status_code=400, detail="filename is not a state this emulator would write")
 
-    # Unique per request: two pushes sharing one temp name interleave their
-    # writes, and the os.replace below then publishes the mixture as a state.
-    tmp = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
-    written = 0
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # Streamed to disk rather than buffered: a state runs to hundreds of
-        # megabytes and holding one per request on the heap is the whole limit
-        # multiplied by however many callers are pushing at once.
-        with tmp.open("wb") as out:
-            async for chunk in request.stream():
-                written += len(chunk)
-                if written > settings.STATE_FILE_MAX_BYTES:
-                    raise HTTPException(status_code=413, detail="state file exceeds size limit")
-                await anyio.to_thread.run_sync(out.write, chunk)
-        if written == 0:
-            raise HTTPException(status_code=400, detail="empty request body")
-        os.replace(tmp, target)
-    except HTTPException:
-        _unlink_best_effort(tmp)
-        raise
-    except OSError as exc:
-        _unlink_best_effort(tmp)
-        log.warning("state-file: could not write %s: %s", target, exc)
-        raise HTTPException(status_code=500, detail="could not write state file")
+        # Unique per request: two pushes sharing one temp name interleave their
+        # writes, and the os.replace below then publishes the mixture as a state.
+        tmp = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
+        written = 0
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # Streamed to disk rather than buffered: a state runs to hundreds of
+            # megabytes and holding one per request on the heap is the whole limit
+            # multiplied by however many callers are pushing at once.
+            with tmp.open("wb") as out:
+                async for chunk in request.stream():
+                    written += len(chunk)
+                    if written > settings.STATE_FILE_MAX_BYTES:
+                        raise HTTPException(status_code=413, detail="state file exceeds size limit")
+                    await anyio.to_thread.run_sync(out.write, chunk)
+            if written == 0:
+                raise HTTPException(status_code=400, detail="empty request body")
+            os.replace(tmp, target)
+        except HTTPException:
+            _unlink_best_effort(tmp)
+            raise
+        except OSError as exc:
+            _unlink_best_effort(tmp)
+            log.warning("state-file: could not write %s: %s", target, exc)
+            raise HTTPException(status_code=500, detail="could not write state file")
 
-    log.info("state-file: stored %s (%d bytes)", target.name, written)
-    return {"status": "ok", "filename": target.name, "slot": emulator.state_slot}
+        log.info("state-file: stored %s (%d bytes)", target.name, written)
+        return {"status": "ok", "filename": target.name, "slot": emulator.state_slot}
 
 
 def _scratch_file(label: str) -> Path:
@@ -1268,7 +1378,9 @@ def _refuse_while_session_active(action: str) -> None:
     The emulator holds the card open for the life of the game, so a card read
     out from under it is a card caught mid-write, and one written under it is
     corrupted outright. RomM hydrates before activate and evacuates after exit,
-    so neither direction has to work with something running.
+    so neither direction has to work with something running. Only checked with
+    the session lock held, so no launch can turn this answer stale between the
+    check and the card operation it clears.
 
     Args:
         action: The verb for the reply, e.g. `capture` or `replace`.
@@ -1338,21 +1450,23 @@ async def get_memory_card(
 
     Raises:
         HTTPException: 403 on a bad secret; 422 for an unknown emulator; 400
-            when it has no memory card; 409 when another card operation is in
-            flight, a session is active, or the card could not be captured; 404
-            with `X-Memory-Card: absent` when the slot is empty.
+            when it has no memory card; 409 when another card or session
+            operation is in flight, a session is active, or the card could not
+            be captured; 404 with `X-Memory-Card: absent` when the slot is empty.
     """
     _check_secret(x_broker_secret)
     card, marker = _memory_card(emulator, platform)
-    # Contention means a card operation is already in flight, and the caller
-    # should come back rather than queue behind it.
-    if not memcard.LOCK.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail="a memory card operation is in progress")
-    try:
-        _refuse_while_session_active("capture")
-        result = await anyio.to_thread.run_sync(memcard.build_archive, card, marker)
-    finally:
-        memcard.LOCK.release()
+    # The session lock keeps an activate from launching over the capture, the
+    # card lock keeps another card operation off the same staging paths.
+    # Contention on either means the caller should come back rather than queue.
+    with _session_operation("memory-card capture"):
+        if not memcard.LOCK.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="a memory card operation is in progress")
+        try:
+            _refuse_while_session_active("capture")
+            result = await anyio.to_thread.run_sync(memcard.build_archive, card, marker)
+        finally:
+            memcard.LOCK.release()
     if isinstance(result, str):
         raise HTTPException(status_code=409, detail=result)
     if result is None:
@@ -1396,8 +1510,8 @@ async def put_memory_card(
         HTTPException: 403 on a bad secret; 422 for an unknown emulator; 400
             when it has no memory card, the body is empty or the archive is
             rejected; 413 when the body exceeds SAVE_FILE_MAX_BYTES; 409 when
-            another card operation is in flight or a session is active; 500 when
-            the body cannot be staged on disk.
+            another card or session operation is in flight or a session is
+            active; 500 when the body cannot be staged on disk.
     """
     _check_secret(x_broker_secret)
     card, marker = _memory_card(emulator, platform)
@@ -1417,14 +1531,17 @@ async def put_memory_card(
         if written == 0:
             raise HTTPException(status_code=400, detail="empty request body")
 
-        if not memcard.LOCK.acquire(blocking=False):
-            raise HTTPException(status_code=409, detail="a memory card operation is in progress")
-        try:
-            _refuse_while_session_active("replace")
-            content = await anyio.to_thread.run_sync(tmp.read_bytes)
-            result = await anyio.to_thread.run_sync(memcard.replace, card, content, marker)
-        finally:
-            memcard.LOCK.release()
+        # Taken only once the whole body is staged, so a slow upload never
+        # holds the lock a launch or a teardown is waiting on.
+        with _session_operation("memory-card replace"):
+            if not memcard.LOCK.acquire(blocking=False):
+                raise HTTPException(status_code=409, detail="a memory card operation is in progress")
+            try:
+                _refuse_while_session_active("replace")
+                content = await anyio.to_thread.run_sync(tmp.read_bytes)
+                result = await anyio.to_thread.run_sync(memcard.replace, card, content, marker)
+            finally:
+                memcard.LOCK.release()
     except OSError as exc:
         log.error("memory-card: could not stage the upload at %s: %s", tmp, exc)
         raise HTTPException(status_code=500, detail="could not store the memory card")
