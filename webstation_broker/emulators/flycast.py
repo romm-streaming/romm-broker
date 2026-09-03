@@ -50,7 +50,9 @@ saves from savestates from a first-run onboarding artifact.
 import logging
 import os
 import re
+import stat
 import subprocess
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -132,8 +134,98 @@ makes it recoverable at all: DATA_DIR itself does not outlive the container.
 """
 
 
+STATE_WAIT = float(os.environ.get("FLYCAST_STATE_WAIT", "30.0"))
+"""Seconds a shutdown save gets to land on disk (env `FLYCAST_STATE_WAIT`, default 30)."""
+STATE_STABLE = float(os.environ.get("FLYCAST_STATE_STABLE", "1.5"))
+"""Seconds size and mtime must both hold still before a state counts as written.
+
+From env `FLYCAST_STATE_STABLE`, default 1.5. Long enough that a stalled
+write does not read as a finished one on a loaded host.
+"""
+
+
 def _state_path_for(rom_path: Path) -> Path:
     return DATA_DIR / f"{rom_path.stem}.state"
+
+
+def _state_is_loadable(path: Path) -> bool:
+    """Whether a resume state is worth pointing Dreamcast.AutoLoadState at.
+
+    A zero-byte state is what an interrupted write or a truncated restore
+    leaves behind, and flycast auto-loading one gives the player a dead boot
+    instead of the fresh start it would otherwise have had.
+
+    Args:
+        path: The resume state to check.
+
+    Returns:
+        True when the file is a regular file holding any data at all.
+    """
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        log.warning("could not check the resume state at %s: %s", path, exc)
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_size > 0
+
+
+def _wait_for_state_write(
+    path: Path, before: Optional[tuple[int, float]], deadline: float
+) -> Optional[tuple[int, float]]:
+    """Poll a resume state until this exit's write settles, or the deadline passes.
+
+    The process being gone is not proof the state is whole: flycast writes it
+    from `unloadGame()` on its way out, and the broker zips DATA_DIR into the
+    upload archive the moment `save_and_exit` returns, so a single stat taken
+    the instant the pid dies can measure a half-flushed file and ship it to
+    RomM as the player's progress. A write therefore only counts once the file
+    differs from `before`, is non-empty, and has held both size and mtime still
+    for `STATE_STABLE`. Size alone over one sample is not enough, and neither
+    is a stalled writer's steady size over a short window.
+
+    Args:
+        path: The resume state this exit should have written.
+        before: `(size, mtime)` the state carried before the exit, or None when
+            there was no state then.
+        deadline: `time.monotonic` value to give up at.
+
+    Returns:
+        The settled `(size, mtime)`, or None when nothing was written, nothing
+        changed, or the write never settled in time.
+    """
+    POLL_SECS = 0.1
+    last: Optional[tuple[int, float]] = None
+    stable_since = 0.0
+    reason = ""
+    while True:
+        try:
+            st = path.stat()
+        except OSError:
+            cur = None
+        else:
+            cur = (st.st_size, st.st_mtime)
+        if cur is None:
+            reason = "no resume state written during shutdown"
+        elif cur == before:
+            reason = "resume state unchanged, exit may not have saved"
+        else:
+            reason = "resume state never finished writing before the deadline"
+            if cur != last:
+                last = cur
+                stable_since = time.monotonic()
+            elif cur[0] > 0 and time.monotonic() - stable_since >= STATE_STABLE:
+                log.info("resume state write complete: %s (%d bytes)", path.name, cur[0])
+                return cur
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(POLL_SECS)
+    if last is None:
+        log.warning("%s: %s", reason, path)
+    else:
+        log.warning("%s: %s (%d bytes)", reason, path, last[0])
+    return None
 
 
 class Flycast(Emulator):
@@ -282,8 +374,8 @@ class Flycast(Emulator):
 
         Args:
             rom_path: The resolved disc image or file to boot.
-            resume_slot: If not None and a resume state exists for this rom,
-                enable auto-load on boot; otherwise boot fresh.
+            resume_slot: If not None and a loadable resume state exists for
+                this rom, enable auto-load on boot; otherwise boot fresh.
         """
         self.stop()
         self._rom_path = rom_path
@@ -296,7 +388,7 @@ class Flycast(Emulator):
             "window:fullscreen=yes",
         ]
         if resume_path is not None:
-            if resume_path.is_file():
+            if _state_is_loadable(resume_path):
                 config_opts.append("config:Dreamcast.AutoLoadState=yes")
             else:
                 log.warning("resume requested but no resume state at %s", resume_path)
@@ -389,7 +481,10 @@ class Flycast(Emulator):
             slot), and "state_file" (a dict of the trusted state file's
             path, size, and mtime, or None). A state file is only trusted
             when the process was not force-killed (no SIGTERM/SIGKILL
-            escalation) and its size or mtime changed during this exit.
+            escalation) and its size or mtime changed during this exit and
+            then settled, per `_wait_for_state_write`. Returning is what
+            releases the caller to zip DATA_DIR, so waiting for the write to
+            settle here is what keeps a torn state out of the archive.
         """
         saved = False
         state_file = None
@@ -427,14 +522,8 @@ class Flycast(Emulator):
                     if before is None or before != (st.st_size, st.st_mtime):
                         self._set_aside_untrusted_state(p)
             else:
-                try:
-                    st = p.stat()
-                except OSError:
-                    log.warning("no resume state written during shutdown: %s", p)
-                else:
-                    if before is not None and before == (st.st_size, st.st_mtime):
-                        log.warning("resume state at %s unchanged, exit may not have saved", p)
-                    else:
-                        saved = True
-                        state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
+                stamp = _wait_for_state_write(p, before, time.monotonic() + STATE_WAIT)
+                if stamp is not None:
+                    saved = True
+                    state_file = {"path": str(p), "size": stamp[0], "mtime": stamp[1]}
         return {"state_saved": saved, "state_slot": slot, "state_file": state_file}

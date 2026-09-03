@@ -1,5 +1,6 @@
 """Flycast ROM resolution, transient -config composition, launch, and exit via a graceful close request."""
 
+import itertools
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
@@ -8,6 +9,13 @@ from typing import NoReturn, Optional
 import pytest
 
 from webstation_broker.emulators import base, flycast
+
+
+@pytest.fixture(autouse=True)
+def fast_state_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shrink the shutdown-save poll window so exit tests do not sit on real seconds."""
+    monkeypatch.setattr(flycast, "STATE_WAIT", 0.5)
+    monkeypatch.setattr(flycast, "STATE_STABLE", 0.0)
 
 
 @pytest.fixture
@@ -254,6 +262,48 @@ def test_launch_with_a_resume_slot_but_no_state_boots_fresh(
 
     assert "config:Dreamcast.AutoLoadState=yes" not in spawned["cmd"][2]
     assert "resume requested but no resume state" in caplog.text
+
+
+def test_launch_with_a_zero_byte_resume_state_boots_fresh(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An empty state file is a torn write, not a resume point: booting fresh beats a dead boot."""
+    monkeypatch.setattr(flycast.Flycast, "stop", lambda self: None)
+    spawned = {}
+
+    def fake_spawn(
+        self: flycast.Flycast, cmd: list[str], env: dict[str, str], stdin_pipe: bool = False
+    ) -> None:
+        spawned["cmd"] = cmd
+
+    monkeypatch.setattr(flycast.Flycast, "_spawn", fake_spawn)
+    rom = rom_root / "game.chd"
+    rom.write_bytes(b"")
+    (data_dir / "game.state").write_bytes(b"")
+
+    with caplog.at_level("WARNING"):
+        flycast.Flycast().launch(rom, resume_slot=1)
+
+    assert "config:Dreamcast.AutoLoadState=yes" not in spawned["cmd"][2]
+    assert "resume requested but no resume state" in caplog.text
+
+
+def test_a_resume_state_that_cannot_be_stat_ed_is_not_loaded_and_is_logged(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A state the broker cannot look at is never handed to AutoLoadState."""
+    state = data_dir / "game.state"
+    state.write_bytes(b"state")
+
+    def boom(self: Path) -> NoReturn:
+        raise OSError("stale nfs handle")
+
+    monkeypatch.setattr(Path, "stat", boom)
+
+    with caplog.at_level("WARNING"):
+        assert flycast._state_is_loadable(state) is False
+
+    assert "could not check the resume state" in caplog.text
 
 
 # ── _window (title match confirmed by owning pid) ──────────────────────────
@@ -547,6 +597,106 @@ def test_exit_with_a_slot_reports_the_state_the_shutdown_wrote(
     assert report["state_saved"] is True
     assert report["state_slot"] == 1
     assert report["state_file"]["path"] == str(state)
+
+
+def test_exit_waits_for_a_half_written_state_to_settle_before_measuring_it(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pid dying is not proof the state is whole, and the caller zips DATA_DIR the moment this returns.
+
+    A state still being flushed must be waited out, not measured once and
+    shipped to RomM half written.
+    """
+    rom = rom_root / "game.chd"
+    rom.write_bytes(b"")
+    state = data_dir / "game.state"
+    whole = b"a whole session, once the flush finishes"
+
+    def fake_stop(self: flycast.Flycast) -> None:
+        state.write_bytes(b"")
+
+    monkeypatch.setattr(flycast.Flycast, "stop", fake_stop)
+    chunks = iter([whole[:8], whole])
+
+    def fake_sleep(_secs: float) -> None:
+        chunk = next(chunks, None)
+        if chunk is not None:
+            state.write_bytes(chunk)
+
+    monkeypatch.setattr(flycast.time, "sleep", fake_sleep)
+    emu = flycast.Flycast()
+    emu._rom_path = rom
+    emu._proc = _FakeProc()
+    emu._proc.returncode = 0
+    monkeypatch.setattr(emu, "alive", lambda: True)
+
+    report = emu.save_and_exit(1)
+
+    assert report["state_saved"] is True
+    assert report["state_file"]["size"] == len(whole)
+    assert state.read_bytes() == whole
+
+
+def test_exit_never_reports_a_state_whose_write_does_not_settle(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A state still growing when the deadline passes is not reported, and not destroyed either."""
+    rom = rom_root / "game.chd"
+    rom.write_bytes(b"")
+    state = data_dir / "game.state"
+
+    def fake_stop(self: flycast.Flycast) -> None:
+        state.write_bytes(b"x")
+
+    monkeypatch.setattr(flycast.Flycast, "stop", fake_stop)
+    written = bytearray(b"x")
+
+    def fake_sleep(_secs: float) -> None:
+        written.extend(b"x")
+        state.write_bytes(bytes(written))
+
+    # A clock that only moves when it is read keeps the deadline deterministic
+    # while the fake writer runs without ever pausing.
+    ticks = itertools.count(0.0, 0.05)
+    monkeypatch.setattr(flycast.time, "sleep", fake_sleep)
+    monkeypatch.setattr(flycast.time, "monotonic", lambda: next(ticks))
+    emu = flycast.Flycast()
+    emu._rom_path = rom
+    emu._proc = _FakeProc()
+    emu._proc.returncode = 0
+    monkeypatch.setattr(emu, "alive", lambda: True)
+
+    with caplog.at_level("WARNING"):
+        report = emu.save_and_exit(1)
+
+    assert report == {"state_saved": False, "state_slot": 1, "state_file": None}
+    assert "never finished writing" in caplog.text
+    assert state.exists()
+
+
+def test_exit_never_reports_a_state_left_at_zero_bytes(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A created-but-empty state is a write that never happened, however still its size holds."""
+    rom = rom_root / "game.chd"
+    rom.write_bytes(b"")
+    state = data_dir / "game.state"
+
+    def fake_stop(self: flycast.Flycast) -> None:
+        state.write_bytes(b"")
+
+    monkeypatch.setattr(flycast.Flycast, "stop", fake_stop)
+    emu = flycast.Flycast()
+    emu._rom_path = rom
+    emu._proc = _FakeProc()
+    emu._proc.returncode = 0
+    monkeypatch.setattr(emu, "alive", lambda: True)
+
+    with caplog.at_level("WARNING"):
+        report = emu.save_and_exit(1)
+
+    assert report == {"state_saved": False, "state_slot": 1, "state_file": None}
+    assert "never finished writing" in caplog.text
 
 
 def test_exit_with_a_slot_reports_no_save_when_the_state_is_unchanged(
