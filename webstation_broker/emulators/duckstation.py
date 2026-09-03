@@ -18,7 +18,6 @@ API symmetry.
 import logging
 import os
 import re
-import signal
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Optional
@@ -445,13 +444,15 @@ class Duckstation(Emulator):
         # its resume state on every graceful shutdown regardless of `slot`;
         # an exit with no state requested only skips reporting it here, the
         # file still lands in the save archive dump since it is newer than
-        # the session baseline. We can only trust that write if SIGTERM was
-        # enough: a SIGKILL escalation (term_timeout exceeded), or stop()
-        # never confirming the process died at all, can cut the write off
-        # mid-flight. A killed process's changed file is discarded outright
-        # rather than just left unreported, since the archive dump sweeps up
-        # anything with a fresh mtime whether or not this method reports it.
-        killed = proc is None or proc.returncode is None or proc.returncode == -signal.SIGKILL
+        # the session baseline. We can only trust that write if SIGTERM ran
+        # its graceful shutdown to completion: death by any signal, not just
+        # a SIGKILL escalation, can cut the write off mid-flight (SIGTERM
+        # itself included, since term_timeout can still expire and force an
+        # OS-level SIGKILL after a hung shutdown). A killed process's changed
+        # file is discarded outright rather than just left unreported, since
+        # the archive dump sweeps up anything with a fresh mtime whether or
+        # not this method reports it.
+        killed = proc is None or proc.returncode is None or proc.returncode < 0
         if was_alive:
             p = _changed_resume_state(before)
             if killed:

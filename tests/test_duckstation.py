@@ -539,6 +539,94 @@ def test_exit_with_a_slot_discards_a_state_from_a_force_killed_process(
     assert "force-killed" in caplog.text
 
 
+@pytest.mark.parametrize("returncode", [-15, -6, -11])
+def test_exit_with_a_slot_discards_a_state_from_a_process_killed_by_any_signal(
+    returncode: int,
+    duckstation_dirs: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Any signal death, not just the SIGKILL escalation, can cut the resume state write short.
+
+    A negative returncode is the POSIX marker for that. SIGTERM's own graceful shutdown counts:
+    stop() escalates to an OS-level SIGKILL once term_timeout expires, and the wait then reports
+    the signal that actually landed.
+    """
+    written = duckstation.SSTATE_DIR / "SLUS-00001_resume.sav"
+
+    class FakeProc:
+        pass
+
+    proc = FakeProc()
+    proc.returncode = returncode
+
+    def fake_stop(self: duckstation.Duckstation) -> None:
+        # Simulates a partial write landing before the signal lands.
+        _touch(written)
+
+    monkeypatch.setattr(duckstation.Duckstation, "stop", fake_stop)
+    emu = duckstation.Duckstation()
+    emu._proc = proc
+    monkeypatch.setattr(emu, "alive", lambda: True)
+
+    with caplog.at_level("WARNING"):
+        report = emu.save_and_exit(1)
+
+    assert report == {"state_saved": False, "state_slot": 1, "state_file": None}
+    assert not written.exists()
+    assert "force-killed" in caplog.text
+
+
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_exit_with_a_slot_trusts_a_state_from_a_process_that_exited_on_its_own(
+    returncode: int, duckstation_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-negative returncode means the shutdown ran to completion, so its write is kept."""
+    written = _touch(duckstation.SSTATE_DIR / "SLUS-00001_resume.sav")
+
+    class FakeProc:
+        pass
+
+    proc = FakeProc()
+    proc.returncode = returncode
+
+    def fake_stop(self: duckstation.Duckstation) -> None:
+        written.write_bytes(b"a fresh resume state")
+
+    monkeypatch.setattr(duckstation.Duckstation, "stop", fake_stop)
+    emu = duckstation.Duckstation()
+    emu._proc = proc
+    monkeypatch.setattr(emu, "alive", lambda: True)
+
+    report = emu.save_and_exit(1)
+
+    assert report["state_saved"] is True
+    assert written.exists()
+
+
+def test_exit_without_a_slot_still_discards_a_state_from_a_killed_process(
+    duckstation_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The discard is independent of the slot: the dump sweeps by mtime whatever this reports."""
+    written = duckstation.SSTATE_DIR / "SLUS-00001_resume.sav"
+
+    class FakeProc:
+        returncode = -15
+
+    def fake_stop(self: duckstation.Duckstation) -> None:
+        _touch(written)
+
+    monkeypatch.setattr(duckstation.Duckstation, "stop", fake_stop)
+    emu = duckstation.Duckstation()
+    emu._proc = FakeProc()
+    monkeypatch.setattr(emu, "alive", lambda: True)
+
+    report = emu.save_and_exit(None)
+
+    assert report == {"state_saved": False, "state_slot": None, "state_file": None}
+    assert not written.exists()
+
+
 def test_exit_with_a_slot_discards_a_state_when_stop_never_confirms_the_exit(
     duckstation_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
