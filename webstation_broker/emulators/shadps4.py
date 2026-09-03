@@ -42,7 +42,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
-from typing import Optional
+from typing import Any, Optional
 
 from .. import settings
 from .base import Emulator, base_launch_env
@@ -65,6 +65,13 @@ DATA_DIR = Path(os.environ.get("SHADPS4_DATA_DIR", str(Path(XDG_DATA_HOME) / "sh
 """shadPS4's data root holding save data (env `SHADPS4_DATA_DIR`, default `$XDG_DATA_HOME/shadPS4`)."""
 SHADPS4_LOG_PATH = Path(os.environ.get("SHADPS4_LOG_PATH", "/config/shadps4.log"))
 """The emulator log file (env `SHADPS4_LOG_PATH`, default `/config/shadps4.log`)."""
+
+SAVEDATA_SUBTREE = "home/1000/savedata"
+"""Save data under the default PS4 user, relative to `DATA_DIR`; the whole save archive."""
+_MOUNT_MARKER_DIR = "sce_sys"
+"""Per-save metadata directory shadPS4 keeps the mount marker in."""
+_MOUNT_MARKER_NAME = "corrupted"
+"""File shadPS4 drops into `sce_sys` while a save is mounted read-write, removed on unmount."""
 
 SHADPS4_CONFIG_PATH = Path(
     os.environ.get("SHADPS4_CONFIG_PATH", str(DATA_DIR / "config.json"))
@@ -1065,6 +1072,35 @@ def _pin_gpu_id_locked() -> None:
     log.info("shadps4: pinned Vulkan.gpu_id=%d in %s", gpu_id, SHADPS4_CONFIG_PATH)
 
 
+def _unmounted_saves(savedata_root: Path) -> list[Path]:
+    """Save directories shadPS4 was still holding mounted when it died.
+
+    shadPS4 drops `sce_sys/corrupted` into a save while it has it mounted
+    read-write and removes it again on unmount, so a marker still on disk once
+    the process is gone names a save whose last write was never flushed
+    through a clean unmount. `saves.py` strips the marker itself out of the
+    dump, which means the archive that ships those saves looks clean; naming
+    them here is the only trace an operator gets.
+
+    Args:
+        savedata_root: The savedata subtree to scan.
+
+    Returns:
+        The per-save directories still carrying the marker, sorted. Empty when
+        the subtree is missing or cannot be walked.
+    """
+    if not savedata_root.is_dir():
+        return []
+    found: list[Path] = []
+    try:
+        for marker in sorted(savedata_root.rglob(_MOUNT_MARKER_NAME)):
+            if marker.parent.name == _MOUNT_MARKER_DIR and marker.is_file():
+                found.append(marker.parent.parent)
+    except OSError as exc:
+        log.warning("shadps4: could not scan %s for unmounted saves: %s", savedata_root, exc)
+    return found
+
+
 class Shadps4(Emulator):
     """PlayStation 4 via shadPS4, driven over its stdin IPC protocol.
 
@@ -1097,7 +1133,7 @@ class Shadps4(Emulator):
     name = "shadps4"
     display_name = "shadPS4"
     save_root = DATA_DIR
-    save_subtrees = ("home/1000/savedata",)
+    save_subtrees = (SAVEDATA_SUBTREE,)
     """Save data plus its per-title param.sfo, under the default PS4 user."""
     log_path = SHADPS4_LOG_PATH
     term_timeout = float(os.environ.get("SHADPS4_STOP_WAIT", "20"))
@@ -1106,6 +1142,17 @@ class Shadps4(Emulator):
     STOP goes through the SDL event loop into a graceful teardown; give it
     room before escalating to SIGTERM.
     """
+
+    def __init__(self) -> None:
+        """Start with the base handles and no verdict on a shutdown yet."""
+        super().__init__()
+        self._graceful_exit: Optional[bool] = None
+        """How the last stop of a live process went, None when none has run yet.
+
+        True only for an IPC STOP the emulator answered on its own. False once
+        the SIGTERM escalation had to run, which shadPS4 has no handler for and
+        so cannot flush its save mounts through.
+        """
 
     @property
     def rom_extensions(self) -> tuple[str, ...]:
@@ -1155,6 +1202,16 @@ class Shadps4(Emulator):
             return path
         if not path.is_dir():
             return None
+        # The folder itself, not just its eboot.bin: shadps4 appends the
+        # filename to a directory path on its own, so a folder symlinked out of
+        # the library would otherwise boot a host path nothing here validated.
+        try:
+            if not path.resolve().is_relative_to(rom_root):
+                log.warning("shadps4: refusing %s, it resolves outside %s", path, rom_root)
+                return None
+        except OSError as exc:
+            log.warning("shadps4: could not resolve %s (%s)", path, exc)
+            return None
         eboot = path / "eboot.bin"
         try:
             if eboot.is_file():
@@ -1183,6 +1240,7 @@ class Shadps4(Emulator):
             RuntimeError: When no binary is found under `VERSIONS_DIR`.
         """
         self.stop()
+        self._graceful_exit = None
         if resume_slot is not None:
             log.info(
                 "shadps4 has no save states, resume_slot %s ignored "
@@ -1222,12 +1280,14 @@ class Shadps4(Emulator):
         """
         proc = self._proc
         if proc is None or proc.stdin is None or proc.poll() is not None:
+            log.warning("shadps4: IPC %s not sent, no running process with a stdin pipe", cmd)
             return False
         try:
             proc.stdin.write(f"{cmd}\n".encode())
             proc.stdin.flush()
             return True
-        except (BrokenPipeError, OSError):
+        except OSError as exc:
+            log.warning("shadps4: IPC %s could not be written to stdin: %s", cmd, exc)
             return False
 
     def stop(self) -> None:
@@ -1236,6 +1296,12 @@ class Shadps4(Emulator):
         STOP is written to stdin and the process given `term_timeout` to
         exit on its own; a broken pipe or a timeout falls through to the
         SIGTERM then SIGKILL sequence in the base class.
+
+        Which of the two ran is recorded in `_graceful_exit` for
+        `save_and_exit` to report. shadPS4 registers no SIGTERM handler, so
+        the escalation kills it wherever it happens to be, save mounts
+        included; the save data the dump then ships cannot be trusted the way
+        a clean IPC quit's can.
         """
         proc = self._proc
         if proc is not None and proc.poll() is None and proc.stdin is not None:
@@ -1244,13 +1310,62 @@ class Shadps4(Emulator):
                 proc.stdin.write(b"STOP\n")
                 proc.stdin.flush()
                 proc.wait(timeout=self.term_timeout)
+            except OSError as exc:
+                self._graceful_exit = False
+                log.warning(
+                    "%s (pid %d): IPC STOP could not be delivered (%s), escalating to "
+                    "SIGTERM; save data written this session may be incomplete",
+                    self.name, proc.pid, exc,
+                )
+            except subprocess.TimeoutExpired:
+                self._graceful_exit = False
+                log.warning(
+                    "%s (pid %d) did not exit within %.0fs of STOP, escalating to SIGTERM; "
+                    "save data written this session may be incomplete",
+                    self.name, proc.pid, self.term_timeout,
+                )
+            else:
                 self._forget()
+                self._graceful_exit = True
                 log.info("%s exited gracefully", self.name)
                 return
-            except (BrokenPipeError, OSError):
-                pass
-            except subprocess.TimeoutExpired:
-                log.warning(
-                    "%s did not exit after STOP, escalating to SIGTERM", self.name
-                )
         super().stop()
+
+    def save_and_exit(self, slot: Optional[int]) -> dict[str, Any]:
+        """Stop shadPS4 and report whether the save data it leaves can be trusted.
+
+        There are no save states, so the state fields are always None. What
+        this adds over the base is the shutdown's own verdict: the caller zips
+        the save tree the moment this returns, and a stop that had to escalate
+        to SIGTERM can leave a save half-written, with shadPS4's own
+        `sce_sys/corrupted` marker the only sign of it.
+
+        Args:
+            slot: Ignored with a log line; shadPS4 has no save states.
+
+        Returns:
+            The state fields all None (`state_saved`, `state_slot`,
+            `state_file`), plus `graceful_exit` and `unmounted_saves`, the save
+            directories shadPS4 never unmounted.
+        """
+        if slot is not None:
+            log.info("shadps4 has no save states, exit slot %s ignored", slot)
+        self.stop()
+        stranded = [str(p) for p in _unmounted_saves(self.save_root / SAVEDATA_SUBTREE)]
+        if stranded:
+            log.error(
+                "shadps4: %d save(s) were never unmounted and may be mid-write; "
+                "they still ship in the exit dump: %s",
+                len(stranded), ", ".join(stranded),
+            )
+        elif self._graceful_exit is False:
+            log.warning(
+                "shadps4: the session was force-stopped, but no save was left mounted"
+            )
+        return {
+            "state_saved": None,
+            "state_slot": None,
+            "state_file": None,
+            "graceful_exit": self._graceful_exit,
+            "unmounted_saves": stranded,
+        }

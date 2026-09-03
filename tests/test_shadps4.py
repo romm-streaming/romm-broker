@@ -140,6 +140,32 @@ def test_resolve_refuses_an_eboot_that_symlinks_to_a_non_regular_file_outside_th
     assert shadps4.Shadps4().resolve_rom_file(folder) is None
 
 
+def test_resolve_refuses_a_game_folder_that_symlinks_out_of_the_rom_root(
+    rom_root: Path, tmp_path: Path
+) -> None:
+    """A folder symlinked out of the library is refused even when it holds no eboot.
+
+    shadps4 appends eboot.bin to a directory path itself, so returning the bare folder would
+    hand it a host path nothing validated.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = rom_root / "MyGame"
+    link.symlink_to(outside, target_is_directory=True)
+
+    assert shadps4.Shadps4().resolve_rom_file(link) is None
+
+
+def test_resolve_accepts_a_game_folder_that_symlinks_inside_the_rom_root(rom_root: Path) -> None:
+    """A folder symlink that stays inside the library still resolves to the bare folder."""
+    real = rom_root / "Library" / "MyGame"
+    real.mkdir(parents=True)
+    link = rom_root / "MyGame"
+    link.symlink_to(real, target_is_directory=True)
+
+    assert shadps4.Shadps4().resolve_rom_file(link) == link
+
+
 def test_resolve_takes_a_direct_file_as_given(rom_root: Path) -> None:
     """Resolution returns a direct ROM file path unchanged."""
     rom = rom_root / "game.zar"
@@ -865,6 +891,205 @@ def test_ipc_send_returns_false_when_there_is_no_stdin() -> None:
     emu._proc = proc
 
     assert emu._ipc_send("RUN") is False
+
+
+# ── shutdown verdict and unmounted saves ───────────────────────────────
+
+
+@pytest.fixture
+def savedata_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point the emulator's save root at a temp dir and hand back its savedata subtree."""
+    root = tmp_path / "shadPS4"
+    savedata = root / shadps4.SAVEDATA_SUBTREE
+    savedata.mkdir(parents=True)
+    monkeypatch.setattr(shadps4.Shadps4, "save_root", root)
+    return savedata
+
+
+def _mounted_save(savedata: Path, serial: str, slot: str = "SAVE00") -> Path:
+    """Build a save directory still carrying shadPS4's read-write mount marker."""
+    save = savedata / serial / slot
+    (save / "sce_sys").mkdir(parents=True)
+    (save / "sce_sys" / "corrupted").write_bytes(b"")
+    (save / "data.bin").write_bytes(b"progress")
+    return save
+
+
+def test_stop_records_a_graceful_exit_when_ipc_stop_is_answered(
+    monkeypatch: pytest.MonkeyPatch, pid_record: Path
+) -> None:
+    """A quit shadPS4 performed itself is the only one whose save flush can be trusted."""
+    monkeypatch.setattr(base.Emulator, "stop", lambda self: None)
+    emu = shadps4.Shadps4()
+    emu._proc = _FakeProc()
+
+    emu.stop()
+
+    assert emu._graceful_exit is True
+
+
+def test_stop_records_a_forced_exit_when_the_stdin_write_fails(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A STOP that never reached shadPS4 means SIGTERM killed it wherever it was."""
+    monkeypatch.setattr(base.Emulator, "stop", lambda self: None)
+    emu = shadps4.Shadps4()
+    proc = _FakeProc()
+    proc.stdin = _FakeStdin(fail=True)
+    emu._proc = proc
+
+    with caplog.at_level("WARNING"):
+        emu.stop()
+
+    assert emu._graceful_exit is False
+    assert "IPC STOP could not be delivered" in caplog.text
+
+
+def test_stop_records_a_forced_exit_when_the_process_never_exits(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A STOP that timed out escalates to SIGTERM, which shadPS4 has no handler for."""
+    monkeypatch.setattr(base.Emulator, "stop", lambda self: None)
+    emu = shadps4.Shadps4()
+    proc = _FakeProc()
+    proc.wait_exc = subprocess.TimeoutExpired(cmd="shadps4", timeout=emu.term_timeout)
+    emu._proc = proc
+
+    with caplog.at_level("WARNING"):
+        emu.stop()
+
+    assert emu._graceful_exit is False
+    assert "did not exit within" in caplog.text
+
+
+def test_launch_clears_the_previous_sessions_shutdown_verdict(
+    monkeypatch: pytest.MonkeyPatch, versions_dir: Path, rom_root: Path
+) -> None:
+    """A verdict left over from the last session must not be reported for this one."""
+    _make_release(versions_dir, "v0.17.0 - Only Release")
+    monkeypatch.setattr(shadps4.Shadps4, "stop", lambda self: None)
+
+    def fake_spawn(
+        self: shadps4.Shadps4, cmd: list[str], env: dict[str, str], stdin_pipe: bool = False
+    ) -> None:
+        self._proc = _FakeProc()
+
+    monkeypatch.setattr(shadps4.Shadps4, "_spawn", fake_spawn)
+    rom = rom_root / "game.zar"
+    rom.write_bytes(b"")
+    emu = shadps4.Shadps4()
+    emu._graceful_exit = False
+
+    emu.launch(rom, resume_slot=None)
+
+    assert emu._graceful_exit is None
+
+
+def test_save_and_exit_reports_a_clean_shutdown(
+    monkeypatch: pytest.MonkeyPatch, savedata_root: Path
+) -> None:
+    """A graceful stop that left no save mounted reports exactly that, with no states."""
+    (savedata_root / "CUSA00001" / "SAVE00" / "sce_sys").mkdir(parents=True)
+    monkeypatch.setattr(shadps4.Shadps4, "stop", lambda self: None)
+    emu = shadps4.Shadps4()
+    emu._graceful_exit = True
+
+    report = emu.save_and_exit(None)
+
+    assert report == {
+        "state_saved": None,
+        "state_slot": None,
+        "state_file": None,
+        "graceful_exit": True,
+        "unmounted_saves": [],
+    }
+
+
+def test_save_and_exit_names_the_saves_shadps4_never_unmounted(
+    monkeypatch: pytest.MonkeyPatch, savedata_root: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A save still marked mounted was cut off mid-write, and the dump ships it regardless.
+
+    saves.py strips the marker itself out of the archive, so this log line is the only
+    trace that the uploaded save may be torn.
+    """
+    stranded = _mounted_save(savedata_root, "CUSA00001")
+    monkeypatch.setattr(shadps4.Shadps4, "stop", lambda self: None)
+    emu = shadps4.Shadps4()
+    emu._graceful_exit = False
+
+    with caplog.at_level("ERROR"):
+        report = emu.save_and_exit(None)
+
+    assert report["graceful_exit"] is False
+    assert report["unmounted_saves"] == [str(stranded)]
+    assert "never unmounted" in caplog.text
+
+
+def test_save_and_exit_warns_when_a_forced_stop_left_no_save_mounted(
+    monkeypatch: pytest.MonkeyPatch, savedata_root: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A forced stop with nothing left mounted is still worth saying, but is not an error."""
+    monkeypatch.setattr(shadps4.Shadps4, "stop", lambda self: None)
+    emu = shadps4.Shadps4()
+    emu._graceful_exit = False
+
+    with caplog.at_level("WARNING"):
+        report = emu.save_and_exit(None)
+
+    assert report["unmounted_saves"] == []
+    assert "force-stopped" in caplog.text
+
+
+def test_save_and_exit_logs_and_ignores_a_slot(
+    monkeypatch: pytest.MonkeyPatch, savedata_root: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A state slot is meaningless here and must not be echoed back as if one was written."""
+    monkeypatch.setattr(shadps4.Shadps4, "stop", lambda self: None)
+    emu = shadps4.Shadps4()
+
+    with caplog.at_level("INFO"):
+        report = emu.save_and_exit(2)
+
+    assert report["state_slot"] is None
+    assert "exit slot 2 ignored" in caplog.text
+
+
+def test_save_and_exit_stops_the_emulator_before_reading_the_save_tree(
+    monkeypatch: pytest.MonkeyPatch, savedata_root: Path
+) -> None:
+    """The scan has to follow the stop: a running emulator's markers say nothing yet."""
+    order = []
+    monkeypatch.setattr(shadps4.Shadps4, "stop", lambda self: order.append("stop"))
+    monkeypatch.setattr(
+        shadps4, "_unmounted_saves", lambda root: order.append("scan") or []
+    )
+
+    shadps4.Shadps4().save_and_exit(None)
+
+    assert order == ["stop", "scan"]
+
+
+def test_unmounted_saves_ignores_a_corrupted_file_outside_sce_sys(savedata_root: Path) -> None:
+    """Only shadPS4's own sce_sys marker counts; a game's own file of that name does not."""
+    save = savedata_root / "CUSA00001" / "SAVE00"
+    save.mkdir(parents=True)
+    (save / "corrupted").write_bytes(b"a save file the game happened to name that")
+
+    assert shadps4._unmounted_saves(savedata_root) == []
+
+
+def test_unmounted_saves_finds_every_marked_save(savedata_root: Path) -> None:
+    """Each mounted save is reported once, at the slot directory holding the marker."""
+    first = _mounted_save(savedata_root, "CUSA00001")
+    second = _mounted_save(savedata_root, "CUSA00002", "SAVE01")
+
+    assert shadps4._unmounted_saves(savedata_root) == sorted([first, second])
+
+
+def test_unmounted_saves_is_empty_without_a_savedata_tree(tmp_path: Path) -> None:
+    """A container that has never run a game has no savedata tree to scan."""
+    assert shadps4._unmounted_saves(tmp_path / "nope") == []
 
 
 # ── pkg extraction / extraction cache ──────────────────────────────────
