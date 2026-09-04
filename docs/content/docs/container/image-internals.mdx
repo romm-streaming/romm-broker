@@ -38,7 +38,7 @@ ARG BROKER_RELEASE
 Three things fall out of that:
 
 - **The Python package is pip-installed** system wide, which registers the
-  `webstation-broker` console script the service runs.
+  `romm-broker` console script the service runs.
 - **The frontend is built once, at image build time**, with
   `SUBFOLDER=/streaming/` baked into the vite base. Outside dev mode the
   broker serves that `dist` as static files from `BROKER_FRONTEND_DIST`
