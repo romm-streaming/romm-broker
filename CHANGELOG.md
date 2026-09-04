@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.8.0](https://github.com/romm-streaming/romm-broker/compare/v0.7.0...v0.8.0) (2026-09-04)
+
+
+### Features
+
+* **scummvm:** add a ScummVM launcher ([7057270](https://github.com/romm-streaming/romm-broker/commit/7057270ab5f690ddb13e2b21e16f89aead1d4b5b))
+
+
+### Bug Fixes
+
+* **ci:** let the build-app smoke test run without BROKER_SECRET ([0ba1a9f](https://github.com/romm-streaming/romm-broker/commit/0ba1a9f19e083e043c46ca7f3a2c732cc0cfc4be))
+* **ci:** let the build-app smoke test run without BROKER_SECRET ([6585f05](https://github.com/romm-streaming/romm-broker/commit/6585f0535f2c7fb2e792a189e83558f23193f98c))
+
 ## [0.7.0](https://github.com/romm-streaming/romm-broker/compare/v0.6.0...v0.7.0) (2026-08-30)
 
 
