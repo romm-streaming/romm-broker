@@ -120,6 +120,54 @@ def test_the_right_secret_gets_through(
     assert _activate(secret_client, broker_dirs).status_code == 200
 
 
+def test_activate_hands_the_emulator_the_rom_language(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """The rom's language reaches the emulator, the same way its platform does.
+
+    A launcher whose games ship several languages in one folder (ScummVM
+    registers one target per language) has no other way to know which to boot.
+    """
+    rom = {
+        "id": 5,
+        "name": "Game",
+        "platform": "ps2",
+        "language": "fr",
+        "path": str(broker_dirs["roms"] / "Game.iso"),
+    }
+
+    assert _activate(client, broker_dirs, rom=rom).status_code == 200
+    assert fake_emulator[0].language == "fr"
+
+
+def test_activate_without_a_language_leaves_it_unset(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A payload that names no language leaves the emulator on its own default."""
+    assert _activate(client, broker_dirs).status_code == 200
+    assert fake_emulator[0].language is None
+
+
+def test_activate_hands_the_emulator_the_gui_language(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """The player's interface language reaches the emulator too.
+
+    An emulator with a translated UI follows it, and a multilingual game folder
+    falls back to it when the rom names no language of its own.
+    """
+    assert _activate(client, broker_dirs, gui_language="fr").status_code == 200
+    assert fake_emulator[0].gui_language == "fr"
+
+
+def test_activate_without_a_gui_language_leaves_it_unset(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A payload that names no interface language leaves the emulator's own."""
+    assert _activate(client, broker_dirs).status_code == 200
+    assert fake_emulator[0].gui_language is None
+
+
 def test_activate_launches_the_rom_and_hands_back_a_landing_url(
     client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
 ) -> None:
