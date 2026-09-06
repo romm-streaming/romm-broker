@@ -37,10 +37,14 @@ SSTATE_DIR = Path(os.environ.get("SSTATE_DIR", "/config/.config/PCSX2/sstates"))
 PCSX2_LOG_PATH = Path(os.environ.get("PCSX2_LOG_PATH", "/config/pcsx2-qt.log"))
 """Log file the broker tails for this emulator (env `PCSX2_LOG_PATH`, default `/config/pcsx2-qt.log`)."""
 STATE_SLOT = int(os.environ.get("PCSX2_STATE_SLOT", "10"))
-"""The one slot the broker works in (env `PCSX2_STATE_SLOT`, default 10).
+"""Default slot the broker works in (env `PCSX2_STATE_SLOT`, default 10).
 
 10 is PCSX2's own autosave slot, which the per-emulator broker has always
 used, so containers that ran that one keep resolving their existing states.
+
+Only a default: each `Pcsx2` copies it into `state_slot` at construction and
+every state operation reads that instance attribute, so a session can be
+pointed at another slot without moving the whole process.
 """
 
 MEMCARD_DIR = Path("/config/.config/PCSX2/memcards")
@@ -112,6 +116,7 @@ PINE_SOCKET = Path(XDG_RUNTIME_DIR) / "pcsx2.sock"
 
 _PINE_MSG_SAVE_STATE = 0x09
 _PINE_MSG_LOAD_STATE = 0x0A
+_PINE_MSG_GAME_ID = 0x0C
 _PINE_MSG_EMU_STATUS = 0x0F
 
 _PINE_MAX_REPLY_BYTES = 64 * 1024
@@ -175,7 +180,8 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
                 continue
             real = p.resolve()
             rel = p.relative_to(base)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            log.debug("pcsx2: skipping the unusable rom candidate %s under %s: %s", p, base, exc)
             continue
         if not real.is_relative_to(ROM_ROOT):
             continue
@@ -360,8 +366,10 @@ def _sstate_snapshot() -> dict[Path, tuple[int, float]]:
         try:
             st = p.stat()
             snap[p] = (st.st_size, st.st_mtime)
-        except OSError:
-            pass
+        except OSError as exc:
+            # Debug, not warning: this runs on a 0.1s poll and a state PCSX2
+            # is replacing is expected to go missing between scans.
+            log.debug("pcsx2: could not stat the state %s while snapshotting: %s", p, exc)
     return snap
 
 
@@ -385,6 +393,26 @@ The serial is what ties the file to a disc, the slot is just which of the ten
 it went in. A serial stops at a path separator, so a pushed name carrying
 directories is not a state name here whatever else checks it.
 """
+
+
+_STATE_CRC_RE = re.compile(r"\s*\([0-9A-Fa-f]+\)$")
+"""The `(<crc>)` suffix PCSX2 appends to the serial in a state name."""
+
+
+def _state_serial(filename: str) -> Optional[str]:
+    """Return the disc serial a state file was captured from.
+
+    Args:
+        filename: The basename of a state file.
+
+    Returns:
+        The serial with PCSX2's CRC suffix stripped, or None when `filename` is
+        not a state name or names no serial.
+    """
+    match = _STATE_NAME_RE.match(filename)
+    if match is None:
+        return None
+    return _STATE_CRC_RE.sub("", match.group("serial")).strip() or None
 
 
 def _restamp_slot(filename: str, slot: int) -> Optional[str]:
@@ -433,7 +461,8 @@ def _holds_open(pid: Optional[int], path: Path) -> bool:
             try:
                 if os.path.realpath(fd) == target:
                     return True
-            except OSError:
+            except OSError as exc:
+                log.debug("could not resolve the pcsx2 descriptor %s: %s", fd, exc)
                 continue
     except OSError as exc:
         log.debug("could not read the open files of pcsx2 pid %s for %s: %s", pid, path, exc)
@@ -477,7 +506,10 @@ def _wait_for_sstate_write(
                 if slot is not None and not _matches_slot(p, slot):
                     continue
                 prev = before.get(p)
-                if prev is None or prev[1] != mtime:
+                # Size as well as mtime: mtime lands on a 1s granularity on
+                # some mounts, so a rewrite inside the same second as the
+                # snapshot is only visible as a change of size.
+                if prev is None or prev != (size, mtime):
                     target = p
                     last_size = size
                     stable_since = time.monotonic()
@@ -508,27 +540,65 @@ def _wait_for_sstate_write(
     return False
 
 
+def _discard_unfinished_states(before: dict[Path, tuple[int, float]], slot: int) -> list[Path]:
+    """Delete the states in `slot` that a failed save wrote.
+
+    A save PCSX2 acked but never finished leaves a truncated `.p2s` behind, and
+    the exit archive ships whatever is in the state directory. Shipping it hands
+    RomM a file that looks like the session's save and loads into a crash, or
+    silently replaces the good state the player actually had, so a write that
+    was never confirmed is deleted instead. Only files this save touched are
+    considered, which leaves a state that was already in the slot alone.
+
+    Args:
+        before: Snapshot from `_sstate_snapshot` taken before the save was requested.
+        slot: The slot the failed save was aimed at.
+
+    Returns:
+        The states that were deleted.
+    """
+    removed: list[Path] = []
+    for p, meta in _sstate_snapshot().items():
+        if not _matches_slot(p, slot) or before.get(p) == meta:
+            continue
+        try:
+            p.unlink()
+        except OSError as exc:
+            log.warning("pcsx2: could not discard the unfinished state %s: %s", p, exc)
+            continue
+        removed.append(p)
+        log.warning("pcsx2: discarded %s, left unfinished by a failed save into slot %d", p.name, slot)
+    return removed
+
+
 def newest_state_for_slot(slot: int) -> Optional[Path]:
     """Find the most recently written state in `slot`.
+
+    Two states written inside the same second are indistinguishable by mtime
+    alone, so size breaks the tie: of two same-second writes the larger is the
+    one that got further, and a truncated leftover never outranks a complete
+    state.
 
     Args:
         slot: The slot number, matched in both its padded and unpadded spelling.
 
     Returns:
-        The newest matching `.p2s` by mtime, or None when the slot holds nothing.
+        The newest matching `.p2s` by mtime then size, or None when the slot holds nothing.
     """
     if not SSTATE_DIR.is_dir():
         return None
-    candidates: list[tuple[float, Path]] = []
+    candidates: list[tuple[float, int, Path]] = []
     for pattern in {f"*.{slot:02d}.p2s", f"*.{slot}.p2s"}:
         for p in SSTATE_DIR.glob(pattern):
             try:
-                candidates.append((p.stat().st_mtime, p))
-            except OSError:
-                pass
+                st = p.stat()
+            except OSError as exc:
+                log.warning("pcsx2: could not stat the state %s in slot %d: %s", p, slot, exc)
+                continue
+            candidates.append((st.st_mtime, st.st_size, p))
     if not candidates:
         return None
-    return max(candidates)[1]
+    return max(candidates)[2]
 
 
 def _pine_recv_exact(sock: _socket.socket, n: int, deadline: float) -> Optional[bytes]:
@@ -618,6 +688,26 @@ def _pine_emu_status() -> Optional[int]:
     return struct.unpack("<I", body[:4])[0]
 
 
+def _pine_game_serial() -> Optional[str]:
+    """Ask PCSX2 for the serial of the disc it is running.
+
+    The reply is a u32 length followed by a null-terminated string, and the
+    serial is the same identity PCSX2 names its state files after, which is
+    what makes it comparable with a state on disk.
+
+    Returns:
+        The running disc's serial (such as `SLUS-20946`), or None when PINE is
+        down, refuses the opcode, or names no disc.
+    """
+    body = _pine_request(_PINE_MSG_GAME_ID, timeout=2.0)
+    if body is None or len(body) < 4:
+        return None
+    length = struct.unpack("<I", body[:4])[0]
+    raw = body[4 : 4 + length] if length else body[4:]
+    serial = raw.split(b"\x00", 1)[0].decode("utf-8", "replace").strip()
+    return serial or None
+
+
 class Pcsx2(Emulator):
     """PlayStation 2 sessions on pcsx2-qt.
 
@@ -625,7 +715,7 @@ class Pcsx2(Emulator):
     its settings into PCSX2.ini (PINE on, fullscreen, no shutdown confirm, no
     setup wizard, no state on shutdown, the broker's folder card in Slot 1)
     and binding Pad1 to the Selkies SDL gamepad. Save states are driven over
-    the PINE Unix socket: a save command into `STATE_SLOT` followed by a poll
+    the PINE Unix socket: a save command into `state_slot` followed by a poll
     of the state directory, because PINE acks before the file is written, and
     a load command once a state is confirmed on disk. Every launch starts a
     boot watchdog that polls the VM status; a resume is delivered as a
@@ -650,7 +740,8 @@ class Pcsx2(Emulator):
         memory_card_marker: File whose presence makes PCSX2 treat a directory as a folder card.
         rom_extensions: Bootable disc formats, best first.
         supports_states: True, states are saved and loaded over PINE.
-        state_slot: The one slot the broker works in, echoed back as the effective slot.
+        state_slot: The slot this instance works in, echoed back as the effective slot.
+            Defaults to `STATE_SLOT` and is the only slot any state operation reads.
         state_dir: Where PCSX2 writes `.p2s` files.
         log_path: The pcsx2-qt log the broker exposes.
         boot_failed: Set by the boot watchdog when the VM never reached a running state.
@@ -670,9 +761,12 @@ class Pcsx2(Emulator):
     log_path = PCSX2_LOG_PATH
 
     def __init__(self) -> None:
-        """Set up the process state and the launch sequence counter that fences the watchdog."""
+        """Set up the process state, the working slot, and the sequence counter that fences the watchdog."""
         super().__init__()
         self._launch_seq = 0
+        # Per instance: a slot changed on one session must not move the slot
+        # every other session is saving into.
+        self.state_slot = STATE_SLOT
 
     def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """Resolve a RomM path to the disc image to boot.
@@ -692,8 +786,10 @@ class Pcsx2(Emulator):
             # rather than trusting every future caller to do the same.
             try:
                 if not path.resolve().is_relative_to(ROM_ROOT):
+                    log.warning("pcsx2: %s resolves outside the rom library, refusing to boot it", path)
                     return None
-            except OSError:
+            except OSError as exc:
+                log.warning("pcsx2: could not resolve the rom path %s: %s", path, exc)
                 return None
             return path
         if not path.is_dir():
@@ -702,8 +798,10 @@ class Pcsx2(Emulator):
         for pattern in _ROM_SEARCH_GLOBS:
             try:
                 candidates.extend(path.glob(pattern))
-            except OSError:
-                return None
+            except OSError as exc:
+                # One unreadable subdirectory must not discard what the other
+                # patterns already found and report the disc as unbootable.
+                log.warning("pcsx2: search of %s for %s failed: %s", path, pattern, exc)
         return _pick_rom_file(candidates, path)
 
     def memory_card_path(self, platform: Optional[str] = None) -> Optional[Path]:
@@ -811,9 +909,11 @@ class Pcsx2(Emulator):
         """Save a state into the broker's slot over PINE and wait for it to land.
 
         `slot` is what RomM asked for and is ignored: this saves into
-        `STATE_SLOT` and the caller reads the effective slot back off
-        `state_slot`. PINE can address any slot directly, but RomM keeps the
-        library of states, so working in one slot is all this needs to do.
+        `state_slot` and the caller reads the effective slot back off that same
+        attribute. PINE can address any slot directly, but RomM keeps the
+        library of states, so working in one slot is all this needs to do. A
+        write that never settles is not left on disk, because the exit archive
+        would ship the truncated file as this session's save.
 
         Args:
             slot: The slot RomM requested; not used.
@@ -823,31 +923,79 @@ class Pcsx2(Emulator):
             PINE rejected the command or the write never completed.
         """
         before = _sstate_snapshot()
-        if _pine_request(_PINE_MSG_SAVE_STATE, bytes([STATE_SLOT])) is None:
+        if _pine_request(_PINE_MSG_SAVE_STATE, bytes([self.state_slot])) is None:
+            log.warning("pcsx2: PINE refused a save into slot %d", self.state_slot)
             return False
         pid = self._proc.pid if self._proc is not None else None
-        return _wait_for_sstate_write(before, time.monotonic() + PINE_WAIT, STATE_SLOT, pid)
+        if _wait_for_sstate_write(before, time.monotonic() + PINE_WAIT, self.state_slot, pid):
+            return True
+        log.warning("pcsx2: save into slot %d never landed, discarding what it wrote", self.state_slot)
+        _discard_unfinished_states(before, self.state_slot)
+        return False
+
+    def _state_matches_disc(self, state: Path) -> bool:
+        """Tell whether `state` was captured from the disc PCSX2 is running.
+
+        PCSX2 resolves a load by the serial it reads off the running disc, not
+        by the path the broker points at, and acks the command whether or not
+        it found anything. A state belonging to another disc is therefore
+        reported back as a successful load while the player carries on in an
+        untouched game, so the two serials are compared here instead of
+        trusting the ack. An unavailable serial skips the check rather than
+        failing it: a build that does not answer the game-id opcode would
+        otherwise lose every resume.
+
+        Args:
+            state: The state file about to be loaded.
+
+        Returns:
+            False only when both serials are known and name different discs.
+        """
+        captured = _state_serial(state.name)
+        running = _pine_game_serial()
+        if captured is None or running is None:
+            log.debug(
+                "pcsx2: load serial check skipped for %s (captured %s, running %s)",
+                state.name,
+                captured,
+                running,
+            )
+            return True
+        if captured.casefold() != running.casefold():
+            log.warning(
+                "pcsx2: refusing to load %s, captured from %s but the running disc is %s",
+                state.name,
+                captured,
+                running,
+            )
+            return False
+        return True
 
     def load_state(self, slot: int) -> bool:
         """Load the broker's slot over PINE.
 
-        PINE acks a load for an empty slot, so an absent file has to be caught
-        here or the caller reads a no-op as success.
+        PINE acks a load for an empty slot and for a state belonging to another
+        disc, so both have to be caught here or the caller reads a no-op as
+        success.
 
         Args:
-            slot: The slot RomM requested; the broker's `STATE_SLOT` is what gets loaded.
+            slot: The slot RomM requested; the broker's `state_slot` is what gets loaded.
 
         Returns:
-            True when a state file exists and PINE accepted the load, False otherwise.
+            True when a state file for the running disc exists and PINE accepted the load,
+            False otherwise.
         """
-        if self.state_path() is None:
-            log.warning("load state: slot %d holds no state file", STATE_SLOT)
+        state = self.state_path()
+        if state is None:
+            log.warning("load state: slot %d holds no state file", self.state_slot)
             return False
-        return _pine_request(_PINE_MSG_LOAD_STATE, bytes([STATE_SLOT])) is not None
+        if not self._state_matches_disc(state):
+            return False
+        return _pine_request(_PINE_MSG_LOAD_STATE, bytes([self.state_slot])) is not None
 
     def state_path(self) -> Optional[Path]:
         """Return the newest state file in the broker's slot, or None when it holds nothing."""
-        return newest_state_for_slot(STATE_SLOT)
+        return newest_state_for_slot(self.state_slot)
 
     def clear_working_slot(self) -> None:
         """Delete every state in the broker's slot before a new session boots.
@@ -861,7 +1009,7 @@ class Pcsx2(Emulator):
         """
         if not SSTATE_DIR.is_dir():
             return
-        for pattern in {f"*.{STATE_SLOT:02d}.p2s", f"*.{STATE_SLOT}.p2s"}:
+        for pattern in {f"*.{self.state_slot:02d}.p2s", f"*.{self.state_slot}.p2s"}:
             for stale in SSTATE_DIR.glob(pattern):
                 try:
                     stale.unlink()
@@ -888,7 +1036,7 @@ class Pcsx2(Emulator):
         """
         if "/" in filename or filename in ("", ".", ".."):
             return None
-        restamped = _restamp_slot(filename, STATE_SLOT)
+        restamped = _restamp_slot(filename, self.state_slot)
         if restamped is None:
             return None
         existing = self.state_path()
@@ -900,7 +1048,7 @@ class Pcsx2(Emulator):
         """Save a state if asked, then stop the emulator.
 
         Args:
-            slot: Slot RomM asked to save into (resolved to `STATE_SLOT`), or None to exit
+            slot: Slot RomM asked to save into (resolved to `state_slot`), or None to exit
                 without saving a state.
 
         Returns:
@@ -925,7 +1073,7 @@ class Pcsx2(Emulator):
         self.stop()
         return {
             "state_saved": saved,
-            "state_slot": STATE_SLOT if slot is not None else None,
+            "state_slot": self.state_slot if slot is not None else None,
             "state_file": state_file,
         }
 
