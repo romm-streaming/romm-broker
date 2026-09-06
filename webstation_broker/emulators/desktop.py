@@ -4,11 +4,14 @@ Starts selkies-desktop so the user can configure emulators through the GUI.
 Managed like any emulator session, just with no ROM and no save sync.
 """
 
+import logging
 import os
 from pathlib import Path
 from typing import Optional
 
 from .base import Emulator, base_launch_env
+
+log = logging.getLogger(__name__)
 
 
 class Desktop(Emulator):
@@ -44,7 +47,16 @@ class Desktop(Emulator):
         Args:
             rom_path: Ignored; the desktop has no content to boot.
             resume_slot: Ignored; the desktop has no state.
+
+        Raises:
+            OSError: When the binary cannot be started or its pid cannot be
+                recorded; logged here since this launch failure otherwise
+                surfaced nowhere.
         """
         self.stop()
         binary = os.environ.get("DESKTOP_BIN", "selkies-desktop")
-        self._spawn([binary], base_launch_env())
+        try:
+            self._spawn([binary], base_launch_env())
+        except OSError:
+            log.exception("desktop: failed to launch %s", binary)
+            raise
