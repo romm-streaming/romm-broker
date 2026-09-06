@@ -231,7 +231,8 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
                 continue
             real = p.resolve()
             rel = p.relative_to(base)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            log.debug("cemu: skipping candidate %s: %s", p, exc)
             continue
         if not real.is_relative_to(ROM_ROOT):
             continue
@@ -285,6 +286,7 @@ def _patch_settings() -> None:
         tmp = SETTINGS_PATH.with_suffix(".tmp")
         ET.ElementTree(root).write(tmp, encoding="UTF-8", xml_declaration=True)
         tmp.replace(SETTINGS_PATH)
+        log.debug("cemu: patched %s", SETTINGS_PATH)
     except OSError as exc:
         log.error("cemu: settings.xml patch failed at %s: %s", SETTINGS_PATH, exc)
         raise RuntimeError(
@@ -404,6 +406,7 @@ class Cemu(Emulator):
             The file itself, the best-ranked bootable file in the folder, or None.
         """
         if path.is_file():
+            log.debug("cemu: resolved rom file %s", path)
             return path
         if not path.is_dir():
             return None
@@ -411,9 +414,13 @@ class Cemu(Emulator):
         for pattern in _ROM_SEARCH_GLOBS:
             try:
                 candidates.extend(path.glob(pattern))
-            except OSError:
+            except OSError as exc:
+                log.debug("cemu: could not glob %s under %s: %s", pattern, path, exc)
                 return None
-        return _pick_rom_file(candidates, path)
+        picked = _pick_rom_file(candidates, path)
+        if picked is not None:
+            log.debug("cemu: resolved rom file %s from %s", picked, path)
+        return picked
 
     def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
         """Patch settings, seed the pad profile and boot the game fullscreen.
@@ -510,11 +517,13 @@ class Cemu(Emulator):
         # mtime in this session's title save dirs: they ship whole, other
         # titles' saves stay filtered out.
         now = time.time()
-        for d in self._modified_title_saves():
+        modified = self._modified_title_saves()
+        for d in modified:
             for p in d.rglob("*"):
                 if p.is_file():
                     try:
                         os.utime(p, (now, now))
                     except OSError as exc:
                         log.warning("could not restamp %s, may be dropped from the dump: %s", p, exc)
+        log.info("cemu: restamped %d title save dir(s) for the dump", len(modified))
         return {"state_saved": None, "state_slot": None, "state_file": None}

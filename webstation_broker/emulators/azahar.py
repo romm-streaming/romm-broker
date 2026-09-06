@@ -148,7 +148,8 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
                 continue
             real = p.resolve()
             rel = p.relative_to(base)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            log.debug("skipping rom candidate %s: %s", p, exc)
             continue
         if not real.is_relative_to(ROM_ROOT):
             continue
@@ -204,6 +205,7 @@ def _patch_config() -> None:
             # reading the file sees one style throughout.
             parser.write(fh, space_around_delimiters=False)
         tmp.replace(CONFIG_PATH)
+        log.debug("azahar: patched qt-config.ini at %s", CONFIG_PATH)
     except (OSError, configparser.Error, UnicodeError):
         log.exception("azahar: qt-config.ini patch failed at %s, refusing to launch", CONFIG_PATH)
         raise
@@ -300,7 +302,10 @@ class Azahar(Emulator):
                 # One unreadable subdirectory must not discard what the other
                 # patterns already found and report the title as unbootable.
                 log.warning("azahar: search of %s for %s failed: %s", path, pattern, exc)
-        return _pick_rom_file(candidates, path)
+        picked = _pick_rom_file(candidates, path)
+        if picked is not None:
+            log.debug("azahar: resolved rom file: %s", picked)
+        return picked
 
     def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
         """Patch qt-config.ini and boot the game windowed.

@@ -307,7 +307,8 @@ def _is_safe_extracted_member(candidate: Path, root_real: Path) -> bool:
     """
     try:
         return candidate.is_file() and candidate.resolve().is_relative_to(root_real)
-    except OSError:
+    except OSError as exc:
+        log.debug("shadps4: could not resolve %s to check extraction safety: %s", candidate, exc)
         return False
 
 
@@ -337,7 +338,8 @@ def _extracted_dir_size(path: Path) -> int:
         try:
             if f.is_file():
                 total += f.stat().st_size
-        except OSError:
+        except OSError as exc:
+            log.debug("shadps4 cache: skipping %s while sizing %s: %s", f, path, exc)
             continue
     return total
 
@@ -375,7 +377,11 @@ def _evict_lru(needed_bytes: int, keep: str) -> None:
             marker = game_dir / _LAST_ACCESSED_MARKER
             try:
                 mtime = marker.stat().st_mtime if marker.exists() else 0.0
-            except OSError:
+            except OSError as exc:
+                log.debug(
+                    "shadps4 cache: could not read last-accessed time for %s, treating as oldest: %s",
+                    game_dir, exc,
+                )
                 mtime = 0.0
             candidates.append((mtime, game_dir))
         if not candidates:
@@ -509,6 +515,7 @@ def _run_extractor(cmd: list[str], what: str) -> str:
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=PKG_EXTRACT_TIMEOUT)
     except (OSError, subprocess.TimeoutExpired) as exc:
+        log.error("shadps4: %s failed to run: %s", what, exc)
         raise RuntimeError(f"{what} failed to run: {exc}") from exc
     if result.returncode != 0:
         raise RuntimeError(f"{what} exited {result.returncode}: {result.stderr.strip()}")
@@ -655,6 +662,7 @@ def _reject_escaped_tree(dest: Path) -> None:
             try:
                 target_real = p.resolve()
             except OSError as exc:
+                log.error("shadps4: could not resolve extracted member %s: %s", p, exc)
                 raise RuntimeError(f"could not resolve extracted member {p}: {exc}") from exc
             if target_real != dest_real and dest_real not in target_real.parents:
                 log.error("shadps4: extracted member %s points outside %s, at %s", p, dest, target_real)
@@ -691,6 +699,7 @@ def _extract_archive(archive: Path, dest: Path) -> None:
             with zipfile.ZipFile(archive) as zf:
                 _safe_extract_zip(zf, dest)
         except (zipfile.BadZipFile, OSError) as exc:
+            log.error("shadps4: zip extraction of %s failed: %s", archive.name, exc)
             raise RuntimeError(f"zip extraction of {archive.name} failed: {exc}") from exc
     elif ext == ".rar":
         _reject_unsafe_members(dest, _rar_member_paths(archive))
@@ -725,6 +734,7 @@ def _run_pkg_extractor(pkg: Path, dest: Path) -> None:
             timeout=PKG_EXTRACT_TIMEOUT,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
+        log.error("shadps4: pkg_extractor failed to run on %s: %s", pkg.name, exc)
         raise RuntimeError(f"pkg_extractor failed to run on {pkg.name}: {exc}") from exc
     if result.returncode != 0:
         raise RuntimeError(
@@ -826,7 +836,8 @@ def _extract_and_cache_pkg(rom: Path, emulator: Emulator) -> Path:
         try:
             try:
                 size = rom.stat().st_size
-            except OSError:
+            except OSError as exc:
+                log.debug("shadps4 cache: could not stat %s, treating size as 0: %s", rom, exc)
                 size = 0
             # An archive needs its scratch extraction and pkg_extractor's
             # staged output living under CACHE_DIR at the same time; only the
@@ -1314,7 +1325,8 @@ class Shadps4(Emulator):
                 # and falling through to `return path` would hand shadps4 an
                 # unvalidated target via its own eboot.bin lookup.
                 return None
-        except OSError:
+        except OSError as exc:
+            log.debug("shadps4: could not check %s while resolving the boot target: %s", eboot, exc)
             return None
         return path  # shadps4 appends eboot.bin to directory paths itself
 

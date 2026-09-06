@@ -103,7 +103,8 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
                 continue
             real = p.resolve()
             rel = p.relative_to(base)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            log.debug("eden: skipping candidate %s: %s", p, exc)
             continue
         if not real.is_relative_to(ROM_ROOT):
             continue
@@ -139,6 +140,7 @@ def _patch_ini() -> None:
             INI_PATH.write_text(
                 "[UI]\n" + "\n".join(_INI_PATCHES.values()) + "\n"
             )
+            log.debug("eden: seeded a new %s", INI_PATH)
             return
         lines = INI_PATH.read_text().splitlines()
         section = ""
@@ -184,6 +186,7 @@ def _patch_ini() -> None:
         tmp = INI_PATH.with_suffix(".tmp")
         tmp.write_text("\n".join(new_lines) + "\n")
         tmp.replace(INI_PATH)
+        log.debug("eden: patched %s", INI_PATH)
     except (OSError, UnicodeDecodeError):
         log.exception("eden: qt-config.ini patch failed at %s, refusing to launch", INI_PATH)
         raise

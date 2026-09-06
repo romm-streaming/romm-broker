@@ -208,7 +208,8 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
                 continue
             real = p.resolve()
             rel = p.relative_to(base)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            log.debug("ppsspp: skipping rom candidate %s: %s", p, exc)
             continue
         if not real.is_relative_to(ROM_ROOT):
             continue
@@ -354,8 +355,11 @@ def _state_for_slot(slot: int) -> Optional[Path]:
     for p in STATE_DIR.glob(f"*_{slot}.ppst"):
         try:
             candidates.append((p.stat().st_mtime, p))
-        except OSError:
-            pass
+        except OSError as exc:
+            # Unlike _snapshot, a dropped candidate here can leave an older
+            # state silently picked as the newest, which reads as a good
+            # resume of the wrong save.
+            log.warning("ppsspp: could not stat state candidate %s for slot %d: %s", p, slot, exc)
     if not candidates:
         return None
     return max(candidates)[1]
@@ -375,8 +379,8 @@ def _snapshot() -> dict[Path, tuple[int, float]]:
         try:
             st = p.stat()
             snap[p] = (st.st_size, st.st_mtime)
-        except OSError:
-            pass
+        except OSError as exc:
+            log.debug("ppsspp: state %s vanished mid-scan, skipping: %s", p, exc)
     return snap
 
 
@@ -474,6 +478,7 @@ def _wait_for_screenshot(state: Path, deadline: float) -> None:
         try:
             size = shot.stat().st_size
         except FileNotFoundError:
+            log.debug("screenshot not yet present beside %s", state.name)
             size = 0
         except OSError as exc:
             log.warning("could not stat the screenshot beside %s: %s", state.name, exc)
@@ -669,8 +674,10 @@ class Ppsspp(Emulator):
             try:
                 if not path.resolve().is_relative_to(ROM_ROOT):
                     return None
-            except OSError:
+            except OSError as exc:
+                log.debug("resolve_rom_file: could not resolve %s: %s", path, exc)
                 return None
+            log.debug("resolve_rom_file: resolved directly to %s", path)
             return path
         if not path.is_dir():
             return None
@@ -680,7 +687,10 @@ class Ppsspp(Emulator):
                 candidates.extend(path.glob(pattern))
             except OSError as exc:
                 log.warning("rom search %r under %s failed: %s", pattern, path, exc)
-        return _pick_rom_file(candidates, path)
+        resolved = _pick_rom_file(candidates, path)
+        if resolved is not None:
+            log.debug("resolve_rom_file: resolved %s to %s", path, resolved)
+        return resolved
 
     def _xdotool(self, *args: str) -> Optional[str]:
         """Run one xdotool command against the session display.

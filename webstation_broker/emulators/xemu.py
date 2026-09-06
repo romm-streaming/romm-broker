@@ -252,7 +252,8 @@ def _write_toml(text: str) -> bool:
         return False
     try:
         mode = XEMU_TOML.stat().st_mode & 0o777
-    except OSError:
+    except OSError as exc:
+        log.warning("could not read %s's mode, defaulting to 0o644: %s", XEMU_TOML, exc)
         mode = 0o644
     tmp = None
     try:
@@ -345,7 +346,8 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
                 continue
             real = p.resolve()
             rel = p.relative_to(base)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            log.debug("xemu: skipping candidate %s: %s", p, exc)
             continue
         if not real.is_relative_to(rom_root):
             log.warning("xemu: skipping %s, it resolves outside %s", p, rom_root)
@@ -583,7 +585,12 @@ def _fatx_isdir(fs: Fatx, path: str) -> bool:
     """
     try:
         return bool(fs.get_attr(path).is_directory)
-    except AssertionError:
+    except AssertionError as exc:
+        # str(exc) eagerly, not the exception itself: pyfatx's flush runs in
+        # fs's __del__, and a logged exception's traceback would keep this
+        # frame's fs reference alive for as long as the log record is kept,
+        # holding the flush back with it.
+        log.warning("could not confirm %s is a directory, image may be corrupt: %s", path, str(exc))
         return False
 
 
@@ -607,7 +614,14 @@ def _fatx_find_dir(fs: Fatx, parent: str, name: str) -> Optional[str]:
     wanted = name.lower()
     try:
         entries = list(fs.listdir(parent))
-    except (AssertionError, OSError):
+    except AssertionError as exc:
+        # str(exc) eagerly: a logged traceback would keep this frame's fs
+        # reference alive, holding back the __del__-triggered flush pyfatx
+        # relies on since it has no explicit close()/flush().
+        log.warning("could not list %s, image may be corrupt: %s", parent, str(exc))
+        return None
+    except OSError as exc:
+        log.debug("could not list %s: %s", parent, str(exc))
         return None
     for attr in entries:
         if attr.is_directory and attr.filename.lower() == wanted:
@@ -624,7 +638,12 @@ def _fatx_discard(fs: Fatx, path: str) -> None:
     """
     try:
         fs.get_attr(path)
-    except (AssertionError, OSError):
+    except (AssertionError, OSError) as exc:
+        # str(exc) eagerly: a logged traceback would keep this frame's fs
+        # reference alive, holding back the __del__-triggered flush pyfatx
+        # relies on since it has no explicit close()/flush().
+        log.error("could not confirm whether %s exists on the HDD image to discard "
+                  "it; a partially written file may remain: %s", path, str(exc))
         return
     try:
         fs.unlink(path)
@@ -654,7 +673,12 @@ def _fatx_write_file(fs: Fatx, path: str, data: bytes) -> None:
     """
     try:
         existing = fs.get_attr(path).file_size
-    except (AssertionError, OSError):
+    except (AssertionError, OSError) as exc:
+        # str(exc) eagerly: a logged traceback would keep this frame's fs
+        # reference alive, holding back the __del__-triggered flush pyfatx
+        # relies on since it has no explicit close()/flush().
+        log.error("could not read %s's existing size before writing; assuming 0, "
+                  "which may leave stale data spliced onto the new save: %s", path, str(exc))
         existing = 0
     try:
         if existing > len(data):
@@ -1147,6 +1171,7 @@ class Xemu(Emulator):
         self._restore_pending = True
         self._restore_failed = False
         self._forced_exit = False
+        log.info("xemu: prepared %s for a save restore", self.hdd_image)
 
     def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
         """Inject any restored saves, pin display settings and boot the disc.

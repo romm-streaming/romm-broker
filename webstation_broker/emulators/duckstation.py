@@ -133,7 +133,8 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
                 continue
             real = p.resolve()
             rel = p.relative_to(base)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            log.debug("duckstation: skipping rom candidate %s: %s", p, exc)
             continue
         if not real.is_relative_to(ROM_ROOT):
             continue
@@ -241,8 +242,8 @@ def _resume_snapshot() -> dict[Path, tuple[int, float]]:
         try:
             st = p.stat()
             snap[p] = (st.st_size, st.st_mtime)
-        except OSError:
-            pass
+        except OSError as exc:
+            log.debug("duckstation: resume state %s vanished mid-scan, skipping: %s", p, exc)
     return snap
 
 
@@ -305,6 +306,7 @@ def _state_owner(state: Path) -> Optional[str]:
     try:
         recorded = marker.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
+        log.debug("duckstation: no state marker at %s", marker)
         return None
     except (OSError, ValueError) as exc:
         log.warning("duckstation: could not read the state marker %s: %s", marker, exc)
@@ -376,6 +378,8 @@ def _resume_state_for(rom: Path) -> Optional[Path]:
                 rom.name,
                 best.name,
             )
+        else:
+            log.debug("duckstation: resuming %s, marked for %s", best.name, rom.name)
         return best
     if len(states) == 1 and owners[states[0]] is None:
         log.info(
@@ -549,6 +553,7 @@ class Duckstation(Emulator):
             The image to pass to duckstation-qt, or None when there is nothing bootable.
         """
         if path.is_file():
+            log.debug("duckstation: resolve_rom_file resolved directly to %s", path)
             return path
         if not path.is_dir():
             return None
@@ -556,9 +561,13 @@ class Duckstation(Emulator):
         for pattern in _ROM_SEARCH_GLOBS:
             try:
                 candidates.extend(path.glob(pattern))
-            except OSError:
+            except OSError as exc:
+                log.debug("duckstation: rom search %r under %s failed: %s", pattern, path, exc)
                 return None
-        return _pick_rom_file(candidates, path)
+        resolved = _pick_rom_file(candidates, path)
+        if resolved is not None:
+            log.debug("duckstation: resolve_rom_file resolved %s to %s", path, resolved)
+        return resolved
 
     def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
         """Stop any running instance, patch settings.ini, and start duckstation-qt.
