@@ -12,6 +12,7 @@ from typing import Optional
 
 import pytest
 
+from webstation_broker import saves
 from webstation_broker.emulators import dolphin
 
 
@@ -448,6 +449,33 @@ def test_the_access_time_probe_measures_the_filesystem_and_cleans_up(tmp_path: P
     assert list(tmp_path.iterdir()) == []
 
 
+def test_the_access_time_probe_never_ships_in_a_save_archive(
+    state_dir: Path, tmp_path: Path
+) -> None:
+    """A probe stranded by a kill is left out of the archive the exit dump builds."""
+    state = _touch(state_dir / "GXCE01.s01")
+    dolphin._atime_probe_path(state_dir).write_bytes(b"probe")
+
+    report = saves.build_save_archive(tmp_path, ("StateSaves",), 0.0)
+
+    assert [f["path"] for f in report["files"]] == [f"StateSaves/{state.name}"]
+
+
+def test_a_stranded_access_time_probe_is_cleared_before_the_dump(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit sweeps a probe whose own cleanup never ran, and leaves the states alone."""
+    monkeypatch.setattr(dolphin, "STATE_SLOT", 1)
+    stranded = dolphin._atime_probe_path(state_dir)
+    stranded.write_bytes(b"probe")
+    state = _touch(state_dir / "GXCE01.s01")
+
+    dolphin.Dolphin().save_and_exit(None)
+
+    assert not stranded.exists()
+    assert state.exists()
+
+
 def test_the_access_time_probe_fails_closed_on_a_directory_that_is_not_there(
     tmp_path: Path,
 ) -> None:
@@ -473,7 +501,11 @@ def test_a_state_nothing_ever_read_is_not_a_load(state_dir: Path) -> None:
 
 
 def _loadable(
-    monkeypatch: pytest.MonkeyPatch, state_dir: Path, reads: bool, tracked: bool = True
+    monkeypatch: pytest.MonkeyPatch,
+    state_dir: Path,
+    reads: bool,
+    tracked: bool = True,
+    writes_undo: bool = False,
 ) -> dolphin.Dolphin:
     """Build an emulator whose load hotkey optionally reads the state back.
 
@@ -482,6 +514,7 @@ def _loadable(
         state_dir: The state directory holding the working slot.
         reads: Whether the hotkey moves the state's access time, as a real load would.
         tracked: What the access-time probe reports for the state directory.
+        writes_undo: Whether the hotkey rewrites the undo buffer, as a real load would.
 
     Returns:
         The emulator, with a state already in the working slot.
@@ -498,6 +531,8 @@ def _loadable(
         assert key == dolphin.LOAD_KEY
         if reads:
             os.utime(state, (time.time(), 5000))
+        if writes_undo:
+            (state_dir / dolphin._UNDO_BUFFER_NAME).write_bytes(b"undo state")
         return True
 
     emu._send_key = fake_send
@@ -532,11 +567,50 @@ def test_a_load_hotkey_that_could_not_be_sent_fails(
     assert emu.load_state(1) is False
 
 
-def test_a_load_is_taken_on_trust_where_access_times_are_not_recorded(
+def test_a_load_falls_back_to_the_undo_buffer_where_access_times_are_not_recorded(
     state_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """On a noatime mount the read cannot be seen, so a sent hotkey is not called a failure."""
+    """On a noatime mount the undo buffer Dolphin rewrites is what confirms the load."""
+    emu = _loadable(monkeypatch, state_dir, reads=False, tracked=False, writes_undo=True)
+
+    assert emu.load_state(1) is True
+
+
+def test_an_undo_buffer_rewritten_over_an_older_one_still_confirms_the_load(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second load in one session is confirmed by the undo buffer changing, not by it appearing."""
+    emu = _loadable(monkeypatch, state_dir, reads=False, tracked=False, writes_undo=True)
+    _touch(state_dir / dolphin._UNDO_BUFFER_NAME, mtime=5000)
+
+    assert emu.load_state(1) is True
+
+
+def test_a_load_nothing_can_confirm_is_reported_as_a_failure(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no access time and no undo buffer rewrite, a load is a failure, not an assumed success."""
     emu = _loadable(monkeypatch, state_dir, reads=False, tracked=False)
+
+    assert emu.load_state(1) is False
+
+
+def test_an_untouched_undo_buffer_never_confirms_a_load(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The undo buffer a previous load left behind is not taken as this load's confirmation."""
+    emu = _loadable(monkeypatch, state_dir, reads=False, tracked=False)
+    _touch(state_dir / dolphin._UNDO_BUFFER_NAME, mtime=5000)
+
+    assert emu.load_state(1) is False
+
+
+def test_a_state_whose_marker_could_not_be_stamped_falls_back_to_the_undo_buffer(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A backdate that failed leaves no marker to watch, so the undo buffer stands in for it."""
+    emu = _loadable(monkeypatch, state_dir, reads=False, tracked=True, writes_undo=True)
+    monkeypatch.setattr(dolphin, "_backdate_atime", lambda p: None)
 
     assert emu.load_state(1) is True
 
