@@ -28,7 +28,9 @@ replies to *stdout*. Commands:
 * `DISK_NEXT`: step to the next disc in the loaded playlist.
 * `QUIT`: no reply; queued for the runloop.
 
-Saves are confirmed on the filesystem instead of from a reply.
+Saves and loads are confirmed on the filesystem instead of from a reply: a
+save by the state file it writes, a load by the access time of the state file
+it reads.
 
 Save slots: there is no "save to slot n" command. `SAVE_STATE` writes whichever
 slot is current, nothing reports which that is, and a `state_slot` in the
@@ -58,6 +60,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import threading
@@ -65,7 +68,7 @@ import time
 import zipfile
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 import httpx
 
@@ -168,6 +171,30 @@ SAVE_FILES_WAIT = float(os.environ.get("RETROARCH_SAVE_FILES_WAIT", "10.0"))
 """Seconds to wait for the `SAVE_FILES` reply at exit, from `RETROARCH_SAVE_FILES_WAIT` (default 10)."""
 STATE_CONFIRM_WAIT = float(os.environ.get("RETROARCH_STATE_CONFIRM_WAIT", "10.0"))
 """Seconds a save gets to land on disk, from `RETROARCH_STATE_CONFIRM_WAIT` (default 10)."""
+STATE_THUMBNAIL_WAIT = float(os.environ.get("RETROARCH_STATE_THUMBNAIL_WAIT", "3.0"))
+"""Seconds a save thumbnail gets to land on disk, from `RETROARCH_STATE_THUMBNAIL_WAIT` (default 3).
+
+Its own window, not carved out of `STATE_CONFIRM_WAIT`: the state file is
+already confirmed by the time this runs, so the thumbnail is not owed a
+share of that budget, and giving it a fixed one of its own means a slow
+state-file write can never starve it down to nothing.
+"""
+SAVE_LOCK_WAIT = float(os.environ.get("RETROARCH_SAVE_LOCK_WAIT", "30.0"))
+"""Seconds a save waits for an in-flight resume load or disc swap, from `RETROARCH_SAVE_LOCK_WAIT`.
+
+Defaults to 30. A save queues rather than failing fast (the way a second disc
+swap does) because the state it would write mid-resume is the pre-resume one,
+and the resume then loads that back over the player's own save.
+"""
+EXIT_SAVE_LOCK_WAIT = float(os.environ.get("RETROARCH_EXIT_SAVE_LOCK_WAIT", "3.0"))
+"""Seconds the exit save waits for the tray, from `RETROARCH_EXIT_SAVE_LOCK_WAIT`.
+
+Defaults to 3, far below `SAVE_LOCK_WAIT`. The exit runs under the API's
+process-wide session lock, so every second spent here is a second every other
+session route answers 409 for. A resume load still holding the tray at exit is
+already off the rails, and waiting out the full save budget inside that lock
+would not make it any likelier to finish.
+"""
 QUIT_WAIT = float(os.environ.get("RETROARCH_QUIT_WAIT", "10.0"))
 """Seconds the second `QUIT` gets before SIGTERM, from `RETROARCH_QUIT_WAIT` (default 10)."""
 QUIT_CONFIRM_GAP = float(os.environ.get("RETROARCH_QUIT_CONFIRM_GAP", "0.1"))
@@ -179,8 +206,52 @@ From `RETROARCH_RESUME_WAIT` (default 90).
 """
 RESUME_LOAD_SETTLE = float(os.environ.get("RETROARCH_RESUME_SETTLE", "3.0"))
 """Seconds between the core reporting PLAYING and the load, from `RETROARCH_RESUME_SETTLE` (default 3)."""
+RESUME_LOAD_RETRY_GAP = float(os.environ.get("RETROARCH_RESUME_RETRY_GAP", "2.0"))
+"""Seconds between resume load attempts, from `RETROARCH_RESUME_RETRY_GAP` (default 2).
+
+A core that echoed the load but never read the state was not ready for it, so
+the next attempt is worth spacing out rather than firing back immediately.
+"""
+RESUME_ATTEMPT_LOCK_WAIT = float(os.environ.get("RETROARCH_RESUME_LOCK_WAIT", "15.0"))
+"""Seconds one resume load attempt waits for the tray, from `RETROARCH_RESUME_LOCK_WAIT`.
+
+Defaults to 15, which covers a save running to its own confirmation timeout.
+The retries drop the tray between attempts, so this bounds a single attempt
+rather than the whole resume budget.
+"""
 LOAD_ACK_WAIT = float(os.environ.get("RETROARCH_LOAD_ACK_WAIT", "10.0"))
 """Seconds to wait for the `LOAD_STATE_SLOT` echo, from `RETROARCH_LOAD_ACK_WAIT` (default 10)."""
+LOAD_CONFIRM_WAIT = float(os.environ.get("RETROARCH_LOAD_CONFIRM_WAIT", "10.0"))
+"""Seconds RetroArch gets to actually read the state file after the echo.
+
+From `RETROARCH_LOAD_CONFIRM_WAIT` (default 10). The echo says the command
+was parsed, not that a state was restored; the read is what says that.
+"""
+LOAD_LOCK_WAIT = float(os.environ.get("RETROARCH_LOAD_LOCK_WAIT", "30.0"))
+"""Seconds a manual load waits for the tray, from `RETROARCH_LOAD_LOCK_WAIT` (default 30).
+
+Matches `SAVE_LOCK_WAIT`: a manual load and a deferred resume attempt both
+back-date the same state file's access time and poll it to confirm their own
+read, so they must never run that confirmation concurrently, or either one
+can mistake the other's read for its own.
+"""
+LOAD_TAINT_RETRY_LIMIT = int(os.environ.get("RETROARCH_LOAD_TAINT_RETRY_LIMIT", "2"))
+"""Extra backdate-and-send cycles a tainted load gets, from `RETROARCH_LOAD_TAINT_RETRY_LIMIT`.
+
+A handout landing inside the read wait taints that attempt for good under
+`relatime` (see `_wait_for_state_read`), so a fresh marker is the only way
+left to detect the load actually happening; without a retry here a load that
+RetroArch genuinely performed would surface to the caller as a plain failure
+whenever it raced a state-file handout.
+"""
+_ATIME_BACKDATE = 1.0
+"""Seconds a state's access time is set behind its own mtime, so the load's read of it stands out."""
+STATE_READ_HANDOUT_GRACE = float(os.environ.get("RETROARCH_STATE_HANDOUT_GRACE", "2.0"))
+"""Seconds a handed-out state path stays suspect, from `RETROARCH_STATE_HANDOUT_GRACE`.
+
+Defaults to 2, enough to cover the gap between a caller asking `state_path`
+for the file and its own read of it landing.
+"""
 STATE_SLOT = int(os.environ.get("RETROARCH_STATE_SLOT", "0"))
 """The one slot the broker works in, from `RETROARCH_STATE_SLOT` (default 0).
 
@@ -356,12 +427,59 @@ def _core_url(core: str, source: Optional[dict[str, Any]]) -> str:
     return f"{CORES_BASE_URL}/{core}_libretro.so.zip"
 
 
+def _download_core_bytes(core: str, url: str) -> bytes:
+    """Fetch `url` and return the `_libretro.so` inside it, verified.
+
+    A truncated transfer is the failure this guards against, because the
+    result of one is a shorter but perfectly loadable file: RetroArch would
+    dlopen it and crash somewhere unrelated. Three checks rule that out. The
+    body has to match the declared `Content-Length`, the zip's own per-member
+    CRC-32 has to match (`ZipFile.read` raises `BadZipFile` when it does not),
+    and the extracted core has to hold bytes.
+
+    Args:
+        core: The libretro core name, without the `_libretro.so` suffix.
+        url: Where the zip is downloaded from.
+
+    Returns:
+        The bytes of the core shared object.
+
+    Raises:
+        RuntimeError: When the download fails, arrives short, holds no core,
+            or the core inside it is empty.
+    """
+    try:
+        resp = httpx.get(url, follow_redirects=True, timeout=CORE_DOWNLOAD_TIMEOUT)
+        resp.raise_for_status()
+        body = resp.content
+        declared = resp.headers.get("content-length")
+        if declared is not None and declared.isdigit() and int(declared) != len(body):
+            raise RuntimeError(
+                f"core download for {core} was truncated: got {len(body)} of {declared} bytes"
+            )
+        with zipfile.ZipFile(io.BytesIO(body)) as zf:
+            names = [n for n in zf.namelist() if n.endswith("_libretro.so")]
+            if not names:
+                raise RuntimeError(f"core zip for {core} contained no _libretro.so")
+            data = zf.read(sorted(names)[0])
+    except (httpx.HTTPError, zipfile.BadZipFile, OSError) as exc:
+        log.error("retroarch: core %s could not be downloaded from %s: %s", core, url, exc)
+        raise RuntimeError(f"failed to download libretro core {core}: {exc}") from exc
+    if not data:
+        log.error("retroarch: core %s downloaded from %s is empty", core, url)
+        raise RuntimeError(f"core {core} downloaded from {url} is empty")
+    return data
+
+
 def _ensure_core(core: str, source: Optional[dict[str, Any]] = None) -> Path:
     """Return the core's .so, downloading it if missing.
 
     The zip is fetched into memory, the first `_libretro.so` inside it is
-    written to a temp file in `CORES_DIR`, made executable, and moved into
-    place.
+    verified by `_download_core_bytes`, written to a uniquely named temp file
+    in `CORES_DIR`, made executable, and moved into place. The temp name
+    carries a random token because two sessions can activate the same
+    unmapped platform at once: a shared name would let one download's partial
+    write be renamed into place by the other.
 
     Args:
         core: The libretro core name, without the `_libretro.so` suffix.
@@ -371,8 +489,9 @@ def _ensure_core(core: str, source: Optional[dict[str, Any]] = None) -> Path:
         The path of the installed `.so`.
 
     Raises:
-        RuntimeError: When no download can be resolved, the download fails, or
-            the zip holds no core.
+        RuntimeError: When no download can be resolved, the download fails or
+            arrives incomplete, the zip holds no core, or the core cannot be
+            written into `CORES_DIR`.
     """
     so = CORES_DIR / f"{core}_libretro.so"
     if so.is_file():
@@ -381,23 +500,28 @@ def _ensure_core(core: str, source: Optional[dict[str, Any]] = None) -> Path:
     try:
         url = _core_url(core, source)
     except (httpx.HTTPError, KeyError, ValueError) as exc:
+        log.error("retroarch: no download could be resolved for core %s: %s", core, exc)
         raise RuntimeError(f"could not resolve a download for core {core}: {exc}") from exc
     log.info("retroarch: downloading core %s from %s", core, url)
+    data = _download_core_bytes(core, url)
+    tmp = CORES_DIR / f".{core}_libretro.so.{secrets.token_hex(8)}.tmp"
     try:
-        resp = httpx.get(url, follow_redirects=True, timeout=CORE_DOWNLOAD_TIMEOUT)
-        resp.raise_for_status()
-        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-            names = [n for n in zf.namelist() if n.endswith("_libretro.so")]
-            if not names:
-                raise RuntimeError(f"core zip for {core} contained no _libretro.so")
-            data = zf.read(sorted(names)[0])
-    except (httpx.HTTPError, zipfile.BadZipFile, OSError) as exc:
-        raise RuntimeError(f"failed to download libretro core {core}: {exc}") from exc
-    tmp = CORES_DIR / f"{core}_libretro.so.tmp"
-    tmp.write_bytes(data)
-    tmp.chmod(0o755)
-    os.replace(tmp, so)
-    log.info("retroarch: core %s installed at %s", core, so)
+        tmp.write_bytes(data)
+        written = tmp.stat().st_size
+        if written != len(data):
+            raise RuntimeError(
+                f"core {core} was written short: {written} of {len(data)} bytes on disk"
+            )
+        tmp.chmod(0o755)
+        os.replace(tmp, so)
+    except (OSError, RuntimeError) as exc:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError as cleanup_exc:
+            log.warning("retroarch: could not remove the partial core %s: %s", tmp, cleanup_exc)
+        log.error("retroarch: core %s could not be installed at %s: %s", core, so, exc)
+        raise RuntimeError(f"failed to install libretro core {core}: {exc}") from exc
+    log.info("retroarch: core %s installed at %s (%d bytes)", core, so, len(data))
     return so
 
 
@@ -556,10 +680,19 @@ def _state_snapshot(dir_path: Path, base: str) -> dict[Path, tuple[int, float]]:
         for p in dir_path.rglob("*"):
             if not p.is_file() or not p.name.startswith(prefix):
                 continue
-            st = p.stat()
+            try:
+                st = p.stat()
+            except OSError as exc:
+                # A miss here must not blank the rest of the walk: that would
+                # make _stable_file_wait read every other file in this snapshot
+                # as freshly created, not just the one that failed to stat.
+                log.warning(
+                    "retroarch: could not stat %s while snapshotting state files, leaving it out: %s", p, exc
+                )
+                continue
             snap[p] = (st.st_size, st.st_mtime)
-    except OSError:
-        pass
+    except OSError as exc:
+        log.warning("retroarch: could not walk %s while snapshotting state files: %s", dir_path, exc)
     return snap
 
 
@@ -678,9 +811,185 @@ def _newest_state(dir_path: Path, base: str, slot: int) -> Optional[Path]:
             st = p.stat()
             if best is None or st.st_mtime > best[0]:
                 best = (st.st_mtime, p)
-    except OSError:
+    except OSError as exc:
+        # Every caller treats None as "slot is empty"; log so a directory
+        # that failed to read doesn't pass for a game that was never saved.
+        log.warning("retroarch: could not search %s for %s's state: %s", dir_path, name, exc)
         return None
     return best[1] if best is not None else None
+
+
+def _backdate_atime(path: Path) -> Optional[float]:
+    """Stamp `path`'s access time behind its own mtime and return what was written.
+
+    Under `relatime`, the mount default, the kernel refreshes an access time
+    only while it still sits at or behind the file's mtime. A state loaded
+    twice in one session would already carry an atime past its mtime by the
+    second load, and that read would leave no trace, so the stamp goes back
+    behind the mtime before every load.
+
+    Args:
+        path: The state file about to be loaded.
+
+    Returns:
+        The access time stamped on, or None when it could not be read or set.
+    """
+    try:
+        st = path.stat()
+        marker = st.st_mtime - _ATIME_BACKDATE
+        os.utime(path, (marker, st.st_mtime))
+    except OSError as exc:
+        log.warning("retroarch: could not backdate the access time of the state %s: %s", path, exc)
+        return None
+    return marker
+
+
+class AtimeProbeError(RuntimeError):
+    """The access-time probe could not be run, so the mount's behaviour is unknown."""
+
+
+def _atime_tracked(dir_path: Path) -> bool:
+    """Tell whether reading a file in `dir_path` moves its access time.
+
+    A `noatime` mount records nothing, and on one of those the read a load
+    makes is invisible: without this every load would be reported as failed.
+    Measured on a scratch file, because the probe's own read is the thing
+    being measured and making it against the state would spend the backdated
+    marker the load itself needs.
+
+    A probe that cannot run raises rather than answering False: "this mount
+    keeps no access times" is the one verdict that lets a load pass on its
+    echo alone, and a probe file that could not be written or removed has
+    proven nothing about the mount.
+
+    Args:
+        dir_path: The directory the state file lives in.
+
+    Returns:
+        True only when the probe's read demonstrably moved the access time.
+
+    Raises:
+        AtimeProbeError: When the probe file itself could not be written,
+            stamped, read or removed.
+    """
+    probe = dir_path / f".atime-probe.{os.getpid()}.{secrets.token_hex(4)}"
+    try:
+        probe.write_bytes(b"probe")
+        st = probe.stat()
+        marker = st.st_mtime - _ATIME_BACKDATE
+        os.utime(probe, (marker, st.st_mtime))
+        with probe.open("rb") as fh:
+            fh.read(1)
+        moved = probe.stat().st_atime > marker
+    except OSError as exc:
+        log.warning("retroarch: could not probe access-time tracking in %s: %s", dir_path, exc)
+        raise AtimeProbeError(f"access-time probe failed in {dir_path}: {exc}") from exc
+    finally:
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("retroarch: could not remove the access-time probe %s: %s", probe, exc)
+    return moved
+
+
+def _state_identity(path: Path) -> Optional[tuple[int, float]]:
+    """The inode and mtime that say a state file is still the same file.
+
+    Args:
+        path: The state file to fingerprint.
+
+    Returns:
+        `(st_ino, st_mtime)`, or None when the file cannot be stat'd.
+    """
+    try:
+        st = path.stat()
+    except OSError as exc:
+        log.warning("retroarch: could not fingerprint the state %s: %s", path, exc)
+        return None
+    return (st.st_ino, st.st_mtime)
+
+
+def _wait_for_state_read(
+    path: Path,
+    marker: float,
+    deadline: float,
+    identity: Optional[tuple[int, float]] = None,
+    tainted_until: Callable[[], float] = lambda: float("-inf"),
+) -> Optional[bool]:
+    """Poll until `path`'s access time moves past `marker`, or `deadline` passes.
+
+    A libretro load only reads the state, it writes nothing back, so the
+    access time is the whole of the on-disk trace and any other reader of the
+    same file satisfies it too. `identity` closes the one impostor this file
+    can name on its own: a state replaced under the load (a pushed state
+    landing through `state_target`) is a new inode whose fresh access time
+    would otherwise read as a confirmation. Readers that leave the file
+    itself alone are indistinguishable here and are ruled out by the caller,
+    which knows who was handed the path: `tainted_until` names a window, as of
+    the moment it is called, inside which some other reader touched the file.
+    An access-time move seen inside that window taints this call for good,
+    not just until the window closes — under `relatime` a second, genuine
+    read by the load does not move the access time again once the handout's
+    read has already pushed it past the mtime, so there is no later move left
+    to wait for. A tainted call reports `None` rather than `False`, so the
+    caller can tell "genuinely never read" apart from "read, but only where it
+    couldn't be trusted" and retry the latter with a fresh marker instead of
+    reporting the load failed outright.
+
+    Args:
+        path: The state file whose access time was backdated to `marker`.
+        marker: The access time stamped on before the load command was sent.
+        deadline: A `time.monotonic()` value to give up at.
+        identity: The `_state_identity` taken with `marker`, or None to skip
+            the check.
+        tainted_until: Called on each poll; an access-time move seen while
+            `time.monotonic()` is before its return value taints the rest of
+            this call. Defaults to a window that is always closed.
+
+    Returns:
+        True once the access time has moved past `marker` on the same file,
+        untainted; False on timeout with no move at all, or if the file went
+        away or was replaced; None when the only move seen was tainted by a
+        handout, meaning the load needs a fresh marker to be confirmable.
+    """
+    POLL = 0.1
+    tainted = False
+    while time.monotonic() < deadline:
+        try:
+            st = path.stat()
+        except OSError as exc:
+            log.warning(
+                "retroarch: state %s went away while waiting for the load to read it: %s", path, exc
+            )
+            return False
+        if identity is not None and (st.st_ino, st.st_mtime) != identity:
+            log.warning(
+                "retroarch: state %s was replaced while the load was in flight, its access time "
+                "no longer says anything about that load",
+                path,
+            )
+            return False
+        if st.st_atime > marker:
+            if tainted:
+                pass
+            elif time.monotonic() >= tainted_until():
+                return True
+            else:
+                log.warning(
+                    "retroarch: state %s was read while a state-file handout was in flight, not "
+                    "trusting that access time for this load",
+                    path,
+                )
+                tainted = True
+        time.sleep(POLL)
+    if tainted:
+        log.error(
+            "retroarch: state %s was only read during a state-file handout, the load needs a "
+            "fresh attempt to be confirmed",
+            path,
+        )
+        return None
+    return False
 
 
 def _disc_number(rel: Path) -> int:
@@ -842,6 +1151,7 @@ class Retroarch(Emulator):
         supports_disc_swap: On; discs are swapped through the virtual tray.
         state_slot: `STATE_SLOT`, the one slot the broker works in.
         state_dir: `STATE_DIR`, the broker-managed savestate directory.
+        clears_stale_saves: On; activate empties the platform's save subtrees.
         term_timeout: Seconds `QUIT` gets before SIGTERM, from
             `RETROARCH_STOP_WAIT` (default 15).
         platform: The RomM platform slug, set before launch.
@@ -863,6 +1173,8 @@ class Retroarch(Emulator):
     """The one slot the broker works in."""
     state_dir = STATE_DIR
     """The broker-managed savestate directory."""
+    clears_stale_saves = True
+    """`clear_working_slot` empties every save subtree before a restore."""
     term_timeout = float(os.environ.get("RETROARCH_STOP_WAIT", "15"))
     """Seconds the graceful exit gets before SIGTERM, from `RETROARCH_STOP_WAIT` (default 15).
 
@@ -905,10 +1217,20 @@ class Retroarch(Emulator):
         remembers what it did and steps relative to that.
         """
         self._disc_lock = threading.Lock()
-        """Serializes `swap_disc` against itself and against the deferred resume load.
+        """Serializes `swap_disc`, `save_state` and one resume load attempt.
 
-        Both poll for PLAYING and then act on the live process, and a
-        `LOAD_STATE` landing inside a tray-settle window is the collision.
+        All three act on the live process after polling for PLAYING: a
+        `LOAD_STATE` landing inside a tray-settle window, or a `SAVE_STATE`
+        landing inside a resume's settle window, is the collision. The waiters
+        differ: a swap fails fast, a save queues. The resume's retry loop holds
+        this only for an attempt at a time, never across the gaps between them.
+        """
+        self._state_handout_at: float = float("-inf")
+        """`time.monotonic()` of the last time the state-file GET route read the file.
+
+        Set by `note_state_handout`. `load_state`'s confirmation watches the
+        same access time that read moves, so a handout landing mid-load reads
+        as a false confirmation unless the wait knows to discount it.
         """
 
     @property
@@ -1210,12 +1532,15 @@ class Retroarch(Emulator):
         """Load `slot` once RetroArch reports the content PLAYING.
 
         Cores with no game running yet (Dolphin boot screen) reject loads, so
-        this polls `GET_STATUS` first, then waits out `_resume_settle` and
-        for the slot to hold a state file before loading. `_resume_settle`
-        defaults to `RESUME_LOAD_SETTLE` but a platform can ask for longer:
-        PPSSPP keeps loading and registering HLE module state well after
-        RetroArch reports PLAYING, and a load attempted too early corrupts
-        the core's HLE event table instead of restoring the game.
+        this polls `GET_STATUS` first and does nothing else itself. Everything
+        the load needs (the wait for the slot's state file, `_resume_settle`,
+        the load and its retries) belongs to `_load_until_confirmed`, which
+        runs all of it under the tray lock for what is left of
+        `RESUME_LOAD_WAIT`.
+
+        The status poll is the one part that stays outside the tray: it sends
+        no tray command and reads nothing off disk, so a save or disc swap
+        running alongside it cannot collide with anything.
 
         Args:
             slot: The slot to load.
@@ -1228,28 +1553,133 @@ class Retroarch(Emulator):
                 return
             reply = self._send("GET_STATUS", wait_prefix="GET_STATUS", timeout=2.0)
             if reply and reply.startswith("GET_STATUS PLAYING"):
-                # Shares the tray lock with swap_disc: both poll for PLAYING
-                # and then act, and a LOAD_STATE landing inside a swap's tray
-                # settle is the collision this guards against.
-                with self._disc_lock:
-                    if self._launch_seq != seq or not self.alive():
-                        return
-                    time.sleep(self._resume_settle)
-                    if not self.wait_for_state(deadline):
-                        log.warning("resume: slot %d never got a state file", slot)
-                        return
-                    if self._launch_seq != seq:
-                        return
-                    log.info(
-                        "resume: load of slot %d %s",
-                        slot,
-                        "delivered" if self.load_state(slot) else "failed",
-                    )
+                self._load_until_confirmed(slot, deadline, seq)
                 return
             time.sleep(1.0)
         log.warning(
             "resume: retroarch never reported PLAYING, slot %d not loaded", slot
         )
+
+    def _load_until_confirmed(self, slot: int, deadline: float, seq: int) -> bool:
+        """Wait for the slot's state file, settle, then load it, retrying until `deadline`.
+
+        A load RetroArch echoes but never reads leaves the player in a fresh
+        boot with the resume silently lost, and one attempt is too little to
+        call it: the core can still be finishing its own startup past the
+        settle. Attempts repeat every `RESUME_LOAD_RETRY_GAP` while the resume
+        budget holds. Nothing on the status route carries a resume result, so
+        an exhausted budget is escalated to an `error` log rather than setting
+        `boot_failed`, which means a game that never started at all.
+
+        Each attempt takes `_disc_lock` on its own and drops it again, rather
+        than the whole retry run holding it: an attempt is a few seconds long
+        while the run can span the entire resume budget, and a save queued
+        behind that would time out and be lost. The first attempt keeps the
+        wait for the state file and `_resume_settle` inside its own hold, since
+        a save landing in either window writes exactly the unrestored state the
+        resume is about to read back. Waiting outside the tray is not enough:
+        that save creates the very file the wait is looking for. Later attempts
+        already know the file is there and only re-send the load, but the tray
+        is free between attempts, so a save can still land in the retry gap;
+        the file is fingerprinted the moment it is found ready and re-checked
+        before every later attempt, and a mismatch ends the run rather than
+        loading whatever is there now back as if it were the resume.
+
+        The state-file wait gets no longer than `RESUME_ATTEMPT_LOCK_WAIT` of
+        any one hold; a slot still empty at that point drops the tray and comes
+        back on the next attempt, so a state RomM pushes late is still caught
+        without a save waiting out the whole resume budget behind it.
+
+        Args:
+            slot: The slot to load.
+            deadline: A `time.monotonic()` value to stop retrying at.
+            seq: The launch generation this load belongs to.
+
+        Returns:
+            True once a load is confirmed; False when the budget runs out, the
+            session is relaunched, or the process dies.
+        """
+        attempts = 0
+        ready = False
+        ready_identity: Optional[tuple[int, float]] = None
+        while True:
+            attempts += 1
+            loaded = False
+            if not self._disc_lock.acquire(timeout=RESUME_ATTEMPT_LOCK_WAIT):
+                log.warning(
+                    "resume: attempt %d at slot %d gave up after %.1fs waiting on a save or disc "
+                    "swap for the tray (platform=%s, rom=%s)",
+                    attempts, slot, RESUME_ATTEMPT_LOCK_WAIT, self.platform, self._rom_base,
+                )
+            else:
+                try:
+                    if self._launch_seq != seq or not self.alive():
+                        log.warning(
+                            "resume: session ended before slot %d could be loaded "
+                            "(platform=%s, rom=%s)",
+                            slot, self.platform, self._rom_base,
+                        )
+                        return False
+                    if not ready:
+                        slice_end = min(deadline, time.monotonic() + RESUME_ATTEMPT_LOCK_WAIT)
+                        if self.wait_for_state(slice_end):
+                            time.sleep(self._resume_settle)
+                            current = self.state_path()
+                            fingerprint = _state_identity(current) if current is not None else None
+                            if fingerprint is not None:
+                                ready = True
+                                ready_identity = fingerprint
+                            else:
+                                log.warning(
+                                    "resume: slot %d's state file could not be fingerprinted right "
+                                    "after the wait, treating attempt %d as not ready "
+                                    "(platform=%s, rom=%s)",
+                                    slot, attempts, self.platform, self._rom_base,
+                                )
+                        else:
+                            log.warning(
+                                "resume: slot %d still holds no state file on attempt %d "
+                                "(platform=%s, rom=%s)",
+                                slot, attempts, self.platform, self._rom_base,
+                            )
+                    else:
+                        current = self.state_path()
+                        current_identity = _state_identity(current) if current is not None else None
+                        if current_identity != ready_identity:
+                            log.error(
+                                "resume: slot %d's state file changed since attempt %d found it "
+                                "ready, most likely a save or a state push landed in the retry "
+                                "gap; the game is running unrestored and no further attempt "
+                                "would load the right content (platform=%s, rom=%s)",
+                                slot, attempts, self.platform, self._rom_base,
+                            )
+                            return False
+                    if ready:
+                        loaded = self._load_state_locked(slot)
+                finally:
+                    self._disc_lock.release()
+            if loaded:
+                log.info("resume: load of slot %d delivered on attempt %d", slot, attempts)
+                return True
+            if self._launch_seq != seq or not self.alive():
+                log.warning(
+                    "resume: session ended before slot %d could be loaded (platform=%s, rom=%s)",
+                    slot, self.platform, self._rom_base,
+                )
+                return False
+            if time.monotonic() + RESUME_LOAD_RETRY_GAP >= deadline:
+                log.error(
+                    "resume: load of slot %d failed on all %d attempt(s) within the resume "
+                    "budget, the game is running unrestored (platform=%s, rom=%s)",
+                    slot, attempts, self.platform, self._rom_base,
+                )
+                return False
+            log.warning(
+                "resume: load of slot %d failed on attempt %d, retrying in %.1fs "
+                "(platform=%s, rom=%s)",
+                slot, attempts, RESUME_LOAD_RETRY_GAP, self.platform, self._rom_base,
+            )
+            time.sleep(RESUME_LOAD_RETRY_GAP)
 
     def _wait_until_playing(self, deadline: float, seq: int) -> bool:
         """Block until the core reports a running game, or `deadline` passes.
@@ -1395,7 +1825,7 @@ class Retroarch(Emulator):
         """Send `SAVE_STATE` once and confirm the file landed in `STATE_SLOT`.
 
         When the platform writes thumbnails, the sibling `.png` is also
-        waited on (within what is left of the same deadline) once the state
+        waited on, in its own `STATE_THUMBNAIL_WAIT` window, once the state
         file itself is confirmed. A thumbnail that never lands is only logged:
         the state file is already good, and losing a preview should not read
         as losing the save.
@@ -1407,22 +1837,20 @@ class Retroarch(Emulator):
         before = _state_snapshot(STATE_DIR, self._rom_base)
         if not self._write_cmd("SAVE_STATE"):
             return False
-        deadline = time.monotonic() + STATE_CONFIRM_WAIT
         if not _wait_for_state_file(before, STATE_DIR, self._rom_base, STATE_SLOT, STATE_CONFIRM_WAIT):
             return False
         if self._thumbnail_enabled:
-            self._wait_for_state_thumbnail(before, deadline)
+            self._wait_for_state_thumbnail(before)
         return True
 
-    def _wait_for_state_thumbnail(self, before: dict[Path, tuple[int, float]], deadline: float) -> None:
+    def _wait_for_state_thumbnail(self, before: dict[Path, tuple[int, float]]) -> None:
         """Wait for the working slot's save thumbnail, without failing the save on a miss.
 
         Args:
             before: The `_state_snapshot` taken before `SAVE_STATE` was sent.
-            deadline: A `time.monotonic()` value shared with the state-file
-                wait, not a fresh window of its own.
         """
         target_name = _state_name(self._rom_base, STATE_SLOT) + ".png"
+        deadline = time.monotonic() + STATE_THUMBNAIL_WAIT
         if _stable_file_wait(before, STATE_DIR, self._rom_base, target_name, deadline) is None:
             log.warning(
                 "retroarch: save thumbnail %s not confirmed on disk (platform=%s, rom=%s)",
@@ -1440,58 +1868,234 @@ class Retroarch(Emulator):
         only to recover: a save landing on another slot means the player moved
         it with their own hotkeys, and re-homing puts the next one back.
 
+        The save takes `_disc_lock`, so it cannot land inside a deferred resume
+        load's settle window: a save written there captures the game before the
+        resume was restored, and the resume then loads that back over what the
+        player had. Unlike `swap_disc` this waits (up to `SAVE_LOCK_WAIT`)
+        instead of failing fast, because after the resume finishes the save is
+        exactly the one the caller asked for.
+
         Args:
             slot: The slot RomM asked for; ignored.
 
         Returns:
             True once the state file is confirmed on disk; False when the core
-            is not running or both the save and the re-homed retry miss.
+            is not running, a resume load or disc swap still holds the tray
+            after `SAVE_LOCK_WAIT`, or both the save and the re-homed retry
+            miss.
+        """
+        return self._save_into_slot(SAVE_LOCK_WAIT)
+
+    def _save_into_slot(self, lock_wait: float) -> bool:
+        """Take the tray within `lock_wait` and write the running game into `STATE_SLOT`.
+
+        The wait is the caller's to pick because the cost of waiting is not the
+        same everywhere: an ordinary save only delays itself, while the exit
+        save holds the API's process-wide session lock for as long as it sits
+        here.
+
+        Args:
+            lock_wait: Seconds to wait for `_disc_lock` before giving up.
+
+        Returns:
+            True once the state file is confirmed on disk; False when the core
+            is not running, the tray is still held after `lock_wait`, or both
+            the save and the re-homed retry miss.
         """
         if not self.alive():
             return False
-        if not self._slot_homed and not self._home_state_slot():
-            log.warning(
-                "retroarch: state slot not parked on %d, saving into whatever slot is current "
-                "(platform=%s, rom=%s)",
-                STATE_SLOT, self.platform, self._rom_base,
+        if not self._disc_lock.acquire(timeout=lock_wait):
+            log.error(
+                "retroarch: save of slot %d gave up after %.1fs waiting on an in-flight resume "
+                "load or disc swap (platform=%s, rom=%s)",
+                STATE_SLOT, lock_wait, self.platform, self._rom_base,
             )
-        if self._try_save():
-            return True
-        if not self.alive():
             return False
-        log.info("retroarch: save missed slot %d, re-homing and retrying", STATE_SLOT)
-        self._home_state_slot()
-        return self._try_save()
+        try:
+            if not self.alive():
+                log.warning(
+                    "retroarch: core died while the save of slot %d waited for the tray "
+                    "(platform=%s, rom=%s)",
+                    STATE_SLOT, self.platform, self._rom_base,
+                )
+                return False
+            if not self._slot_homed and not self._home_state_slot():
+                log.warning(
+                    "retroarch: state slot not parked on %d, saving into whatever slot is current "
+                    "(platform=%s, rom=%s)",
+                    STATE_SLOT, self.platform, self._rom_base,
+                )
+            if self._try_save():
+                return True
+            if not self.alive():
+                return False
+            log.info("retroarch: save missed slot %d, re-homing and retrying", STATE_SLOT)
+            self._home_state_slot()
+            return self._try_save()
+        finally:
+            self._disc_lock.release()
 
     def load_state(self, slot: int) -> bool:
-        """Load `STATE_SLOT` into the running game.
+        """Take `_disc_lock` and load `STATE_SLOT`, confirming the state was read.
 
-        `LOAD_STATE_SLOT` is absolute and does not move the current slot, so
-        this needs no homing. The echo carries no success bit and a load writes
-        nothing to disk, so an empty slot is ruled out here instead.
+        The lock keeps this load's access-time backdate-and-poll from
+        overlapping a deferred resume attempt's: both watch the same state
+        file to confirm their own read, and without serializing them one can
+        mistake the other's read for its own and report a load that never
+        happened.
 
         Args:
             slot: The slot RomM asked for; ignored in favour of `STATE_SLOT`.
 
         Returns:
-            True once RetroArch echoes the command; False when the core is not
-            running, the slot holds no state file, or no echo arrives within
-            `LOAD_ACK_WAIT`.
+            True once the load is confirmed by `_load_state_locked`; False
+            when `_disc_lock` could not be taken within `LOAD_LOCK_WAIT`, or
+            for any reason `_load_state_locked` itself returns False.
+        """
+        if not self._disc_lock.acquire(timeout=LOAD_LOCK_WAIT):
+            log.error(
+                "load state: gave up after %.1fs waiting on an in-flight resume load or disc "
+                "swap (platform=%s, rom=%s)",
+                LOAD_LOCK_WAIT, self.platform, self._rom_base,
+            )
+            return False
+        try:
+            return self._load_state_locked(slot)
+        finally:
+            self._disc_lock.release()
+
+    def _load_state_locked(self, slot: int) -> bool:
+        """Load `STATE_SLOT` into the running game and confirm the state was read.
+
+        Assumes `_disc_lock` is already held; called by `load_state` and by
+        the resume retry loop, which holds the lock across its own attempt.
+
+        `LOAD_STATE_SLOT` is absolute and does not move the current slot, so
+        this needs no homing. Its echo is a bare repeat of the command with no
+        success bit, and a load writes nothing to disk, so the echo alone
+        cannot tell a restored game from a refused load (a core that has no
+        content up yet rejects one). What does separate them is the read: a
+        load that happens opens the state file, so the file's access time is
+        stamped behind its own mtime beforehand and polled for afterwards.
+
+        On a `noatime` mount nothing records that read, and there the echo is
+        all there is; the load is then reported as delivered and the warning
+        says the result is unconfirmed. That charity is for the mount, where no
+        load could ever be confirmed. A mount that does track access times but
+        whose state file could not be stamped is a fault on that one file, so
+        it is reported as a failed load and left for the caller to retry. A
+        probe that could not run at all proved nothing about the mount, so it
+        is treated as tracking rather than earning the same charity: guessing
+        `noatime` there would pass every load through unchecked.
+
+        The state is fingerprinted alongside the stamp, so a state pushed in
+        over the slot while the load is in flight is not mistaken for the load
+        having read the one that was there. The state-file GET route reads the
+        same file and moves the same access time; an access-time move seen
+        within `STATE_READ_HANDOUT_GRACE` of one of those reads taints that
+        attempt's read for good (see `_wait_for_state_read`), so a tainted
+        attempt is retried with a fresh marker up to `LOAD_TAINT_RETRY_LIMIT`
+        times rather than being reported as a failed load RetroArch actually
+        performed.
+
+        Args:
+            slot: The slot RomM asked for; ignored in favour of `STATE_SLOT`.
+
+        Returns:
+            True once RetroArch has read the slot's state file (or echoed the
+            command, where access times are not tracked); False when the core
+            is not running, the slot holds no state file, the state's access
+            time could not be backdated, no echo arrives within
+            `LOAD_ACK_WAIT`, or the state is replaced or never read within
+            `LOAD_CONFIRM_WAIT` after every tainted attempt is used up.
         """
         if not self.alive():
             return False
-        if self.state_path() is None:
+        state = self.state_path()
+        if state is None:
             log.warning("load state: slot %d holds no state file", STATE_SLOT)
             return False
-        echo = self._send(
-            f"LOAD_STATE_SLOT {STATE_SLOT}",
-            wait_prefix="LOAD_STATE_SLOT",
-            timeout=LOAD_ACK_WAIT,
-        )
-        if echo is None:
-            log.warning("load state: retroarch did not acknowledge slot %d", STATE_SLOT)
+        try:
+            tracked = _atime_tracked(state.parent)
+        except AtimeProbeError as exc:
+            log.error(
+                "load state: the access-time probe for %s failed (%s), so the load of slot %d "
+                "cannot be trusted on its echo and has to be confirmed like any tracked mount "
+                "(platform=%s, rom=%s)",
+                state.parent, exc, STATE_SLOT, self.platform, self._rom_base,
+            )
+            tracked = True
+        for attempt in range(1, LOAD_TAINT_RETRY_LIMIT + 2):
+            marker = _backdate_atime(state) if tracked else None
+            if marker is not None:
+                identity = _state_identity(state)
+                if identity is None:
+                    # The backdate a moment ago proved the file was there; losing
+                    # the stat now is itself the kind of in-flight change this
+                    # guard exists to catch, not a reason to run without it.
+                    log.error(
+                        "load state: could not fingerprint %s right after backdating it, the load "
+                        "of slot %d cannot be confirmed safely (platform=%s, rom=%s)",
+                        state, STATE_SLOT, self.platform, self._rom_base,
+                    )
+                    return False
+            else:
+                identity = None
+            echo = self._send(
+                f"LOAD_STATE_SLOT {STATE_SLOT}",
+                wait_prefix="LOAD_STATE_SLOT",
+                timeout=LOAD_ACK_WAIT,
+            )
+            if echo is None:
+                log.warning("load state: retroarch did not acknowledge slot %d", STATE_SLOT)
+                return False
+            if marker is None:
+                if tracked:
+                    log.error(
+                        "load state: could not backdate %s to confirm the load of slot %d, so the "
+                        "load is unverifiable and the game may still be running unrestored "
+                        "(platform=%s, rom=%s)",
+                        state, STATE_SLOT, self.platform, self._rom_base,
+                    )
+                    return False
+                log.warning(
+                    "load state: access times are not tracked for %s, so slot %d is reported on "
+                    "the echo alone and the game may still be running unrestored "
+                    "(platform=%s, rom=%s)",
+                    state.parent, STATE_SLOT, self.platform, self._rom_base,
+                )
+                return True
+            confirmed = _wait_for_state_read(
+                state,
+                marker,
+                time.monotonic() + LOAD_CONFIRM_WAIT,
+                identity=identity,
+                tainted_until=lambda: self._state_handout_at + STATE_READ_HANDOUT_GRACE,
+            )
+            if confirmed is True:
+                log.info("load state: slot %d restored from %s", STATE_SLOT, state.name)
+                return True
+            if confirmed is False:
+                log.error(
+                    "load state: retroarch echoed slot %d but never read %s within %.1fs, the "
+                    "game is still running unrestored (platform=%s, rom=%s)",
+                    STATE_SLOT, state.name, LOAD_CONFIRM_WAIT, self.platform, self._rom_base,
+                )
+                return False
+            if attempt <= LOAD_TAINT_RETRY_LIMIT:
+                log.warning(
+                    "load state: slot %d's read was tainted by a state-file handout, retrying "
+                    "with a fresh marker (attempt %d/%d) (platform=%s, rom=%s)",
+                    STATE_SLOT, attempt, LOAD_TAINT_RETRY_LIMIT, self.platform, self._rom_base,
+                )
+                continue
+            log.error(
+                "load state: slot %d could not be confirmed after %d tainted attempt(s), the "
+                "game is still running unrestored (platform=%s, rom=%s)",
+                STATE_SLOT, attempt, self.platform, self._rom_base,
+            )
             return False
-        return True
+        return False
 
     def state_path(self) -> Optional[Path]:
         """The newest state file for the loaded content in `STATE_SLOT`, or None.
@@ -1503,6 +2107,31 @@ class Retroarch(Emulator):
         if not self._rom_base:
             return None
         return _newest_state(STATE_DIR, self._rom_base, STATE_SLOT)
+
+    def note_state_handout(self) -> None:
+        """Record now as the last time the state-file GET route read our state.
+
+        See `_state_handout_at`.
+        """
+        self._state_handout_at = time.monotonic()
+
+    def lock_for_state_write(self) -> bool:
+        """Take `_disc_lock` before a pushed state overwrites the working slot.
+
+        Without this, a push racing an in-flight resume attempt or manual
+        load would replace the file those are backdating and polling for
+        their own confirmation, which reads as a save landing in the retry
+        gap even when it is the resume's own seed pushed twice.
+
+        Returns:
+            True once `_disc_lock` is held; False after `LOAD_LOCK_WAIT` with
+            no luck.
+        """
+        return self._disc_lock.acquire(timeout=LOAD_LOCK_WAIT)
+
+    def unlock_state_write(self) -> None:
+        """Release `_disc_lock` taken by `lock_for_state_write`."""
+        self._disc_lock.release()
 
     def state_screenshot_path(self) -> Optional[Path]:
         """The thumbnail RetroArch wrote beside the working slot's state, or None.
@@ -1519,37 +2148,62 @@ class Retroarch(Emulator):
         shot = state.with_name(f"{state.name}.png")
         return shot if shot.is_file() else None
 
-    def clear_working_slot(self) -> None:
-        """Delete every content's state in the broker's slot, and its thumbnail.
+    def _clear_subtree(self, subtree: str) -> None:
+        """Empty one of `save_subtrees` without removing the directory itself.
 
-        RetroArch names a state after the loaded content, so a leftover for a
-        different game is already invisible to a resume. One for the *same*
-        game is not: in a shared container the previous player's state would
-        be served to the next, since nothing about the name says whose it is.
+        The directory stays because the broker config names it as RetroArch's
+        savestate or savefile directory, and a launch that finds it missing
+        writes its saves somewhere else entirely.
 
-        Searched recursively, since a core may redirect states into a subdir
-        of its own.
+        Args:
+            subtree: A path relative to `save_root`, as `save_subtrees` names it.
         """
-        if not STATE_DIR.is_dir():
-            return
-        suffix = _state_suffix(STATE_SLOT)
+        root = self.save_root
+        target = root / subtree
         try:
-            stale_states = [p for p in STATE_DIR.rglob(f"*{suffix}") if p.is_file()]
+            resolved = target.resolve()
+            # The subtrees come from the platform table; a relative escape in
+            # one would otherwise point this delete outside the save tree.
+            if not resolved.is_relative_to(root.resolve()):
+                log.error(
+                    "retroarch: refusing to clear %s, it escapes the save root %s", target, root
+                )
+                return
+            if not target.is_dir():
+                return
+            entries = list(target.iterdir())
         except OSError as exc:
-            log.warning("could not scan %s for stale states: %s", STATE_DIR, exc)
+            log.warning("retroarch: could not scan %s for stale save data: %s", target, exc)
             return
-        for stale in stale_states:
+        for entry in entries:
             try:
-                stale.unlink()
-                log.info("cleared stale state %s", stale.name)
+                if entry.is_symlink() or entry.is_file():
+                    entry.unlink()
+                else:
+                    shutil.rmtree(entry)
             except OSError as exc:
-                log.warning("could not clear stale state %s: %s", stale.name, exc)
+                log.warning("retroarch: could not clear stale save data %s: %s", entry, exc)
                 continue
-            shot = stale.with_name(f"{stale.name}.png")
-            try:
-                shot.unlink(missing_ok=True)
-            except OSError as exc:
-                log.warning("could not clear stale state thumbnail %s: %s", shot.name, exc)
+            log.info("retroarch: cleared stale save data %s", entry)
+
+    def clear_working_slot(self) -> None:
+        """Empty every save subtree the incoming archive restores into.
+
+        The states alone are not enough. RetroArch names both a state and an
+        SRAM file after the loaded content and nothing in either name says
+        whose session wrote it, so in a shared container the previous player's
+        `.srm` sits there with a fresh mtime when the next player activates
+        the same title. The restore then skips its own member as older than
+        what is on disk, and the exit dump ships the leftover back as the new
+        player's save. Clearing the whole tree first is what leaves the
+        restore the only thing that puts save data in place.
+
+        Scoped to `save_subtrees`, so the platforms that share a savefile dir
+        with their core's app data (dolphin, azahar) lose their saves and keep
+        the rest of that dir.
+        """
+        for subtree in self.save_subtrees:
+            self._clear_subtree(subtree)
 
     def state_target(self, filename: str) -> Optional[Path]:
         """Where a pushed state called `filename` belongs.
@@ -1614,18 +2268,26 @@ class Retroarch(Emulator):
         ahead, since holding the session open would not make the refusal any
         more likely to succeed.
 
+        The save here waits only `EXIT_SAVE_LOCK_WAIT` for the tray, not the
+        `SAVE_LOCK_WAIT` an ordinary save gets: this runs under the API's
+        process-wide session lock, so the wait is paid by every other session
+        route as well.
+
         Args:
             slot: The slot to save into, or None to exit without writing a
                 state.
 
         Returns:
-            A dict with `{"state_saved", "state_slot", "state_file"}`: whether
-            the save was confirmed, `STATE_SLOT` (or None when no save was
-            asked for), and the saved file's `{"path", "size", "mtime"}` or
-            None.
+            A dict with `{"state_saved", "state_slot", "state_file",
+            "sram_flushed"}`: whether the save was confirmed, `STATE_SLOT`
+            (or None when no save was asked for), the saved file's
+            `{"path", "size", "mtime"}` or None, and whether `_flush_sram`
+            got its `OK` (None when the process was already gone, so no
+            flush was attempted).
         """
         saved = False
         state_file = None
+        flushed = None
         if self.alive():
             if slot is not None and not self.supports_states:
                 log.warning(
@@ -1633,10 +2295,17 @@ class Retroarch(Emulator):
                     self.platform,
                 )
             if slot is not None and self.supports_states:
-                saved = self.save_state(slot)
+                saved = self._save_into_slot(EXIT_SAVE_LOCK_WAIT)
                 if saved:
                     p = self.state_path()
-                    if p is not None:
+                    if p is None:
+                        log.warning(
+                            "retroarch: save confirmed but no state file could be found "
+                            "afterward (platform=%s, rom=%s)",
+                            self.platform, self._rom_base,
+                        )
+                        saved = False
+                    else:
                         try:
                             st = p.stat()
                         except OSError as exc:
@@ -1644,12 +2313,13 @@ class Retroarch(Emulator):
                             saved = False
                         else:
                             state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
-            self._flush_sram()
+            flushed = self._flush_sram()
         self._quit()
         return {
             "state_saved": saved,
             "state_slot": STATE_SLOT if slot is not None else None,
             "state_file": state_file,
+            "sram_flushed": flushed,
         }
 
     def _quit(self) -> None:
@@ -1657,8 +2327,10 @@ class Retroarch(Emulator):
 
         `QUIT` is sent, then sent again after `QUIT_CONFIRM_GAP` if the process
         is still running, and given `QUIT_WAIT` to exit. A graceful exit
-        forgets the handle; anything else falls through to the base `stop` and
-        its SIGTERM.
+        forgets the handle; anything else falls through to `self.stop`
+        (not the base class's) and its SIGTERM, so an in-flight deferred
+        resume load is invalidated the same as any other exit path even when
+        the process outlives that SIGTERM/SIGKILL escalation.
         """
         proc = self._proc
         if proc is not None and proc.poll() is None and proc.stdin is not None:
@@ -1694,7 +2366,7 @@ class Retroarch(Emulator):
                 log.warning(
                     "%s did not exit after QUIT, escalating to SIGTERM", self.name
                 )
-        super().stop()
+        self.stop()
 
     def stop(self) -> None:
         """Stop RetroArch, invalidating any in-flight deferred state load before the kill."""
