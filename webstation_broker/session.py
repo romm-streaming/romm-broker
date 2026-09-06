@@ -28,7 +28,7 @@ Shape:
 ```
 {
   "id", "active", "created_at",
-  "user": {...}, "emulator": "pcsx2", "rom": {...}, "rom_file": str,
+  "user": {...}, "emulator": "pcsx2", "rom": {...}, "rom_file": str | None,
   "save": {...} | None, "callback": {...} | None, "multiplayer": bool,
   "controller_token", "controller_public_id",
   "invites": {"participant": str, "readonly": str},
@@ -106,7 +106,9 @@ def _session_id(raw: object) -> str:
     return cleaned or secrets.token_hex(8)
 
 
-def new_session(payload: dict[str, Any], emulator_obj: "Emulator", rom_file: str) -> dict[str, Any]:
+def new_session(
+    payload: dict[str, Any], emulator_obj: "Emulator", rom_file: Optional[str]
+) -> dict[str, Any]:
     """Replace the module-level session with a fresh one built from the activate payload.
 
     The controller starts with gamepad 1 and mouse/keyboard control; the viewer
@@ -117,7 +119,10 @@ def new_session(payload: dict[str, Any], emulator_obj: "Emulator", rom_file: str
             (`session_id`, `user`, `rom`, `save`, `callback`, `multiplayer`) is
             optional.
         emulator_obj: The emulator instance driving this session.
-        rom_file: The resolved path of the ROM file being played.
+        rom_file: The resolved path of the ROM file being played, or None for a
+            session with nothing to boot from (a resumed state, or an emulator
+            launched without a ROM). Only ever read back out for the status
+            routes to report.
 
     Returns:
         The new session dict, which is also stored in `SESSION`.
@@ -519,6 +524,11 @@ async def handle_assign_slot(viewer_token: Optional[str], slot: Optional[int]) -
     `gamepad_change` notification is broadcast for every change made, followed
     by a state update. Unknown tokens are logged and ignored.
 
+    A push selkies refuses is logged and the room is still told: the
+    notification describes what the session now holds, and the next successful
+    push carries the whole map, so nothing here is worth leaving the room's
+    view of itself out of step with the broker's over.
+
     Args:
         viewer_token: The token of the member to change; the controller's own
             token targets the controller.
@@ -573,7 +583,13 @@ async def handle_assign_slot(viewer_token: Optional[str], slot: Optional[int]) -
     elif slot is None and old_slot is not None:
         notifications.append(f"{target_username} was unassigned from Gamepad {old_slot}.")
 
-    await selkies.push_tokens(SESSION)
+    if not await selkies.push_tokens(SESSION):
+        log.error(
+            "session %s: selkies kept the old token map, gamepad slot %s for %r is not live yet",
+            SESSION["id"],
+            slot,
+            target_username,
+        )
     for msg in notifications:
         await broadcast_to_room(
             {"type": "gamepad_change", "message": msg, "timestamp": int(time.time() * 1000)}
@@ -587,7 +603,8 @@ async def handle_assign_mk(target_token: Optional[str]) -> None:
     The controller's own token and None both mean control returns to the
     controller. A no-op when the target already holds it; otherwise the token
     map is pushed to selkies and an `mk_change` notification and a state update
-    are broadcast.
+    are broadcast. A push selkies refuses is logged, since input keeps routing
+    by the map it already has until some later push lands.
 
     Args:
         target_token: The token of the viewer to receive control, or None (or
@@ -608,7 +625,13 @@ async def handle_assign_mk(target_token: Optional[str]) -> None:
                 username = v.get("username", "User")
                 break
 
-    await selkies.push_tokens(SESSION)
+    if not await selkies.push_tokens(SESSION):
+        log.error(
+            "session %s: selkies kept the old token map, mouse and keyboard control "
+            "is still routed to whoever held it before %r",
+            SESSION["id"],
+            username,
+        )
     await broadcast_to_room(
         {
             "type": "mk_change",

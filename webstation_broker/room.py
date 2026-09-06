@@ -501,7 +501,12 @@ async def room_websocket(websocket: WebSocket) -> None:
                 if input_released:
                     from . import selkies
 
-                    await selkies.push_tokens(sess)
+                    if not await selkies.push_tokens(sess):
+                        log.error(
+                            "room: selkies kept the old token map after %r disconnected, "
+                            "their input routing is still live",
+                            current_username,
+                        )
 
         if was_live and connection_info.get("has_joined"):
             await session.broadcast_to_room(
