@@ -178,6 +178,7 @@ def replace(card: Path, content: bytes, marker: Optional[str] = None) -> Union[i
         staging = parent / f".{card.name}.new"
         backup = parent / f".{card.name}.old"
         shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(backup, ignore_errors=True)
         written = 0
         try:
             staging.mkdir(parents=True)
@@ -202,7 +203,7 @@ def replace(card: Path, content: bytes, marker: Optional[str] = None) -> Union[i
             if card.exists():
                 os.replace(card, backup)
             os.replace(staging, card)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
             shutil.rmtree(staging, ignore_errors=True)
             if not card.exists() and backup.exists():
                 try:
