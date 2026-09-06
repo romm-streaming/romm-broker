@@ -20,12 +20,15 @@ from typing import Callable, NoReturn, Optional
 
 import pytest
 
+from webstation_broker import settings
 from webstation_broker.emulators import rpcs3
 
 
 @pytest.fixture
 def rpcs3_dirs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Path]:
-    """Point the RPCS3 emulator's dev_hdd0 layout at isolated temp directories."""
+    """Point the RPCS3 emulator's dev_hdd0 layout and the ROM root at temp directories."""
+    rom_root = tmp_path / "romm"
+    rom_root.mkdir()
     data_dir = tmp_path / "data"
     dev_hdd0 = data_dir / "dev_hdd0"
     user_home = dev_hdd0 / "home" / "00000001"
@@ -46,7 +49,10 @@ def rpcs3_dirs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Pat
     monkeypatch.setattr(rpcs3, "SSTATE_ROOT", sstate_root)
     monkeypatch.setattr(rpcs3, "_SSTATE_LINK", sstate_link)
     monkeypatch.setattr(rpcs3.Rpcs3, "save_root", dev_hdd0)
+    monkeypatch.setattr(rpcs3, "ROM_ROOT", rom_root)
+    monkeypatch.setattr(settings, "ROM_ROOT", rom_root)
     return {
+        "rom_root": rom_root,
         "data_dir": data_dir,
         "dev_hdd0": dev_hdd0,
         "user_home": user_home,
@@ -297,6 +303,132 @@ def test_clearing_the_working_slot_enters_restoring_mode(rpcs3_dirs: dict[str, P
 
     assert emu._restoring is True
     assert emu.save_subtrees == ("home/00000001/savedata", "game", "savestates")
+
+
+# ── stale save data ─────────────────────────────────────────────────────
+
+
+def test_clearing_the_working_slot_drops_the_last_players_save_data(
+    rpcs3_dirs: dict[str, Path], tmp_path: Path
+) -> None:
+    """A previous player's cellSaveData dir must not survive into this session.
+
+    The restore only writes the members this player's archive names, so an
+    untouched leftover would still be sitting in the save dir at exit, where
+    the restamp ships the dir whole into this player's own archive.
+    """
+    leftover = _touch(rpcs3.USER_HOME / "savedata" / "BLUS30443-AUTO" / "SAVE.BIN")
+    pkg = _write_pkg(tmp_path / "roms" / "game.pkg", "BLUS30443")
+
+    emu = rpcs3.Rpcs3()
+    emu.resolve_rom_file(pkg)
+    emu.clear_working_slot()
+
+    assert not leftover.exists()
+    assert not leftover.parent.exists()
+
+
+def test_clearing_the_working_slot_drops_another_titles_save_data_too(
+    rpcs3_dirs: dict[str, Path], tmp_path: Path
+) -> None:
+    """A save dir named for another title is another player's data just the same."""
+    other = _touch(rpcs3.USER_HOME / "savedata" / "BLES00001-AUTO" / "SAVE.BIN")
+    pkg = _write_pkg(tmp_path / "roms" / "game.pkg", "BLUS30443")
+
+    emu = rpcs3.Rpcs3()
+    emu.resolve_rom_file(pkg)
+    emu.clear_working_slot()
+
+    assert not other.exists()
+
+
+def test_clearing_the_working_slot_drops_save_data_without_a_resolved_rom(
+    rpcs3_dirs: dict[str, Path],
+) -> None:
+    """Save data needs no title id to clear, unlike a savestate dir.
+
+    A boot target whose title id only PINE can supply leaves the savestate
+    clear waiting on the watchdog, but the save-data clear has nothing to
+    wait for and must not be deferred with it.
+    """
+    leftover = _touch(rpcs3.USER_HOME / "savedata" / "BLUS30443-AUTO" / "SAVE.BIN")
+
+    rpcs3.Rpcs3().clear_working_slot()
+
+    assert not leftover.exists()
+
+
+def test_clearing_the_working_slot_drops_stale_game_data(
+    rpcs3_dirs: dict[str, Path],
+) -> None:
+    """Game data under game/ is save data too, and goes with the rest."""
+    gamedata = _touch(rpcs3_dirs["game_dir"] / "BLES00002" / "USRDIR" / "DATA.BIN")
+
+    rpcs3.Rpcs3().clear_working_slot()
+
+    assert not gamedata.exists()
+
+
+def test_clearing_the_working_slot_keeps_installed_pkg_titles(
+    rpcs3_dirs: dict[str, Path],
+) -> None:
+    """An installed title is the game itself, not save data, so the clear leaves it."""
+    eboot = _touch(rpcs3_dirs["game_dir"] / "BLUS30443" / "USRDIR" / "EBOOT.BIN")
+
+    rpcs3.Rpcs3().clear_working_slot()
+
+    assert eboot.exists()
+
+
+def test_clearing_the_working_slot_logs_save_data_it_cannot_remove(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A save dir that cannot be removed is reported, never silently left in place."""
+    _touch(rpcs3.USER_HOME / "savedata" / "BLUS30443-AUTO" / "SAVE.BIN")
+
+    def boom(path: Path) -> NoReturn:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(rpcs3.shutil, "rmtree", boom)
+
+    with caplog.at_level(logging.WARNING):
+        rpcs3.Rpcs3().clear_working_slot()
+
+    assert "could not clear stale save data" in caplog.text
+
+
+def test_rpcs3_declares_that_it_clears_stale_saves(rpcs3_dirs: dict[str, Path]) -> None:
+    """The activate contract's flag has to match what clear_working_slot actually does."""
+    assert rpcs3.Rpcs3.clears_stale_saves is True
+
+
+def test_exit_cannot_ship_a_previous_players_leftover_saves(
+    rpcs3_dirs: dict[str, Path],
+    no_boot_watchdog: list[tuple[str, tuple]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exit restamp can only reach files this session's own activate left behind.
+
+    save_and_exit restamps a session save dir whole so a partially rewritten
+    save ships intact, which is exactly why nothing from an earlier session
+    may still be in that dir by then.
+    """
+    monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
+    monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
+    monkeypatch.setattr(rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: None)
+    monkeypatch.setattr(rpcs3.Rpcs3, "stop", lambda self: None)
+    leftover = _touch(rpcs3.USER_HOME / "savedata" / "BLUS30443-AUTO" / "OLD.BIN", mtime=1000)
+    eboot = _touch(rpcs3_dirs["game_dir"] / "BLUS30443" / "USRDIR" / "EBOOT.BIN")
+
+    emu = rpcs3.Rpcs3()
+    emu.resolve_rom_file(eboot)
+    emu.clear_working_slot()
+    emu.launch(eboot, None)
+    mine = _touch(rpcs3.USER_HOME / "savedata" / "BLUS30443-AUTO" / "MINE.BIN", mtime=1000)
+    emu.save_and_exit(None)
+
+    assert not leftover.exists()
+    assert mine.stat().st_mtime > emu._session_start
 
 
 # ── save_subtrees ───────────────────────────────────────────────────────
@@ -902,7 +1034,7 @@ def test_launch_falls_back_to_a_fresh_boot_with_no_known_serial(
     monkeypatch.setattr(
         rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: spawned.setdefault("cmd", cmd)
     )
-    iso = tmp_path / "Game.iso"
+    iso = rpcs3_dirs["rom_root"] / "Game.iso"
     iso.write_bytes(b"iso")
 
     rpcs3.Rpcs3().launch(iso, 1)
@@ -970,6 +1102,84 @@ def test_launch_clears_leftovers_once_the_serial_is_known_synchronously(
 
     assert not stale.exists()
     assert emu._leftover_snapshot is None
+
+
+def test_launch_refuses_a_rom_symlinked_out_of_the_library(
+    rpcs3_dirs: dict[str, Path], no_boot_watchdog: list[tuple[str, tuple]],
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A boot target resolving outside the library and the data dirs is never spawned.
+
+    The plain-file branch boots the ROM path as it stands, so a symlink in
+    the library would otherwise hand rpcs3 a file from anywhere on the host.
+    """
+    monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
+    monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: spawned.append(cmd))
+    outside = tmp_path / "elsewhere" / "secret.iso"
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(b"iso")
+    link = rpcs3_dirs["rom_root"] / "Game.iso"
+    link.symlink_to(outside)
+
+    with pytest.raises(RuntimeError, match="resolves outside"):
+        rpcs3.Rpcs3().launch(link, None)
+
+    assert spawned == []
+
+
+def test_launch_refuses_an_eboot_symlinked_out_of_the_game_dir(
+    rpcs3_dirs: dict[str, Path], no_boot_watchdog: list[tuple[str, tuple]],
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """An installed title's EBOOT is re-checked too, not trusted for sitting under game/."""
+    monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
+    monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: spawned.append(cmd))
+    outside = _touch(tmp_path / "elsewhere" / "EBOOT.BIN")
+    eboot = rpcs3_dirs["game_dir"] / "BLUS30443" / "USRDIR" / "EBOOT.BIN"
+    eboot.parent.mkdir(parents=True)
+    eboot.symlink_to(outside)
+
+    with pytest.raises(RuntimeError, match="resolves outside"):
+        rpcs3.Rpcs3().launch(eboot, None)
+
+    assert spawned == []
+
+
+def test_launch_accepts_a_rom_inside_the_library(
+    rpcs3_dirs: dict[str, Path], no_boot_watchdog: list[tuple[str, tuple]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ROM sitting in the library boots normally through the containment check."""
+    monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
+    monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: spawned.append(cmd))
+    iso = rpcs3_dirs["rom_root"] / "Game.iso"
+    iso.write_bytes(b"iso")
+
+    rpcs3.Rpcs3().launch(iso, None)
+
+    assert spawned[0][-1] == str(iso)
+
+
+def test_verify_boot_target_accepts_a_savestate(rpcs3_dirs: dict[str, Path]) -> None:
+    """A resume boots the state file itself, so the savestate root is a boot root."""
+    state = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT")
+
+    rpcs3._verify_boot_target(state)  # must not raise
+
+
+def test_verify_boot_target_accepts_an_extraction(
+    rpcs3_dirs: dict[str, Path], cache_dir: Path
+) -> None:
+    """An archive boots out of the extraction cache, which is a boot root of its own."""
+    boot = _touch(cache_dir / "Game-abc123" / "EBOOT.BIN")
+
+    rpcs3._verify_boot_target(boot)  # must not raise
 
 
 # ── save_and_exit ───────────────────────────────────────────────────────
@@ -1474,18 +1684,45 @@ def test_stop_invalidates_an_in_flight_boot_watchdog(rpcs3_dirs: dict[str, Path]
 # ── xdotool window targeting ────────────────────────────────────────────
 
 
+def _fake_xdotool(
+    calls: list[tuple], windows: str, pids: Optional[dict[str, str]] = None
+) -> Callable[..., Optional[str]]:
+    """Build an `_xdotool` stub answering a class search and the pid lookups after it.
+
+    Args:
+        calls: Collects every invocation, in order.
+        windows: Whitespace-separated window ids the class search returns.
+        pids: Window id to the `getwindowpid` reply for it; a window missing
+            from the mapping answers with no pid at all.
+
+    Returns:
+        The stub, ready to be bound in place of `Rpcs3._xdotool`.
+    """
+    replies = pids or {}
+
+    def run(*args: str) -> Optional[str]:
+        calls.append(args)
+        if args[0] == "search":
+            return windows
+        if args[0] == "getwindowpid":
+            return replies.get(args[1])
+        return "ok"
+
+    return run
+
+
 def test_send_key_activates_then_sends_the_key(rpcs3_dirs: dict[str, Path]) -> None:
     """Send key activates then sends the key."""
     emu = rpcs3.Rpcs3()
-    calls = []
-    emu._xdotool = lambda *args: (calls.append(args), "111\n")[1] if args[0] == "search" else (
-        calls.append(args), "ok"
-    )[1]
+    emu._proc = SimpleNamespace(pid=os.getpid())
+    calls: list[tuple] = []
+    emu._xdotool = _fake_xdotool(calls, "111\n", {"111": str(os.getpid())})
 
     assert emu._send_key("ctrl+alt+1") is True
     assert calls[0] == ("search", "--class", rpcs3._WINDOW_CLASS)
-    assert calls[1][0] == "windowactivate"
-    assert calls[2] == ("key", "--clearmodifiers", "ctrl+alt+1")
+    assert calls[1] == ("getwindowpid", "111")
+    assert calls[2][0] == "windowactivate"
+    assert calls[3] == ("key", "--clearmodifiers", "ctrl+alt+1")
 
 
 def test_send_key_fails_with_no_window(rpcs3_dirs: dict[str, Path]) -> None:
@@ -1494,6 +1731,67 @@ def test_send_key_fails_with_no_window(rpcs3_dirs: dict[str, Path]) -> None:
     emu._xdotool = lambda *args: None
 
     assert emu._send_key("ctrl+alt+1") is False
+
+
+def test_game_window_picks_the_window_owned_by_this_launch(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale instance's window is skipped for the one this session's launch owns.
+
+    The window class is shared by every rpcs3 on the display, so the first
+    search hit can be a zombie left by a session that failed to die, and a
+    save hotkey sent there would save nothing.
+    """
+    emu = rpcs3.Rpcs3()
+    emu._proc = SimpleNamespace(pid=4242)
+    monkeypatch.setattr(rpcs3, "_launch_pids", lambda pid: [4242, 4243])
+    emu._xdotool = _fake_xdotool(
+        [], "111 222\n", {"111": "9999", "222": "4243"}
+    )
+
+    assert emu._game_window() == "222"
+
+
+def test_game_window_is_none_when_every_window_belongs_to_another_process(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No window of the launch's own means no key is sent, rather than one sent to a stale instance."""
+    emu = rpcs3.Rpcs3()
+    emu._proc = SimpleNamespace(pid=4242)
+    monkeypatch.setattr(rpcs3, "_launch_pids", lambda pid: [4242])
+    emu._xdotool = _fake_xdotool([], "111\n", {"111": "9999"})
+
+    with caplog.at_level(logging.WARNING):
+        assert emu._game_window() is None
+
+    assert "belongs to this launch" in caplog.text
+
+
+def test_game_window_falls_back_to_a_window_reporting_no_pid(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An X server without _NET_WM_PID still gets its hotkeys, with the gap logged."""
+    emu = rpcs3.Rpcs3()
+    emu._proc = SimpleNamespace(pid=4242)
+    monkeypatch.setattr(rpcs3, "_launch_pids", lambda pid: [4242])
+    emu._xdotool = _fake_xdotool([], "111\n")
+
+    with caplog.at_level(logging.WARNING):
+        assert emu._game_window() == "111"
+
+    assert "reports no pid" in caplog.text
+
+
+def test_game_window_prefers_the_launch_pid_over_a_window_with_no_pid(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A window the launch positively owns beats one that merely cannot be attributed."""
+    emu = rpcs3.Rpcs3()
+    emu._proc = SimpleNamespace(pid=4242)
+    monkeypatch.setattr(rpcs3, "_launch_pids", lambda pid: [4242])
+    emu._xdotool = _fake_xdotool([], "111 222\n", {"222": "4242"})
+
+    assert emu._game_window() == "222"
 
 
 # ── archive extraction / extraction cache ─────────────────────────────
@@ -2255,6 +2553,7 @@ def test_sweep_stale_extractions_is_a_noop_without_a_cache_dir(cache_dir: Path) 
 
 def test_launch_extracts_and_boots_from_an_archive_rom(
     rpcs3_dirs: dict[str, Path],
+    cache_dir: Path,
     no_boot_watchdog: list[tuple[str, tuple]],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2266,7 +2565,7 @@ def test_launch_extracts_and_boots_from_an_archive_rom(
     monkeypatch.setattr(
         rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: spawned.setdefault("cmd", cmd)
     )
-    extracted_boot = _touch(tmp_path / "extracted" / "EBOOT.BIN")
+    extracted_boot = _touch(cache_dir / "Game-abc123" / "EBOOT.BIN")
     monkeypatch.setattr(rpcs3, "_extract_and_cache", lambda archive, emulator: extracted_boot)
     archive = tmp_path / "Game.7z"
     archive.write_bytes(b"7z")

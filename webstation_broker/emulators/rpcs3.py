@@ -1273,6 +1273,97 @@ def _clear_leftover_states(title_id: str, before: dict) -> None:
             log.debug("rpcs3: cleared leftover savestate %s for %s", p, title_id)
 
 
+def _clear_stale_save_data() -> None:
+    """Empty the cellSaveData and cellGameData trees before an archive restore.
+
+    A restore only writes the members the incoming archive happens to name, so
+    an earlier session's save dirs otherwise survive into this one: readable by
+    the next player, and swept into that player's exit dump by the restamp in
+    `save_and_exit`, which ships a session save dir whole rather than
+    file by file.
+
+    Every dir under home/00000001/savedata and every cellGameData dir under
+    game/ goes, not just the incoming title's: a dir named for another title
+    holds another player's data just the same, and `_session_save_dirs` can
+    select one of those by its mtime alone. Savestates are handled separately
+    (see `clear_working_slot`), and installed PKG titles are not save data,
+    which is why the listing comes from `_gamedata_dirs`.
+    """
+    targets: list[Path] = []
+    savedata = USER_HOME / "savedata"
+    if savedata.is_dir():
+        try:
+            targets.extend(savedata.iterdir())
+        except OSError as exc:
+            log.warning("rpcs3: could not list %s to clear stale save data: %s", savedata, exc)
+    targets.extend(_gamedata_dirs())
+    cleared = 0
+    for entry in targets:
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+        except OSError as exc:
+            log.warning("rpcs3: could not clear stale save data %s: %s", entry, exc)
+        else:
+            cleared += 1
+            log.debug("rpcs3: cleared stale save data %s", entry)
+    if cleared:
+        log.info("rpcs3: cleared %d stale save data dir(s) before the restore", cleared)
+
+
+def _boot_roots() -> tuple[Path, ...]:
+    """The resolved trees a boot target is allowed to live in.
+
+    Resolved per call rather than at import: every one of them is env-derived,
+    and a bind or NFS layout routinely makes one a symlink, which an
+    unresolved comparison would reject every launch on.
+
+    Returns:
+        The ROM library, the game install dir, the extraction cache and the
+        savestate root, minus any that cannot be resolved at all.
+    """
+    roots: list[Path] = []
+    for root in (settings.rom_root(), GAME_DIR, CACHE_DIR, SSTATE_ROOT):
+        try:
+            roots.append(root.resolve())
+        except OSError as exc:
+            log.warning("rpcs3: could not resolve the boot root %s: %s", root, exc)
+    return tuple(roots)
+
+
+def _verify_boot_target(target: Path) -> None:
+    """Refuse a boot target resolving outside every tree the broker owns.
+
+    The ROM path is contained when it is resolved, but each branch that turns
+    it into a boot target reads a fresh path back off the disk afterwards: a
+    PKG install names its EBOOT by title id, an extraction is searched for
+    one, and a resume picks a savestate. A symlink at any of those steps
+    points rpcs3 at a file the library never held.
+
+    Args:
+        target: The final boot target, about to be spawned.
+
+    Raises:
+        RuntimeError: If it resolves outside the ROM library, the game install
+            dir, the extraction cache and the savestate root.
+    """
+    try:
+        real = target.resolve()
+    except OSError as exc:
+        log.error("rpcs3: could not resolve the boot target %s: %s", target, exc)
+        raise RuntimeError(f"could not resolve the boot target {target}: {exc}") from exc
+    roots = _boot_roots()
+    if any(real.is_relative_to(root) for root in roots):
+        return
+    log.error(
+        "rpcs3: refusing to boot %s, it resolves to %s outside %s",
+        target, real, ", ".join(str(r) for r in roots),
+    )
+    raise RuntimeError(f"boot target {target} resolves outside the rom and data dirs")
+
+
 def _launch_pids(pid: Optional[int]) -> list[int]:
     """Every pid in the launch `pid` leads, itself included.
 
@@ -1503,6 +1594,14 @@ class Rpcs3(Emulator):
     save_root = DEV_HDD0
     state_subtrees = ("savestates",)
     """States land under the symlinked `savestates` dir; see `_ensure_sstate_link`."""
+    clears_stale_saves = True
+    """On: `clear_working_slot` empties every cellSaveData and cellGameData dir.
+
+    Savestates are the one part of the tree cleared per title rather than
+    whole, since a title the session never boots can hold states no dump has
+    carried off yet; the ones a session cannot scope by title id are handled
+    by `_clear_leftover_states` once PINE names the title.
+    """
     _restoring = False
     _pending_rom: Optional[Path] = None
     """Boot target this activate resolved, or None when none was resolved.
@@ -1551,7 +1650,13 @@ class Rpcs3(Emulator):
         return tuple(e for e in ROM_EXTENSIONS if e not in _ARCHIVE_EXTS)
 
     def clear_working_slot(self) -> None:
-        """Create the savestates symlink and drop this title's stale savestates.
+        """Create the savestates symlink and drop the last session's saves and states.
+
+        Save data goes first and goes whole (`_clear_stale_save_data`): a save
+        dir is not scoped to the incoming title the way a savestate dir is, and
+        the exit dump ships a session save dir whole, so a previous player's
+        untouched files left sitting in one would leave in this player's
+        archive.
 
         RPCS3 has no fixed slot to clear, but activate() calls this before
         it ever reads save_subtrees to restore an archive, which makes it the
@@ -1573,6 +1678,7 @@ class Rpcs3(Emulator):
         restore extract before it ever calls prepare_restore().
         """
         _ensure_sstate_link()
+        _clear_stale_save_data()
         self._restoring = True
         self._leftover_snapshot = None
         rom = self._pending_rom
@@ -1678,11 +1784,50 @@ class Rpcs3(Emulator):
         return result.stdout
 
     def _game_window(self) -> Optional[str]:
+        """The render window belonging to this session's rpcs3, or None.
+
+        The class is shared by every rpcs3 on the display, so a zombie left by
+        a session that failed to die answers the search too, and the first
+        match is as likely to be that one as this one: a save hotkey sent
+        there saves nothing and never returns a state. `xdotool search --pid`
+        cannot make the distinction either, because AppRun runs the emulator
+        as a child and the window's pid is the child's, not the handle's, so
+        the launch process group is what names it.
+
+        Returns:
+            The matching window id. A window whose pid cannot be read at all
+            is taken over nothing, since a display with one rpcs3 on it and no
+            readable pid is the ordinary case on an X server without
+            _NET_WM_PID.
+        """
         out = self._xdotool("search", "--class", _WINDOW_CLASS)
         if not out:
             log.warning("no rpcs3 window found")
             return None
-        return out.split()[0]
+        win_ids = out.split()
+        pids = set(_launch_pids(self._proc.pid if self._proc is not None else None))
+        unknown: list[str] = []
+        for win_id in win_ids:
+            pid_out = self._xdotool("getwindowpid", win_id)
+            owner = pid_out.strip() if pid_out else ""
+            if not owner.isdigit():
+                unknown.append(win_id)
+                continue
+            if int(owner) in pids:
+                return win_id
+        if unknown:
+            log.warning(
+                "rpcs3 window %s reports no pid, sending to it anyway (launch pids: %s)",
+                unknown[0],
+                ", ".join(str(p) for p in sorted(pids)) or "none",
+            )
+            return unknown[0]
+        log.warning(
+            "no rpcs3 window belongs to this launch (windows: %s, launch pids: %s)",
+            ", ".join(win_ids),
+            ", ".join(str(p) for p in sorted(pids)) or "none",
+        )
+        return None
 
     def _send_key(self, key: str) -> bool:
         """Focus the render window and send `key` through XTEST.
@@ -1708,6 +1853,11 @@ class Rpcs3(Emulator):
         Args:
             rom_path: RomM's resolved rom path (file or directory).
             resume_slot: Slot to resume from, or None for a fresh boot.
+
+        Raises:
+            RuntimeError: If the PKG install or the archive extraction fails,
+                or the boot target it produced resolves outside the ROM
+                library and the emulator's own data dirs.
         """
         self.stop()
         self._restoring = False
@@ -1763,6 +1913,7 @@ class Rpcs3(Emulator):
                 else:
                     target = state
 
+        _verify_boot_target(target)
         self._session_start = time.time()
         log.info(
             "launching rpcs3 (rom=%s, boot=%s, serial=%s)",
