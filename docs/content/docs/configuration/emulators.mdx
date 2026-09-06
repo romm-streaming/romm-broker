@@ -191,3 +191,22 @@ Timings are in seconds.
 | `FLYCAST_DATA_DIR` | `/config/.local/share/flycast` | Flycast's flat data directory (VMU saves and the savestate); `$XDG_DATA_HOME/flycast` when that is set. |
 | `FLYCAST_LOG_PATH` | `/config/flycast.log` | Where Flycast's stdout/stderr is captured. |
 | `FLYCAST_STOP_WAIT` | `20` | How long the Alt+F4 close request gets before escalating to a SIGTERM that Flycast has no handler for, and which skips the save entirely. |
+
+## ScummVM
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `SCUMMVM_BIN` | probed | ScummVM binary; `/usr/games/scummvm`, `/usr/bin/scummvm` and `/usr/local/bin/scummvm` are tried in that order. |
+| `SCUMMVM_CONFIG_DIR` | `/config/.config/scummvm` | Holds `scummvm.ini`, which the broker pins its settings into and reads game targets back out of. |
+| `SCUMMVM_DATA_DIR` | `/config/.local/share/scummvm` | ScummVM's data directory; `saves/` under it is the save subtree and the working slot alike. |
+| `SCUMMVM_LOG_PATH` | `/config/scummvm.log` | Where ScummVM's stdout/stderr is captured. |
+| `SCUMMVM_STATE_SLOT` | `1` | The slot the broker saves into. Kept low because the chooser is walked one `Down` per slot, and slot 0 is ScummVM's write-protected autosave. |
+| `SCUMMVM_MENU_KEY` | `F11` | Key the broker binds to the global menu action in `scummvm.ini`, and opens the Global Main Menu with. ScummVM's own `C+F5` loses its modifier on the way through Xwayland, and the unmodified `F5` belongs to the engine keymap, which an engine may take for itself. |
+| `SCUMMVM_STATE_WAIT` | `10` | How long a save waits for the slot's file to change before reporting failure. The menu macro gives no acknowledgement of its own. |
+| `SCUMMVM_KEY_DELAY` | `0.8` | Seconds between the macro's steps. The menu and its chooser animate in, and a keystroke sent into either transition is dropped. |
+| `SCUMMVM_ADD_TIMEOUT` | `120` | How long `scummvm --add` gets to scan a folder. Detection reads through every file in it. |
+| `SCUMMVM_RESUME_LOAD_WAIT` | `45` | How long a deferred resume waits for the parent to push its state. |
+| `SCUMMVM_RESUME_LOAD_SETTLE` | `8` | How long that resume then gives the game to reach a state where it answers the menu. |
+| `SCUMMVM_FILL_SCREEN` | `true` | Grow the game window to the display after launch, so a 640x480 game is not a postage stamp on a 1080p stream. Done through the window manager, not ScummVM's own fullscreen, which would make SDL grab and confine the pointer against a stack that feeds it absolutely. Best-effort: a failure leaves the game at its own size. |
+| `SCUMMVM_FILL_SCREEN_WAIT` | `10` | Seconds to wait for the game window to appear before giving up on growing it. |
+| `SCUMMVM_STOP_WAIT` | `10` | Seconds SIGTERM gets, which ScummVM spends flushing its config, before escalating to SIGKILL. |

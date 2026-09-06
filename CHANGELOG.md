@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.7.0](https://github.com/romm-streaming/romm-broker/compare/v0.6.0...v0.7.0) (2026-08-30)
+
+
+### Features
+
+* **room:** run the room socket, audio pipelines and capture rungs in workers ([534c052](https://github.com/romm-streaming/romm-broker/commit/534c052876ab2b3551ef710072178be7ed85a0d0))
+* **rpcs3,shadps4:** bound GPU-probe retries, harden cache moves, sweep RPCS3 scratch dirs ([ec51bba](https://github.com/romm-streaming/romm-broker/commit/ec51bba7daf8d485379c8b6b14ec834061feefc7))
+* **saves:** label archive members in a manifest, close RetroArch state gaps ([cd6d576](https://github.com/romm-streaming/romm-broker/commit/cd6d576a74798faac165a26162dff5f3343098fd))
+* **shadps4,rpcs3:** surface extraction progress, gate pkg/archive on the cache ([adc6359](https://github.com/romm-streaming/romm-broker/commit/adc63597ed0446103a29e268611c465e2b97e61a))
+* **shadps4:** unpack pkg/archive ROMs through a CACHE_DIR extraction cache ([d2597cb](https://github.com/romm-streaming/romm-broker/commit/d2597cb47b18d603bae01d70e07c5e70d4060789))
+
+
+### Bug Fixes
+
+* address full-codebase review findings ([f206891](https://github.com/romm-streaming/romm-broker/commit/f20689112f75032db5b092064cfe2848da624718))
+* **api:** retire the session when activate's launch fails ([53ed7de](https://github.com/romm-streaming/romm-broker/commit/53ed7deaf3125bb07e5c1785398e354982754df6))
+* **cache:** refuse an extraction that cannot fit before it starts ([a372a93](https://github.com/romm-streaming/romm-broker/commit/a372a93da0d81f1a40e4a7148aac1c99de589089))
+* **cemu:** default the TV/Pad audio device instead of leaving it blank ([b6b8c25](https://github.com/romm-streaming/romm-broker/commit/b6b8c2552935041c1274e73484efbf31aae0356b))
+* **cemu:** match SDL's name-based fallback GUID for the virtual pad ([71685a2](https://github.com/romm-streaming/romm-broker/commit/71685a2e751ca0f41c93ef5add9daa19e81f9dd2))
+* Merge pull request [#24](https://github.com/romm-streaming/romm-broker/issues/24) from romm-streaming/dev ([62b9bad](https://github.com/romm-streaming/romm-broker/commit/62b9badf0228e802ce7a6731c56a72573f1a18ad))
+* **room:** cap concurrent viewer seats ([d2637e1](https://github.com/romm-streaming/romm-broker/commit/d2637e1f737a0eb1d99fe6eabf5264ad939de9ed))
+* **room:** close a rejoin-evicted seat's still-live socket ([39e4143](https://github.com/romm-streaming/romm-broker/commit/39e414362fd6a0b17801cc4446aca863a773dae2))
+* **room:** close reclaim gaps found in a second review pass ([9d0919f](https://github.com/romm-streaming/romm-broker/commit/9d0919faba155ec19ab830b13bb73e9f2f791754))
+* **room:** close reclaim gaps found in a third review pass ([c461839](https://github.com/romm-streaming/romm-broker/commit/c461839f3c4db59872de2ce3900fee6898ef30ff))
+* **room:** keep seat admission atomic and cover CI for async tests ([d39ed08](https://github.com/romm-streaming/romm-broker/commit/d39ed081c6ee215c64fef716d9389cbb5eae5e20))
+* **room:** reclaim disconnected anonymous seats at the cap ([8b13b73](https://github.com/romm-streaming/romm-broker/commit/8b13b73c4f071d0374ff29e093300c444f610e47))
+* **room:** share seat-release cleanup between rejoin and reclaim ([340c562](https://github.com/romm-streaming/romm-broker/commit/340c562b92bfdbb24281d1acbd1e20244a262869))
+* **room:** stop broadcasting raw bearer tokens in state_update ([be7346e](https://github.com/romm-streaming/romm-broker/commit/be7346e3b01d6b528c9ae4e6f4624be6dcde1714))
+* **saves,retroarch:** guard the manifest classifier, log RetroArch's silent state drops ([03c991e](https://github.com/romm-streaming/romm-broker/commit/03c991e3fb5042bc38049aac05391dc1b939e5fc))
+* **tests:** wait for a sleeper's argv before recording its pid ([ecd56ab](https://github.com/romm-streaming/romm-broker/commit/ecd56abaae2efcda6e89167678fdfe953d442c8f))
+
+
+### Documentation
+
+* add CONTRIBUTING.md and set the LICENSE copyright holder ([75bfcc7](https://github.com/romm-streaming/romm-broker/commit/75bfcc7be60082114d9e894ad899146eebf05e85))
+* add player/frontend guides and fix documentation audit gaps ([8661a20](https://github.com/romm-streaming/romm-broker/commit/8661a203b93aafeef2b4666a6d3dec2119d5366d))
+* add README quickstart, fix developer guide gaps ([e419e3b](https://github.com/romm-streaming/romm-broker/commit/e419e3b8322f08f40a770050d7e09b61ef3c37d6))
+* add SECURITY.md, note the desktop terminal in README ([f1cedcc](https://github.com/romm-streaming/romm-broker/commit/f1cedcc0181f15fb6f5a2ffc4c61da721fbe067e))
+* use romm-broker as the display name, document optional BIOS volume mount ([009eed3](https://github.com/romm-streaming/romm-broker/commit/009eed393e11b21d2464752aad38a6f2e79f950e))
+
 ## [0.6.0](https://github.com/romm-streaming/romm-broker/compare/v0.5.0...v0.6.0) (2026-08-24)
 
 

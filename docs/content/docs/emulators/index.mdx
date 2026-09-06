@@ -22,6 +22,7 @@ state on demand.
 | `rpcs3` | PlayStation 3 | no | no | the save directories under `dev_hdd0/` |
 | `xemu` | Xbox | no | no | extracted from the HDD image into a staging directory |
 | `xenia` | Xbox 360 | no | no | `content/` under `XENIA_DATA_DIR` |
+| `scummvm` | LucasArts and Sierra era adventure games | yes, over the Global Main Menu | no | `saves/` under `SCUMMVM_DATA_DIR` |
 | `flycast` | Sega Dreamcast | no (a resume state is written at exit) | no | the flat `FLYCAST_DATA_DIR` (VMU saves and the savestate) |
 | `desktop` | the webstation desktop itself | no | no | none |
 
@@ -209,6 +210,104 @@ with it as one save subtree, since nothing separates them from the savestate
 or a first-run onboarding artifact. A RetroArch core also covers Dreamcast
 (`dc` defaults to it), for anyone who prefers RetroArch's shared save-state UI
 and hotkeys instead.
+
+## ScummVM
+
+`rom.path` is a *folder* of game data rather than a disc image: ScummVM detects
+a game by scanning a directory, so a launch registers it with
+`scummvm --add --path=<folder>` and reads the generated *target* name
+(`monkey`, `gob1-cd-fr`) back out of `scummvm.ini`. That target, not the path,
+is what boots the game and what every save file is named after, and a folder
+that gains no domain is what "nothing bootable here" means: `--add` reports
+success having added nothing, so its exit code settles neither question. A
+`rom.path` pointing at a file, a `.scummvm` marker for instance, registers the
+folder around it.
+
+A multilingual game folder registers one target per language ScummVM
+detects in it (`gob1-cd-fr`, `gob1-cd-de`), and the target decides which
+variant's resources the engine loads: `--language` alone does not reroute a
+launch. The `language` on the activate payload is what picks between them, and
+it also goes on the command line so the running game agrees with the domain it
+booted from. Codes are translated to ScummVM's own spellings (`pt-br` becomes
+`br`, `jp` becomes `ja`, `zh-hans` becomes `cn`), a close relative stands in
+when the exact one is absent (a `us` variant answers an `en` request), and a
+code ScummVM would reject is dropped rather than failing the boot. A rom that
+names no language falls back to `gui_language`, the player's own interface
+language: RomM rarely knows what language a game is in, and a multilingual
+folder is exactly the case where it usually does not, so the player's is then
+the only thing saying which variant they want. With neither, the pick is
+alphabetical and stable, which is what keeps the `<target>.sNN` save names from
+moving between relaunches.
+
+There is no control socket and no state hotkeys, so save and load drive the
+Global Main Menu with xdotool: the menu key opens it, the bare-letter Save/Load
+hotkey presses the button, `Down` walks the chooser to the slot and `Return`
+activates it. In save mode the first `Return` starts editing the slot's
+description and a second commits it. Three things are pinned in `scummvm.ini`
+to make that work at all. `gui_saveload_chooser=list`, because the default grid
+chooser has no keyboard path to a numbered slot. `keymap_global_MENU`, bound to
+`SCUMMVM_MENU_KEY` (default `F11`): ScummVM ships the menu on `C+F5`, and a
+modifier does not survive injection into the container's Xwayland, so the key
+arrives without its Ctrl and the menu never opens; the unmodified `F5` that
+does work belongs to the engine keymap, which an engine may take for itself
+(gob answers it with Gobliiins' own panel, which has no Save). And the button
+letters follow the GUI translation (`~S~ave` becomes `~S~auvegarder`), so they
+are read back from `gui_language`, which the activate payload pins when it
+carries one and leaves as the user set it when it does not. Only that
+one keymap action is pinned; any other binding the user set is left alone.
+
+The macro says nothing about its result, so a save is only reported once the
+slot's file has actually changed on disk. Engines without runtime save support
+put up a message dialog instead, which the broker dismisses rather than leaving
+the game paused behind a menu. Gobliiins is the canonical case: its gob engine
+creates no save handler at all, since passwords are the game's own progression
+system. Those games still ship their own saves in the archive, and a boot-time
+resume still works.
+
+ScummVM's saves *are* its states: there is no separate state format, so the
+working slot and the game's own saves come out of one directory and are told
+apart by filename. Slot 0 is ScummVM's autosave and its own chooser marks it
+write protected (`MetaEngine::listSaves` sets the flag), so the broker never
+writes there; it works in `SCUMMVM_STATE_SLOT` (default 1). A state pushed back
+in is renamed onto the booted target, because ScummVM finds a save by name
+alone and a multilingual folder registers one target per language.
+
+Two more pins are for the stream rather than for ScummVM's own sake.
+`fullscreen`, pinned **off** whatever the launch. A ScummVM window is its
+game's own resolution, so 640x480 sits as a postage stamp in the middle of the
+stream. ScummVM's own fullscreen is the wrong way to fix that: it makes
+SDL grab the pointer and confine it to a rect (`shouldGrab = ... ||
+fullscreenFlags`, then `SDL_SetWindowMouseRect`) and ask for an explicit
+display mode, and both fight a stack that feeds an absolute pointer and owns
+the display size itself: the pointer stops tracking the stream while clicks
+still land, and these games are nothing but mouse.
+
+So the window manager does it instead. After launch the window is moved to the
+origin and sized to the display (`SCUMMVM_FILL_SCREEN`, on by default). SDL
+reads that as an ordinary resize, scales its output into it and letterboxes to
+keep the game's 4:3 on its own, and never sets the flag that triggers the grab.
+It is best-effort and purely cosmetic: a display size it cannot read, or a
+window that never appears, leaves the game running at its own size rather than
+failing the launch. What it does not remove is the title bar, since no tool in
+the image can (xdotool 3.2016 has no `windowstate`, and there is no wmctrl);
+a labwc window rule would. (ScummVM's `window_maximized` is not used either:
+labwc leaves the window at its own size regardless, so it fills nothing.) And
+`gfx_mode=surfacesdl`, because the OpenGL renderer scales mouse coordinates
+through `SDL_GL_GetDrawableSize`, which means nothing outside a GL window, so
+against an injected absolute pointer the game takes clicks while the cursor
+stops moving. SDL is also forced onto X11 at launch so the macros have an
+Xwayland window to talk to.
+
+None of that reaches the one pointer problem a launcher cannot fix. A running
+game holds Xwayland's warp-emulation pointer lock (ScummVM hides the system
+cursor and warps the pointer), and labwc drops the *absolute* motion the
+browser sends while a lock is active yet still forwards relative motion, so
+the in-game cursor freezes with clicks landing. The image has to patch
+selkies' `input_handler.py` to send every absolute move as a relative delta
+followed by the absolute position, and to read the X pointer back after a
+pause (it ships `python-xlib` for that) so a warp issued by the game does not
+leave a lasting offset. Without it the pointer is dead windowed too, whatever
+this launcher pins.
 
 ## Desktop
 
