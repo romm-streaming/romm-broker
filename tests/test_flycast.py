@@ -936,6 +936,346 @@ def test_exit_with_a_slot_but_not_alive_reports_nothing(
     assert report == {"state_saved": False, "state_slot": 1, "state_file": None}
 
 
+def test_a_torn_state_is_set_aside_on_a_force_kill_even_with_no_slot_requested(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """AutoSaveState is on for every launch, so a kill can tear a state no caller asked to save.
+
+    The caller dumps DATA_DIR by mtime the moment this returns, so a state
+    left plain would ride the archive as this player's progress.
+    """
+    rom = rom_root / "game.chd"
+    rom.write_bytes(b"")
+    state = data_dir / "game.state"
+
+    def fake_stop(self: flycast.Flycast) -> None:
+        _touch(state, b"maybe torn")
+
+    monkeypatch.setattr(flycast.Flycast, "stop", fake_stop)
+    emu = flycast.Flycast()
+    emu._rom_path = rom
+    emu._proc = _FakeProc()
+    emu._proc.returncode = -9
+    monkeypatch.setattr(emu, "alive", lambda: True)
+
+    with caplog.at_level("WARNING"):
+        report = emu.save_and_exit(None)
+
+    assert report == {"state_saved": False, "state_slot": None, "state_file": None}
+    assert not state.exists()
+    aside = data_dir / ("game.state" + flycast.UNTRUSTED_SUFFIX)
+    assert aside.read_bytes() == b"maybe torn"
+    assert "force-killed" in caplog.text
+
+
+def test_a_clean_exit_with_no_slot_leaves_its_state_in_place_unreported(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A graceful exit's state is not quarantined when no slot was asked for, only left unreported."""
+    rom = rom_root / "game.chd"
+    rom.write_bytes(b"")
+    state = data_dir / "game.state"
+
+    def fake_stop(self: flycast.Flycast) -> None:
+        _touch(state, b"a whole session")
+
+    monkeypatch.setattr(flycast.Flycast, "stop", fake_stop)
+    emu = flycast.Flycast()
+    emu._rom_path = rom
+    emu._proc = _FakeProc()
+    emu._proc.returncode = 0
+    monkeypatch.setattr(emu, "alive", lambda: True)
+
+    report = emu.save_and_exit(None)
+
+    assert report == {"state_saved": False, "state_slot": None, "state_file": None}
+    assert state.read_bytes() == b"a whole session"
+    assert not (data_dir / ("game.state" + flycast.UNTRUSTED_SUFFIX)).exists()
+
+
+# ── owner markers ────────────────────────────────────────────────────────
+
+
+def _mark(state: Path, rom: Path) -> Path:
+    """Write the owner marker claiming `state` for `rom`."""
+    return _touch(
+        state.with_name(state.name + flycast.OWNER_SUFFIX),
+        f"{rom.resolve()}\n".encode(),
+    )
+
+
+def test_rom_identity_falls_back_to_the_given_path_when_it_cannot_be_resolved(
+    rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unresolvable rom still gets an identity rather than failing the marker outright."""
+    rom = rom_root / "game.chd"
+
+    def boom(self: Path, strict: bool = False) -> NoReturn:
+        raise OSError("stale nfs handle")
+
+    monkeypatch.setattr(Path, "resolve", boom)
+
+    with caplog.at_level("WARNING"):
+        assert flycast._rom_identity(rom) == str(rom)
+
+    assert "could not resolve" in caplog.text
+
+
+def test_a_confirmed_save_marks_the_state_as_belonging_to_the_rom(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The state filename carries only a basename, so a confirmed write records the rom it came from."""
+    rom = rom_root / "USA" / "game.chd"
+    rom.parent.mkdir()
+    rom.write_bytes(b"")
+    state = data_dir / "game.state"
+
+    def fake_stop(self: flycast.Flycast) -> None:
+        _touch(state, b"a fresh state")
+
+    monkeypatch.setattr(flycast.Flycast, "stop", fake_stop)
+    emu = flycast.Flycast()
+    emu._rom_path = rom
+    emu._proc = _FakeProc()
+    emu._proc.returncode = 0
+    monkeypatch.setattr(emu, "alive", lambda: True)
+
+    assert emu.save_and_exit(1)["state_saved"] is True
+
+    marker = data_dir / ("game.state" + flycast.OWNER_SUFFIX)
+    assert marker.read_text(encoding="utf-8").strip() == str(rom.resolve())
+
+
+def test_an_unconfirmed_save_writes_no_marker(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A state whose write never settled is not this exit's, so nothing claims it for this rom."""
+    rom = rom_root / "game.chd"
+    rom.write_bytes(b"")
+    _touch(data_dir / "game.state", b"stale, never rewritten")
+
+    monkeypatch.setattr(flycast.Flycast, "stop", lambda self: None)
+    emu = flycast.Flycast()
+    emu._rom_path = rom
+    emu._proc = _FakeProc()
+    emu._proc.returncode = 0
+    monkeypatch.setattr(emu, "alive", lambda: True)
+
+    assert emu.save_and_exit(1)["state_saved"] is False
+    assert not (data_dir / ("game.state" + flycast.OWNER_SUFFIX)).exists()
+
+
+def test_a_marker_that_cannot_be_written_is_logged_and_the_save_still_reports(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unmarked state still ships and still resumes, so a failed marker costs no progress."""
+    rom = rom_root / "game.chd"
+    rom.write_bytes(b"")
+    state = data_dir / "game.state"
+
+    def fake_stop(self: flycast.Flycast) -> None:
+        _touch(state, b"a fresh state")
+
+    def boom(self: Path, data: str, encoding: Optional[str] = None) -> NoReturn:
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(flycast.Flycast, "stop", fake_stop)
+    monkeypatch.setattr(Path, "write_text", boom)
+    emu = flycast.Flycast()
+    emu._rom_path = rom
+    emu._proc = _FakeProc()
+    emu._proc.returncode = 0
+    monkeypatch.setattr(emu, "alive", lambda: True)
+
+    with caplog.at_level("WARNING"):
+        assert emu.save_and_exit(1)["state_saved"] is True
+
+    assert "could not mark game.state as belonging to" in caplog.text
+
+
+def test_a_state_with_no_rom_recorded_is_left_unmarked(
+    data_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A marker naming no rom would claim the state for nothing, so none is written."""
+    state = _touch(data_dir / "game.state")
+
+    with caplog.at_level("WARNING"):
+        flycast._write_owner_marker(state, None)
+
+    assert not (data_dir / ("game.state" + flycast.OWNER_SUFFIX)).exists()
+    assert "no rom recorded for this session" in caplog.text
+
+
+def test_a_state_marked_for_another_disc_is_never_resumed_from(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A region pair in two folders shares one state filename; the marker is what tells them apart."""
+    usa = rom_root / "USA" / "game.chd"
+    usa.parent.mkdir()
+    usa.write_bytes(b"")
+    eur = rom_root / "EUR" / "game.chd"
+    eur.parent.mkdir()
+    eur.write_bytes(b"")
+    _mark(_touch(data_dir / "game.state", b"the USA player's progress"), usa)
+
+    monkeypatch.setattr(flycast.Flycast, "stop", lambda self: None)
+    spawned = {}
+
+    def fake_spawn(
+        self: flycast.Flycast, cmd: list[str], env: dict[str, str], stdin_pipe: bool = False
+    ) -> None:
+        spawned["cmd"] = cmd
+
+    monkeypatch.setattr(flycast.Flycast, "_spawn", fake_spawn)
+
+    with caplog.at_level("WARNING"):
+        flycast.Flycast().launch(eur, resume_slot=1)
+
+    assert "config:Dreamcast.AutoLoadState=yes" not in spawned["cmd"][2]
+    assert "booting clean" in caplog.text
+
+
+def test_a_state_marked_for_this_disc_is_resumed_from(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A marker naming the booting rom is what lets its own state load."""
+    rom = rom_root / "USA" / "game.chd"
+    rom.parent.mkdir()
+    rom.write_bytes(b"")
+    _mark(_touch(data_dir / "game.state", b"progress"), rom)
+
+    monkeypatch.setattr(flycast.Flycast, "stop", lambda self: None)
+    spawned = {}
+
+    def fake_spawn(
+        self: flycast.Flycast, cmd: list[str], env: dict[str, str], stdin_pipe: bool = False
+    ) -> None:
+        spawned["cmd"] = cmd
+
+    monkeypatch.setattr(flycast.Flycast, "_spawn", fake_spawn)
+
+    flycast.Flycast().launch(rom, resume_slot=1)
+
+    assert "config:Dreamcast.AutoLoadState=yes" in spawned["cmd"][2]
+
+
+def test_a_state_with_no_marker_still_resumes(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unmarked state is what archives written before markers existed carry."""
+    rom = rom_root / "game.chd"
+    rom.write_bytes(b"")
+    _touch(data_dir / "game.state", b"progress")
+
+    monkeypatch.setattr(flycast.Flycast, "stop", lambda self: None)
+    spawned = {}
+
+    def fake_spawn(
+        self: flycast.Flycast, cmd: list[str], env: dict[str, str], stdin_pipe: bool = False
+    ) -> None:
+        spawned["cmd"] = cmd
+
+    monkeypatch.setattr(flycast.Flycast, "_spawn", fake_spawn)
+
+    flycast.Flycast().launch(rom, resume_slot=1)
+
+    assert "config:Dreamcast.AutoLoadState=yes" in spawned["cmd"][2]
+
+
+def test_a_marker_that_cannot_be_read_is_logged_and_the_state_still_resumes(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unreadable marker is no worse than none: refusing every resume over it helps nobody."""
+    rom = rom_root / "game.chd"
+    rom.write_bytes(b"")
+    state = _touch(data_dir / "game.state", b"progress")
+    _mark(state, rom)
+
+    def boom(self: Path, encoding: Optional[str] = None) -> NoReturn:
+        raise OSError("stale nfs handle")
+
+    monkeypatch.setattr(Path, "read_text", boom)
+
+    with caplog.at_level("WARNING"):
+        assert flycast._state_belongs_to(state, rom) is True
+
+    assert "could not read the state marker" in caplog.text
+
+
+def test_an_empty_marker_names_no_rom_and_does_not_block_a_resume(
+    data_dir: Path, rom_root: Path
+) -> None:
+    """A truncated marker claims nothing, so it is treated as no marker at all."""
+    rom = rom_root / "game.chd"
+    rom.write_bytes(b"")
+    state = _touch(data_dir / "game.state", b"progress")
+    _touch(state.with_name(state.name + flycast.OWNER_SUFFIX), b"")
+
+    assert flycast._state_owner(state) is None
+    assert flycast._state_belongs_to(state, rom) is True
+
+
+def test_a_set_aside_state_takes_its_marker_with_it(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A marker left behind would claim the next state flycast writes under the same basename."""
+    rom = rom_root / "game.chd"
+    rom.write_bytes(b"")
+    state = data_dir / "game.state"
+    _mark(_touch(state), rom)
+
+    def fake_stop(self: flycast.Flycast) -> None:
+        _touch(state, b"maybe torn")
+
+    monkeypatch.setattr(flycast.Flycast, "stop", fake_stop)
+    emu = flycast.Flycast()
+    emu._rom_path = rom
+    emu._proc = _FakeProc()
+    emu._proc.returncode = -9
+    monkeypatch.setattr(emu, "alive", lambda: True)
+
+    emu.save_and_exit(1)
+
+    assert not (data_dir / ("game.state" + flycast.OWNER_SUFFIX)).exists()
+    aside_marker = data_dir / (
+        "game.state" + flycast.UNTRUSTED_SUFFIX + flycast.OWNER_SUFFIX
+    )
+    assert aside_marker.read_text(encoding="utf-8").strip() == str(rom.resolve())
+
+
+def test_a_marker_that_cannot_travel_with_its_state_is_logged(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The state still gets set aside when only its marker cannot follow."""
+    rom = rom_root / "game.chd"
+    rom.write_bytes(b"")
+    state = _touch(data_dir / "game.state")
+    _mark(state, rom)
+    real_replace = Path.replace
+
+    def flaky_replace(self: Path, target: Path) -> Path:
+        if self.name.endswith(flycast.OWNER_SUFFIX):
+            raise OSError("read-only filesystem")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", flaky_replace)
+
+    with caplog.at_level("WARNING"):
+        flycast.Flycast()._set_aside_untrusted_state(state)
+
+    assert (data_dir / ("game.state" + flycast.UNTRUSTED_SUFFIX)).exists()
+    assert "could not set aside the state marker" in caplog.text
+
+
+def test_the_owner_marker_rides_the_archive_as_ordinary_save_data() -> None:
+    """A marker is not a state RomM can offer the player, so it is labelled as save data."""
+    emulator = flycast.Flycast()
+    data = flycast.DATA_DIR.name
+
+    assert emulator.save_file_kind(f"{data}/Game.state{flycast.OWNER_SUFFIX}") == "save"
+    assert emulator.save_file_kind(f"{data}/Game.state{flycast.UNTRUSTED_SUFFIX}") == "save"
+
+
 # ── clear_working_slot ──────────────────────────────────────────────────
 
 
@@ -967,19 +1307,67 @@ def test_clear_working_slot_wipes_every_leftover_resume_state(data_dir: Path) ->
     assert data_dir.is_dir()
 
 
-def test_clear_working_slot_leaves_unrelated_files_alone(data_dir: Path) -> None:
-    """Files that are not resume states are left untouched."""
-    vmu = _touch(data_dir / "vmu_save_A1.bin")
+def test_clear_working_slot_sweeps_the_previous_players_loose_save_data(data_dir: Path) -> None:
+    """VMU images, arcade nvmem and eeprom are not namespaced by title or player.
+
+    Left in place they are handed to the next player and swept into that
+    player's exit archive as their own progress.
+    """
+    leftovers = [
+        _touch(data_dir / "vmu_save_A1.bin"),
+        _touch(data_dir / "vmu_save_B1.bin"),
+        _touch(data_dir / "nvmem.bin"),
+        _touch(data_dir / "eeprom.bin"),
+        _touch(data_dir / "game.state"),
+        _touch(data_dir / ("game.state" + flycast.OWNER_SUFFIX)),
+    ]
 
     flycast.Flycast().clear_working_slot()
 
-    assert vmu.exists()
+    assert [p for p in leftovers if p.exists()] == []
+    assert data_dir.is_dir()
+
+
+def test_clear_working_slot_keeps_the_container_owned_bios_and_config(data_dir: Path) -> None:
+    """The BIOS pair and emu.cfg are container setup every session needs, not one player's data."""
+    kept = [
+        _touch(data_dir / "dc_boot.bin", b"bios"),
+        _touch(data_dir / "dc_flash.bin", b"flash"),
+        _touch(data_dir / "emu.cfg", b"[config]"),
+    ]
+
+    flycast.Flycast().clear_working_slot()
+
+    assert all(p.exists() for p in kept)
+
+
+def test_clear_working_slot_keeps_a_quarantined_state_and_its_marker(data_dir: Path) -> None:
+    """A set-aside state can be the only copy of that progress, and no resume can pick it up anyway."""
+    aside = _touch(data_dir / ("game.state" + flycast.UNTRUSTED_SUFFIX), b"kept")
+    marker = _touch(
+        data_dir / ("game.state" + flycast.UNTRUSTED_SUFFIX + flycast.OWNER_SUFFIX), b"/romm/game.chd"
+    )
+
+    flycast.Flycast().clear_working_slot()
+
+    assert aside.exists()
+    assert marker.exists()
+
+
+def test_clear_working_slot_leaves_subdirectories_alone(data_dir: Path) -> None:
+    """Flycast's controller mappings are container setup, not session save data."""
+    mapping = data_dir / "mappings" / "SDL_Xbox.cfg"
+    _touch(mapping, b"[emulator]")
+
+    flycast.Flycast().clear_working_slot()
+
+    assert mapping.exists()
 
 
 def test_clear_working_slot_tolerates_a_file_it_cannot_delete(
     data_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A resume state that cannot be deleted is logged and does not raise."""
+    """A file that cannot be deleted is logged and does not raise."""
     stuck = _touch(data_dir / "game.state")
 
     def boom(self: Path) -> NoReturn:
@@ -991,7 +1379,23 @@ def test_clear_working_slot_tolerates_a_file_it_cannot_delete(
         flycast.Flycast().clear_working_slot()  # must not raise
 
     assert stuck.exists()
-    assert "could not clear stale resume state" in caplog.text
+    assert "could not clear stale save data" in caplog.text
+
+
+def test_clear_working_slot_tolerates_a_data_dir_it_cannot_list(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A data dir that cannot be listed is logged and does not raise."""
+
+    def boom(self: Path) -> NoReturn:
+        raise OSError("stale nfs handle")
+
+    monkeypatch.setattr(Path, "iterdir", boom)
+
+    with caplog.at_level("WARNING"):
+        flycast.Flycast().clear_working_slot()  # must not raise
+
+    assert "could not list" in caplog.text
 
 
 # ── class attributes (API surface parity with the other exit-only emulators) ──

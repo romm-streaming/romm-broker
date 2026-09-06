@@ -33,18 +33,27 @@ Save state is a single deterministic file, `<rom-basename>.state`, in the
 flat XDG data dir ($XDG_DATA_HOME/flycast or ~/.local/share/flycast, same
 resolution flycast itself does). With slot pinned to 0 the broker can compute
 that path itself instead of guessing at the newest or most-recently-changed
-file in the directory. clear_working_slot() still has to sweep the directory
-though: the name is only unambiguous once the rom is known, and that happens
-after clear_working_slot() runs (activate resolves the rom, then clears the
-slot, then launches), so a leftover from an earlier local session for the
-same title would otherwise sit there with a newer mtime than the incoming
-archive member and get skipped by extract_save_archive's newer-file guard,
-same as DuckStation's problem.
+file in the directory.
+
+That name is flycast's, not the broker's to pick, and it carries the rom's
+basename alone: two discs sharing a basename in different folders (a region
+or revision pair) write the same state file. So a confirmed write also
+records a `<rom-basename>.state.rom` marker naming the rom it came from, the
+same ownership trick duckstation.py uses on its flat savestates directory,
+and a resume is refused when the marker names a different rom. A state with
+no marker still loads, since an unidentified state is all the broker had
+before.
 
 VMU saves are loose files in the same flat data dir (vmu_save_A1.bin etc.,
-shared across games by default). The whole directory ships as one save
-subtree rather than named files, since nothing here otherwise separates VMU
-saves from savestates from a first-run onboarding artifact.
+shared across games by default), beside the arcade nvmem and eeprom files.
+The whole directory ships as one save subtree rather than named files, since
+nothing here otherwise separates VMU saves from savestates from a first-run
+onboarding artifact. clear_working_slot() sweeps all of it at activate: none
+of it is namespaced by title or by player, and it runs before the rom is even
+known (activate resolves the rom, then clears the slot, then launches), so
+anything left behind is handed to the next player as their own and swept into
+their exit archive. The BIOS pair, emu.cfg and flycast's own subdirectories
+stay; they belong to the container, not to a session.
 """
 
 import logging
@@ -133,6 +142,28 @@ save archive as ordinary save data (see `save_file_kind`), which is what
 makes it recoverable at all: DATA_DIR itself does not outlive the container.
 """
 
+OWNER_SUFFIX = ".rom"
+"""Suffix of the marker file recording which rom a resume state belongs to.
+
+The marker sits beside the state it names, holds the booted rom's resolved
+path, and rides the save archive with it. It does not match `*.state`, so it
+is never mistaken for a state.
+"""
+
+CONTAINER_FILES = frozenset({"dc_boot.bin", "dc_flash.bin", "emu.cfg"})
+"""DATA_DIR entries that belong to the container rather than to a session.
+
+The Dreamcast BIOS pair is uploaded once during setup and every session needs
+it, and emu.cfg holds the graphics, audio and controller preferences the
+desktop session set. Everything else in the flat data dir is one player's
+progress, so `clear_working_slot` sweeps it and leaves these three.
+"""
+
+
+def _is_quarantined(name: str) -> bool:
+    """Whether a DATA_DIR entry is a set-aside resume state or that state's marker."""
+    return name.endswith(UNTRUSTED_SUFFIX) or name.endswith(UNTRUSTED_SUFFIX + OWNER_SUFFIX)
+
 
 STATE_WAIT = float(os.environ.get("FLYCAST_STATE_WAIT", "30.0"))
 """Seconds a shutdown save gets to land on disk (env `FLYCAST_STATE_WAIT`, default 30)."""
@@ -146,6 +177,98 @@ write does not read as a finished one on a loaded host.
 
 def _state_path_for(rom_path: Path) -> Path:
     return DATA_DIR / f"{rom_path.stem}.state"
+
+
+def _rom_identity(rom: Path) -> str:
+    """The rom identity an owner marker records.
+
+    Args:
+        rom: The disc image or file the session booted.
+
+    Returns:
+        The resolved absolute path as text, so the same disc matches across
+        sessions while two discs sharing a basename stay distinct.
+    """
+    try:
+        return str(rom.resolve())
+    except OSError as exc:
+        log.warning("could not resolve %s for its state marker: %s", rom, exc)
+        return str(rom)
+
+
+def _owner_marker(state: Path) -> Path:
+    """The owner marker path belonging to a resume state."""
+    return state.with_name(state.name + OWNER_SUFFIX)
+
+
+def _state_owner(state: Path) -> Optional[str]:
+    """The rom identity recorded for a resume state.
+
+    Args:
+        state: The resume state to look up.
+
+    Returns:
+        The identity in its marker, or None when the state carries no
+        readable marker.
+    """
+    marker = _owner_marker(state)
+    try:
+        recorded = marker.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        log.warning("could not read the state marker %s: %s", marker, exc)
+        return None
+    return recorded or None
+
+
+def _write_owner_marker(state: Path, rom: Optional[Path]) -> None:
+    """Record which rom wrote a resume state, so a later resume can identify it.
+
+    A failure is logged and stepped over: an unmarked state still ships in
+    the archive and still resumes, so the cost is a resume that stays as
+    ambiguous as it was before markers existed, not lost progress.
+
+    Args:
+        state: The resume state this exit confirmed.
+        rom: The rom the session booted, or None when no launch on this
+            object recorded one.
+    """
+    if rom is None:
+        log.warning("no rom recorded for this session, leaving %s unmarked", state.name)
+        return
+    marker = _owner_marker(state)
+    try:
+        marker.write_text(_rom_identity(rom) + "\n", encoding="utf-8")
+    except OSError as exc:
+        log.warning("could not mark %s as belonging to %s: %s", state.name, rom, exc)
+    else:
+        log.info("marked resume state %s as belonging to %s", state.name, rom)
+
+
+def _state_belongs_to(state: Path, rom: Path) -> bool:
+    """Whether a resume state may be loaded for the rom about to boot.
+
+    Flycast names the state after the rom's basename alone, so a region or
+    revision pair in two folders writes the same filename. The marker the
+    last confirmed exit left is what tells them apart, and it is matched
+    exactly. A state with no marker is still taken, which is what carries
+    archives written before markers existed.
+
+    Args:
+        state: The resume state found for this rom's basename.
+        rom: The rom about to boot.
+
+    Returns:
+        True when the state is unmarked or marked for this exact rom.
+    """
+    owner = _state_owner(state)
+    if owner is None or owner == _rom_identity(rom):
+        return True
+    log.warning(
+        "resume state %s is marked for %s, not %s, booting clean", state.name, owner, rom
+    )
+    return False
 
 
 def _state_is_loadable(path: Path) -> bool:
@@ -374,8 +497,9 @@ class Flycast(Emulator):
 
         Args:
             rom_path: The resolved disc image or file to boot.
-            resume_slot: If not None and a loadable resume state exists for
-                this rom, enable auto-load on boot; otherwise boot fresh.
+            resume_slot: If not None and a loadable resume state claimed by
+                this rom exists, enable auto-load on boot; otherwise boot
+                fresh.
         """
         self.stop()
         self._rom_path = rom_path
@@ -388,10 +512,10 @@ class Flycast(Emulator):
             "window:fullscreen=yes",
         ]
         if resume_path is not None:
-            if _state_is_loadable(resume_path):
-                config_opts.append("config:Dreamcast.AutoLoadState=yes")
-            else:
+            if not _state_is_loadable(resume_path):
                 log.warning("resume requested but no resume state at %s", resume_path)
+            elif _state_belongs_to(resume_path, rom_path):
+                config_opts.append("config:Dreamcast.AutoLoadState=yes")
 
         log.info("launching flycast (rom=%s, resume_slot=%s)", rom_path, resume_slot)
         self._spawn(
@@ -424,35 +548,53 @@ class Flycast(Emulator):
         super().stop()
 
     def clear_working_slot(self) -> None:
-        """Drop every resume state left in DATA_DIR before a restore.
+        """Drop every session-owned file left in DATA_DIR before a restore.
 
-        The name only stops being ambiguous once the rom is known, and that
-        happens after this runs (activate resolves the rom, clears the slot,
-        then launches), so a leftover from an earlier local session for the
-        same title would otherwise sit here with a newer mtime than the
-        incoming archive member and get skipped by extract_save_archive's
-        newer-file guard. Anything still here belongs to a session that
-        already exited, so dropping it all is the same trade-off
-        DuckStation's clear_working_slot makes.
+        Resume states, their owner markers, VMU images, arcade nvmem and
+        eeprom all sit loose in one flat directory, none of them namespaced
+        by title or by player, and this runs before the rom is even known
+        (activate resolves the rom, clears the slot, then launches). A
+        leftover would either outrank its incoming archive member by mtime
+        and get skipped by extract_save_archive's newer-file guard, or, with
+        no member to replace it at all, be handed to the next player and
+        swept into their exit archive as their own progress. Anything still
+        here belongs to a session that already exited, so dropping it all is
+        the same trade-off DuckStation's clear_working_slot makes.
+
+        `CONTAINER_FILES` and subdirectories (flycast's controller mappings)
+        are left: they are container setup, not one session's data. So are
+        states set aside under `UNTRUSTED_SUFFIX`, which can be the only copy
+        of that progress and which no resume can pick up anyway.
         """
         if not DATA_DIR.is_dir():
             return
-        for stale in DATA_DIR.glob("*.state"):
+        try:
+            entries = list(DATA_DIR.iterdir())
+        except OSError as exc:
+            log.warning("could not list %s to clear the working slot: %s", DATA_DIR, exc)
+            return
+        for stale in entries:
+            if stale.name in CONTAINER_FILES or _is_quarantined(stale.name):
+                continue
+            if stale.is_dir():
+                log.debug("leaving the %s directory in place", stale.name)
+                continue
             try:
                 stale.unlink()
-                log.info("cleared stale resume state %s", stale.name)
+                log.info("cleared stale save data %s", stale.name)
             except OSError as exc:
-                log.warning("could not clear stale resume state %s: %s", stale.name, exc)
+                log.warning("could not clear stale save data %s: %s", stale.name, exc)
 
     def _set_aside_untrusted_state(self, path: Path) -> None:
-        """Rename a resume state that a force-killed exit may have torn.
+        """Rename a resume state that a force-killed exit may have torn, marker and all.
 
         Size and mtime are all the broker has to judge a state by, and that
         is enough to refuse to resume from one but not enough to destroy the
         only copy of a player's progress, so the file is moved to a
         `UNTRUSTED_SUFFIX` sidecar instead of unlinked. A previous sidecar
         for the same rom is replaced, which bounds the leftovers at one per
-        title.
+        title. The owner marker travels with it: left behind it would claim
+        the next state flycast writes under the same basename.
 
         Args:
             path: The resume state to move aside.
@@ -462,19 +604,29 @@ class Flycast(Emulator):
             path.replace(aside)
         except OSError as exc:
             log.warning("could not set aside untrusted resume state at %s: %s", path, exc)
-        else:
-            log.warning("set aside untrusted resume state at %s as %s", path, aside.name)
+            return
+        log.warning("set aside untrusted resume state at %s as %s", path, aside.name)
+        marker = _owner_marker(path)
+        if not marker.exists():
+            return
+        try:
+            marker.replace(_owner_marker(aside))
+        except OSError as exc:
+            log.warning("could not set aside the state marker %s: %s", marker, exc)
 
     def save_and_exit(self, slot: Optional[int]) -> dict:
         """Stop the emulator and report whether this exit actually saved state.
 
         A state the exit may have torn is not reported and not resumed from,
         but it is kept: `_set_aside_untrusted_state` renames it rather than
-        deleting it.
+        deleting it. That quarantine does not depend on `slot`, since
+        AutoSaveState is on for every launch and the caller dumps DATA_DIR by
+        mtime whether or not a slot was asked for.
 
         Args:
-            slot: The resume slot to report on. If None, the emulator is
-                stopped without inspecting any resume state.
+            slot: The resume slot to report on. If None, a torn state is
+                still caught and set aside, but a good one is not waited for
+                or reported.
 
         Returns:
             A dict with "state_saved" (bool), "state_slot" (the given
@@ -509,10 +661,14 @@ class Flycast(Emulator):
         # session for this same rom name must not be reported as this exit's
         # save.
         killed = proc is None or proc.returncode is None or proc.returncode < 0
-        if was_alive and slot is not None:
+        if was_alive:
             if p is None:
-                log.warning("save_and_exit requested a slot but no rom is currently loaded")
+                if slot is not None:
+                    log.warning("save_and_exit requested a slot but no rom is currently loaded")
             elif killed:
+                # Independent of `slot`: AutoSaveState is on for every launch,
+                # so the kill can have torn a state the caller's mtime-based
+                # dump would sweep into this player's archive either way.
                 log.warning("flycast had to be force-killed, resume state not trusted")
                 try:
                     st = p.stat()
@@ -521,9 +677,12 @@ class Flycast(Emulator):
                 else:
                     if before is None or before != (st.st_size, st.st_mtime):
                         self._set_aside_untrusted_state(p)
+            elif slot is None:
+                log.info("flycast exited with no slot requested, resume state left unreported")
             else:
                 stamp = _wait_for_state_write(p, before, time.monotonic() + STATE_WAIT)
                 if stamp is not None:
                     saved = True
                     state_file = {"path": str(p), "size": stamp[0], "mtime": stamp[1]}
+                    _write_owner_marker(p, rom_path)
         return {"state_saved": saved, "state_slot": slot, "state_file": state_file}
