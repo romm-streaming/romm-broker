@@ -472,19 +472,35 @@ def _check_expansion(actual_bytes: int, reserved_bytes: int, rom_name: str) -> N
 
 
 def _cache_key(rom: Path) -> str:
-    """Cache dir name for rom (a .pkg or an archive).
+    """Cache dir name for rom (a .pkg or an archive): its stem plus a short identity hash.
 
-    Its stem plus a short hash of the file's own name, size, and mtime. A
-    bare stem collides two ROMs that share a name, and survives a
+    A bare stem collides two ROMs that share a name, and survives a
     same-named re-upload with different content, either of which would
     otherwise serve up whatever is sitting in the old cache dir as if it
-    were the new ROM.
+    were the new ROM. The hash therefore covers the resolved path, the size,
+    and the nanosecond mtime: same-second rewrites are exactly how a library
+    sync replaces a dump, so second granularity would let a replacement keep
+    the old key, and two same-named ROMs in different folders keying off the
+    bare filename would share one cache dir.
+
+    Args:
+        rom: The .pkg or archive being extracted.
+
+    Returns:
+        The cache directory name for this ROM.
+
+    Raises:
+        RuntimeError: If the ROM cannot be read. Falling back to the bare
+            name here would hand back the collision-prone key this function
+            exists to avoid, and the extraction that follows would fail on
+            the same unreadable file anyway.
     """
     try:
         st = rom.stat()
-        fingerprint = f"{rom.name}:{st.st_size}:{int(st.st_mtime)}"
-    except OSError:
-        fingerprint = rom.name
+        fingerprint = f"{rom.resolve()}:{st.st_size}:{st.st_mtime_ns}"
+    except OSError as exc:
+        log.error("shadps4 cache: could not read %s to key its extraction: %s", rom, exc)
+        raise RuntimeError(f"could not read {rom.name} to key its extraction: {exc}") from exc
     digest = hashlib.sha1(fingerprint.encode()).hexdigest()[:12]
     return f"{rom.stem}-{digest}"
 
@@ -782,10 +798,11 @@ def _extract_and_cache_pkg(rom: Path, emulator: Emulator) -> Path:
 
     Raises:
         RuntimeError: If another extraction still holds the cache lock, the
-            extraction cannot fit in the cache or on the disk, archive
-            extraction or pkg_extractor fails, the archive holds no .pkg, the
-            extraction holds no eboot.bin, it outgrew the whole cache cap, or
-            it cannot be moved to its cache key.
+            ROM cannot be read to key it, the extraction cannot fit in the
+            cache or on the disk, archive extraction or pkg_extractor fails,
+            the archive holds no .pkg, the extraction holds no eboot.bin, it
+            outgrew the whole cache cap, or it cannot be moved to its cache
+            key.
         OSError: If CACHE_DIR or a scratch dir cannot be created at all.
     """
     with _cache_lock(rom.name):
@@ -1101,6 +1118,58 @@ def _unmounted_saves(savedata_root: Path) -> list[Path]:
     return found
 
 
+def _clear_stale_save_data(savedata_root: Path) -> None:
+    """Empty the savedata subtree before an archive restore.
+
+    A restore only writes the members the incoming archive happens to name, so
+    an earlier session's save dirs otherwise survive into this one: readable by
+    the next player, and swept into that player's exit dump, which ships the
+    whole subtree rather than the titles this session booted.
+
+    Every per-serial dir goes, not just the incoming title's: a dir named for
+    another title holds another player's data just the same, and shadPS4 keys
+    its save paths by game serial, so the next player booting that title would
+    mount the previous one's slots. Nothing outside the subtree is touched, so
+    installed titles keep their game data: pkg_extractor's output lives in
+    CACHE_DIR, a sibling of the save tree rather than a part of it.
+
+    A save shadPS4 never unmounted is named before it goes. `save_and_exit`
+    reports those at the end of the session that stranded them, but a broker
+    that died before dumping leaves them here with no other trace.
+
+    Args:
+        savedata_root: The savedata subtree to empty.
+    """
+    if not savedata_root.is_dir():
+        return
+    stranded = _unmounted_saves(savedata_root)
+    if stranded:
+        log.warning(
+            "shadps4: dropping %d save(s) an earlier session left mounted, "
+            "never archived: %s",
+            len(stranded), ", ".join(str(p) for p in stranded),
+        )
+    try:
+        entries = list(savedata_root.iterdir())
+    except OSError as exc:
+        log.warning("shadps4: could not list %s to clear stale save data: %s", savedata_root, exc)
+        return
+    cleared = 0
+    for entry in entries:
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+        except OSError as exc:
+            log.warning("shadps4: could not clear stale save data %s: %s", entry, exc)
+        else:
+            cleared += 1
+            log.debug("shadps4: cleared stale save data %s", entry)
+    if cleared:
+        log.info("shadps4: cleared %d stale save entries before the restore", cleared)
+
+
 class Shadps4(Emulator):
     """PlayStation 4 via shadPS4, driven over its stdin IPC protocol.
 
@@ -1126,6 +1195,7 @@ class Shadps4(Emulator):
         display_name: Human-readable name.
         save_root: The data directory the save subtree hangs off.
         save_subtrees: Save data plus its per-title param.sfo, under the default PS4 user.
+        clears_stale_saves: On; `clear_working_slot` empties the savedata subtree.
         log_path: The emulator log file.
         term_timeout: Seconds STOP gets before SIGTERM (env `SHADPS4_STOP_WAIT`, default 20).
     """
@@ -1135,6 +1205,14 @@ class Shadps4(Emulator):
     save_root = DATA_DIR
     save_subtrees = (SAVEDATA_SUBTREE,)
     """Save data plus its per-title param.sfo, under the default PS4 user."""
+    clears_stale_saves = True
+    """On: `clear_working_slot` empties `home/1000/savedata` before every restore.
+
+    Safe to empty whole because the subtree holds nothing but per-player save
+    slots, keyed by game serial. Installed titles are not in it: pkg_extractor
+    writes its output to CACHE_DIR, and config.json sits above the subtree, so
+    neither is in reach of the clear.
+    """
     log_path = SHADPS4_LOG_PATH
     term_timeout = float(os.environ.get("SHADPS4_STOP_WAIT", "20"))
     """Seconds the IPC STOP gets before SIGTERM (env `SHADPS4_STOP_WAIT`, default 20).
@@ -1165,6 +1243,17 @@ class Shadps4(Emulator):
         if CACHE_ENABLED:
             return ROM_EXTENSIONS
         return tuple(e for e in ROM_EXTENSIONS if e != ".pkg" and e not in _ARCHIVE_EXTS)
+
+    def clear_working_slot(self) -> None:
+        """Drop the previous session's save data before this session's restore.
+
+        There is no save state and no working slot to reset, so the whole of
+        the clear is the savedata subtree (`_clear_stale_save_data`). It goes
+        whole rather than scoped to the incoming serial: the exit dump ships
+        the subtree, not the titles this session booted, so another title's
+        leftovers would leave in this player's archive.
+        """
+        _clear_stale_save_data(self.save_root / SAVEDATA_SUBTREE)
 
     def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """The path shadPS4 should boot for `path`.

@@ -1092,6 +1092,115 @@ def test_unmounted_saves_is_empty_without_a_savedata_tree(tmp_path: Path) -> Non
     assert shadps4._unmounted_saves(tmp_path / "nope") == []
 
 
+# ── clearing stale save data at activate ───────────────────────────────
+
+
+def test_shadps4_declares_that_it_clears_stale_saves() -> None:
+    """The activate contract's flag has to match what clear_working_slot actually does."""
+    assert shadps4.Shadps4.clears_stale_saves is True
+
+
+def test_clearing_the_working_slot_drops_another_titles_leftover_saves(
+    savedata_root: Path,
+) -> None:
+    """A title this session never boots still holds the previous player's saves."""
+    leftover = savedata_root / "CUSA00002" / "SAVE00" / "data.bin"
+    leftover.parent.mkdir(parents=True)
+    leftover.write_bytes(b"someone else's progress")
+
+    shadps4.Shadps4().clear_working_slot()
+
+    assert not leftover.exists()
+    assert savedata_root.is_dir()
+
+
+def test_clearing_the_working_slot_drops_the_incoming_titles_leftover_saves(
+    savedata_root: Path,
+) -> None:
+    """A restore only writes what its archive names, so the same serial's old slots go too."""
+    leftover = savedata_root / "CUSA00001" / "SAVE01" / "data.bin"
+    leftover.parent.mkdir(parents=True)
+    leftover.write_bytes(b"a slot this archive does not carry")
+
+    shadps4.Shadps4().clear_working_slot()
+
+    assert not leftover.exists()
+
+
+def test_clearing_the_working_slot_keeps_everything_outside_the_save_subtree(
+    savedata_root: Path,
+) -> None:
+    """Installed titles and the emulator's own config are not save data."""
+    root = shadps4.Shadps4.save_root
+    extracted = root / "extracted" / "Game-abc123" / "CUSA00001" / "eboot.bin"
+    extracted.parent.mkdir(parents=True)
+    extracted.write_bytes(b"game")
+    config = root / "config.json"
+    config.write_text("{}")
+
+    shadps4.Shadps4().clear_working_slot()
+
+    assert extracted.exists()
+    assert config.exists()
+
+
+def test_clearing_the_working_slot_unlinks_a_symlink_instead_of_following_it(
+    savedata_root: Path, tmp_path: Path
+) -> None:
+    """A symlinked save dir is removed as a link; whatever it points at is not touched."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keepme.bin").write_bytes(b"host data")
+    (savedata_root / "CUSA00003").symlink_to(outside)
+
+    shadps4.Shadps4().clear_working_slot()
+
+    assert not (savedata_root / "CUSA00003").exists()
+    assert (outside / "keepme.bin").exists()
+
+
+def test_clearing_the_working_slot_names_saves_left_mounted_by_a_kill(
+    savedata_root: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A save stranded by a crashed broker was never dumped, so its removal is reported."""
+    stranded = _mounted_save(savedata_root, "CUSA00001")
+
+    with caplog.at_level("WARNING"):
+        shadps4.Shadps4().clear_working_slot()
+
+    assert not stranded.exists()
+    assert "left mounted" in caplog.text
+    assert str(stranded) in caplog.text
+
+
+def test_clearing_the_working_slot_logs_save_data_it_cannot_remove(
+    savedata_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A save dir that cannot be removed is reported, never silently left in place."""
+    (savedata_root / "CUSA00001" / "SAVE00").mkdir(parents=True)
+
+    def boom(path: Path) -> NoReturn:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(shadps4.shutil, "rmtree", boom)
+
+    with caplog.at_level("WARNING"):
+        shadps4.Shadps4().clear_working_slot()
+
+    assert "could not clear stale save data" in caplog.text
+
+
+def test_clearing_the_working_slot_is_a_noop_without_a_savedata_tree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A container whose first session has not run yet has nothing to clear."""
+    monkeypatch.setattr(shadps4.Shadps4, "save_root", tmp_path / "shadPS4")
+
+    shadps4.Shadps4().clear_working_slot()
+
+    assert not (tmp_path / "shadPS4").exists()
+
+
 # ── pkg extraction / extraction cache ──────────────────────────────────
 
 
@@ -1248,6 +1357,94 @@ def test_cache_key_changes_when_a_same_named_pkg_is_replaced(tmp_path: Path) -> 
     os.utime(pkg, (pkg.stat().st_mtime + 5, pkg.stat().st_mtime + 5))
 
     assert shadps4._cache_key(pkg) != original_key
+
+
+def test_cache_key_differs_for_same_named_roms_in_different_folders(tmp_path: Path) -> None:
+    """Two ROMs sharing a filename, size, and second-granularity mtime still key apart.
+
+    A library holds one title per folder, so same-named dumps sitting side
+    by side is ordinary; keying off the bare filename would hand them a
+    single cache dir and boot whichever extraction landed there first.
+    """
+    first = tmp_path / "USA" / "Game.pkg"
+    second = tmp_path / "EUR" / "Game.pkg"
+    _touch(first, mtime=1000)
+    _touch(second, mtime=1000)
+
+    assert shadps4._cache_key(first) != shadps4._cache_key(second)
+
+
+def test_cache_key_changes_for_a_same_second_replacement_of_the_same_size(
+    tmp_path: Path,
+) -> None:
+    """A rewrite within the same second still changes the key.
+
+    A library sync replaces a dump in place, so the old and new file can
+    share a size and a whole-second mtime; a key truncated to seconds would
+    keep serving the previous extraction as if it were the new ROM.
+    """
+    pkg = tmp_path / "Game.pkg"
+    pkg.write_bytes(b"original")
+    os.utime(pkg, ns=(1_000_000_000_000, 1_000_000_000_000))
+    original_key = shadps4._cache_key(pkg)
+
+    pkg.write_bytes(b"replaced")
+    os.utime(pkg, ns=(1_000_000_000_000 + 250_000_000, 1_000_000_000_000 + 250_000_000))
+
+    assert int(pkg.stat().st_mtime) == 1000
+    assert shadps4._cache_key(pkg) != original_key
+
+
+def test_cache_key_refuses_an_unreadable_rom_instead_of_keying_it_by_name(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unstattable ROM raises rather than falling back to an under-specified key.
+
+    The bare-name fallback returns exactly the collision-prone key the hash
+    exists to avoid, and the extraction that follows fails on the same
+    unreadable file anyway.
+    """
+    missing = tmp_path / "Game.pkg"
+
+    with caplog.at_level("ERROR"):
+        with pytest.raises(RuntimeError, match="to key its extraction"):
+            shadps4._cache_key(missing)
+
+    assert "could not read" in caplog.text
+
+
+def test_extract_and_cache_pkg_refuses_an_unreadable_rom(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ROM that cannot be keyed stops the extraction before anything is unpacked."""
+    extracted = []
+    monkeypatch.setattr(shadps4, "_run_pkg_extractor", lambda p, d: extracted.append(p))
+
+    with pytest.raises(RuntimeError, match="to key its extraction"):
+        shadps4._extract_and_cache_pkg(tmp_path / "Gone.pkg", shadps4.Shadps4())
+
+    assert extracted == []
+
+
+def test_extract_and_cache_pkg_does_not_reuse_an_entry_from_a_same_second_replacement(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replacement dump written in the same second gets its own extraction."""
+    pkg = tmp_path / "Game.pkg"
+    pkg.write_bytes(b"original")
+    os.utime(pkg, ns=(1_000_000_000_000, 1_000_000_000_000))
+    stale_eboot = _touch(cache_dir / shadps4._cache_key(pkg) / "CUSA23079" / "eboot.bin")
+
+    pkg.write_bytes(b"replaced")
+    os.utime(pkg, ns=(1_000_000_000_000 + 250_000_000, 1_000_000_000_000 + 250_000_000))
+
+    monkeypatch.setattr(
+        shadps4, "_run_pkg_extractor", lambda p, d: _touch(d / "CUSA23079" / "eboot.bin")
+    )
+
+    boot = shadps4._extract_and_cache_pkg(pkg, shadps4.Shadps4())
+
+    assert boot.parent.parent != stale_eboot.parent.parent
 
 
 def test_run_pkg_extractor_raises_on_a_nonzero_exit(
