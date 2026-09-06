@@ -167,7 +167,18 @@ def _patch_config() -> None:
     Patched key-wise, and with raw parsing, so everything else in the file
     survives: Azahar rewrites this whole file on exit, and it holds the
     player's own settings alongside QSettings-encoded keys that would not
-    round-trip through interpolation. Failures are logged, not raised.
+    round-trip through interpolation.
+
+    Raises:
+        OSError: When the file cannot be written or replaced.
+        configparser.Error: When the patched values cannot be serialized.
+        UnicodeError: When the merged contents cannot be re-encoded as UTF-8.
+
+    All three are fatal to a launch rather than a warning to launch past:
+    an unpatched config leaves `confirmClose` on, so the close the broker
+    drives ends at a confirmation modal in a session nobody can click, and
+    the update check and Discord presence put their own dialogs in front of
+    the game.
     """
     try:
         parser = configparser.RawConfigParser()
@@ -193,8 +204,9 @@ def _patch_config() -> None:
             # reading the file sees one style throughout.
             parser.write(fh, space_around_delimiters=False)
         tmp.replace(CONFIG_PATH)
-    except Exception:
-        log.exception("qt-config.ini patch failed, broker settings NOT applied")
+    except (OSError, configparser.Error, UnicodeError):
+        log.exception("azahar: qt-config.ini patch failed at %s, refusing to launch", CONFIG_PATH)
+        raise
 
 
 class Azahar(Emulator):
@@ -202,8 +214,10 @@ class Azahar(Emulator):
 
     Azahar has no control API reachable from outside the process, so the
     broker pins qt-config.ini before every launch (no close confirmation, no
-    update check, no Discord presence) and boots windowed with `-w`:
-    fullscreen Azahar stops rendering when the display resizes under it,
+    update check, no Discord presence) and boots windowed with `-w`. A patch
+    that fails aborts the launch: those keys are the only thing keeping a
+    modal nobody can click out of the session.
+    Fullscreen Azahar stops rendering when the display resizes under it,
     which happens whenever the player resizes their browser. Azahar installs
     no SIGTERM handler, so the stop is a hard kill and the dump takes
     whatever the game had already committed to disk.
@@ -250,7 +264,7 @@ class Azahar(Emulator):
     """
 
     def __init__(self) -> None:
-        """Initialise the process handle, the session baseline and the restamp log."""
+        """Initialise the process handle and the session baseline."""
         super().__init__()
         self._session_start = float("inf")
         """Unix time `launch` started the emulator at; infinity until it does.
@@ -259,14 +273,6 @@ class Azahar(Emulator):
         matches no file at all. A baseline of zero is newer than nothing, so
         every title in the container would read as touched this session and
         `save_and_exit` would restamp and ship all of them.
-        """
-        self._restamped: list[tuple[Path, float, float]] = []
-        """What the last `save_and_exit` restamped: path, original atime, original mtime.
-
-        The restamp is a deliberate edit of the player's own files, so the
-        originals are kept: `revert_restamps` puts them back when the dump the
-        restamp was for did not happen, and the entries say which files the
-        game did not write this session.
         """
 
     def prepare_restore(self) -> None:
@@ -290,8 +296,10 @@ class Azahar(Emulator):
         for pattern in _ROM_SEARCH_GLOBS:
             try:
                 candidates.extend(path.glob(pattern))
-            except OSError:
-                return None
+            except OSError as exc:
+                # One unreadable subdirectory must not discard what the other
+                # patterns already found and report the title as unbootable.
+                log.warning("azahar: search of %s for %s failed: %s", path, pattern, exc)
         return _pick_rom_file(candidates, path)
 
     def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
@@ -300,10 +308,16 @@ class Azahar(Emulator):
         Args:
             rom_path: The file to boot.
             resume_slot: Ignored with a log line; there are no reachable save states.
+
+        Raises:
+            OSError: When qt-config.ini could not be patched, so nothing is
+                spawned; see `_patch_config`.
+            configparser.Error: Likewise, when the patched values cannot be serialized.
+            UnicodeError: Likewise, when the merged contents cannot be encoded.
         """
         self.stop()
         _patch_config()
-        if resume_slot:
+        if resume_slot is not None:
             log.info(
                 "azahar has no reachable save states, resume_slot %s ignored "
                 "(game resumes from its own save data)",
@@ -342,17 +356,27 @@ class Azahar(Emulator):
                                 for p in title.rglob("*")
                             ):
                                 selected.append(title)
-                        except OSError:
-                            continue
-            except OSError:
-                continue
+                        except OSError as exc:
+                            log.warning(
+                                "azahar: could not scan the title save dir at %s, "
+                                "its saves may be dropped from the dump: %s",
+                                title,
+                                exc,
+                            )
+            except OSError as exc:
+                log.warning(
+                    "azahar: could not list the save tree at %s, the dump may be incomplete: %s",
+                    root,
+                    exc,
+                )
         return selected
 
-    def save_and_exit(self, slot: int) -> dict[str, Any]:
+    def save_and_exit(self, slot: Optional[int]) -> dict[str, Any]:
         """Stop Azahar and mark this session's title saves for the dump.
 
         Args:
-            slot: Ignored; there are no save states.
+            slot: Ignored, including None; there are no save states to write,
+                and the save-data restamp is what an exit does either way.
 
         Returns:
             `state_saved`, `state_slot` and `state_file`, all None.

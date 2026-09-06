@@ -26,7 +26,7 @@ const links = [
 export default function HomePage() {
   return (
     <div className="flex flex-col flex-1 items-center justify-center px-6 py-16 text-center">
-      <h1 className="text-3xl font-bold mb-3">webstation-broker</h1>
+      <h1 className="text-3xl font-bold mb-3">romm-broker</h1>
       <p className="max-w-2xl text-fd-muted-foreground mb-10">
         Session broker and collaboration interface for the RomM webstation container. One play
         session at a time: a game is activated over REST, the emulator launches with its save data

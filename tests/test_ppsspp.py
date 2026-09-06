@@ -5,6 +5,7 @@ naming contract, and finding the game window among PPSSPP's windows.
 """
 
 import os
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Optional
@@ -250,6 +251,34 @@ def test_clearing_the_slot_leaves_the_other_slots_alone(
     assert other.exists()
 
 
+def test_clearing_the_slot_removes_a_staging_file_a_killed_session_left(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A staging file left by a session killed mid-save must not ship to RomM as a state."""
+    monkeypatch.setattr(ppsspp, "STATE_SLOT", 1)
+    staged = _touch(state_dir / ("ULUS10041_1_1.ppst" + ppsspp._STAGING_SUFFIX))
+    other_staged = _touch(state_dir / ("ULUS10041_1_2.ppst" + ppsspp._STAGING_SUFFIX))
+
+    ppsspp.Ppsspp().clear_working_slot()
+
+    assert not staged.exists()
+    assert other_staged.exists()
+
+
+def test_clearing_the_slot_removes_a_screenshot_whose_state_is_already_gone(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An orphaned thumbnail is swept by name, not only alongside the state it belonged to."""
+    monkeypatch.setattr(ppsspp, "STATE_SLOT", 1)
+    orphan = _touch(state_dir / "ULUS10041_1_1.jpg")
+    other = _touch(state_dir / "ULUS10041_1_2.jpg")
+
+    ppsspp.Ppsspp().clear_working_slot()
+
+    assert not orphan.exists()
+    assert other.exists()
+
+
 def test_state_screenshot_path_matches_the_working_state(
     state_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -343,6 +372,45 @@ def test_the_broker_owned_settings_are_still_written_over(config_inis: tuple[Pat
     assert "FirstRun = False" in body
     assert f"StateSlot = {ppsspp.STATE_SLOT}" in body
     assert "StateSlot = 4" not in body
+
+
+def test_a_config_the_patcher_cannot_read_fails_the_patch(
+    config_inis: tuple[Path, Path], caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unpatched controls.ini leaves the bracket keys unbound, so the failure has to surface."""
+    _ini, controls = config_inis
+    controls.mkdir()
+
+    with caplog.at_level("ERROR"):
+        with pytest.raises(RuntimeError, match="could not apply broker settings"):
+            ppsspp._patch_config()
+
+    assert "patch failed" in caplog.text
+
+
+def test_a_config_that_is_not_decodable_text_fails_the_patch(
+    config_inis: tuple[Path, Path],
+) -> None:
+    """A corrupt ini is not silently launched past: nothing the broker forces would be applied."""
+    ini, _controls = config_inis
+    ini.write_bytes(b"\xff\xfe[General]\n")
+
+    with pytest.raises(RuntimeError, match="could not apply broker settings"):
+        ppsspp._patch_config()
+
+
+def test_a_launch_whose_config_cannot_be_patched_never_spawns(
+    config_inis: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """A session on an unpatched config parks on the setup wizard with dead hotkeys, so it is refused."""
+    ini, _controls = config_inis
+    ini.mkdir()
+    emu = ppsspp.Ppsspp()
+    emu.stop = lambda: None
+    emu._spawn = lambda cmd, env: pytest.fail("ppsspp spawned with its config unpatched")
+
+    with pytest.raises(RuntimeError):
+        emu.launch(tmp_path / "Game.iso", None)
 
 
 class _FakeProc:
@@ -440,6 +508,26 @@ class _FakeClock:
         self.now += seconds
 
 
+class _WritingClock(_FakeClock):
+    """A fake clock that grows a file as it advances, standing in for a write still in flight."""
+
+    def __init__(self, path: Path, done_at: float) -> None:
+        """Grow `path` by 100 bytes per fake second until `done_at`, then hold it still.
+
+        Args:
+            path: The file the imaginary writer is filling.
+            done_at: Fake time the write finishes at.
+        """
+        super().__init__()
+        self.path = path
+        self.done_at = done_at
+
+    def sleep(self, seconds: float) -> None:
+        """Advance the fake clock and write however much has been produced by then."""
+        super().sleep(seconds)
+        self.path.write_bytes(b"x" * int(min(self.now, self.done_at) * 100))
+
+
 def test_a_write_that_stalls_mid_flight_is_not_reported_as_complete(
     state_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -524,6 +612,134 @@ def test_load_state_refuses_an_empty_slot(state_dir: Path) -> None:
     assert emu.load_state(1) is False
 
 
+def test_backdating_puts_the_access_time_behind_the_mtime(state_dir: Path) -> None:
+    """A state's access time is stamped behind its own mtime, which is left alone."""
+    state = _touch(state_dir / "ULUS10041_1_1.ppst", mtime=5000)
+
+    marker = ppsspp._backdate_atime(state)
+
+    assert marker == 5000 - ppsspp._ATIME_BACKDATE
+    st = state.stat()
+    assert st.st_atime == marker
+    assert st.st_mtime == 5000
+
+
+def test_backdating_a_state_that_is_not_there_reports_no_marker(state_dir: Path) -> None:
+    """A state that vanished before the load leaves no marker to watch."""
+    assert ppsspp._backdate_atime(state_dir / "gone_1_1.ppst") is None
+
+
+def test_the_access_time_probe_measures_the_filesystem_and_cleans_up(tmp_path: Path) -> None:
+    """The probe agrees with what a read actually does to an access time, and leaves nothing."""
+    probe = tmp_path / "probe"
+    probe.write_bytes(b"x")
+    marker = probe.stat().st_mtime - ppsspp._ATIME_BACKDATE
+    os.utime(probe, (marker, probe.stat().st_mtime))
+    probe.read_bytes()
+    if probe.stat().st_atime <= marker:
+        pytest.skip("the test filesystem does not record access times")
+    probe.unlink()
+
+    assert ppsspp._atime_tracked(tmp_path) is True
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_access_time_probe_fails_closed_on_a_directory_that_is_not_there(
+    tmp_path: Path,
+) -> None:
+    """A state directory the probe cannot write to reports no access-time tracking."""
+    assert ppsspp._atime_tracked(tmp_path / "gone") is False
+
+
+def test_a_read_of_the_state_confirms_the_load(state_dir: Path) -> None:
+    """The load is confirmed once something moves the state's access time past the marker."""
+    state = _touch(state_dir / "ULUS10041_1_1.ppst", mtime=5000)
+    marker = ppsspp._backdate_atime(state)
+    os.utime(state, (5000, 5000))
+
+    assert ppsspp._wait_for_state_read(state, marker, time.monotonic() + 0.5) is True
+
+
+def test_a_state_nothing_ever_read_is_not_a_load(state_dir: Path) -> None:
+    """An access time that never moves means the hotkey never reached the core."""
+    state = _touch(state_dir / "ULUS10041_1_1.ppst", mtime=5000)
+    marker = ppsspp._backdate_atime(state)
+
+    assert ppsspp._wait_for_state_read(state, marker, time.monotonic() + 0.3) is False
+
+
+def _loadable(
+    monkeypatch: pytest.MonkeyPatch, state_dir: Path, reads: bool, tracked: bool = True
+) -> ppsspp.Ppsspp:
+    """Build an emulator whose load hotkey optionally reads the state back.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        state_dir: The state directory holding the working slot.
+        reads: Whether the hotkey moves the state's access time, as a real load would.
+        tracked: What the access-time probe reports for the state directory.
+
+    Returns:
+        The emulator, with a state already in the working slot.
+    """
+    monkeypatch.setattr(ppsspp, "STATE_SLOT", 1)
+    monkeypatch.setattr(ppsspp, "LOAD_WAIT", 0.5)
+    monkeypatch.setattr(ppsspp, "LOAD_SETTLE", 0.0)
+    monkeypatch.setattr(ppsspp, "_atime_tracked", lambda d: tracked)
+    state = _touch(state_dir / "ULUS10041_1_1.ppst", mtime=5000)
+    emu = ppsspp.Ppsspp()
+
+    def fake_send(key: str) -> bool:
+        """Send the load hotkey, reading the state back when the emulator would."""
+        assert key == ppsspp.LOAD_KEY
+        if reads:
+            os.utime(state, (time.time(), 5000))
+        return True
+
+    emu._send_key = fake_send
+    return emu
+
+
+def test_load_state_waits_for_ppsspp_to_read_the_state_back(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A load whose state was read back reports success."""
+    emu = _loadable(monkeypatch, state_dir, reads=True)
+
+    assert emu.load_state(1) is True
+
+
+def test_a_dropped_load_hotkey_is_not_reported_as_a_load(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A hotkey an unfocused or still-booting PPSSPP swallowed never reads the state, so it fails."""
+    emu = _loadable(monkeypatch, state_dir, reads=False)
+
+    with caplog.at_level("WARNING"):
+        assert emu.load_state(1) is False
+
+    assert "never read" in caplog.text
+
+
+def test_a_load_hotkey_that_could_not_be_sent_fails(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A load with no game window to send the hotkey at fails without waiting it out."""
+    emu = _loadable(monkeypatch, state_dir, reads=False)
+    emu._send_key = lambda key: False
+
+    assert emu.load_state(1) is False
+
+
+def test_a_load_is_taken_on_trust_where_access_times_are_not_recorded(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a noatime mount the read cannot be seen, so a sent hotkey is not called a failure."""
+    emu = _loadable(monkeypatch, state_dir, reads=False, tracked=False)
+
+    assert emu.load_state(1) is True
+
+
 def test_exit_reports_the_working_slot_without_a_running_emulator(
     state_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -533,3 +749,115 @@ def test_exit_reports_the_working_slot_without_a_running_emulator(
     report = ppsspp.Ppsspp().save_and_exit(4)
 
     assert report == {"state_saved": False, "state_slot": 1, "state_file": None}
+
+
+def test_a_screenshot_still_being_written_is_waited_out(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A save reported done while the thumbnail is mid-write serves RomM a torn image."""
+    state = _touch(state_dir / "ULUS10041_1_1.ppst")
+    clock = _WritingClock(state_dir / "ULUS10041_1_1.jpg", done_at=1.0)
+    monkeypatch.setattr(ppsspp, "time", clock)
+
+    with caplog.at_level("WARNING"):
+        ppsspp._wait_for_screenshot(state, 5.0)
+
+    assert clock.now >= 1.0 + ppsspp.STATE_SHOT_STABLE
+    assert "never settled" not in caplog.text
+
+
+def test_a_screenshot_that_never_lands_does_not_fail_the_save(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The state is already confirmed by then, so a missing preview is logged and nothing more."""
+    clock = _FakeClock()
+    monkeypatch.setattr(ppsspp, "time", clock)
+    state = _touch(state_dir / "ULUS10041_1_1.ppst")
+
+    with caplog.at_level("WARNING"):
+        ppsspp._wait_for_screenshot(state, 3.0)
+
+    assert "never settled" in caplog.text
+
+
+def test_a_save_is_not_reported_done_until_its_screenshot_is_waited_on(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The save route answering is what sends RomM to fetch the thumbnail, so the wait belongs here."""
+    monkeypatch.setattr(ppsspp, "STATE_SLOT", 1)
+    state = _touch(state_dir / "ULUS10041_1_1.ppst")
+    waited: list[Path] = []
+    monkeypatch.setattr(ppsspp, "_wait_for_state_write", lambda before, deadline: True)
+    monkeypatch.setattr(ppsspp, "_wait_for_screenshot", lambda s, d: waited.append(s))
+    emu = ppsspp.Ppsspp()
+    emu._send_key = lambda key: True
+
+    assert emu.save_state(4) is True
+    assert waited == [state]
+
+
+def test_a_resume_load_waits_for_the_game_window_before_sending_the_hotkey(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resume state is on disk before the boot starts, so the hotkey has to wait on the window."""
+    monkeypatch.setattr(ppsspp, "STATE_SLOT", 1)
+    clock = _FakeClock()
+    monkeypatch.setattr(ppsspp, "time", clock)
+    _touch(state_dir / "ULUS10041_1_1.ppst")
+    emu = ppsspp.Ppsspp()
+    emu._launch_seq = 1
+    emu.wait_for_state = lambda deadline: True
+    # The game window only turns up 20 s into the boot, long past the settle
+    # the old code sent its one and only hotkey after.
+    emu._game_window = lambda log_missing=True: "333" if clock.now >= 20.0 else None
+    sent: list[tuple[str, float]] = []
+    emu._send_key = lambda key: bool(sent.append((key, clock.now))) or True
+
+    emu._deferred_load_state(1)
+
+    assert sent == [(ppsspp.LOAD_KEY, 20.0 + ppsspp.RESUME_LOAD_SETTLE)]
+
+
+def test_a_resume_load_is_abandoned_when_no_game_window_ever_comes_up(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A boot that never reaches a game gets no blind hotkey fired into it."""
+    monkeypatch.setattr(ppsspp, "STATE_SLOT", 1)
+    clock = _FakeClock()
+    monkeypatch.setattr(ppsspp, "time", clock)
+    _touch(state_dir / "ULUS10041_1_1.ppst")
+    emu = ppsspp.Ppsspp()
+    emu._launch_seq = 1
+    emu.wait_for_state = lambda deadline: True
+    emu._game_window = lambda log_missing=True: None
+    emu._send_key = lambda key: pytest.fail("load hotkey sent with no game window up")
+
+    with caplog.at_level("WARNING"):
+        emu._deferred_load_state(1)
+
+    assert "no game window came up in time" in caplog.text
+
+
+def test_a_resume_load_is_dropped_when_the_launch_is_superseded_while_booting(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A session that ended during the window wait must not have a hotkey land in the next one."""
+    monkeypatch.setattr(ppsspp, "STATE_SLOT", 1)
+    clock = _FakeClock()
+    monkeypatch.setattr(ppsspp, "time", clock)
+    _touch(state_dir / "ULUS10041_1_1.ppst")
+    emu = ppsspp.Ppsspp()
+    emu._launch_seq = 1
+    emu.wait_for_state = lambda deadline: True
+
+    def window_then_relaunch(log_missing: bool = True) -> Optional[str]:
+        emu._launch_seq = 2
+        return "333"
+
+    emu._game_window = window_then_relaunch
+    emu._send_key = lambda key: pytest.fail("load hotkey sent for a superseded launch")
+
+    with caplog.at_level("INFO"):
+        emu._deferred_load_state(1)
+
+    assert "launch superseded" in caplog.text

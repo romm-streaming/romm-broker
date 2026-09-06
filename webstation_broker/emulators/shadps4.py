@@ -42,7 +42,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
-from typing import Optional
+from typing import Any, Optional
 
 from .. import settings
 from .base import Emulator, base_launch_env
@@ -65,6 +65,13 @@ DATA_DIR = Path(os.environ.get("SHADPS4_DATA_DIR", str(Path(XDG_DATA_HOME) / "sh
 """shadPS4's data root holding save data (env `SHADPS4_DATA_DIR`, default `$XDG_DATA_HOME/shadPS4`)."""
 SHADPS4_LOG_PATH = Path(os.environ.get("SHADPS4_LOG_PATH", "/config/shadps4.log"))
 """The emulator log file (env `SHADPS4_LOG_PATH`, default `/config/shadps4.log`)."""
+
+SAVEDATA_SUBTREE = "home/1000/savedata"
+"""Save data under the default PS4 user, relative to `DATA_DIR`; the whole save archive."""
+_MOUNT_MARKER_DIR = "sce_sys"
+"""Per-save metadata directory shadPS4 keeps the mount marker in."""
+_MOUNT_MARKER_NAME = "corrupted"
+"""File shadPS4 drops into `sce_sys` while a save is mounted read-write, removed on unmount."""
 
 SHADPS4_CONFIG_PATH = Path(
     os.environ.get("SHADPS4_CONFIG_PATH", str(DATA_DIR / "config.json"))
@@ -465,19 +472,35 @@ def _check_expansion(actual_bytes: int, reserved_bytes: int, rom_name: str) -> N
 
 
 def _cache_key(rom: Path) -> str:
-    """Cache dir name for rom (a .pkg or an archive).
+    """Cache dir name for rom (a .pkg or an archive): its stem plus a short identity hash.
 
-    Its stem plus a short hash of the file's own name, size, and mtime. A
-    bare stem collides two ROMs that share a name, and survives a
+    A bare stem collides two ROMs that share a name, and survives a
     same-named re-upload with different content, either of which would
     otherwise serve up whatever is sitting in the old cache dir as if it
-    were the new ROM.
+    were the new ROM. The hash therefore covers the resolved path, the size,
+    and the nanosecond mtime: same-second rewrites are exactly how a library
+    sync replaces a dump, so second granularity would let a replacement keep
+    the old key, and two same-named ROMs in different folders keying off the
+    bare filename would share one cache dir.
+
+    Args:
+        rom: The .pkg or archive being extracted.
+
+    Returns:
+        The cache directory name for this ROM.
+
+    Raises:
+        RuntimeError: If the ROM cannot be read. Falling back to the bare
+            name here would hand back the collision-prone key this function
+            exists to avoid, and the extraction that follows would fail on
+            the same unreadable file anyway.
     """
     try:
         st = rom.stat()
-        fingerprint = f"{rom.name}:{st.st_size}:{int(st.st_mtime)}"
-    except OSError:
-        fingerprint = rom.name
+        fingerprint = f"{rom.resolve()}:{st.st_size}:{st.st_mtime_ns}"
+    except OSError as exc:
+        log.error("shadps4 cache: could not read %s to key its extraction: %s", rom, exc)
+        raise RuntimeError(f"could not read {rom.name} to key its extraction: {exc}") from exc
     digest = hashlib.sha1(fingerprint.encode()).hexdigest()[:12]
     return f"{rom.stem}-{digest}"
 
@@ -775,10 +798,11 @@ def _extract_and_cache_pkg(rom: Path, emulator: Emulator) -> Path:
 
     Raises:
         RuntimeError: If another extraction still holds the cache lock, the
-            extraction cannot fit in the cache or on the disk, archive
-            extraction or pkg_extractor fails, the archive holds no .pkg, the
-            extraction holds no eboot.bin, it outgrew the whole cache cap, or
-            it cannot be moved to its cache key.
+            ROM cannot be read to key it, the extraction cannot fit in the
+            cache or on the disk, archive extraction or pkg_extractor fails,
+            the archive holds no .pkg, the extraction holds no eboot.bin, it
+            outgrew the whole cache cap, or it cannot be moved to its cache
+            key.
         OSError: If CACHE_DIR or a scratch dir cannot be created at all.
     """
     with _cache_lock(rom.name):
@@ -1065,6 +1089,87 @@ def _pin_gpu_id_locked() -> None:
     log.info("shadps4: pinned Vulkan.gpu_id=%d in %s", gpu_id, SHADPS4_CONFIG_PATH)
 
 
+def _unmounted_saves(savedata_root: Path) -> list[Path]:
+    """Save directories shadPS4 was still holding mounted when it died.
+
+    shadPS4 drops `sce_sys/corrupted` into a save while it has it mounted
+    read-write and removes it again on unmount, so a marker still on disk once
+    the process is gone names a save whose last write was never flushed
+    through a clean unmount. `saves.py` strips the marker itself out of the
+    dump, which means the archive that ships those saves looks clean; naming
+    them here is the only trace an operator gets.
+
+    Args:
+        savedata_root: The savedata subtree to scan.
+
+    Returns:
+        The per-save directories still carrying the marker, sorted. Empty when
+        the subtree is missing or cannot be walked.
+    """
+    if not savedata_root.is_dir():
+        return []
+    found: list[Path] = []
+    try:
+        for marker in sorted(savedata_root.rglob(_MOUNT_MARKER_NAME)):
+            if marker.parent.name == _MOUNT_MARKER_DIR and marker.is_file():
+                found.append(marker.parent.parent)
+    except OSError as exc:
+        log.warning("shadps4: could not scan %s for unmounted saves: %s", savedata_root, exc)
+    return found
+
+
+def _clear_stale_save_data(savedata_root: Path) -> None:
+    """Empty the savedata subtree before an archive restore.
+
+    A restore only writes the members the incoming archive happens to name, so
+    an earlier session's save dirs otherwise survive into this one: readable by
+    the next player, and swept into that player's exit dump, which ships the
+    whole subtree rather than the titles this session booted.
+
+    Every per-serial dir goes, not just the incoming title's: a dir named for
+    another title holds another player's data just the same, and shadPS4 keys
+    its save paths by game serial, so the next player booting that title would
+    mount the previous one's slots. Nothing outside the subtree is touched, so
+    installed titles keep their game data: pkg_extractor's output lives in
+    CACHE_DIR, a sibling of the save tree rather than a part of it.
+
+    A save shadPS4 never unmounted is named before it goes. `save_and_exit`
+    reports those at the end of the session that stranded them, but a broker
+    that died before dumping leaves them here with no other trace.
+
+    Args:
+        savedata_root: The savedata subtree to empty.
+    """
+    if not savedata_root.is_dir():
+        return
+    stranded = _unmounted_saves(savedata_root)
+    if stranded:
+        log.warning(
+            "shadps4: dropping %d save(s) an earlier session left mounted, "
+            "never archived: %s",
+            len(stranded), ", ".join(str(p) for p in stranded),
+        )
+    try:
+        entries = list(savedata_root.iterdir())
+    except OSError as exc:
+        log.warning("shadps4: could not list %s to clear stale save data: %s", savedata_root, exc)
+        return
+    cleared = 0
+    for entry in entries:
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+        except OSError as exc:
+            log.warning("shadps4: could not clear stale save data %s: %s", entry, exc)
+        else:
+            cleared += 1
+            log.debug("shadps4: cleared stale save data %s", entry)
+    if cleared:
+        log.info("shadps4: cleared %d stale save entries before the restore", cleared)
+
+
 class Shadps4(Emulator):
     """PlayStation 4 via shadPS4, driven over its stdin IPC protocol.
 
@@ -1090,6 +1195,7 @@ class Shadps4(Emulator):
         display_name: Human-readable name.
         save_root: The data directory the save subtree hangs off.
         save_subtrees: Save data plus its per-title param.sfo, under the default PS4 user.
+        clears_stale_saves: On; `clear_working_slot` empties the savedata subtree.
         log_path: The emulator log file.
         term_timeout: Seconds STOP gets before SIGTERM (env `SHADPS4_STOP_WAIT`, default 20).
     """
@@ -1097,8 +1203,16 @@ class Shadps4(Emulator):
     name = "shadps4"
     display_name = "shadPS4"
     save_root = DATA_DIR
-    save_subtrees = ("home/1000/savedata",)
+    save_subtrees = (SAVEDATA_SUBTREE,)
     """Save data plus its per-title param.sfo, under the default PS4 user."""
+    clears_stale_saves = True
+    """On: `clear_working_slot` empties `home/1000/savedata` before every restore.
+
+    Safe to empty whole because the subtree holds nothing but per-player save
+    slots, keyed by game serial. Installed titles are not in it: pkg_extractor
+    writes its output to CACHE_DIR, and config.json sits above the subtree, so
+    neither is in reach of the clear.
+    """
     log_path = SHADPS4_LOG_PATH
     term_timeout = float(os.environ.get("SHADPS4_STOP_WAIT", "20"))
     """Seconds the IPC STOP gets before SIGTERM (env `SHADPS4_STOP_WAIT`, default 20).
@@ -1106,6 +1220,17 @@ class Shadps4(Emulator):
     STOP goes through the SDL event loop into a graceful teardown; give it
     room before escalating to SIGTERM.
     """
+
+    def __init__(self) -> None:
+        """Start with the base handles and no verdict on a shutdown yet."""
+        super().__init__()
+        self._graceful_exit: Optional[bool] = None
+        """How the last stop of a live process went, None when none has run yet.
+
+        True only for an IPC STOP the emulator answered on its own. False once
+        the SIGTERM escalation had to run, which shadPS4 has no handler for and
+        so cannot flush its save mounts through.
+        """
 
     @property
     def rom_extensions(self) -> tuple[str, ...]:
@@ -1118,6 +1243,17 @@ class Shadps4(Emulator):
         if CACHE_ENABLED:
             return ROM_EXTENSIONS
         return tuple(e for e in ROM_EXTENSIONS if e != ".pkg" and e not in _ARCHIVE_EXTS)
+
+    def clear_working_slot(self) -> None:
+        """Drop the previous session's save data before this session's restore.
+
+        There is no save state and no working slot to reset, so the whole of
+        the clear is the savedata subtree (`_clear_stale_save_data`). It goes
+        whole rather than scoped to the incoming serial: the exit dump ships
+        the subtree, not the titles this session booted, so another title's
+        leftovers would leave in this player's archive.
+        """
+        _clear_stale_save_data(self.save_root / SAVEDATA_SUBTREE)
 
     def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """The path shadPS4 should boot for `path`.
@@ -1155,6 +1291,16 @@ class Shadps4(Emulator):
             return path
         if not path.is_dir():
             return None
+        # The folder itself, not just its eboot.bin: shadps4 appends the
+        # filename to a directory path on its own, so a folder symlinked out of
+        # the library would otherwise boot a host path nothing here validated.
+        try:
+            if not path.resolve().is_relative_to(rom_root):
+                log.warning("shadps4: refusing %s, it resolves outside %s", path, rom_root)
+                return None
+        except OSError as exc:
+            log.warning("shadps4: could not resolve %s (%s)", path, exc)
+            return None
         eboot = path / "eboot.bin"
         try:
             if eboot.is_file():
@@ -1183,6 +1329,7 @@ class Shadps4(Emulator):
             RuntimeError: When no binary is found under `VERSIONS_DIR`.
         """
         self.stop()
+        self._graceful_exit = None
         if resume_slot is not None:
             log.info(
                 "shadps4 has no save states, resume_slot %s ignored "
@@ -1222,12 +1369,14 @@ class Shadps4(Emulator):
         """
         proc = self._proc
         if proc is None or proc.stdin is None or proc.poll() is not None:
+            log.warning("shadps4: IPC %s not sent, no running process with a stdin pipe", cmd)
             return False
         try:
             proc.stdin.write(f"{cmd}\n".encode())
             proc.stdin.flush()
             return True
-        except (BrokenPipeError, OSError):
+        except OSError as exc:
+            log.warning("shadps4: IPC %s could not be written to stdin: %s", cmd, exc)
             return False
 
     def stop(self) -> None:
@@ -1236,6 +1385,12 @@ class Shadps4(Emulator):
         STOP is written to stdin and the process given `term_timeout` to
         exit on its own; a broken pipe or a timeout falls through to the
         SIGTERM then SIGKILL sequence in the base class.
+
+        Which of the two ran is recorded in `_graceful_exit` for
+        `save_and_exit` to report. shadPS4 registers no SIGTERM handler, so
+        the escalation kills it wherever it happens to be, save mounts
+        included; the save data the dump then ships cannot be trusted the way
+        a clean IPC quit's can.
         """
         proc = self._proc
         if proc is not None and proc.poll() is None and proc.stdin is not None:
@@ -1244,13 +1399,62 @@ class Shadps4(Emulator):
                 proc.stdin.write(b"STOP\n")
                 proc.stdin.flush()
                 proc.wait(timeout=self.term_timeout)
+            except OSError as exc:
+                self._graceful_exit = False
+                log.warning(
+                    "%s (pid %d): IPC STOP could not be delivered (%s), escalating to "
+                    "SIGTERM; save data written this session may be incomplete",
+                    self.name, proc.pid, exc,
+                )
+            except subprocess.TimeoutExpired:
+                self._graceful_exit = False
+                log.warning(
+                    "%s (pid %d) did not exit within %.0fs of STOP, escalating to SIGTERM; "
+                    "save data written this session may be incomplete",
+                    self.name, proc.pid, self.term_timeout,
+                )
+            else:
                 self._forget()
+                self._graceful_exit = True
                 log.info("%s exited gracefully", self.name)
                 return
-            except (BrokenPipeError, OSError):
-                pass
-            except subprocess.TimeoutExpired:
-                log.warning(
-                    "%s did not exit after STOP, escalating to SIGTERM", self.name
-                )
         super().stop()
+
+    def save_and_exit(self, slot: Optional[int]) -> dict[str, Any]:
+        """Stop shadPS4 and report whether the save data it leaves can be trusted.
+
+        There are no save states, so the state fields are always None. What
+        this adds over the base is the shutdown's own verdict: the caller zips
+        the save tree the moment this returns, and a stop that had to escalate
+        to SIGTERM can leave a save half-written, with shadPS4's own
+        `sce_sys/corrupted` marker the only sign of it.
+
+        Args:
+            slot: Ignored with a log line; shadPS4 has no save states.
+
+        Returns:
+            The state fields all None (`state_saved`, `state_slot`,
+            `state_file`), plus `graceful_exit` and `unmounted_saves`, the save
+            directories shadPS4 never unmounted.
+        """
+        if slot is not None:
+            log.info("shadps4 has no save states, exit slot %s ignored", slot)
+        self.stop()
+        stranded = [str(p) for p in _unmounted_saves(self.save_root / SAVEDATA_SUBTREE)]
+        if stranded:
+            log.error(
+                "shadps4: %d save(s) were never unmounted and may be mid-write; "
+                "they still ship in the exit dump: %s",
+                len(stranded), ", ".join(stranded),
+            )
+        elif self._graceful_exit is False:
+            log.warning(
+                "shadps4: the session was force-stopped, but no save was left mounted"
+            )
+        return {
+            "state_saved": None,
+            "state_slot": None,
+            "state_file": None,
+            "graceful_exit": self._graceful_exit,
+            "unmounted_saves": stranded,
+        }

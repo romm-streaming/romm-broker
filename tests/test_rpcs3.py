@@ -6,6 +6,8 @@ target selection, save-and-exit, and boot verification.
 
 import logging
 import os
+import shlex
+import signal
 import socket
 import struct
 import subprocess
@@ -18,12 +20,15 @@ from typing import Callable, NoReturn, Optional
 
 import pytest
 
+from webstation_broker import settings
 from webstation_broker.emulators import rpcs3
 
 
 @pytest.fixture
 def rpcs3_dirs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Path]:
-    """Point the RPCS3 emulator's dev_hdd0 layout at isolated temp directories."""
+    """Point the RPCS3 emulator's dev_hdd0 layout and the ROM root at temp directories."""
+    rom_root = tmp_path / "romm"
+    rom_root.mkdir()
     data_dir = tmp_path / "data"
     dev_hdd0 = data_dir / "dev_hdd0"
     user_home = dev_hdd0 / "home" / "00000001"
@@ -44,7 +49,10 @@ def rpcs3_dirs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Pat
     monkeypatch.setattr(rpcs3, "SSTATE_ROOT", sstate_root)
     monkeypatch.setattr(rpcs3, "_SSTATE_LINK", sstate_link)
     monkeypatch.setattr(rpcs3.Rpcs3, "save_root", dev_hdd0)
+    monkeypatch.setattr(rpcs3, "ROM_ROOT", rom_root)
+    monkeypatch.setattr(settings, "ROM_ROOT", rom_root)
     return {
+        "rom_root": rom_root,
         "data_dir": data_dir,
         "dev_hdd0": dev_hdd0,
         "user_home": user_home,
@@ -248,6 +256,41 @@ def test_clearing_the_working_slot_keeps_states_without_a_resolved_rom(
     assert kept.exists()
 
 
+def test_clearing_the_working_slot_snapshots_leftovers_when_the_title_is_unknown(
+    rpcs3_dirs: dict[str, Path], tmp_path: Path
+) -> None:
+    """An unknown title id must still record a pre-restore snapshot to diff against later.
+
+    clear_working_slot cannot scope a clear without a title id, but the
+    files sitting under SSTATE_ROOT right now are exactly what a later
+    deferred clear needs to tell a leftover apart from this session's
+    restore, once PINE names the title.
+    """
+    leftover = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT")
+    iso = tmp_path / "roms" / "game.iso"
+    iso.parent.mkdir(parents=True)
+    iso.write_bytes(b"iso")
+
+    emu = rpcs3.Rpcs3()
+    emu.resolve_rom_file(iso)
+    emu.clear_working_slot()
+
+    assert emu._leftover_snapshot == {leftover: (leftover.stat().st_size, leftover.stat().st_mtime)}
+
+
+def test_clearing_the_working_slot_records_no_snapshot_when_the_title_is_known(
+    rpcs3_dirs: dict[str, Path], tmp_path: Path
+) -> None:
+    """A known title id already scopes its own clear, so no deferred snapshot is needed."""
+    pkg = _write_pkg(tmp_path / "roms" / "game.pkg", "BLUS30443")
+
+    emu = rpcs3.Rpcs3()
+    emu.resolve_rom_file(pkg)
+    emu.clear_working_slot()
+
+    assert emu._leftover_snapshot is None
+
+
 def test_clearing_the_working_slot_enters_restoring_mode(rpcs3_dirs: dict[str, Path]) -> None:
     """clear_working_slot must flip _restoring itself, not prepare_restore().
 
@@ -260,6 +303,132 @@ def test_clearing_the_working_slot_enters_restoring_mode(rpcs3_dirs: dict[str, P
 
     assert emu._restoring is True
     assert emu.save_subtrees == ("home/00000001/savedata", "game", "savestates")
+
+
+# ── stale save data ─────────────────────────────────────────────────────
+
+
+def test_clearing_the_working_slot_drops_the_last_players_save_data(
+    rpcs3_dirs: dict[str, Path], tmp_path: Path
+) -> None:
+    """A previous player's cellSaveData dir must not survive into this session.
+
+    The restore only writes the members this player's archive names, so an
+    untouched leftover would still be sitting in the save dir at exit, where
+    the restamp ships the dir whole into this player's own archive.
+    """
+    leftover = _touch(rpcs3.USER_HOME / "savedata" / "BLUS30443-AUTO" / "SAVE.BIN")
+    pkg = _write_pkg(tmp_path / "roms" / "game.pkg", "BLUS30443")
+
+    emu = rpcs3.Rpcs3()
+    emu.resolve_rom_file(pkg)
+    emu.clear_working_slot()
+
+    assert not leftover.exists()
+    assert not leftover.parent.exists()
+
+
+def test_clearing_the_working_slot_drops_another_titles_save_data_too(
+    rpcs3_dirs: dict[str, Path], tmp_path: Path
+) -> None:
+    """A save dir named for another title is another player's data just the same."""
+    other = _touch(rpcs3.USER_HOME / "savedata" / "BLES00001-AUTO" / "SAVE.BIN")
+    pkg = _write_pkg(tmp_path / "roms" / "game.pkg", "BLUS30443")
+
+    emu = rpcs3.Rpcs3()
+    emu.resolve_rom_file(pkg)
+    emu.clear_working_slot()
+
+    assert not other.exists()
+
+
+def test_clearing_the_working_slot_drops_save_data_without_a_resolved_rom(
+    rpcs3_dirs: dict[str, Path],
+) -> None:
+    """Save data needs no title id to clear, unlike a savestate dir.
+
+    A boot target whose title id only PINE can supply leaves the savestate
+    clear waiting on the watchdog, but the save-data clear has nothing to
+    wait for and must not be deferred with it.
+    """
+    leftover = _touch(rpcs3.USER_HOME / "savedata" / "BLUS30443-AUTO" / "SAVE.BIN")
+
+    rpcs3.Rpcs3().clear_working_slot()
+
+    assert not leftover.exists()
+
+
+def test_clearing_the_working_slot_drops_stale_game_data(
+    rpcs3_dirs: dict[str, Path],
+) -> None:
+    """Game data under game/ is save data too, and goes with the rest."""
+    gamedata = _touch(rpcs3_dirs["game_dir"] / "BLES00002" / "USRDIR" / "DATA.BIN")
+
+    rpcs3.Rpcs3().clear_working_slot()
+
+    assert not gamedata.exists()
+
+
+def test_clearing_the_working_slot_keeps_installed_pkg_titles(
+    rpcs3_dirs: dict[str, Path],
+) -> None:
+    """An installed title is the game itself, not save data, so the clear leaves it."""
+    eboot = _touch(rpcs3_dirs["game_dir"] / "BLUS30443" / "USRDIR" / "EBOOT.BIN")
+
+    rpcs3.Rpcs3().clear_working_slot()
+
+    assert eboot.exists()
+
+
+def test_clearing_the_working_slot_logs_save_data_it_cannot_remove(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A save dir that cannot be removed is reported, never silently left in place."""
+    _touch(rpcs3.USER_HOME / "savedata" / "BLUS30443-AUTO" / "SAVE.BIN")
+
+    def boom(path: Path) -> NoReturn:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(rpcs3.shutil, "rmtree", boom)
+
+    with caplog.at_level(logging.WARNING):
+        rpcs3.Rpcs3().clear_working_slot()
+
+    assert "could not clear stale save data" in caplog.text
+
+
+def test_rpcs3_declares_that_it_clears_stale_saves(rpcs3_dirs: dict[str, Path]) -> None:
+    """The activate contract's flag has to match what clear_working_slot actually does."""
+    assert rpcs3.Rpcs3.clears_stale_saves is True
+
+
+def test_exit_cannot_ship_a_previous_players_leftover_saves(
+    rpcs3_dirs: dict[str, Path],
+    no_boot_watchdog: list[tuple[str, tuple]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exit restamp can only reach files this session's own activate left behind.
+
+    save_and_exit restamps a session save dir whole so a partially rewritten
+    save ships intact, which is exactly why nothing from an earlier session
+    may still be in that dir by then.
+    """
+    monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
+    monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
+    monkeypatch.setattr(rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: None)
+    monkeypatch.setattr(rpcs3.Rpcs3, "stop", lambda self: None)
+    leftover = _touch(rpcs3.USER_HOME / "savedata" / "BLUS30443-AUTO" / "OLD.BIN", mtime=1000)
+    eboot = _touch(rpcs3_dirs["game_dir"] / "BLUS30443" / "USRDIR" / "EBOOT.BIN")
+
+    emu = rpcs3.Rpcs3()
+    emu.resolve_rom_file(eboot)
+    emu.clear_working_slot()
+    emu.launch(eboot, None)
+    mine = _touch(rpcs3.USER_HOME / "savedata" / "BLUS30443-AUTO" / "MINE.BIN", mtime=1000)
+    emu.save_and_exit(None)
+
+    assert not leftover.exists()
+    assert mine.stat().st_mtime > emu._session_start
 
 
 # ── save_subtrees ───────────────────────────────────────────────────────
@@ -352,7 +521,323 @@ def test_changed_state_picks_the_newest_when_several_files_changed(rpcs3_dirs: d
     assert rpcs3._changed_state("BLUS30443", before) == newest
 
 
+def test_all_state_files_spans_every_title_dir(rpcs3_dirs: dict[str, Path]) -> None:
+    """All state files spans every title dir."""
+    a = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT", mtime=1000)
+    b = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_2.SAVESTAT.zst", mtime=2000)
+    c = _touch(rpcs3_dirs["sstate_root"] / "OTHER00000" / "OTHER00000_1.SAVESTAT.gz", mtime=3000)
+
+    snap = rpcs3._all_state_files()
+
+    assert set(snap) == {a, b, c}
+    assert snap[c] == (a.stat().st_size, 3000)
+
+
+def test_all_state_files_is_empty_when_the_root_does_not_exist(
+    rpcs3_dirs: dict[str, Path]
+) -> None:
+    """A savestates root that was never created must read as no states, not raise."""
+    assert not rpcs3_dirs["sstate_root"].exists()
+
+    assert rpcs3._all_state_files() == {}
+
+
+def test_all_state_files_ignores_files_sitting_directly_in_the_root(
+    rpcs3_dirs: dict[str, Path]
+) -> None:
+    """Only title dirs hold states, so a loose file in the root must be skipped."""
+    rpcs3_dirs["sstate_root"].mkdir(parents=True)
+    (rpcs3_dirs["sstate_root"] / "stray.SAVESTAT").write_bytes(b"state")
+    kept = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT")
+
+    assert set(rpcs3._all_state_files()) == {kept}
+
+
+def test_all_state_files_reports_a_root_it_cannot_list(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unlistable savestates root must log and read as no states, not raise."""
+    rpcs3_dirs["sstate_root"].mkdir(parents=True)
+
+    def deny(_self: Path) -> NoReturn:
+        raise PermissionError("nope")
+
+    monkeypatch.setattr(Path, "iterdir", deny)
+
+    with caplog.at_level(logging.WARNING):
+        assert rpcs3._all_state_files() == {}
+
+    assert "could not list" in caplog.text
+
+
+# ── deferred leftover-savestate clear ───────────────────────────────────
+
+
+def test_clear_leftover_states_drops_files_unchanged_since_the_snapshot(
+    rpcs3_dirs: dict[str, Path]
+) -> None:
+    """A file that matches the pre-restore snapshot exactly must be dropped."""
+    stale = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT", mtime=1000)
+    before = rpcs3._state_snapshot("BLUS30443")
+
+    rpcs3._clear_leftover_states("BLUS30443", before)
+
+    assert not stale.exists()
+
+
+def test_clear_leftover_states_keeps_a_file_the_restore_changed(
+    rpcs3_dirs: dict[str, Path]
+) -> None:
+    """A file whose size/mtime moved since the snapshot was taken must be kept.
+
+    The restore can overwrite a leftover in place with a state carrying an
+    older archived mtime, so identity, not recency, is what tells a kept
+    file apart from a stale one.
+    """
+    path = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT", mtime=1000)
+    before = rpcs3._state_snapshot("BLUS30443")
+    _touch(path, mtime=500)  # restore overwrote it with an older archived save
+
+    rpcs3._clear_leftover_states("BLUS30443", before)
+
+    assert path.exists()
+
+
+def test_clear_leftover_states_keeps_a_file_the_restore_added(
+    rpcs3_dirs: dict[str, Path]
+) -> None:
+    """A file absent from the pre-restore snapshot must be kept, not swept."""
+    before = rpcs3._state_snapshot("BLUS30443")
+    added = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_2.SAVESTAT")
+
+    rpcs3._clear_leftover_states("BLUS30443", before)
+
+    assert added.exists()
+
+
+def test_clear_leftover_states_is_a_noop_with_an_empty_snapshot(
+    rpcs3_dirs: dict[str, Path]
+) -> None:
+    """A known title id with nothing recorded beforehand must touch nothing."""
+    kept = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT")
+
+    rpcs3._clear_leftover_states("BLUS30443", {})
+
+    assert kept.exists()
+
+
+def test_clear_leftover_states_logs_a_file_it_cannot_remove(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unremovable leftover must be logged, not raise past the caller."""
+    stale = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT", mtime=1000)
+    before = rpcs3._state_snapshot("BLUS30443")
+
+    def deny(_self: Path) -> NoReturn:
+        raise PermissionError("nope")
+
+    monkeypatch.setattr(Path, "unlink", deny)
+
+    with caplog.at_level(logging.WARNING):
+        rpcs3._clear_leftover_states("BLUS30443", before)
+
+    assert "could not clear leftover savestate" in caplog.text
+    assert stale.exists()
+
+
+# ── launch process group / open descriptors ─────────────────────────────
+
+needs_procfs = pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(), reason="requires a Linux procfs"
+)
+
+
+def _run_in_own_session(script: str) -> "subprocess.Popen[bytes]":
+    """Start `script` under `sh` in a session of its own, the way `_spawn` does."""
+    return subprocess.Popen(
+        ["sh", "-c", script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _kill_group(proc: "subprocess.Popen[bytes]") -> None:
+    """Tear down a whole test launch, children included."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except OSError:
+        proc.kill()
+    proc.wait(timeout=10)
+
+
+def _wait_until(predicate: Callable[[], bool], timeout: float = 10.0) -> bool:
+    """Poll `predicate` until it holds or `timeout` seconds pass."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_launch_pids_is_empty_without_a_process_handle() -> None:
+    """No handle means no pids to inspect, not a crash."""
+    assert rpcs3._launch_pids(None) == []
+
+
+@needs_procfs
+def test_launch_pids_finds_children_of_the_group_leader() -> None:
+    """The AppImage wrapper's children must be found, not just the leader.
+
+    RPCS3_BIN is an AppRun wrapper, so the pid the broker holds is never the
+    process that writes a savestate; the whole process group has to come back.
+    """
+    proc = _run_in_own_session("sleep 30 & wait")
+    try:
+        assert _wait_until(lambda: len(rpcs3._launch_pids(proc.pid)) > 1)
+        pids = rpcs3._launch_pids(proc.pid)
+        assert proc.pid in pids
+        assert all(os.getpgid(p) == proc.pid for p in pids)
+    finally:
+        _kill_group(proc)
+
+
+@needs_procfs
+def test_launch_pids_falls_back_to_the_leader_when_it_is_already_gone() -> None:
+    """A pid that has exited still reports itself, and never raises."""
+    proc = _run_in_own_session("exit 0")
+    proc.wait(timeout=10)
+
+    # The Popen handle is reaped, so the pid resolves to nothing at all.
+    assert rpcs3._launch_pids(proc.pid) in ([proc.pid], [])
+
+
+def test_launch_pids_falls_back_to_the_leader_when_proc_cannot_be_scanned(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unreadable /proc must degrade to the leader alone, not raise."""
+
+    def deny(_self: Path) -> NoReturn:
+        raise PermissionError("nope")
+
+    monkeypatch.setattr(Path, "iterdir", deny)
+
+    with caplog.at_level(logging.DEBUG, logger=rpcs3.log.name):
+        assert rpcs3._launch_pids(os.getpid()) == [os.getpid()]
+
+    assert "could not scan /proc" in caplog.text
+
+
+@needs_procfs
+def test_launch_pids_skips_a_process_that_exits_mid_scan(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pid that disappears between listing /proc and reading it must be skipped."""
+    real_getpgid = os.getpgid
+    mine = os.getpid()
+
+    def vanishing(pid: int) -> int:
+        if pid != mine:
+            raise ProcessLookupError(pid)
+        return real_getpgid(pid)
+
+    monkeypatch.setattr(rpcs3.os, "getpgid", vanishing)
+
+    assert rpcs3._launch_pids(mine) == [mine]
+
+
+def test_holds_open_is_false_without_a_process_handle(tmp_path: Path) -> None:
+    """No handle means the descriptor test cannot contribute, so it says False."""
+    target = tmp_path / "BLUS30443_1.SAVESTAT"
+    target.write_bytes(b"state")
+
+    assert rpcs3._holds_open(None, target) is False
+
+
+@needs_procfs
+def test_holds_open_sees_a_descriptor_the_test_process_itself_holds(tmp_path: Path) -> None:
+    """An open descriptor on the state file reads as a write still in flight."""
+    target = tmp_path / "BLUS30443_1.SAVESTAT"
+    target.write_bytes(b"state")
+
+    with target.open("rb"):
+        assert rpcs3._holds_open(os.getpid(), target) is True
+    assert rpcs3._holds_open(os.getpid(), target) is False
+
+
+@needs_procfs
+def test_holds_open_sees_a_descriptor_held_by_a_child_of_the_leader(tmp_path: Path) -> None:
+    """The wrapper's child, not the leader, is what holds the state file open."""
+    target = tmp_path / "BLUS30443_1.SAVESTAT"
+    target.write_bytes(b"state")
+    quoted = shlex.quote(str(target))
+    proc = _run_in_own_session(f"sh -c 'exec 3<{quoted}; sleep 30' & wait")
+    try:
+        assert _wait_until(lambda: rpcs3._holds_open(proc.pid, target))
+        # The leader never opened the file, so only the group scan can see the write.
+        leader_fds = {os.path.realpath(fd) for fd in Path(f"/proc/{proc.pid}/fd").iterdir()}
+        assert os.path.realpath(target) not in leader_fds
+    finally:
+        _kill_group(proc)
+
+
+@needs_procfs
+def test_holds_open_resolves_the_state_file_through_a_symlink(tmp_path: Path) -> None:
+    """dev_hdd0/savestates is a symlink, so both spellings must compare equal."""
+    real = tmp_path / "real"
+    real.mkdir()
+    target = real / "BLUS30443_1.SAVESTAT"
+    target.write_bytes(b"state")
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+
+    with target.open("rb"):
+        assert rpcs3._holds_open(os.getpid(), link / target.name) is True
+
+
+def test_holds_open_is_false_when_the_descriptor_list_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A /proc entry that vanishes or is unreadable must log and read as False."""
+    target = tmp_path / "BLUS30443_1.SAVESTAT"
+    target.write_bytes(b"state")
+    monkeypatch.setattr(rpcs3, "_launch_pids", lambda _pid: [4242])
+
+    def deny(_self: Path) -> NoReturn:
+        raise FileNotFoundError("gone")
+
+    monkeypatch.setattr(Path, "iterdir", deny)
+
+    with caplog.at_level(logging.DEBUG, logger=rpcs3.log.name):
+        assert rpcs3._holds_open(4242, target) is False
+
+    assert "could not read the open files" in caplog.text
+
+
 # ── save state write confirmation ───────────────────────────────────────
+
+
+class _SleepClock:
+    """A monotonic clock that only advances when the code under test sleeps."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def sleep_clock(monkeypatch: pytest.MonkeyPatch) -> _SleepClock:
+    """Drive `_wait_for_state_write`'s poll loop without real sleeping."""
+    clock = _SleepClock()
+    monkeypatch.setattr(rpcs3.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(rpcs3.time, "sleep", clock.sleep)
+    return clock
 
 
 def test_wait_for_state_write_returns_the_file_once_its_size_stops_changing(
@@ -403,6 +888,81 @@ def test_wait_for_state_write_returns_none_when_nothing_ever_appears(
     result = rpcs3._wait_for_state_write("BLUS30443", {}, time.monotonic() + 0.1)
 
     assert result is None
+
+
+def test_wait_for_state_write_never_hands_back_a_zero_byte_state(
+    rpcs3_dirs: dict[str, Path], sleep_clock: _SleepClock
+) -> None:
+    """A created-but-never-written state holds a steady size of nothing.
+
+    Size stability alone would call that finished and archive an empty file.
+    """
+    serial = "BLUS30443"
+    before = rpcs3._state_snapshot(serial)
+    empty = rpcs3_dirs["sstate_root"] / serial / f"{serial}_1.SAVESTAT"
+    empty.parent.mkdir(parents=True)
+    empty.write_bytes(b"")
+
+    result = rpcs3._wait_for_state_write(serial, before, sleep_clock.monotonic() + 5.0)
+
+    assert result is None
+
+
+def test_wait_for_state_write_waits_while_rpcs3_still_holds_the_file_open(
+    rpcs3_dirs: dict[str, Path], sleep_clock: _SleepClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A steady size over an open descriptor is a stalled write, not a finished one.
+
+    RPCS3 compresses a state as it writes it, so a busy host can hold the
+    size still for a whole poll window mid-write.
+    """
+    serial = "BLUS30443"
+    before = rpcs3._state_snapshot(serial)
+    target = _touch(rpcs3_dirs["sstate_root"] / serial / f"{serial}_1.SAVESTAT")
+    calls = {"n": 0}
+
+    def open_for_a_while(pid: Optional[int], path: Path) -> bool:
+        assert pid == 4242
+        assert path == target
+        calls["n"] += 1
+        return calls["n"] < 4
+
+    monkeypatch.setattr(rpcs3, "_holds_open", open_for_a_while)
+
+    result = rpcs3._wait_for_state_write(serial, before, sleep_clock.monotonic() + 30.0, 4242)
+
+    assert result == target
+    assert calls["n"] == 4
+
+
+def test_wait_for_state_write_times_out_while_the_file_is_still_held_open(
+    rpcs3_dirs: dict[str, Path], sleep_clock: _SleepClock, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A descriptor never released before the deadline must report no save."""
+    serial = "BLUS30443"
+    before = rpcs3._state_snapshot(serial)
+    _touch(rpcs3_dirs["sstate_root"] / serial / f"{serial}_1.SAVESTAT")
+    monkeypatch.setattr(rpcs3, "_holds_open", lambda _pid, _path: True)
+
+    with caplog.at_level(logging.WARNING):
+        result = rpcs3._wait_for_state_write(serial, before, sleep_clock.monotonic() + 5.0, 4242)
+
+    assert result is None
+    assert "never settled" in caplog.text
+
+
+def test_wait_for_state_write_falls_back_to_size_alone_without_a_pid(
+    rpcs3_dirs: dict[str, Path], sleep_clock: _SleepClock
+) -> None:
+    """No process handle leaves the size test as the only confirmation there is."""
+    serial = "BLUS30443"
+    before = rpcs3._state_snapshot(serial)
+    target = _touch(rpcs3_dirs["sstate_root"] / serial / f"{serial}_1.SAVESTAT")
+
+    result = rpcs3._wait_for_state_write(serial, before, sleep_clock.monotonic() + 5.0, None)
+
+    assert result == target
 
 
 # ── launch() resume selection ───────────────────────────────────────────
@@ -474,7 +1034,7 @@ def test_launch_falls_back_to_a_fresh_boot_with_no_known_serial(
     monkeypatch.setattr(
         rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: spawned.setdefault("cmd", cmd)
     )
-    iso = tmp_path / "Game.iso"
+    iso = rpcs3_dirs["rom_root"] / "Game.iso"
     iso.write_bytes(b"iso")
 
     rpcs3.Rpcs3().launch(iso, 1)
@@ -517,6 +1077,109 @@ def test_launch_always_spawns_the_boot_watchdog(
     assert len(no_boot_watchdog) == 1
     assert no_boot_watchdog[0][0] == "_boot_watchdog"
     assert no_boot_watchdog[0][1] == (emu._launch_seq,)
+
+
+def test_launch_clears_leftovers_once_the_serial_is_known_synchronously(
+    rpcs3_dirs: dict[str, Path], no_boot_watchdog: list[tuple[str, tuple]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A boot target whose serial resolves inside launch() itself must run the deferred clear too.
+
+    An installed/disc-rip EBOOT resolves its serial synchronously in
+    launch(), before the boot watchdog ever starts, so a pending
+    pre-restore snapshot from clear_working_slot must be consumed here,
+    not left for a PINE round trip that will never happen.
+    """
+    monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
+    monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
+    monkeypatch.setattr(rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: None)
+    eboot = rpcs3_dirs["game_dir"] / "BLUS30443" / "USRDIR" / "EBOOT.BIN"
+    _touch(eboot)
+    stale = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT")
+
+    emu = rpcs3.Rpcs3()
+    emu._leftover_snapshot = rpcs3._state_snapshot("BLUS30443")
+    emu.launch(eboot, None)
+
+    assert not stale.exists()
+    assert emu._leftover_snapshot is None
+
+
+def test_launch_refuses_a_rom_symlinked_out_of_the_library(
+    rpcs3_dirs: dict[str, Path], no_boot_watchdog: list[tuple[str, tuple]],
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A boot target resolving outside the library and the data dirs is never spawned.
+
+    The plain-file branch boots the ROM path as it stands, so a symlink in
+    the library would otherwise hand rpcs3 a file from anywhere on the host.
+    """
+    monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
+    monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: spawned.append(cmd))
+    outside = tmp_path / "elsewhere" / "secret.iso"
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(b"iso")
+    link = rpcs3_dirs["rom_root"] / "Game.iso"
+    link.symlink_to(outside)
+
+    with pytest.raises(RuntimeError, match="resolves outside"):
+        rpcs3.Rpcs3().launch(link, None)
+
+    assert spawned == []
+
+
+def test_launch_refuses_an_eboot_symlinked_out_of_the_game_dir(
+    rpcs3_dirs: dict[str, Path], no_boot_watchdog: list[tuple[str, tuple]],
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """An installed title's EBOOT is re-checked too, not trusted for sitting under game/."""
+    monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
+    monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: spawned.append(cmd))
+    outside = _touch(tmp_path / "elsewhere" / "EBOOT.BIN")
+    eboot = rpcs3_dirs["game_dir"] / "BLUS30443" / "USRDIR" / "EBOOT.BIN"
+    eboot.parent.mkdir(parents=True)
+    eboot.symlink_to(outside)
+
+    with pytest.raises(RuntimeError, match="resolves outside"):
+        rpcs3.Rpcs3().launch(eboot, None)
+
+    assert spawned == []
+
+
+def test_launch_accepts_a_rom_inside_the_library(
+    rpcs3_dirs: dict[str, Path], no_boot_watchdog: list[tuple[str, tuple]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ROM sitting in the library boots normally through the containment check."""
+    monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
+    monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: spawned.append(cmd))
+    iso = rpcs3_dirs["rom_root"] / "Game.iso"
+    iso.write_bytes(b"iso")
+
+    rpcs3.Rpcs3().launch(iso, None)
+
+    assert spawned[0][-1] == str(iso)
+
+
+def test_verify_boot_target_accepts_a_savestate(rpcs3_dirs: dict[str, Path]) -> None:
+    """A resume boots the state file itself, so the savestate root is a boot root."""
+    state = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT")
+
+    rpcs3._verify_boot_target(state)  # must not raise
+
+
+def test_verify_boot_target_accepts_an_extraction(
+    rpcs3_dirs: dict[str, Path], cache_dir: Path
+) -> None:
+    """An archive boots out of the extraction cache, which is a boot root of its own."""
+    boot = _touch(cache_dir / "Game-abc123" / "EBOOT.BIN")
+
+    rpcs3._verify_boot_target(boot)  # must not raise
 
 
 # ── save_and_exit ───────────────────────────────────────────────────────
@@ -594,7 +1257,9 @@ def test_exit_reports_no_save_when_no_new_state_appears(
     emu._session_serial = "BLUS30443"
     monkeypatch.setattr(rpcs3.Rpcs3, "alive", lambda self: True)
     emu._send_key = lambda key: True
-    monkeypatch.setattr(rpcs3, "_wait_for_state_write", lambda serial, before, deadline: None)
+    monkeypatch.setattr(
+        rpcs3, "_wait_for_state_write", lambda serial, before, deadline, pid=None: None
+    )
 
     report = emu.save_and_exit(1)
 
@@ -615,7 +1280,9 @@ def test_exit_does_not_abort_the_save_dump_when_the_state_file_disappears_before
     monkeypatch.setattr(rpcs3.Rpcs3, "alive", lambda self: True)
     emu._send_key = lambda key: True
     missing = rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT"
-    monkeypatch.setattr(rpcs3, "_wait_for_state_write", lambda serial, before, deadline: missing)
+    monkeypatch.setattr(
+        rpcs3, "_wait_for_state_write", lambda serial, before, deadline, pid=None: missing
+    )
     stopped = {"called": False}
     emu.stop = lambda: stopped.__setitem__("called", True)
 
@@ -623,6 +1290,55 @@ def test_exit_does_not_abort_the_save_dump_when_the_state_file_disappears_before
 
     assert report == {"state_saved": False, "state_slot": 1, "state_file": None}
     assert stopped["called"] is True
+
+
+def test_exit_hands_the_running_pid_to_the_write_confirmation(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The write confirmation needs the launch pid to read its open descriptors.
+
+    Without it every write looks closed and a stalled save is archived as a
+    finished one.
+    """
+    emu = rpcs3.Rpcs3()
+    emu._session_serial = "BLUS30443"
+    emu._proc = SimpleNamespace(pid=4242)
+    monkeypatch.setattr(rpcs3.Rpcs3, "alive", lambda self: True)
+    emu._send_key = lambda key: True
+    emu.stop = lambda: None
+    seen: dict = {}
+
+    def record(serial: Optional[str], before: dict, deadline: float, pid: Optional[int]) -> None:
+        seen["pid"] = pid
+        return None
+
+    monkeypatch.setattr(rpcs3, "_wait_for_state_write", record)
+
+    emu.save_and_exit(1)
+
+    assert seen["pid"] == 4242
+
+
+def test_exit_passes_no_pid_when_the_broker_holds_no_handle(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A save with no process handle must still run, on the size test alone."""
+    emu = rpcs3.Rpcs3()
+    emu._session_serial = "BLUS30443"
+    monkeypatch.setattr(rpcs3.Rpcs3, "alive", lambda self: True)
+    emu._send_key = lambda key: True
+    emu.stop = lambda: None
+    seen: dict = {}
+
+    def record(serial: Optional[str], before: dict, deadline: float, pid: Optional[int]) -> None:
+        seen["pid"] = pid
+        return None
+
+    monkeypatch.setattr(rpcs3, "_wait_for_state_write", record)
+
+    emu.save_and_exit(1)
+
+    assert seen["pid"] is None
 
 
 # ── PINE wire protocol ────────────────────────────────────────────────────
@@ -833,6 +1549,47 @@ def test_boot_watchdog_resolves_an_unknown_serial_once_running(
     assert emu.boot_failed is False
 
 
+def test_boot_watchdog_clears_leftovers_once_the_title_resolves(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, watchdog_env: _FakeClock
+) -> None:
+    """A bare .iso's leftover states must be cleared once PINE names the title.
+
+    clear_working_slot could not scope its clear at activate time, so the
+    boot watchdog is the one place left that ever learns the title id for
+    a bare .iso boot; it must finish the deferred clear _all_state_files
+    was built to feed.
+    """
+    monkeypatch.setattr(rpcs3, "_pine_status", lambda: 0)
+    monkeypatch.setattr(rpcs3, "_pine_title_id", lambda: "BLUS30443")
+    monkeypatch.setattr(rpcs3.Rpcs3, "alive", lambda self: True)
+    stale = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT")
+    emu = rpcs3.Rpcs3()
+    emu._session_serial = None
+    emu._leftover_snapshot = rpcs3._state_snapshot("BLUS30443")
+
+    emu._boot_watchdog(emu._launch_seq)
+
+    assert not stale.exists()
+    assert emu._leftover_snapshot is None
+
+
+def test_boot_watchdog_keeps_a_restored_state_once_the_title_resolves(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, watchdog_env: _FakeClock
+) -> None:
+    """A state the archive restore already wrote must survive the deferred clear."""
+    monkeypatch.setattr(rpcs3, "_pine_status", lambda: 0)
+    monkeypatch.setattr(rpcs3, "_pine_title_id", lambda: "BLUS30443")
+    monkeypatch.setattr(rpcs3.Rpcs3, "alive", lambda self: True)
+    emu = rpcs3.Rpcs3()
+    emu._session_serial = None
+    emu._leftover_snapshot = rpcs3._state_snapshot("BLUS30443")  # taken before the restore
+    restored = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT")
+
+    emu._boot_watchdog(emu._launch_seq)
+
+    assert restored.exists()
+
+
 def test_boot_watchdog_discards_a_title_lookup_that_lands_after_a_supersede(
     rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, watchdog_env: _FakeClock
 ) -> None:
@@ -927,18 +1684,45 @@ def test_stop_invalidates_an_in_flight_boot_watchdog(rpcs3_dirs: dict[str, Path]
 # ── xdotool window targeting ────────────────────────────────────────────
 
 
+def _fake_xdotool(
+    calls: list[tuple], windows: str, pids: Optional[dict[str, str]] = None
+) -> Callable[..., Optional[str]]:
+    """Build an `_xdotool` stub answering a class search and the pid lookups after it.
+
+    Args:
+        calls: Collects every invocation, in order.
+        windows: Whitespace-separated window ids the class search returns.
+        pids: Window id to the `getwindowpid` reply for it; a window missing
+            from the mapping answers with no pid at all.
+
+    Returns:
+        The stub, ready to be bound in place of `Rpcs3._xdotool`.
+    """
+    replies = pids or {}
+
+    def run(*args: str) -> Optional[str]:
+        calls.append(args)
+        if args[0] == "search":
+            return windows
+        if args[0] == "getwindowpid":
+            return replies.get(args[1])
+        return "ok"
+
+    return run
+
+
 def test_send_key_activates_then_sends_the_key(rpcs3_dirs: dict[str, Path]) -> None:
     """Send key activates then sends the key."""
     emu = rpcs3.Rpcs3()
-    calls = []
-    emu._xdotool = lambda *args: (calls.append(args), "111\n")[1] if args[0] == "search" else (
-        calls.append(args), "ok"
-    )[1]
+    emu._proc = SimpleNamespace(pid=os.getpid())
+    calls: list[tuple] = []
+    emu._xdotool = _fake_xdotool(calls, "111\n", {"111": str(os.getpid())})
 
     assert emu._send_key("ctrl+alt+1") is True
     assert calls[0] == ("search", "--class", rpcs3._WINDOW_CLASS)
-    assert calls[1][0] == "windowactivate"
-    assert calls[2] == ("key", "--clearmodifiers", "ctrl+alt+1")
+    assert calls[1] == ("getwindowpid", "111")
+    assert calls[2][0] == "windowactivate"
+    assert calls[3] == ("key", "--clearmodifiers", "ctrl+alt+1")
 
 
 def test_send_key_fails_with_no_window(rpcs3_dirs: dict[str, Path]) -> None:
@@ -947,6 +1731,67 @@ def test_send_key_fails_with_no_window(rpcs3_dirs: dict[str, Path]) -> None:
     emu._xdotool = lambda *args: None
 
     assert emu._send_key("ctrl+alt+1") is False
+
+
+def test_game_window_picks_the_window_owned_by_this_launch(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale instance's window is skipped for the one this session's launch owns.
+
+    The window class is shared by every rpcs3 on the display, so the first
+    search hit can be a zombie left by a session that failed to die, and a
+    save hotkey sent there would save nothing.
+    """
+    emu = rpcs3.Rpcs3()
+    emu._proc = SimpleNamespace(pid=4242)
+    monkeypatch.setattr(rpcs3, "_launch_pids", lambda pid: [4242, 4243])
+    emu._xdotool = _fake_xdotool(
+        [], "111 222\n", {"111": "9999", "222": "4243"}
+    )
+
+    assert emu._game_window() == "222"
+
+
+def test_game_window_is_none_when_every_window_belongs_to_another_process(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No window of the launch's own means no key is sent, rather than one sent to a stale instance."""
+    emu = rpcs3.Rpcs3()
+    emu._proc = SimpleNamespace(pid=4242)
+    monkeypatch.setattr(rpcs3, "_launch_pids", lambda pid: [4242])
+    emu._xdotool = _fake_xdotool([], "111\n", {"111": "9999"})
+
+    with caplog.at_level(logging.WARNING):
+        assert emu._game_window() is None
+
+    assert "belongs to this launch" in caplog.text
+
+
+def test_game_window_falls_back_to_a_window_reporting_no_pid(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An X server without _NET_WM_PID still gets its hotkeys, with the gap logged."""
+    emu = rpcs3.Rpcs3()
+    emu._proc = SimpleNamespace(pid=4242)
+    monkeypatch.setattr(rpcs3, "_launch_pids", lambda pid: [4242])
+    emu._xdotool = _fake_xdotool([], "111\n")
+
+    with caplog.at_level(logging.WARNING):
+        assert emu._game_window() == "111"
+
+    assert "reports no pid" in caplog.text
+
+
+def test_game_window_prefers_the_launch_pid_over_a_window_with_no_pid(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A window the launch positively owns beats one that merely cannot be attributed."""
+    emu = rpcs3.Rpcs3()
+    emu._proc = SimpleNamespace(pid=4242)
+    monkeypatch.setattr(rpcs3, "_launch_pids", lambda pid: [4242])
+    emu._xdotool = _fake_xdotool([], "111 222\n", {"222": "4242"})
+
+    assert emu._game_window() == "222"
 
 
 # ── archive extraction / extraction cache ─────────────────────────────
@@ -1708,6 +2553,7 @@ def test_sweep_stale_extractions_is_a_noop_without_a_cache_dir(cache_dir: Path) 
 
 def test_launch_extracts_and_boots_from_an_archive_rom(
     rpcs3_dirs: dict[str, Path],
+    cache_dir: Path,
     no_boot_watchdog: list[tuple[str, tuple]],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1719,7 +2565,7 @@ def test_launch_extracts_and_boots_from_an_archive_rom(
     monkeypatch.setattr(
         rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: spawned.setdefault("cmd", cmd)
     )
-    extracted_boot = _touch(tmp_path / "extracted" / "EBOOT.BIN")
+    extracted_boot = _touch(cache_dir / "Game-abc123" / "EBOOT.BIN")
     monkeypatch.setattr(rpcs3, "_extract_and_cache", lambda archive, emulator: extracted_boot)
     archive = tmp_path / "Game.7z"
     archive.write_bytes(b"7z")

@@ -90,12 +90,48 @@ From env `PPSSPP_STATE_STABLE`, default 1.5. Long enough that a stalled write
 is not mistaken for a finished one, short enough to stay well inside
 `STATE_WAIT`.
 """
-RESUME_LOAD_WAIT = float(os.environ.get("PPSSPP_RESUME_LOAD_WAIT", "90.0"))
-"""Seconds a deferred resume waits for a state file to arrive (env `PPSSPP_RESUME_LOAD_WAIT`, default 90)."""
-RESUME_LOAD_SETTLE = float(os.environ.get("PPSSPP_RESUME_LOAD_SETTLE", "5.0"))
-"""How long the window has to be up before a hotkey is worth sending (env `PPSSPP_RESUME_LOAD_SETTLE`).
+STATE_SHOT_WAIT = float(os.environ.get("PPSSPP_STATE_SHOT_WAIT", "5.0"))
+"""Seconds the screenshot beside a finished state gets to land (env `PPSSPP_STATE_SHOT_WAIT`, default 5).
 
-Defaults to 5 seconds.
+Its own short window rather than the rest of `STATE_WAIT`: the state itself is
+already confirmed by the time this is waited on, so a screenshot PPSSPP never
+writes costs a few seconds instead of the whole save budget.
+"""
+STATE_SHOT_STABLE = 0.5
+"""Seconds the screenshot's size must hold still before the write counts as finished.
+
+Shorter than `STATE_STABLE`: a jpeg thumbnail is orders of magnitude smaller
+than the state it belongs to.
+"""
+
+LOAD_WAIT = float(os.environ.get("PPSSPP_LOAD_WAIT", "20.0"))
+"""Seconds PPSSPP has to read the state back after the load hotkey (env `PPSSPP_LOAD_WAIT`, default 20)."""
+LOAD_SETTLE = float(os.environ.get("PPSSPP_LOAD_SETTLE", "2.0"))
+"""Seconds a load gets to deserialize once the state file has been read.
+
+From env `PPSSPP_LOAD_SETTLE`, default 2. The deserialize itself is
+unobservable from outside the process, so this is the one bounded guess in
+the load path.
+"""
+_ATIME_BACKDATE = 1.0
+"""Seconds a state's access time is set behind its mtime, so the next read of it stands out."""
+
+RESUME_LOAD_WAIT = float(os.environ.get("PPSSPP_RESUME_LOAD_WAIT", "90.0"))
+"""Seconds a deferred resume has to find both a state file and a game window (env `PPSSPP_RESUME_LOAD_WAIT`).
+
+Defaults to 90. One budget covers both: a resume state is usually already on
+disk from the save archive, so nearly all of it goes on the boot.
+"""
+RESUME_LOAD_SETTLE = float(os.environ.get("PPSSPP_RESUME_LOAD_SETTLE", "12.0"))
+"""Seconds to wait after the game window is up before the load hotkey goes in.
+
+From env `PPSSPP_RESUME_LOAD_SETTLE`, default 12. PPSSPP titles its window
+with the game as soon as the disc is mounted, but keeps loading and
+registering HLE module state well past that point, and a load that lands
+before the event table is complete leaves the core reporting an unregistered
+event and a black screen. This is not the wait for the window itself (that is
+polled for): it is the margin between a window saying a game is running and a
+core that can actually be loaded into.
 """
 
 ROM_EXTENSIONS = (".chd", ".cso", ".pbp", ".iso", ".elf", ".prx")
@@ -215,8 +251,7 @@ def _patch_ini_file(
     `[section]` line and never match it. A missing file is seeded with just
     the forced settings and PPSSPP fills in the rest. Existing keys are
     rewritten in place, missing ones are added under their section (created
-    when absent), and the result is written through a temp file. Any failure
-    is logged rather than raised so the launch still goes ahead.
+    when absent), and the result is written through a temp file.
 
     Args:
         path: The ini file to patch.
@@ -226,6 +261,14 @@ def _patch_ini_file(
             add the broker's value to it instead of replacing the line. Set
             for controls.ini, where the line is the player's whole mapping for
             that action, not a setting the broker owns.
+
+    Raises:
+        RuntimeError: When the file could not be read or rewritten. Launching
+            on an unpatched config is worse than not launching: ppsspp.ini
+            unpatched parks the session on the setup wizard nobody can click
+            through, and controls.ini unpatched leaves the bracket keys
+            unbound, so every save and load hotkey the broker sends does
+            nothing while the routes still report success.
     """
     try:
         if not path.exists():
@@ -281,12 +324,17 @@ def _patch_ini_file(
         tmp = path.with_suffix(".tmp")
         tmp.write_text("﻿" + "\n".join(new_lines) + "\n", encoding="utf-8")
         tmp.replace(path)
-    except Exception:
-        log.exception("%s patch failed, broker settings NOT applied", path.name)
+    except (OSError, UnicodeDecodeError) as exc:
+        log.exception("ppsspp: %s patch failed at %s, refusing to launch", path.name, path)
+        raise RuntimeError(f"could not apply broker settings to {path}: {exc}") from exc
 
 
 def _patch_config() -> None:
-    """Patch both ppsspp.ini and controls.ini with the broker's forced settings."""
+    """Patch both ppsspp.ini and controls.ini with the broker's forced settings.
+
+    Raises:
+        RuntimeError: When either ini could not be patched; see `_patch_ini_file`.
+    """
     _patch_ini_file(INI_PATH, _INI_SECTION, _INI_PATCHES)
     _patch_ini_file(CONTROLS_INI_PATH, _CONTROLS_SECTION, _CONTROLS_PATCHES, merge_existing=True)
 
@@ -404,6 +452,128 @@ def _wait_for_state_write(before: dict[Path, tuple[int, float]], deadline: float
     return False
 
 
+def _wait_for_screenshot(state: Path, deadline: float) -> None:
+    """Wait for the screenshot PPSSPP writes beside `state` to finish landing.
+
+    Unlike the state, the screenshot is written in place with no staging file
+    to rename, so nothing but its size holding still marks the end of that
+    write, and the state-screenshot route serves it straight off disk the
+    moment a save reports done. A screenshot that never settles is only
+    logged: the state is already confirmed good, and losing a preview should
+    not read as losing the save.
+
+    Args:
+        state: The state file the save settled on.
+        deadline: `time.monotonic` value to give up at.
+    """
+    POLL_SECS = 0.1
+    shot = state.with_suffix(".jpg")
+    last: Optional[int] = None
+    stable_since = 0.0
+    while time.monotonic() < deadline:
+        try:
+            size = shot.stat().st_size
+        except FileNotFoundError:
+            size = 0
+        except OSError as exc:
+            log.warning("could not stat the screenshot beside %s: %s", state.name, exc)
+            return
+        if size == 0:
+            last = None
+        elif size != last:
+            last = size
+            stable_since = time.monotonic()
+        elif time.monotonic() - stable_since >= STATE_SHOT_STABLE:
+            log.debug("save state screenshot complete: %s (%d bytes)", shot.name, size)
+            return
+        time.sleep(POLL_SECS)
+    log.warning("save state screenshot %s never settled; the state itself is good", shot.name)
+
+
+def _backdate_atime(path: Path) -> Optional[float]:
+    """Stamp `path`'s access time behind its own mtime and return what was written.
+
+    Under `relatime`, the mount default, the kernel refreshes an access time
+    only while it still sits at or behind the file's mtime. A state loaded
+    twice in one session would already carry an atime past its mtime by the
+    second load, and that read would leave no trace at all, so the stamp goes
+    back behind the mtime before every load.
+
+    Args:
+        path: The state file about to be loaded.
+
+    Returns:
+        The access time stamped on, or None when it could not be read or set.
+    """
+    try:
+        st = path.stat()
+        marker = st.st_mtime - _ATIME_BACKDATE
+        os.utime(path, (marker, st.st_mtime))
+    except OSError as exc:
+        log.warning("could not backdate the access time of the state %s: %s", path, exc)
+        return None
+    return marker
+
+
+def _atime_tracked(dir_path: Path) -> bool:
+    """Tell whether reading a file in `dir_path` moves its access time.
+
+    A `noatime` mount records nothing, and on one of those the read a load
+    makes is invisible: without this the broker would report every load as
+    failed. Measured on a scratch file, because the probe's own read is the
+    thing being measured and making it against the state would spend the
+    backdated marker the load itself needs.
+
+    Args:
+        dir_path: The directory the state file lives in.
+
+    Returns:
+        True only when the probe's read demonstrably moved the access time.
+    """
+    probe = dir_path / f".atime-probe.{os.getpid()}"
+    try:
+        probe.write_bytes(b"probe")
+        st = probe.stat()
+        marker = st.st_mtime - _ATIME_BACKDATE
+        os.utime(probe, (marker, st.st_mtime))
+        with probe.open("rb") as fh:
+            fh.read(1)
+        moved = probe.stat().st_atime > marker
+    except OSError as exc:
+        log.warning("could not probe access-time tracking in %s: %s", dir_path, exc)
+        return False
+    finally:
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("could not remove the access-time probe %s: %s", probe, exc)
+    return moved
+
+
+def _wait_for_state_read(path: Path, marker: float, deadline: float) -> bool:
+    """Poll until `path`'s access time moves past `marker`, or the deadline passes.
+
+    Args:
+        path: The state file whose access time was backdated to `marker`.
+        marker: The access time stamped on before the load hotkey was sent.
+        deadline: `time.monotonic` value to give up at.
+
+    Returns:
+        True once the access time has moved past `marker`, False on timeout or if the file goes
+        away first.
+    """
+    POLL_SECS = 0.1
+    while time.monotonic() < deadline:
+        try:
+            if path.stat().st_atime > marker:
+                return True
+        except OSError as exc:
+            log.warning("state %s went away while waiting for the load to read it: %s", path, exc)
+            return False
+        time.sleep(POLL_SECS)
+    return False
+
+
 def _restamp_slot(filename: str, slot: int) -> Optional[str]:
     """Rename a state for `slot`, keeping the game id and version that tie it to its game.
 
@@ -434,11 +604,12 @@ class Ppsspp(Emulator):
     the only hotkeys that reach PPSSPP through this container's input stack.
     Both files carry a UTF-8 BOM that the patcher strips and restores. Save
     and load are hotkey only: the game window is activated, the key is sent
-    through XTEST, and for a save the state directory is polled until the
-    file settles, since the hotkey gives no acknowledgement. There is no
+    through XTEST, and because the hotkey gives no acknowledgement, a save
+    polls the state directory until the file settles and a load watches the
+    state's access time until PPSSPP reads it back. There is no
     boot-time state-load flag, so a resume always goes through a deferred
-    thread that waits for the state file and then sends the load hotkey once
-    the window has been up long enough.
+    thread that waits for the state file, polls for the game window, and only
+    then sends the load hotkey.
 
     Save data (`SAVEDATA`) and states (`PPSSPP_STATE`) both ride the save
     archive. A state is named for the game id and version, so pushed names
@@ -536,7 +707,7 @@ class Ppsspp(Emulator):
             return None
         return result.stdout
 
-    def _game_window(self) -> Optional[str]:
+    def _game_window(self, log_missing: bool = True) -> Optional[str]:
         """Find the window this launch is running the game in.
 
         Two things have to hold. The window must belong to the process this
@@ -545,6 +716,11 @@ class Ppsspp(Emulator):
         save hotkey, and its title must carry `_GAME_TITLE_MARK`, which
         PPSSPP only appends once a game is loaded: before that the window is
         a menu a hotkey does nothing useful to.
+
+        Args:
+            log_missing: Whether a miss is worth a warning. Off while polling
+                a booting emulator, where a miss is the expected answer until
+                the game comes up.
 
         Returns:
             The X window id as xdotool prints it, or None when this launch has no game window up.
@@ -562,8 +738,25 @@ class Ppsspp(Emulator):
             name = self._xdotool("getwindowname", win_id)
             if name and _GAME_TITLE_MARK in name:
                 return win_id
-        log.warning("no ppsspp game window found for pid %s", proc.pid)
+        if log_missing:
+            log.warning("no ppsspp game window found for pid %s", proc.pid)
         return None
+
+    def _wait_for_game_window(self, deadline: float) -> bool:
+        """Poll until this launch has a game window up, or `deadline` passes.
+
+        Args:
+            deadline: `time.monotonic` value to give up at.
+
+        Returns:
+            True once `_game_window` names a window, False on timeout.
+        """
+        POLL_SECS = 1.0
+        while time.monotonic() < deadline:
+            if self._game_window(log_missing=False) is not None:
+                return True
+            time.sleep(POLL_SECS)
+        return self._game_window(log_missing=False) is not None
 
     def _send_key(self, key: str) -> bool:
         """Focus the game window and send `key` through XTEST.
@@ -595,6 +788,10 @@ class Ppsspp(Emulator):
         Args:
             rom_path: The ROM to boot.
             resume_slot: Slot to resume from, or None to boot clean.
+
+        Raises:
+            RuntimeError: When either ini could not be patched, so nothing is
+                spawned; see `_patch_ini_file`.
         """
         self.stop()
         _patch_config()
@@ -613,12 +810,16 @@ class Ppsspp(Emulator):
             Thread(target=self._deferred_load_state, args=(seq,), daemon=True).start()
 
     def _deferred_load_state(self, seq: int) -> None:
-        """Wait for the resume state to arrive, then load it over the hotkey.
+        """Wait for the resume state and a booted game, then load it over the hotkey.
 
-        Gives the file `RESUME_LOAD_WAIT` to appear, then `RESUME_LOAD_SETTLE`
-        for the window to be ready. Abandons itself whenever `seq` no longer
-        matches the current launch, so a superseded launch never gets a stray
-        load.
+        Both waits share `RESUME_LOAD_WAIT`. The window wait is the
+        load-bearing one: a resume state restored from the save archive is
+        already on disk when the thread starts, so waiting only on the file
+        would fire the one hotkey this path ever sends seconds into a boot
+        with no window to take it, losing the resume silently. Once the game
+        window is up, `RESUME_LOAD_SETTLE` covers the rest of PPSSPP's own
+        boot. Abandons itself whenever `seq` no longer matches the current
+        launch, so a superseded launch never gets a stray load.
 
         Args:
             seq: The launch sequence number this load belongs to.
@@ -630,11 +831,19 @@ class Ppsspp(Emulator):
         if self._launch_seq != seq:
             log.info("resume: launch superseded, load abandoned")
             return
+        if not self._wait_for_game_window(deadline):
+            log.warning("resume: no game window came up in time, load abandoned")
+            return
+        if self._launch_seq != seq:
+            log.info("resume: launch superseded, load abandoned")
+            return
         time.sleep(RESUME_LOAD_SETTLE)
         if self._launch_seq != seq:
             return
-        ok = self.load_state(STATE_SLOT)
-        log.info("resume: deferred load %s", "delivered" if ok else "failed")
+        if self.load_state(STATE_SLOT):
+            log.info("resume: deferred load delivered")
+        else:
+            log.warning("resume: deferred load failed, the session starts the game from scratch")
 
     def save_state(self, slot: int) -> bool:
         """Save a state into the broker's slot over the hotkey and wait for it to land.
@@ -642,6 +851,10 @@ class Ppsspp(Emulator):
         `slot` is what RomM asked for and is ignored: this saves into
         `STATE_SLOT` and the caller reads the effective slot back off
         `state_slot`.
+
+        The screenshot PPSSPP writes beside the state is waited on too, since
+        a save reported done is what sends RomM to fetch the thumbnail. A
+        screenshot that never settles does not fail the save.
 
         Args:
             slot: The slot RomM requested; not used.
@@ -653,24 +866,54 @@ class Ppsspp(Emulator):
         before = _snapshot()
         if not self._send_key(SAVE_KEY):
             return False
-        return _wait_for_state_write(before, time.monotonic() + STATE_WAIT)
+        if not _wait_for_state_write(before, time.monotonic() + STATE_WAIT):
+            return False
+        state = self.state_path()
+        if state is not None:
+            _wait_for_screenshot(state, time.monotonic() + STATE_SHOT_WAIT)
+        return True
 
     def load_state(self, slot: int) -> bool:
-        """Load the broker's slot over the hotkey.
+        """Load the broker's slot over the hotkey and confirm PPSSPP read the state back.
 
         The hotkey is silent on an empty slot, so an absent file has to be
-        caught here or the caller reads a no-op as success.
+        caught here or the caller reads a no-op as success. A hotkey that was
+        sent is no proof either: PPSSPP swallows one that lands on an
+        unfocused window or a core still registering HLE modules, so the
+        state's access time is backdated first and the load only counts once a
+        read has moved it. The deserialize that read starts is unobservable,
+        and `LOAD_SETTLE` covers it rather than handing the caller a session
+        mid-restore.
 
         Args:
             slot: The slot RomM requested; the broker's `STATE_SLOT` is what gets loaded.
 
         Returns:
-            True when a state file exists and the hotkey was sent, False otherwise.
+            True once the state has been read back and settled, False when the slot is empty,
+            the hotkey could not be sent, or nothing read the state within `LOAD_WAIT`.
         """
-        if self.state_path() is None:
+        state = self.state_path()
+        if state is None:
             log.warning("load state: slot %d holds no state file", STATE_SLOT)
             return False
-        return self._send_key(LOAD_KEY)
+        marker = _backdate_atime(state) if _atime_tracked(STATE_DIR) else None
+        if not self._send_key(LOAD_KEY):
+            log.warning("load state: could not send the load hotkey for %s", state.name)
+            return False
+        if marker is None:
+            log.warning(
+                "load state: %s cannot be confirmed, nothing tracks access times under %s",
+                state.name,
+                STATE_DIR,
+            )
+            time.sleep(LOAD_SETTLE)
+            return True
+        if not _wait_for_state_read(state, marker, time.monotonic() + LOAD_WAIT):
+            log.warning("load state: ppsspp never read %s back within %.1fs", state.name, LOAD_WAIT)
+            return False
+        time.sleep(LOAD_SETTLE)
+        log.info("load state: %s read back and settled", state.name)
+        return True
 
     def state_path(self) -> Optional[Path]:
         """Return the newest state file in the broker's slot, or None when it holds nothing."""
@@ -685,22 +928,34 @@ class Ppsspp(Emulator):
         return shot if shot.is_file() else None
 
     def clear_working_slot(self) -> None:
-        """Delete every state in the broker's slot, and its screenshot, before a new session boots.
+        """Delete everything the broker's slot holds before a new session boots.
 
         A state is named for the game it was taken from, and the game id only
         comes off the running disc, so a leftover cannot be told apart from
         the state of the game about to boot. Anything still here belongs to a
         session that has already exited and whose states RomM holds.
+
+        The staging file goes with them. A session killed mid-save leaves one
+        behind with no state to pair it against, and the save archive sweeps
+        up whatever sits in the state tree, so it would ship to RomM as a
+        state of its own. So would a screenshot whose state is already gone,
+        which is why those are swept by name rather than only alongside the
+        state they belong to.
         """
         if not STATE_DIR.is_dir():
             return
-        for stale in STATE_DIR.glob(f"*_{STATE_SLOT}.ppst"):
-            try:
-                stale.unlink()
-                stale.with_suffix(".jpg").unlink(missing_ok=True)
-                log.info("cleared stale state %s", stale.name)
-            except OSError as exc:
-                log.warning("could not clear stale state %s: %s", stale.name, exc)
+        patterns = (
+            f"*_{STATE_SLOT}.ppst",
+            f"*_{STATE_SLOT}.ppst{_STAGING_SUFFIX}",
+            f"*_{STATE_SLOT}.jpg",
+        )
+        for pattern in patterns:
+            for stale in STATE_DIR.glob(pattern):
+                try:
+                    stale.unlink()
+                    log.info("cleared stale state file %s", stale.name)
+                except OSError as exc:
+                    log.warning("could not clear stale state file %s: %s", stale.name, exc)
 
     def state_target(self, filename: str) -> Optional[Path]:
         """Map a pushed state's filename to where it may be written.

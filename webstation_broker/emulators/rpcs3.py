@@ -1197,6 +1197,32 @@ def _state_snapshot(serial: Optional[str]) -> dict:
     return snap
 
 
+def _all_state_files() -> dict[Path, tuple[int, float]]:
+    """Every savestate currently under SSTATE_ROOT, keyed by path.
+
+    A boot target whose title id only PINE can supply reaches
+    `Rpcs3.clear_working_slot` with nothing to scope a clear to, so by the
+    time the id is known the title's dir can hold both a previous session's
+    leftovers and this session's restored states. A snapshot taken before the
+    restore ran is what tells the two apart.
+
+    Returns:
+        Path to (size, mtime) for every state file, empty when SSTATE_ROOT
+        does not exist or cannot be listed.
+    """
+    snap: dict[Path, tuple[int, float]] = {}
+    if not SSTATE_ROOT.is_dir():
+        return snap
+    try:
+        title_dirs = [d for d in SSTATE_ROOT.iterdir() if d.is_dir()]
+    except OSError as exc:
+        log.warning("rpcs3: could not list %s to record leftover savestates: %s", SSTATE_ROOT, exc)
+        return snap
+    for d in title_dirs:
+        snap.update(_state_snapshot(d.name))
+    return snap
+
+
 def _newest_state(serial: Optional[str]) -> Optional[Path]:
     """Newest state file for `serial`.
 
@@ -1221,17 +1247,218 @@ def _changed_state(serial: Optional[str], before: dict) -> Optional[Path]:
     return best[1] if best is not None else None
 
 
-def _wait_for_state_write(serial: Optional[str], before: dict, deadline: float) -> Optional[Path]:
+def _clear_leftover_states(title_id: str, before: dict) -> None:
+    """Drop savestates that predate a deferred clear's pre-restore snapshot.
+
+    clear_working_slot could not scope its clear to `title_id` because the
+    id was not readable from the boot target's path, so whatever the
+    archive restore just wrote and whatever a stale, never-cleared previous
+    session left behind now sit in the same dir. Anything still matching an
+    entry in `before` unchanged was never touched by the restore and is
+    dropped; anything new or changed is the restore's (or this session's
+    own) and stays.
+
+    Args:
+        title_id: The title id now known for this session.
+        before: The pre-restore snapshot from `_all_state_files`.
+    """
+    for p, stamp in _state_snapshot(title_id).items():
+        if before.get(p) != stamp:
+            continue
+        try:
+            p.unlink()
+        except OSError as exc:
+            log.warning("rpcs3: could not clear leftover savestate %s: %s", p, exc)
+        else:
+            log.debug("rpcs3: cleared leftover savestate %s for %s", p, title_id)
+
+
+def _clear_stale_save_data() -> None:
+    """Empty the cellSaveData and cellGameData trees before an archive restore.
+
+    A restore only writes the members the incoming archive happens to name, so
+    an earlier session's save dirs otherwise survive into this one: readable by
+    the next player, and swept into that player's exit dump by the restamp in
+    `save_and_exit`, which ships a session save dir whole rather than
+    file by file.
+
+    Every dir under home/00000001/savedata and every cellGameData dir under
+    game/ goes, not just the incoming title's: a dir named for another title
+    holds another player's data just the same, and `_session_save_dirs` can
+    select one of those by its mtime alone. Savestates are handled separately
+    (see `clear_working_slot`), and installed PKG titles are not save data,
+    which is why the listing comes from `_gamedata_dirs`.
+    """
+    targets: list[Path] = []
+    savedata = USER_HOME / "savedata"
+    if savedata.is_dir():
+        try:
+            targets.extend(savedata.iterdir())
+        except OSError as exc:
+            log.warning("rpcs3: could not list %s to clear stale save data: %s", savedata, exc)
+    targets.extend(_gamedata_dirs())
+    cleared = 0
+    for entry in targets:
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+        except OSError as exc:
+            log.warning("rpcs3: could not clear stale save data %s: %s", entry, exc)
+        else:
+            cleared += 1
+            log.debug("rpcs3: cleared stale save data %s", entry)
+    if cleared:
+        log.info("rpcs3: cleared %d stale save data dir(s) before the restore", cleared)
+
+
+def _boot_roots() -> tuple[Path, ...]:
+    """The resolved trees a boot target is allowed to live in.
+
+    Resolved per call rather than at import: every one of them is env-derived,
+    and a bind or NFS layout routinely makes one a symlink, which an
+    unresolved comparison would reject every launch on.
+
+    Returns:
+        The ROM library, the game install dir, the extraction cache and the
+        savestate root, minus any that cannot be resolved at all.
+    """
+    roots: list[Path] = []
+    for root in (settings.rom_root(), GAME_DIR, CACHE_DIR, SSTATE_ROOT):
+        try:
+            roots.append(root.resolve())
+        except OSError as exc:
+            log.warning("rpcs3: could not resolve the boot root %s: %s", root, exc)
+    return tuple(roots)
+
+
+def _verify_boot_target(target: Path) -> None:
+    """Refuse a boot target resolving outside every tree the broker owns.
+
+    The ROM path is contained when it is resolved, but each branch that turns
+    it into a boot target reads a fresh path back off the disk afterwards: a
+    PKG install names its EBOOT by title id, an extraction is searched for
+    one, and a resume picks a savestate. A symlink at any of those steps
+    points rpcs3 at a file the library never held.
+
+    Args:
+        target: The final boot target, about to be spawned.
+
+    Raises:
+        RuntimeError: If it resolves outside the ROM library, the game install
+            dir, the extraction cache and the savestate root.
+    """
+    try:
+        real = target.resolve()
+    except OSError as exc:
+        log.error("rpcs3: could not resolve the boot target %s: %s", target, exc)
+        raise RuntimeError(f"could not resolve the boot target {target}: {exc}") from exc
+    roots = _boot_roots()
+    if any(real.is_relative_to(root) for root in roots):
+        return
+    log.error(
+        "rpcs3: refusing to boot %s, it resolves to %s outside %s",
+        target, real, ", ".join(str(r) for r in roots),
+    )
+    raise RuntimeError(f"boot target {target} resolves outside the rom and data dirs")
+
+
+def _launch_pids(pid: Optional[int]) -> list[int]:
+    """Every pid in the launch `pid` leads, itself included.
+
+    RPCS3_BIN is the AppImage's AppRun wrapper and the emulator runs as a
+    child of it, so the handle the broker holds is not the process that
+    writes a savestate and its own descriptor list says nothing about the
+    write. `_spawn` starts the wrapper in a session of its own, which makes
+    the process group the way to name the whole launch.
+
+    Args:
+        pid: The process group leader, or None when the broker holds no
+            handle on it.
+
+    Returns:
+        The pids sharing `pid`'s process group, or just `pid` when /proc
+        cannot be scanned.
+    """
+    if pid is None:
+        return []
+    try:
+        pgid = os.getpgid(pid)
+        found = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            candidate = int(entry.name)
+            try:
+                if os.getpgid(candidate) == pgid:
+                    found.append(candidate)
+            except OSError:
+                continue
+    except OSError as exc:
+        log.debug("rpcs3: could not scan /proc for the process group of pid %s: %s", pid, exc)
+        return [pid]
+    return found or [pid]
+
+
+def _holds_open(pid: Optional[int], path: Path) -> bool:
+    """Tell whether the launch `pid` leads still has `path` open.
+
+    A file the writer has not closed yet is a write still in flight, however
+    long its size happens to sit still: RPCS3 compresses a state as it writes
+    it, and a busy or stalled host can leave the file the same size for a
+    full poll window mid-write.
+
+    Args:
+        pid: The emulator process, or None when the broker holds no handle on it.
+        path: The state file being watched.
+
+    Returns:
+        True only when the descriptor is confirmed open. No pid, a `/proc`
+        that cannot be read, and a process already gone all read as False, so
+        the size test stays the answer where this one cannot contribute.
+    """
+    target = os.path.realpath(path)
+    for candidate in _launch_pids(pid):
+        try:
+            for fd in Path(f"/proc/{candidate}/fd").iterdir():
+                try:
+                    if os.path.realpath(fd) == target:
+                        return True
+                except OSError:
+                    continue
+        except OSError as exc:
+            log.debug(
+                "rpcs3: could not read the open files of pid %s for %s: %s", candidate, path, exc
+            )
+    return False
+
+
+def _wait_for_state_write(
+    serial: Optional[str],
+    before: dict,
+    deadline: float,
+    pid: Optional[int] = None,
+) -> Optional[Path]:
     """Poll until the title's savestate write stabilizes, or the deadline passes.
 
-    A new/changed file's size must hold steady for STABLE_SECS to count as
-    finished.
+    A write counts as finished once the file is non-empty, rpcs3 has closed
+    it, and its size has held steady for STABLE_SECS. RPCS3 exiting is not
+    itself proof the write finished: the hotkey ends the process once the
+    state is captured, but nothing here can tell whether compression to disk
+    still trails that. Size alone is not proof either, since an emulator
+    stalled mid-write holds a steady size over a truncated file, and a state
+    that has only been created is zero bytes of nothing.
 
-    RPCS3 exiting is not itself proof the write finished: the hotkey ends
-    the process once the state is captured, but nothing here can tell
-    whether compression to disk still trails that. Polling the file's own
-    size is the only confirmation there is, the same as every other
-    emulator's write-confirmation loop.
+    Args:
+        serial: Title id scoping the state dir to watch.
+        before: Snapshot from `_state_snapshot` taken before the hotkey was sent.
+        deadline: `time.monotonic` value to give up at.
+        pid: The running rpcs3 process, whose open descriptors say whether the
+            write has finished; None falls back to the size test alone.
+
+    Returns:
+        The settled state file, or None on timeout.
     """
     STABLE_SECS = 0.5
     POLL_SECS = 0.2
@@ -1252,12 +1479,22 @@ def _wait_for_state_write(serial: Optional[str], before: dict, deadline: float) 
             target, last_size, stable_since = p, size, time.monotonic()
         elif size != last_size:
             last_size, stable_since = size, time.monotonic()
-        elif stable_since is not None and time.monotonic() - stable_since >= STABLE_SECS:
+        elif (
+            stable_since is not None
+            and time.monotonic() - stable_since >= STABLE_SECS
+            and last_size
+            and not _holds_open(pid, target)
+        ):
             log.info("save state write complete: %s (%d bytes)", target.name, last_size)
             return target
         time.sleep(POLL_SECS)
     if target is not None:
-        log.warning("save state write never stabilized within timeout: %s", target)
+        log.warning(
+            "save state write never settled before the deadline: %s (%s bytes, pid %s)",
+            target,
+            last_size,
+            pid,
+        )
     return None
 
 
@@ -1357,6 +1594,14 @@ class Rpcs3(Emulator):
     save_root = DEV_HDD0
     state_subtrees = ("savestates",)
     """States land under the symlinked `savestates` dir; see `_ensure_sstate_link`."""
+    clears_stale_saves = True
+    """On: `clear_working_slot` empties every cellSaveData and cellGameData dir.
+
+    Savestates are the one part of the tree cleared per title rather than
+    whole, since a title the session never boots can hold states no dump has
+    carried off yet; the ones a session cannot scope by title id are handled
+    by `_clear_leftover_states` once PINE names the title.
+    """
     _restoring = False
     _pending_rom: Optional[Path] = None
     """Boot target this activate resolved, or None when none was resolved.
@@ -1367,6 +1612,13 @@ class Rpcs3(Emulator):
     about to boot.
     """
     _session_serial: Optional[str] = None
+    _leftover_snapshot: Optional[dict] = None
+    """Pre-restore savestate snapshot from clear_working_slot, or None.
+
+    Only set when clear_working_slot ran without a title id to scope its
+    clear to (a bare .iso or an archive). Consumed and cleared the moment
+    this session's title id becomes known, by _clear_leftover_states.
+    """
     _session_start: Optional[float] = None
     """Wall clock at launch, or None when nothing has been launched in this process.
 
@@ -1398,7 +1650,13 @@ class Rpcs3(Emulator):
         return tuple(e for e in ROM_EXTENSIONS if e not in _ARCHIVE_EXTS)
 
     def clear_working_slot(self) -> None:
-        """Create the savestates symlink and drop this title's stale savestates.
+        """Create the savestates symlink and drop the last session's saves and states.
+
+        Save data goes first and goes whole (`_clear_stale_save_data`): a save
+        dir is not scoped to the incoming title the way a savestate dir is, and
+        the exit dump ships a session save dir whole, so a previous player's
+        untouched files left sitting in one would leave in this player's
+        archive.
 
         RPCS3 has no fixed slot to clear, but activate() calls this before
         it ever reads save_subtrees to restore an archive, which makes it the
@@ -1420,10 +1678,13 @@ class Rpcs3(Emulator):
         restore extract before it ever calls prepare_restore().
         """
         _ensure_sstate_link()
+        _clear_stale_save_data()
         self._restoring = True
+        self._leftover_snapshot = None
         rom = self._pending_rom
         title_id = _rom_title_id(rom) if rom is not None else None
         if title_id is None:
+            self._leftover_snapshot = _all_state_files()
             log.info(
                 "rpcs3: no title id for %s, leaving savestates untouched",
                 rom.name if rom is not None else "an unresolved rom",
@@ -1523,11 +1784,50 @@ class Rpcs3(Emulator):
         return result.stdout
 
     def _game_window(self) -> Optional[str]:
+        """The render window belonging to this session's rpcs3, or None.
+
+        The class is shared by every rpcs3 on the display, so a zombie left by
+        a session that failed to die answers the search too, and the first
+        match is as likely to be that one as this one: a save hotkey sent
+        there saves nothing and never returns a state. `xdotool search --pid`
+        cannot make the distinction either, because AppRun runs the emulator
+        as a child and the window's pid is the child's, not the handle's, so
+        the launch process group is what names it.
+
+        Returns:
+            The matching window id. A window whose pid cannot be read at all
+            is taken over nothing, since a display with one rpcs3 on it and no
+            readable pid is the ordinary case on an X server without
+            _NET_WM_PID.
+        """
         out = self._xdotool("search", "--class", _WINDOW_CLASS)
         if not out:
             log.warning("no rpcs3 window found")
             return None
-        return out.split()[0]
+        win_ids = out.split()
+        pids = set(_launch_pids(self._proc.pid if self._proc is not None else None))
+        unknown: list[str] = []
+        for win_id in win_ids:
+            pid_out = self._xdotool("getwindowpid", win_id)
+            owner = pid_out.strip() if pid_out else ""
+            if not owner.isdigit():
+                unknown.append(win_id)
+                continue
+            if int(owner) in pids:
+                return win_id
+        if unknown:
+            log.warning(
+                "rpcs3 window %s reports no pid, sending to it anyway (launch pids: %s)",
+                unknown[0],
+                ", ".join(str(p) for p in sorted(pids)) or "none",
+            )
+            return unknown[0]
+        log.warning(
+            "no rpcs3 window belongs to this launch (windows: %s, launch pids: %s)",
+            ", ".join(win_ids),
+            ", ".join(str(p) for p in sorted(pids)) or "none",
+        )
+        return None
 
     def _send_key(self, key: str) -> bool:
         """Focus the render window and send `key` through XTEST.
@@ -1553,6 +1853,11 @@ class Rpcs3(Emulator):
         Args:
             rom_path: RomM's resolved rom path (file or directory).
             resume_slot: Slot to resume from, or None for a fresh boot.
+
+        Raises:
+            RuntimeError: If the PKG install or the archive extraction fails,
+                or the boot target it produced resolves outside the ROM
+                library and the emulator's own data dirs.
         """
         self.stop()
         self._restoring = False
@@ -1584,6 +1889,10 @@ class Rpcs3(Emulator):
         else:
             self._session_serial = None
 
+        if self._session_serial and self._leftover_snapshot is not None:
+            _clear_leftover_states(self._session_serial, self._leftover_snapshot)
+            self._leftover_snapshot = None
+
         # RPCS3 has no boot-time state-load flag of its own, but it detects a
         # savestate by magic bytes regardless of what is passed as the boot
         # target, so pointing it at the state file IS the boot-time load.
@@ -1604,6 +1913,7 @@ class Rpcs3(Emulator):
                 else:
                     target = state
 
+        _verify_boot_target(target)
         self._session_start = time.time()
         log.info(
             "launching rpcs3 (rom=%s, boot=%s, serial=%s)",
@@ -1640,6 +1950,9 @@ class Rpcs3(Emulator):
                     if title:
                         self._session_serial = title
                         log.info("boot watchdog: resolved title id %s via PINE", title)
+                        if self._leftover_snapshot is not None:
+                            _clear_leftover_states(title, self._leftover_snapshot)
+                            self._leftover_snapshot = None
                 return
             time.sleep(1.0)
 
@@ -1675,7 +1988,10 @@ class Rpcs3(Emulator):
                     log.warning("save-and-exit: could not send the save-state hotkey")
                 else:
                     p = _wait_for_state_write(
-                        self._session_serial, before, time.monotonic() + STATE_WAIT
+                        self._session_serial,
+                        before,
+                        time.monotonic() + STATE_WAIT,
+                        self._proc.pid if self._proc is not None else None,
                     )
                     if p is None:
                         log.warning("save-and-exit: no new state file appeared")

@@ -113,7 +113,8 @@
   "psp": {
     "core": "ppsspp",
     "assets": {"PPSSPP": "/usr/share/ppsspp/assets"},
-    "extensions": [".iso", ".cso", ".pbp", ".chd", ".elf", ".prx"]
+    "extensions": [".iso", ".cso", ".pbp", ".chd", ".elf", ".prx"],
+    "resume_settle": 12.0
   },
   "tg16": {
     "core": "mednafen_pce",

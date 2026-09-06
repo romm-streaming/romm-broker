@@ -13,12 +13,22 @@ before the process exits. The write is confirmed by diffing the directory
 across `stop()`. The resume state is the only state a shutdown produces, so
 it doubles as the broker's save state; the slot number is carried only for
 API symmetry.
+
+Ownership: `savestates/` is flat and shared by every title, and the broker
+never reads a disc's serial, so it records its own `<state>.rom` marker
+beside each state it confirms. That marker, not the filename, is what ties a
+state to the disc that produced it on the next resume. Markers ride the save
+archive with the states they name.
+
+A shutdown the broker had to force-kill may have torn the state mid-write.
+Such a state is set aside under `UNTRUSTED_SUFFIX` rather than destroyed: it
+can be the only copy of the player's progress, and only the resume path
+needs to be kept away from it.
 """
 
 import logging
 import os
 import re
-import signal
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Optional
@@ -239,17 +249,107 @@ def _resume_snapshot() -> dict[Path, tuple[int, float]]:
 _RESUME_SUFFIX = "_resume.sav"
 """Suffix DuckStation appends to a game's serial when it writes a resume state."""
 
+OWNER_SUFFIX = ".rom"
+"""Suffix of the marker file recording which disc a resume state belongs to.
+
+The marker sits beside the state it names, holds the booted disc's resolved
+path, and rides the save archive with it. It does not match `*_resume.sav`,
+so it is never mistaken for a state.
+"""
+
+UNTRUSTED_SUFFIX = ".untrusted"
+"""Suffix a resume state is renamed with when a force-killed exit may have torn it.
+
+The file is only suspected of being incomplete, never known to be, so it is
+set aside under this name rather than deleted. It stops matching
+`*_resume.sav`, so neither `clear_working_slot` nor a resume can pick it up,
+and it rides the save archive as ordinary save data (see `save_file_kind`),
+which is what makes it recoverable at all: SSTATE_DIR does not outlive the
+container.
+"""
+
+
+def _rom_identity(rom: Path) -> str:
+    """The disc identity an owner marker records.
+
+    Args:
+        rom: The disc image or playlist the session booted.
+
+    Returns:
+        The resolved absolute path as text, so the same disc matches across
+        sessions while two discs of one title stay distinct.
+    """
+    try:
+        return str(rom.resolve())
+    except OSError as exc:
+        log.warning("duckstation: could not resolve %s for its state marker: %s", rom, exc)
+        return str(rom)
+
+
+def _owner_marker(state: Path) -> Path:
+    """The owner marker path belonging to a resume state."""
+    return state.with_name(state.name + OWNER_SUFFIX)
+
+
+def _state_owner(state: Path) -> Optional[str]:
+    """The disc identity recorded for a resume state.
+
+    Args:
+        state: The resume state to look up.
+
+    Returns:
+        The identity in its marker, or None when the state carries no
+        readable marker.
+    """
+    marker = _owner_marker(state)
+    try:
+        recorded = marker.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        log.warning("duckstation: could not read the state marker %s: %s", marker, exc)
+        return None
+    return recorded or None
+
+
+def _write_owner_marker(state: Path, rom: Optional[Path]) -> None:
+    """Record which disc wrote a resume state, so a later resume can identify it.
+
+    A failure is logged and stepped over: an unmarked state still ships in
+    the archive and still resumes when it is the only one there, so the cost
+    is a resume that may later be refused as ambiguous, not lost progress.
+
+    Args:
+        state: The resume state this exit confirmed.
+        rom: The disc the session booted, or None when no launch on this
+            object recorded one.
+    """
+    if rom is None:
+        log.warning(
+            "duckstation: no rom recorded for this session, leaving %s unmarked", state.name
+        )
+        return
+    marker = _owner_marker(state)
+    try:
+        marker.write_text(_rom_identity(rom) + "\n", encoding="utf-8")
+    except OSError as exc:
+        log.warning("duckstation: could not mark %s as belonging to %s: %s", state.name, rom, exc)
+    else:
+        log.info("marked resume state %s as belonging to %s", state.name, rom)
+
 
 def _resume_state_for(rom: Path) -> Optional[Path]:
     """The resume state belonging to the disc about to boot, if it can be told.
 
-    `savestates/` is flat and shared by every title, and the serial in the
-    filename is the only thing tying a state to its game. The broker never
-    reads the disc's serial, so a state is claimed either because its serial
-    appears in the ROM's own path or because it is the only one left in a
-    directory `clear_working_slot` empties every session. Anything else is
-    ambiguous, and booting clean costs a resume where handing DuckStation
-    another game's state costs the player their save.
+    `savestates/` is flat and shared by every title and the broker never
+    reads a disc's serial, so a filename says nothing about ownership. The
+    marker the last confirmed exit wrote does, and it is matched exactly: a
+    state marked for a different disc is never claimed, and a name that
+    merely resembles the ROM's path is never enough on its own. A lone
+    unmarked state is still taken, which is what carries archives written
+    before markers existed. Anything past that is ambiguous, and booting
+    clean costs a resume where handing DuckStation another game's state
+    costs the player their save.
 
     Args:
         rom: The disc image or playlist about to boot.
@@ -258,22 +358,34 @@ def _resume_state_for(rom: Path) -> Optional[Path]:
         The state to pass to `-statefile`, or None when there is none or the
         choice cannot be made.
     """
-    states = sorted(_resume_snapshot())
+    snapshot = _resume_snapshot()
+    states = sorted(snapshot)
     if not states:
         return None
-    haystack = str(rom).upper()
-    named = [
-        p
-        for p in states
-        # A serial-less name would match every path, so it identifies nothing.
-        if p.name[: -len(_RESUME_SUFFIX)] and p.name[: -len(_RESUME_SUFFIX)].upper() in haystack
-    ]
-    if len(named) == 1:
-        return named[0]
-    if len(states) == 1:
+    identity = _rom_identity(rom)
+    owners = {p: _state_owner(p) for p in states}
+    owned = [p for p in states if owners[p] == identity]
+    if owned:
+        # Several markers for one disc means a swap wrote more than one
+        # serial; the newest is where the player actually left off.
+        best = max(owned, key=lambda p: snapshot[p][1])
+        if len(owned) > 1:
+            log.info(
+                "duckstation: %d resume states marked for %s, resuming the newest (%s)",
+                len(owned),
+                rom.name,
+                best.name,
+            )
+        return best
+    if len(states) == 1 and owners[states[0]] is None:
+        log.info(
+            "duckstation: resuming %s, the only state in %s, though it carries no owner marker",
+            states[0].name,
+            SSTATE_DIR,
+        )
         return states[0]
     log.error(
-        "duckstation: %d resume states in %s and none identifies %s, booting clean: %s",
+        "duckstation: %d resume states in %s and none is marked for %s, booting clean: %s",
         len(states),
         SSTATE_DIR,
         rom.name,
@@ -348,22 +460,81 @@ class Duckstation(Emulator):
     give it room before the SIGKILL escalation discards it.
     """
 
+    def __init__(self) -> None:
+        """Initialize the emulator with no disc booted yet."""
+        super().__init__()
+        self._rom_path: Optional[Path] = None
+
+    def save_file_kind(self, rel: str) -> str:
+        """Classify an archive member for the manifest.
+
+        The subtree default labels everything under `savestates/` a state,
+        which would offer RomM the broker's own owner markers and the states
+        a force-killed exit set aside as states the player can pick. Neither
+        is loadable, so both ride the archive as opaque save data instead.
+
+        Args:
+            rel: The member path, relative to `save_root` and posix-separated.
+
+        Returns:
+            One of the kinds `Emulator.save_file_kind` defines.
+        """
+        if rel.lower().endswith((OWNER_SUFFIX, UNTRUSTED_SUFFIX)):
+            return "save"
+        return super().save_file_kind(rel)
+
     def clear_working_slot(self) -> None:
-        """Drop every resume state left in SSTATE_DIR before a restore.
+        """Drop every resume state and owner marker left in SSTATE_DIR before a restore.
 
         All titles share one flat directory, and the broker cannot read the
         booting disc's serial to tell which state is its own. Emptying the
-        directory here is what leaves `_resume_state_for` a single candidate
-        it can trust.
+        directory here is what leaves the incoming archive's states, and the
+        markers restored beside them, as the only pairs a resume can see. A
+        marker outliving its state would be worse than none: DuckStation
+        reuses a serial's filename, so the next state written under that name
+        would inherit an ownership claim nothing verified.
+
+        States set aside under `UNTRUSTED_SUFFIX` are left alone. They can be
+        the only copy of that progress and no resume can pick them up anyway.
         """
         if not SSTATE_DIR.is_dir():
             return
-        for stale in SSTATE_DIR.glob("*_resume.sav"):
-            try:
-                stale.unlink()
-                log.info("cleared stale resume state %s", stale.name)
-            except OSError as exc:
-                log.warning("could not clear stale resume state %s: %s", stale.name, exc)
+        patterns = (f"*{_RESUME_SUFFIX}", f"*{_RESUME_SUFFIX}{OWNER_SUFFIX}")
+        for pattern in patterns:
+            for stale in SSTATE_DIR.glob(pattern):
+                try:
+                    stale.unlink()
+                    log.info("cleared stale resume state %s", stale.name)
+                except OSError as exc:
+                    log.warning("could not clear stale resume state %s: %s", stale.name, exc)
+
+    def _set_aside_untrusted_state(self, path: Path) -> None:
+        """Rename a resume state a force-killed exit may have torn, marker and all.
+
+        Size and mtime are all the broker has to judge a state by, and that
+        is enough to refuse to resume from one but not enough to destroy what
+        can be the only copy of the player's progress, so the file is moved
+        to an `UNTRUSTED_SUFFIX` sidecar instead of unlinked. Its marker
+        travels with it: left behind it would claim the next state DuckStation
+        writes under the same serial.
+
+        Args:
+            path: The resume state to move aside.
+        """
+        aside = path.with_name(path.name + UNTRUSTED_SUFFIX)
+        try:
+            path.replace(aside)
+        except OSError as exc:
+            log.warning("could not set aside untrusted resume state at %s: %s", path, exc)
+            return
+        log.warning("set aside untrusted resume state at %s as %s", path, aside.name)
+        marker = _owner_marker(path)
+        if not marker.exists():
+            return
+        try:
+            marker.replace(_owner_marker(aside))
+        except OSError as exc:
+            log.warning("could not set aside the state marker %s: %s", marker, exc)
 
     def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """Resolve a RomM path to the disc image to boot.
@@ -395,7 +566,9 @@ class Duckstation(Emulator):
         The binary comes from env `DUCKSTATION_BIN` (default
         `/opt/duckstation/AppRun`). With `resume_slot` set, the resume state
         `_resume_state_for` claims for this disc is passed with `-statefile`;
-        a resume with no state on disk is logged and boots clean.
+        a resume with no state on disk is logged and boots clean. The disc is
+        recorded on the instance so the exit can mark the state it writes as
+        belonging to it.
 
         Args:
             rom_path: The disc image or playlist to boot.
@@ -418,6 +591,8 @@ class Duckstation(Emulator):
         cmd += ["--", str(rom_path)]
 
         log.info("launching duckstation (rom=%s, statefile=%s)", rom_path, state)
+        # The exit's owner marker names this disc, so it has to outlive launch().
+        self._rom_path = rom_path
         self._spawn(cmd, base_launch_env())
 
     def save_and_exit(self, slot: Optional[int]) -> dict[str, Any]:
@@ -425,7 +600,12 @@ class Duckstation(Emulator):
 
         The save is the graceful shutdown: the savestates directory is
         snapshotted, the process is stopped, and a resume state that appeared
-        or changed across the stop is reported as the saved state.
+        or changed across the stop is reported as the saved state and marked
+        as belonging to the booted disc.
+
+        A state a force-killed exit may have torn is neither reported nor
+        left where a resume can find it, but it is kept:
+        `_set_aside_untrusted_state` renames it rather than deleting it.
 
         Args:
             slot: The slot RomM asked for, echoed back unchanged; None reports no state even
@@ -445,39 +625,46 @@ class Duckstation(Emulator):
         # its resume state on every graceful shutdown regardless of `slot`;
         # an exit with no state requested only skips reporting it here, the
         # file still lands in the save archive dump since it is newer than
-        # the session baseline. We can only trust that write if SIGTERM was
-        # enough: a SIGKILL escalation (term_timeout exceeded), or stop()
-        # never confirming the process died at all, can cut the write off
-        # mid-flight. A killed process's changed file is discarded outright
-        # rather than just left unreported, since the archive dump sweeps up
-        # anything with a fresh mtime whether or not this method reports it.
-        killed = proc is None or proc.returncode is None or proc.returncode == -signal.SIGKILL
+        # the session baseline. We can only trust that write if SIGTERM ran
+        # its graceful shutdown to completion: death by any signal, not just
+        # a SIGKILL escalation, can cut the write off mid-flight (SIGTERM
+        # itself included, since term_timeout can still expire and force an
+        # OS-level SIGKILL after a hung shutdown). A killed process's changed
+        # file has to leave the resume path rather than just go unreported,
+        # since the archive dump sweeps up anything with a fresh mtime whether
+        # or not this method reports it.
+        killed = proc is None or proc.returncode is None or proc.returncode < 0
         if was_alive:
             p = _changed_resume_state(before)
+            # Both the set-aside and the marker are independent of `slot`:
+            # the file ships in the archive whatever this method reports.
             if killed:
-                # Independent of `slot`: DuckStation writes the state either
-                # way, and the archive dump sweeps it up by mtime whether or
-                # not this method reports it.
-                if p is not None:
+                if p is None:
+                    log.warning("duckstation had to be force-killed and wrote no resume state")
+                else:
                     log.warning(
-                        "duckstation had to be force-killed, discarding possibly-incomplete "
-                        "resume state %s",
+                        "duckstation had to be force-killed, setting aside the resume state "
+                        "%s it may have torn",
                         p.name,
                     )
-                    try:
-                        p.unlink()
-                    except OSError as exc:
-                        log.warning("could not discard incomplete resume state %s: %s", p, exc)
-            elif slot is None:
-                log.info("duckstation exited without a state requested, resume state left unreported")
+                    self._set_aside_untrusted_state(p)
             elif p is None:
-                log.warning("no resume state written during shutdown")
-            else:
-                try:
-                    st = p.stat()
-                except OSError as exc:
-                    log.warning("could not stat resume state %s: %s", p, exc)
+                if slot is None:
+                    log.info("duckstation exited without a state requested and wrote none")
                 else:
-                    saved = True
-                    state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
+                    log.warning("no resume state written during shutdown")
+            else:
+                _write_owner_marker(p, self._rom_path)
+                if slot is None:
+                    log.info(
+                        "duckstation exited without a state requested, resume state left unreported"
+                    )
+                else:
+                    try:
+                        st = p.stat()
+                    except OSError as exc:
+                        log.warning("could not stat resume state %s: %s", p, exc)
+                    else:
+                        saved = True
+                        state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
         return {"state_saved": saved, "state_slot": slot, "state_file": state_file}

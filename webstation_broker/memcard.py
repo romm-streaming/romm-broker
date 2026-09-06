@@ -59,7 +59,11 @@ def _is_blank_marker(path: Path, card: Path, marker: Optional[str]) -> bool:
         return False
     try:
         return path.stat().st_size == 0
-    except OSError:
+    except OSError as exc:
+        # Not the blank marker as far as this can tell, so the card counts as
+        # real and build_archive goes on to fail on the file rather than
+        # quietly reporting an empty slot RomM is free to wipe.
+        log.warning("memcard: could not stat the marker at %s: %s", path, exc)
         return False
 
 
@@ -112,8 +116,8 @@ def build_archive(card: Path, marker: Optional[str] = None) -> Optional[Union[by
     for p in files:
         try:
             total += p.stat().st_size
-        except OSError:
-            continue
+        except OSError as exc:
+            log.warning("memcard: could not size %s, leaving it out of the total: %s", p, exc)
     if total > SAVE_FILE_MAX_BYTES:
         log.warning("memcard: card exceeds size limit (%d bytes)", total)
         return "memory card exceeds size limit"
@@ -174,6 +178,7 @@ def replace(card: Path, content: bytes, marker: Optional[str] = None) -> Union[i
         staging = parent / f".{card.name}.new"
         backup = parent / f".{card.name}.old"
         shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(backup, ignore_errors=True)
         written = 0
         try:
             staging.mkdir(parents=True)
@@ -198,7 +203,7 @@ def replace(card: Path, content: bytes, marker: Optional[str] = None) -> Union[i
             if card.exists():
                 os.replace(card, backup)
             os.replace(staging, card)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
             shutil.rmtree(staging, ignore_errors=True)
             if not card.exists() and backup.exists():
                 try:

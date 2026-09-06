@@ -6,7 +6,9 @@ gate, and playlist-driven disc swapping.
 
 import json
 import logging
+import os
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -375,6 +377,30 @@ class TestResumeGate:
 
         assert emulator._playlist is None
 
+    def test_a_platform_without_an_override_uses_the_default_settle(
+        self, tmp_path: Path, _stub_launch: list[tuple[Any, ...]]
+    ) -> None:
+        """A platform with no resume_settle entry keeps the module default."""
+        emu = self._launch(tmp_path, 0)
+
+        assert emu._resume_settle == retroarch.RESUME_LOAD_SETTLE
+
+    def test_a_platform_override_replaces_the_default_settle(
+        self, tmp_path: Path, _stub_launch: list[tuple[Any, ...]]
+    ) -> None:
+        """PPSSPP's slower HLE boot needs longer than the default settle before a load.
+
+        A load issued before the core finishes registering its HLE event
+        table corrupts the resume instead of restoring it, so psp asks for
+        a longer wait via its platform table entry.
+        """
+        emu = retroarch.Retroarch()
+        emu.platform = "psp"
+        emu.launch(tmp_path / "game.iso", 0)
+
+        assert emu._resume_settle == retroarch.PLATFORMS["psp"]["resume_settle"]
+        assert emu._resume_settle != retroarch.RESUME_LOAD_SETTLE
+
 
 class TestPlaylistPreference:
     """A folder holding a playlist and its discs boots the playlist.
@@ -731,7 +757,7 @@ class TestSwapDisc:
         landing inside a swap's tray-settle window is the collision it
         guards against, and the same holds in reverse.
         """
-        monkeypatch.setattr(retroarch, "RESUME_LOAD_SETTLE", 0)
+        emulator._resume_settle = 0
         entered_lock = threading.Event()
         release_resume = threading.Event()
 
@@ -741,7 +767,7 @@ class TestSwapDisc:
             return True
 
         monkeypatch.setattr(emulator, "wait_for_state", fake_wait_for_state)
-        monkeypatch.setattr(emulator, "load_state", lambda slot: True)
+        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: True)
 
         t = threading.Thread(
             target=emulator._deferred_load_state, args=(0, emulator._launch_seq)
@@ -786,15 +812,16 @@ class TestStateSupport:
         monkeypatch.setattr(emu, "_send", lambda *a, **kw: None)
         monkeypatch.setattr(emu, "_quit", lambda: None)
 
-        def refuse(slot: int) -> bool:
-            raise AssertionError("save_state should not run for a core without states")
+        def refuse(lock_wait: float) -> bool:
+            raise AssertionError("the exit save should not run for a core without states")
 
-        monkeypatch.setattr(emu, "save_state", refuse)
+        monkeypatch.setattr(emu, "_save_into_slot", refuse)
 
         assert emu.save_and_exit(0) == {
             "state_saved": False,
             "state_slot": 0,
             "state_file": None,
+            "sram_flushed": False,
         }
 
     def test_a_core_that_cannot_save_logs_the_skipped_state(
@@ -812,6 +839,35 @@ class TestStateSupport:
 
         assert "not saving state on exit" in caplog.text
 
+    def test_a_confirmed_save_with_no_findable_state_file_is_not_reported_saved(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """`state_path()` returning None after a confirmed save downgrades `saved`, logged.
+
+        `_save_into_slot` returning True means RetroArch confirmed the write,
+        but if the state can't be found afterward there is no file for RomM's
+        exit dump to ship; reporting `state_saved: True` here would tell RomM
+        a state exists when it has nothing to serve.
+        """
+        emu = retroarch.Retroarch()
+        emu.platform = "snes"
+        monkeypatch.setattr(emu, "alive", lambda: True)
+        monkeypatch.setattr(emu, "_send", lambda *a, **kw: None)
+        monkeypatch.setattr(emu, "_quit", lambda: None)
+        monkeypatch.setattr(emu, "_save_into_slot", lambda lock_wait: True)
+        monkeypatch.setattr(emu, "state_path", lambda: None)
+
+        with caplog.at_level(logging.WARNING):
+            result = emu.save_and_exit(0)
+
+        assert result == {
+            "state_saved": False,
+            "state_slot": 0,
+            "state_file": None,
+            "sram_flushed": False,
+        }
+        assert "no state file could be found" in caplog.text
+
     def test_the_running_core_is_named_for_the_archive(self) -> None:
         """The archive manifest names the core actually running the game."""
         emu = retroarch.Retroarch()
@@ -825,76 +881,168 @@ class TestStateSupport:
 
 
 class TestClearWorkingSlot:
-    """Clearing the broker's slot so one player's state never resumes for the next."""
+    """Emptying the save tree so one player's saves and states never reach the next."""
 
     @pytest.fixture
-    def state_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-        """Point STATE_DIR at a throwaway directory in the broker's slot 0.
+    def emulator(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> retroarch.Retroarch:
+        """A Retroarch whose save root is a throwaway tree with both subtrees laid down.
 
         Args:
-            tmp_path: The per-test temporary directory.
+            tmp_path: Backs the save root.
             monkeypatch: The pytest monkeypatch fixture.
 
         Returns:
-            The directory STATE_DIR now names.
+            A Retroarch on an unscoped platform, with `save_root` pointing at
+            `tmp_path` and empty `states` and `saves` directories under it.
         """
-        states = tmp_path / "states"
-        states.mkdir()
-        monkeypatch.setattr(retroarch, "STATE_DIR", states)
+        (tmp_path / "states").mkdir()
+        (tmp_path / "saves").mkdir()
         monkeypatch.setattr(retroarch, "STATE_SLOT", 0)
-        return states
+        emulator = retroarch.Retroarch()
+        emulator.platform = "snes"
+        monkeypatch.setattr(emulator, "save_root", tmp_path)
+        return emulator
 
-    def test_a_state_in_the_slot_goes_with_its_thumbnail(self, state_dir: Path) -> None:
+    def test_the_previous_players_save_file_does_not_survive_the_activate(
+        self, emulator: retroarch.Retroarch, tmp_path: Path
+    ) -> None:
+        """The leak this hook exists to close: a leftover .srm from the last session.
+
+        Its fresh mtime is what makes the restore skip the arriving player's
+        own save as older, and what puts it in that player's exit dump.
+        """
+        leftover = tmp_path / "saves" / "Game.srm"
+        leftover.write_bytes(b"player-a save data")
+
+        emulator.clear_working_slot()
+
+        assert not leftover.exists()
+
+    def test_a_save_a_core_keeps_in_its_own_subdir_goes_too(
+        self, emulator: retroarch.Retroarch, tmp_path: Path
+    ) -> None:
+        """Cores that build a directory tree under the savefile dir lose all of it."""
+        nested = tmp_path / "saves" / "dolphin-emu" / "User" / "GC"
+        nested.mkdir(parents=True)
+        (nested / "MemoryCardA.raw").write_bytes(b"card")
+
+        emulator.clear_working_slot()
+
+        assert not (tmp_path / "saves" / "dolphin-emu").exists()
+
+    def test_a_state_in_the_slot_goes_with_its_thumbnail(
+        self, emulator: retroarch.Retroarch, tmp_path: Path
+    ) -> None:
         """A state in the broker's slot is dropped along with its thumbnail."""
-        (state_dir / "Game.state").write_bytes(b"s")
-        (state_dir / "Game.state.png").write_bytes(b"p")
+        (tmp_path / "states" / "Game.state").write_bytes(b"s")
+        (tmp_path / "states" / "Game.state.png").write_bytes(b"p")
 
-        retroarch.Retroarch().clear_working_slot()
+        emulator.clear_working_slot()
 
-        assert not (state_dir / "Game.state").exists()
-        assert not (state_dir / "Game.state.png").exists()
+        assert not (tmp_path / "states" / "Game.state").exists()
+        assert not (tmp_path / "states" / "Game.state.png").exists()
 
-    def test_a_state_a_core_redirected_into_its_own_dir_goes_too(self, state_dir: Path) -> None:
+    def test_a_state_a_core_redirected_into_its_own_dir_goes_too(
+        self, emulator: retroarch.Retroarch, tmp_path: Path
+    ) -> None:
         """A state a core redirected into its own subdir is cleared as well."""
-        nested = state_dir / "dolphin-emu"
+        nested = tmp_path / "states" / "dolphin-emu"
         nested.mkdir()
         (nested / "Game.state").write_bytes(b"s")
 
-        retroarch.Retroarch().clear_working_slot()
+        emulator.clear_working_slot()
 
-        assert not (nested / "Game.state").exists()
+        assert not nested.exists()
 
-    def test_another_slot_is_left_alone(self, state_dir: Path) -> None:
-        """States outside the broker's slot are not the broker's to drop."""
-        (state_dir / "Game.state3").write_bytes(b"s")
-        (state_dir / "Game.state.auto").write_bytes(b"a")
+    def test_states_outside_the_brokers_slot_go_too(
+        self, emulator: retroarch.Retroarch, tmp_path: Path
+    ) -> None:
+        """A state the player parked on another slot is still the last player's."""
+        (tmp_path / "states" / "Game.state3").write_bytes(b"s")
+        (tmp_path / "states" / "Game.state.auto").write_bytes(b"a")
 
-        retroarch.Retroarch().clear_working_slot()
+        emulator.clear_working_slot()
 
-        assert (state_dir / "Game.state3").exists()
-        assert (state_dir / "Game.state.auto").exists()
+        assert not (tmp_path / "states" / "Game.state3").exists()
+        assert not (tmp_path / "states" / "Game.state.auto").exists()
 
-    def test_save_data_is_left_alone(self, state_dir: Path) -> None:
-        """Nothing but a state file is touched."""
-        (state_dir / "Game.srm").write_bytes(b"v")
+    def test_the_save_directories_themselves_survive(
+        self, emulator: retroarch.Retroarch, tmp_path: Path
+    ) -> None:
+        """The dirs stay: the broker config names them, and a launch missing one writes elsewhere."""
+        (tmp_path / "saves" / "Game.srm").write_bytes(b"v")
 
-        retroarch.Retroarch().clear_working_slot()
+        emulator.clear_working_slot()
 
-        assert (state_dir / "Game.srm").exists()
+        assert (tmp_path / "saves").is_dir()
+        assert (tmp_path / "states").is_dir()
 
-    def test_a_missing_state_dir_is_not_an_error(
+    def test_nothing_outside_the_save_subtrees_is_touched(
+        self, emulator: retroarch.Retroarch, tmp_path: Path
+    ) -> None:
+        """The clear is scoped to the subtrees the restore writes into, and no wider."""
+        cfg = tmp_path / "broker.cfg"
+        cfg.write_text("stdin_cmd_enable = \"true\"\n")
+        (tmp_path / "cores").mkdir()
+        (tmp_path / "cores" / "snes9x_libretro.so").write_bytes(b"core")
+
+        emulator.clear_working_slot()
+
+        assert cfg.exists()
+        assert (tmp_path / "cores" / "snes9x_libretro.so").exists()
+
+    def test_a_scoped_platform_keeps_the_rest_of_the_core_data_dir(
+        self, emulator: retroarch.Retroarch, tmp_path: Path
+    ) -> None:
+        """Platforms whose savefile dir is also their app-data dir clear only the save subtrees."""
+        emulator.platform = "ngc"
+        user = tmp_path / "saves" / "dolphin-emu" / "User"
+        (user / "GC").mkdir(parents=True)
+        (user / "Config").mkdir(parents=True)
+        (user / "GC" / "MemoryCardA.raw").write_bytes(b"card")
+        (user / "Config" / "Dolphin.ini").write_text("[General]\n")
+
+        emulator.clear_working_slot()
+
+        assert not (user / "GC" / "MemoryCardA.raw").exists()
+        assert (user / "Config" / "Dolphin.ini").exists()
+
+    def test_a_missing_save_dir_is_not_an_error(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Clearing before RetroArch has ever run is a no-op, not a failure."""
-        monkeypatch.setattr(retroarch, "STATE_DIR", tmp_path / "absent")
+        emulator = retroarch.Retroarch()
+        monkeypatch.setattr(emulator, "save_root", tmp_path / "absent")
 
-        retroarch.Retroarch().clear_working_slot()
+        emulator.clear_working_slot()
 
-    def test_a_state_that_cannot_be_removed_is_logged(
-        self, state_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    def test_a_subtree_that_escapes_the_save_root_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """A state that cannot be removed is logged rather than failing the activate."""
-        (state_dir / "Game.state").write_bytes(b"s")
+        """A subtree pointing out of the save root deletes nothing, and says so."""
+        root = tmp_path / "root"
+        root.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "keep.srm").write_bytes(b"v")
+        emulator = retroarch.Retroarch()
+        monkeypatch.setattr(emulator, "save_root", root)
+        monkeypatch.setattr(
+            retroarch.Retroarch, "save_subtrees", property(lambda self: ("../outside",))
+        )
+
+        with caplog.at_level(logging.ERROR):
+            emulator.clear_working_slot()
+
+        assert (outside / "keep.srm").exists()
+        assert "escapes the save root" in caplog.text
+
+    def test_a_file_that_cannot_be_removed_is_logged(
+        self, emulator: retroarch.Retroarch, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A save that cannot be removed is logged rather than failing the activate."""
+        (tmp_path / "saves" / "Game.srm").write_bytes(b"v")
 
         def refuse(self: Path, missing_ok: bool = False) -> None:
             raise OSError("read-only")
@@ -902,34 +1050,1079 @@ class TestClearWorkingSlot:
         monkeypatch.setattr(Path, "unlink", refuse)
 
         with caplog.at_level(logging.WARNING):
-            retroarch.Retroarch().clear_working_slot()
+            emulator.clear_working_slot()
 
-        assert "could not clear stale state" in caplog.text
+        assert "could not clear stale save data" in caplog.text
 
-    def test_a_thumbnail_that_cannot_be_removed_is_logged_as_a_thumbnail(
-        self, state_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """A thumbnail left behind after the state itself was cleared gets its own message.
+    def test_the_clear_is_declared_to_the_registry(self) -> None:
+        """The base class's flag has to say the save tree is cleared, or the gap goes unnoticed."""
+        assert retroarch.Retroarch.clears_stale_saves is True
 
-        A generic OSError on the thumbnail unlink (not FileNotFoundError, which
-        missing_ok=True already swallows) must not read as a failure to clear
-        the state, which by then already succeeded.
+
+class TestWaitForStateFile:
+    """Confirming a save-state write actually produced bytes, not just a file."""
+
+    @pytest.fixture
+    def state_dir(self, tmp_path: Path) -> Path:
+        """A throwaway savestate directory."""
+        states = tmp_path / "states"
+        states.mkdir()
+        return states
+
+    def test_a_state_stuck_at_zero_bytes_is_never_confirmed(self, state_dir: Path) -> None:
+        """A .state file that stays empty is a write that produced nothing, not a save."""
+        before = retroarch._state_snapshot(state_dir, "Game")
+        (state_dir / "Game.state").write_bytes(b"")
+
+        settled = retroarch._wait_for_state_file(before, state_dir, "Game", 0, 0.9)
+
+        assert settled is False
+
+    def test_a_state_that_becomes_non_empty_and_holds_is_confirmed(self, state_dir: Path) -> None:
+        """A .state file that lands with real bytes and stops changing is reported as saved."""
+        before = retroarch._state_snapshot(state_dir, "Game")
+        (state_dir / "Game.state").write_bytes(b"savedata")
+
+        settled = retroarch._wait_for_state_file(before, state_dir, "Game", 0, 5.0)
+
+        assert settled is True
+
+
+def _write_after(path: Path, data: bytes, delay: float) -> None:
+    """Write `data` to `path` after `delay` seconds, from a background thread.
+
+    Args:
+        path: The file to write.
+        data: The bytes to write.
+        delay: Seconds to sleep before writing, simulating an emulator that
+            produces the file some time after the save was triggered.
+    """
+    time.sleep(delay)
+    path.write_bytes(data)
+
+
+class TestSaveStateThumbnail:
+    """Waiting for the paired save thumbnail alongside the state file."""
+
+    @pytest.fixture
+    def emulator(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> retroarch.Retroarch:
+        """A Retroarch that looks alive, skips slot homing, and drops commands silently.
+
+        Args:
+            tmp_path: Backs the savestate directory.
+            monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            A Retroarch ready to have `save_state` called on it, with
+            `STATE_DIR` pointed at a throwaway directory and enough time on
+            `STATE_CONFIRM_WAIT` and `STATE_THUMBNAIL_WAIT` for both waits to
+            settle.
         """
-        (state_dir / "Game.state").write_bytes(b"s")
-        (state_dir / "Game.state.png").write_bytes(b"p")
+        states = tmp_path / "states"
+        states.mkdir()
+        monkeypatch.setattr(retroarch, "STATE_DIR", states)
+        monkeypatch.setattr(retroarch, "STATE_CONFIRM_WAIT", 2.5)
+        monkeypatch.setattr(retroarch, "STATE_THUMBNAIL_WAIT", 1.5)
+        emulator = retroarch.Retroarch()
+        emulator.platform = "gc"
+        emulator._rom_base = "Game"
+        emulator._slot_homed = True
+        emulator._thumbnail_enabled = True
+        monkeypatch.setattr(emulator, "alive", lambda: True)
+        monkeypatch.setattr(emulator, "_write_cmd", lambda cmd: True)
+        return emulator
 
-        real_unlink = Path.unlink
-
-        def flaky(self: Path, missing_ok: bool = False) -> None:
-            if self.name.endswith(".png"):
-                raise OSError("read-only")
-            real_unlink(self, missing_ok=missing_ok)
-
-        monkeypatch.setattr(Path, "unlink", flaky)
+    def test_a_thumbnail_written_after_the_state_is_still_waited_for(
+        self, emulator: retroarch.Retroarch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A thumbnail that lands after the state file is still confirmed, not skipped."""
+        threading.Thread(
+            target=_write_after, args=(retroarch.STATE_DIR / "Game.state", b"savedata", 0.05), daemon=True
+        ).start()
+        threading.Thread(
+            target=_write_after, args=(retroarch.STATE_DIR / "Game.state.png", b"thumb", 0.7), daemon=True
+        ).start()
 
         with caplog.at_level(logging.WARNING):
-            retroarch.Retroarch().clear_working_slot()
+            assert emulator.save_state(0) is True
 
-        assert not (state_dir / "Game.state").exists()
-        assert "could not clear stale state thumbnail" in caplog.text
-        assert "could not clear stale state Game.state:" not in caplog.text
+        assert "save thumbnail" not in caplog.text
+        assert (retroarch.STATE_DIR / "Game.state.png").exists()
+
+    def test_a_slow_state_confirmation_does_not_starve_the_thumbnail_wait(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The thumbnail gets its own `STATE_THUMBNAIL_WAIT`, not whatever the state wait left behind.
+
+        The state file lands late enough that only a sliver of
+        `STATE_CONFIRM_WAIT` remains once it is confirmed — too little for
+        the thumbnail's own 0.5s stability requirement. If the thumbnail
+        wait were still carved out of that same, nearly-spent deadline (the
+        pre-fix behaviour), a thumbnail landing shortly after would be
+        reported missing even though it arrived in plenty of time.
+        """
+        monkeypatch.setattr(retroarch, "STATE_CONFIRM_WAIT", 1.0)
+        monkeypatch.setattr(retroarch, "STATE_THUMBNAIL_WAIT", 1.0)
+        threading.Thread(
+            target=_write_after, args=(retroarch.STATE_DIR / "Game.state", b"savedata", 0.2), daemon=True
+        ).start()
+        threading.Thread(
+            target=_write_after, args=(retroarch.STATE_DIR / "Game.state.png", b"thumb", 0.9), daemon=True
+        ).start()
+
+        with caplog.at_level(logging.WARNING):
+            assert emulator.save_state(0) is True
+
+        assert "save thumbnail" not in caplog.text
+        assert (retroarch.STATE_DIR / "Game.state.png").exists()
+
+    def test_a_missing_thumbnail_does_not_fail_the_save(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No .png ever lands; the state save itself still reports success, with a warning logged."""
+        monkeypatch.setattr(retroarch, "STATE_CONFIRM_WAIT", 1.0)
+        threading.Thread(
+            target=_write_after, args=(retroarch.STATE_DIR / "Game.state", b"savedata", 0.05), daemon=True
+        ).start()
+
+        with caplog.at_level(logging.WARNING):
+            assert emulator.save_state(0) is True
+
+        assert "save thumbnail" in caplog.text
+        assert "Game.state.png" in caplog.text
+
+
+class TestLoadStateConfirmation:
+    """Telling a load that restored the game from one RetroArch only echoed back."""
+
+    @pytest.fixture
+    def emulator(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> retroarch.Retroarch:
+        """A live Retroarch with a state file sitting in the broker's slot.
+
+        Args:
+            tmp_path: Backs the savestate directory.
+            monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            A Retroarch whose `state_path` resolves, with the confirmation
+            wait short enough to fail a test quickly.
+        """
+        states = tmp_path / "states"
+        states.mkdir()
+        (states / "Game.state").write_bytes(b"savedata")
+        monkeypatch.setattr(retroarch, "STATE_DIR", states)
+        monkeypatch.setattr(retroarch, "STATE_SLOT", 0)
+        monkeypatch.setattr(retroarch, "LOAD_CONFIRM_WAIT", 0.5)
+        emulator = retroarch.Retroarch()
+        emulator.platform = "snes"
+        emulator._rom_base = "Game"
+        monkeypatch.setattr(emulator, "alive", lambda: True)
+        return emulator
+
+    def test_a_load_that_reads_the_state_succeeds(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The state's access time moving past the marker is what confirms the restore."""
+        monkeypatch.setattr(retroarch, "_atime_tracked", lambda d: True)
+
+        def echo_and_read(cmd: str, wait_prefix: Any, timeout: float) -> str:
+            retroarch.STATE_DIR.joinpath("Game.state").read_bytes()
+            return cmd
+
+        monkeypatch.setattr(emulator, "_send", echo_and_read)
+
+        assert emulator.load_state(0) is True
+
+    def test_an_echo_with_no_read_behind_it_fails(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A refused load echoes exactly like one that worked; only the missing read separates them."""
+        monkeypatch.setattr(retroarch, "_atime_tracked", lambda d: True)
+        monkeypatch.setattr(emulator, "_send", lambda cmd, wait_prefix, timeout: cmd)
+
+        with caplog.at_level(logging.ERROR):
+            assert emulator.load_state(0) is False
+
+        assert "never read Game.state" in caplog.text
+
+    def test_no_echo_at_all_fails(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A command that draws no reply is still a failed load."""
+        monkeypatch.setattr(retroarch, "_atime_tracked", lambda d: True)
+        monkeypatch.setattr(emulator, "_send", lambda cmd, wait_prefix, timeout: None)
+
+        assert emulator.load_state(0) is False
+
+    def test_an_untracked_mount_falls_back_to_the_echo_with_a_warning(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """On noatime nothing records the read, so the echo is all there is and it says so."""
+        monkeypatch.setattr(retroarch, "_atime_tracked", lambda d: False)
+        monkeypatch.setattr(emulator, "_send", lambda cmd, wait_prefix, timeout: cmd)
+
+        with caplog.at_level(logging.WARNING):
+            assert emulator.load_state(0) is True
+
+        assert "access times are not tracked" in caplog.text
+
+    def test_an_empty_slot_is_never_sent_at_all(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With no state on disk there is nothing to load and no command goes out."""
+        (retroarch.STATE_DIR / "Game.state").unlink()
+        sent: list[str] = []
+        monkeypatch.setattr(emulator, "_send", lambda cmd, wait_prefix, timeout: sent.append(cmd))
+
+        assert emulator.load_state(0) is False
+        assert sent == []
+
+    def test_a_fingerprint_failure_right_after_backdating_aborts_rather_than_skips_the_guard(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Losing the stat right after backdating is itself the in-flight change the guard exists for.
+
+        Treating a failed fingerprint as "no identity to check" would run the
+        load with the one guard disarmed that catches a state replaced while
+        the load is in flight.
+        """
+        monkeypatch.setattr(retroarch, "_atime_tracked", lambda d: True)
+        monkeypatch.setattr(retroarch, "_state_identity", lambda path: None)
+        sent: list[str] = []
+        monkeypatch.setattr(emulator, "_send", lambda cmd, wait_prefix, timeout: sent.append(cmd))
+
+        with caplog.at_level(logging.ERROR):
+            assert emulator.load_state(0) is False
+
+        assert sent == []
+        assert "cannot be confirmed safely" in caplog.text
+
+    def test_the_state_is_backdated_before_the_command_goes_out(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A state already read this session must not answer the next load off its old atime."""
+        state = retroarch.STATE_DIR / "Game.state"
+        monkeypatch.setattr(retroarch, "_atime_tracked", lambda d: True)
+        seen: list[float] = []
+
+        def record(cmd: str, wait_prefix: Any, timeout: float) -> str:
+            seen.append(state.stat().st_atime)
+            return cmd
+
+        monkeypatch.setattr(emulator, "_send", record)
+        emulator.load_state(0)
+
+        assert seen and seen[0] < state.stat().st_mtime
+
+    def test_a_probe_that_could_not_run_does_not_wave_the_load_through(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A failed probe is not a noatime mount, so the echo alone still confirms nothing."""
+        def raise_probe(dir_path: Path) -> bool:
+            raise retroarch.AtimeProbeError("probe blew up")
+
+        monkeypatch.setattr(retroarch, "_atime_tracked", raise_probe)
+        monkeypatch.setattr(emulator, "_send", lambda cmd, wait_prefix, timeout: cmd)
+
+        with caplog.at_level(logging.WARNING):
+            loaded = emulator.load_state(0)
+
+        assert loaded is False
+        assert "access-time probe for" in caplog.text
+        assert "access times are not tracked" not in caplog.text
+
+    def test_a_state_pushed_in_mid_load_is_not_taken_as_the_confirmation(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A state replaced under the load has a fresh atime that says nothing about that load."""
+        state = retroarch.STATE_DIR / "Game.state"
+        monkeypatch.setattr(retroarch, "_atime_tracked", lambda d: True)
+
+        def replace_and_read(cmd: str, wait_prefix: Any, timeout: float) -> str:
+            state.unlink()
+            state.write_bytes(b"pushed")
+            now = time.time()
+            os.utime(state, (now, now + 10))
+            state.read_bytes()
+            return cmd
+
+        monkeypatch.setattr(emulator, "_send", replace_and_read)
+
+        with caplog.at_level(logging.WARNING):
+            loaded = emulator.load_state(0)
+
+        assert loaded is False
+        assert "was replaced while the load was in flight" in caplog.text
+
+    def test_a_state_file_handout_during_the_wait_is_not_taken_as_the_confirmation(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """RomM's own GET of the state file must not be mistaken for RetroArch's load read."""
+        state = retroarch.STATE_DIR / "Game.state"
+        monkeypatch.setattr(retroarch, "_atime_tracked", lambda d: True)
+
+        def echo_then_handout_read(cmd: str, wait_prefix: Any, timeout: float) -> str:
+            emulator.note_state_handout()
+            state.read_bytes()
+            return cmd
+
+        monkeypatch.setattr(emulator, "_send", echo_then_handout_read)
+
+        with caplog.at_level(logging.WARNING):
+            loaded = emulator.load_state(0)
+
+        assert loaded is False
+        assert "state-file handout was in flight" in caplog.text
+
+    def test_a_tainted_load_is_retried_with_a_fresh_marker_and_confirms(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A load whose only tainted read raced a handout is retried, not reported as failed."""
+        monkeypatch.setattr(retroarch, "_atime_tracked", lambda d: True)
+        sent: list[str] = []
+
+        def send(cmd: str, wait_prefix: Any, timeout: float) -> str:
+            sent.append(cmd)
+            return cmd
+
+        monkeypatch.setattr(emulator, "_send", send)
+
+        results = iter([None, True])
+        monkeypatch.setattr(retroarch, "_wait_for_state_read", lambda *a, **k: next(results))
+
+        with caplog.at_level(logging.WARNING):
+            assert emulator.load_state(0) is True
+
+        assert sent == ["LOAD_STATE_SLOT 0", "LOAD_STATE_SLOT 0"]
+        assert "retrying with a fresh marker" in caplog.text
+
+    def test_a_load_tainted_past_the_retry_limit_is_reported_failed(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A load that never clears the taint on any attempt still ends in a reported failure."""
+        monkeypatch.setattr(retroarch, "_atime_tracked", lambda d: True)
+        monkeypatch.setattr(retroarch, "LOAD_TAINT_RETRY_LIMIT", 1)
+        sent: list[str] = []
+
+        def send(cmd: str, wait_prefix: Any, timeout: float) -> str:
+            sent.append(cmd)
+            return cmd
+
+        monkeypatch.setattr(emulator, "_send", send)
+        monkeypatch.setattr(retroarch, "_wait_for_state_read", lambda *a, **k: None)
+
+        with caplog.at_level(logging.ERROR):
+            assert emulator.load_state(0) is False
+
+        assert sent == ["LOAD_STATE_SLOT 0", "LOAD_STATE_SLOT 0"]
+        assert "could not be confirmed after" in caplog.text
+
+
+class TestAtimeHelpers:
+    """The access-time probe and wait the load confirmation is built on."""
+
+    def test_a_read_is_detected_where_atimes_are_tracked(self, tmp_path: Path) -> None:
+        """The probe reports what the mount this test runs on actually does."""
+        probed = retroarch._atime_tracked(tmp_path)
+
+        assert isinstance(probed, bool)
+
+    def test_the_probe_leaves_nothing_behind(self, tmp_path: Path) -> None:
+        """The scratch file the probe writes is always removed."""
+        retroarch._atime_tracked(tmp_path)
+
+        assert list(tmp_path.iterdir()) == []
+
+    def test_an_unwritable_dir_raises_instead_of_answering_untracked(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A probe that could not run has proved nothing, and must not pass as noatime.
+
+        "This mount keeps no access times" is the one verdict that lets a load
+        through on its echo alone, so a probe that never ran cannot borrow it.
+        """
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(retroarch.AtimeProbeError):
+                retroarch._atime_tracked(tmp_path / "absent")
+
+        assert "could not probe access-time tracking" in caplog.text
+
+    def test_a_replaced_state_is_not_confirmed_by_its_own_fresh_atime(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A state pushed in under the load is a new file, and its read confirms nothing."""
+        state = tmp_path / "Game.state"
+        state.write_bytes(b"original")
+        identity = retroarch._state_identity(state)
+        state.unlink()
+        state.write_bytes(b"pushed")
+        # An inode the kernel handed straight back would leave the mtime as the
+        # only thing separating the two files, so make it separate them.
+        now = time.time()
+        os.utime(state, (now, now + 10))
+
+        with caplog.at_level(logging.WARNING):
+            found = retroarch._wait_for_state_read(
+                state, 0.0, time.monotonic() + 0.5, identity=identity
+            )
+
+        assert found is False
+        assert "was replaced while the load was in flight" in caplog.text
+
+    def test_a_tainted_read_is_not_accepted_while_the_taint_window_is_open(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An access-time move seen during a handout's grace window does not confirm the load."""
+        state = tmp_path / "Game.state"
+        state.write_bytes(b"data")
+        now = time.time()
+        os.utime(state, (now + 10, now))
+
+        with caplog.at_level(logging.WARNING):
+            found = retroarch._wait_for_state_read(
+                state, 0.0, time.monotonic() + 0.3, tainted_until=lambda: float("inf")
+            )
+
+        assert found is None
+        assert "state-file handout was in flight" in caplog.text
+
+    def test_a_tainted_read_never_confirms_even_after_the_window_closes(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A read tainted during the handout window must not confirm once the window closes.
+
+        Under `relatime` a genuine later read does not move the access time
+        again once a handout's read already pushed it past the mtime, so
+        there is no second move left to accept as evidence: the whole attempt
+        has to fail and let the retry run with a fresh marker instead.
+        """
+        state = tmp_path / "Game.state"
+        state.write_bytes(b"data")
+        now = time.time()
+        os.utime(state, (now + 10, now))
+        taint_until = time.monotonic() + 0.15
+
+        with caplog.at_level(logging.ERROR):
+            found = retroarch._wait_for_state_read(
+                state, 0.0, time.monotonic() + 0.5, tainted_until=lambda: taint_until
+            )
+
+        assert found is None
+        assert "needs a fresh attempt to be confirmed" in caplog.text
+
+    def test_backdating_a_missing_file_reports_none(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A state that is gone cannot be marked, and the caller has to hear about it."""
+        with caplog.at_level(logging.WARNING):
+            assert retroarch._backdate_atime(tmp_path / "gone.state") is None
+
+        assert "could not backdate the access time" in caplog.text
+
+    def test_a_state_that_disappears_mid_wait_stops_the_wait(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A state removed while the load is in flight ends the wait instead of timing it out."""
+        with caplog.at_level(logging.WARNING):
+            found = retroarch._wait_for_state_read(
+                tmp_path / "gone.state", 0.0, time.monotonic() + 5.0
+            )
+
+        assert found is False
+        assert "went away while waiting" in caplog.text
+
+
+class TestCoreDownload:
+    """Installing a libretro core without letting a bad binary reach a session."""
+
+    @pytest.fixture
+    def cores_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """Point CORES_DIR at a throwaway directory.
+
+        Args:
+            tmp_path: The per-test temporary directory.
+            monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            The directory CORES_DIR now names.
+        """
+        cores = tmp_path / "cores"
+        cores.mkdir()
+        monkeypatch.setattr(retroarch, "CORES_DIR", cores)
+        return cores
+
+    @staticmethod
+    def _core_zip(payload: bytes = b"\x7fELF core") -> bytes:
+        """A zip holding one `_libretro.so` member.
+
+        Args:
+            payload: The bytes to store as the core.
+
+        Returns:
+            The zip's bytes.
+        """
+        import io
+        import zipfile
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("snes9x_libretro.so", payload)
+        return buf.getvalue()
+
+    def _serve(
+        self, monkeypatch: pytest.MonkeyPatch, body: bytes, headers: Optional[dict[str, str]] = None
+    ) -> None:
+        """Answer every core download with `body`.
+
+        Args:
+            monkeypatch: The pytest monkeypatch fixture.
+            body: The response body to serve.
+            headers: Response headers, defaulting to none.
+        """
+        class FakeResponse:
+            def __init__(self) -> None:
+                self.content = body
+                self.headers = headers or {}
+
+            def raise_for_status(self) -> None:
+                return None
+
+        monkeypatch.setattr(retroarch.httpx, "get", lambda *a, **kw: FakeResponse())
+
+    def test_a_good_download_lands_executable(
+        self, cores_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The core is installed under its real name with the exec bit set."""
+        self._serve(monkeypatch, self._core_zip())
+
+        so = retroarch._ensure_core("snes9x")
+
+        assert so == cores_dir / "snes9x_libretro.so"
+        assert so.read_bytes() == b"\x7fELF core"
+        assert so.stat().st_mode & 0o111
+
+    def test_a_truncated_download_never_becomes_a_core(
+        self, cores_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A body short of its declared Content-Length is refused before anything is written."""
+        body = self._core_zip()
+        self._serve(monkeypatch, body[:-20], {"content-length": str(len(body))})
+
+        with pytest.raises(RuntimeError, match="truncated"):
+            retroarch._ensure_core("snes9x")
+
+        assert not (cores_dir / "snes9x_libretro.so").exists()
+
+    def test_a_corrupted_zip_never_becomes_a_core(
+        self, cores_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A member whose CRC does not match its bytes is refused by the zip read itself."""
+        good = bytearray(self._core_zip(b"\x7fELF core payload here"))
+        good[40:50] = b"\x00" * 10
+        self._serve(monkeypatch, bytes(good))
+
+        with pytest.raises(RuntimeError, match="failed to download"):
+            retroarch._ensure_core("snes9x")
+
+        assert not (cores_dir / "snes9x_libretro.so").exists()
+
+    def test_an_empty_core_is_refused(
+        self, cores_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A zero-byte member would dlopen into an error nowhere near the download."""
+        self._serve(monkeypatch, self._core_zip(b""))
+
+        with pytest.raises(RuntimeError, match="empty"):
+            retroarch._ensure_core("snes9x")
+
+        assert not (cores_dir / "snes9x_libretro.so").exists()
+
+    def test_a_zip_with_no_core_in_it_is_refused(
+        self, cores_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A zip carrying something other than a core is an error, not an install."""
+        import io
+        import zipfile
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("README.md", "not a core")
+        self._serve(monkeypatch, buf.getvalue())
+
+        with pytest.raises(RuntimeError):
+            retroarch._ensure_core("snes9x")
+
+    def test_the_temp_name_is_unique_per_download(
+        self, cores_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two downloads of one core must not share a temp file to half-write over each other."""
+        self._serve(monkeypatch, self._core_zip())
+        seen: list[str] = []
+        real_write = Path.write_bytes
+
+        def record(self: Path, data: bytes) -> int:
+            if self.name.endswith(".tmp"):
+                seen.append(self.name)
+            return real_write(self, data)
+
+        monkeypatch.setattr(Path, "write_bytes", record)
+
+        retroarch._ensure_core("snes9x")
+        (cores_dir / "snes9x_libretro.so").unlink()
+        retroarch._ensure_core("snes9x")
+
+        assert len(seen) == 2
+        assert seen[0] != seen[1]
+
+    def test_a_failed_install_leaves_no_temp_file_behind(
+        self, cores_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A rename that fails cleans up its temp file rather than leaving a stray core."""
+        self._serve(monkeypatch, self._core_zip())
+
+        def refuse(src: Any, dst: Any) -> None:
+            raise OSError("read-only")
+
+        monkeypatch.setattr(retroarch.os, "replace", refuse)
+
+        with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match="failed to install"):
+            retroarch._ensure_core("snes9x")
+
+        assert list(cores_dir.iterdir()) == []
+
+    def test_an_installed_core_is_not_downloaded_again(
+        self, cores_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A core already on disk short-circuits before any HTTP call."""
+        so = cores_dir / "snes9x_libretro.so"
+        so.write_bytes(b"already here")
+
+        def explode(*args: Any, **kwargs: Any) -> None:
+            raise AssertionError("no download should be attempted")
+
+        monkeypatch.setattr(retroarch.httpx, "get", explode)
+
+        assert retroarch._ensure_core("snes9x") == so
+
+
+class TestSaveStateAgainstResume:
+    """A save landing while a deferred resume load is still in flight."""
+
+    @pytest.fixture
+    def emulator(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> retroarch.Retroarch:
+        """A live Retroarch whose save and load are reduced to recorded events.
+
+        Args:
+            tmp_path: Backs a state file `state_path` resolves to, so the
+                resume retry loop's between-attempt fingerprint check has
+                something real to stat.
+            monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            A Retroarch with its slot already homed, `_try_save` and
+            `_load_state_locked` recording into its `events` list, and no
+            settle to wait out.
+        """
+        emulator = retroarch.Retroarch()
+        emulator.platform = "psp"
+        emulator._rom_base = "Game"
+        emulator._slot_homed = True
+        emulator._resume_settle = 0
+        emulator.events = []
+        state = tmp_path / "Game.state"
+        state.write_bytes(b"savedata")
+        monkeypatch.setattr(emulator, "alive", lambda: True)
+        monkeypatch.setattr(emulator, "state_path", lambda: state)
+        monkeypatch.setattr(emulator, "_try_save", lambda: emulator.events.append("save") or True)
+        monkeypatch.setattr(
+            emulator, "_load_state_locked", lambda slot: emulator.events.append("load") or True
+        )
+        return emulator
+
+    def test_a_save_cannot_land_inside_the_resume_load_window(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A save racing the deferred resume waits for the load instead of overwriting the slot.
+
+        A SAVE_STATE sent inside the resume's settle window writes the
+        not-yet-restored boot state into the slot, and the resume load that
+        follows then reads that back over the player's own save.
+        """
+        entered_lock = threading.Event()
+        release_resume = threading.Event()
+
+        def fake_wait_for_state(deadline: float) -> bool:
+            entered_lock.set()
+            release_resume.wait(timeout=2)
+            return True
+
+        monkeypatch.setattr(emulator, "wait_for_state", fake_wait_for_state)
+        monkeypatch.setattr(
+            emulator, "_send", lambda cmd, wait_prefix, timeout: "GET_STATUS PLAYING psp,Game,0"
+        )
+
+        resume = threading.Thread(
+            target=emulator._deferred_load_state, args=(0, emulator._launch_seq)
+        )
+        resume.start()
+        assert entered_lock.wait(timeout=2)
+
+        saved: list[bool] = []
+        saver = threading.Thread(target=lambda: saved.append(emulator.save_state(0)))
+        saver.start()
+        time.sleep(0.2)
+
+        assert emulator.events == []
+
+        release_resume.set()
+        resume.join(timeout=2)
+        saver.join(timeout=2)
+
+        assert emulator.events == ["load", "save"]
+        assert saved == [True]
+
+    def test_a_save_that_never_gets_the_tray_fails_loudly(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A save gives up rather than blocking forever, and says why."""
+        monkeypatch.setattr(retroarch, "SAVE_LOCK_WAIT", 0.05)
+        emulator._disc_lock.acquire()
+        try:
+            with caplog.at_level(logging.ERROR):
+                assert emulator.save_state(0) is False
+        finally:
+            emulator._disc_lock.release()
+
+        assert emulator.events == []
+        assert "waiting on an in-flight resume load or disc swap" in caplog.text
+
+    def test_the_exit_save_gives_up_on_the_tray_far_sooner_than_a_normal_save(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The exit runs under the API's session lock, so it waits its own short budget.
+
+        Waiting out `SAVE_LOCK_WAIT` there would answer every other session
+        route 409 for half a minute.
+        """
+        monkeypatch.setattr(retroarch, "SAVE_LOCK_WAIT", 30.0)
+        monkeypatch.setattr(retroarch, "EXIT_SAVE_LOCK_WAIT", 0.1)
+        monkeypatch.setattr(emulator, "_flush_sram", lambda: True)
+        monkeypatch.setattr(emulator, "_quit", lambda: None)
+
+        emulator._disc_lock.acquire()
+        try:
+            started = time.monotonic()
+            with caplog.at_level(logging.ERROR):
+                result = emulator.save_and_exit(0)
+            waited = time.monotonic() - started
+        finally:
+            emulator._disc_lock.release()
+
+        assert result["state_saved"] is False
+        assert waited < 1.0
+        assert emulator.events == []
+        assert "gave up after 0.1s" in caplog.text
+
+    def test_a_save_with_the_tray_free_still_goes_straight_through(
+        self, emulator: retroarch.Retroarch
+    ) -> None:
+        """The tray lock is released again, so back-to-back saves both run."""
+        assert emulator.save_state(0) is True
+        assert emulator.save_state(0) is True
+        assert emulator.events == ["save", "save"]
+
+
+class TestResumeLoadRetry:
+    """The deferred resume load's bounded retry and its failure escalation."""
+
+    @pytest.fixture
+    def emulator(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> retroarch.Retroarch:
+        """A live Retroarch that retries without waiting between attempts.
+
+        Args:
+            tmp_path: Backs a state file `state_path` resolves to, so the
+                retry loop's between-attempt fingerprint check has something
+                real to stat.
+            monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            A Retroarch with `RESUME_LOAD_RETRY_GAP` collapsed to nothing and
+            the slot already holding a state file.
+        """
+        monkeypatch.setattr(retroarch, "RESUME_LOAD_RETRY_GAP", 0)
+        emulator = retroarch.Retroarch()
+        emulator.platform = "psp"
+        emulator._rom_base = "Game"
+        emulator._resume_settle = 0
+        state = tmp_path / "Game.state"
+        state.write_bytes(b"savedata")
+        monkeypatch.setattr(emulator, "alive", lambda: True)
+        monkeypatch.setattr(emulator, "wait_for_state", lambda deadline: True)
+        monkeypatch.setattr(emulator, "state_path", lambda: state)
+        return emulator
+
+    def test_a_load_that_misses_once_is_tried_again(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A core that was not ready for the first load gets another attempt."""
+        results = [False, True]
+        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: results.pop(0))
+
+        with caplog.at_level(logging.INFO):
+            confirmed = emulator._load_until_confirmed(0, time.monotonic() + 5.0, emulator._launch_seq)
+
+        assert confirmed is True
+        assert results == []
+        assert "delivered on attempt 2" in caplog.text
+
+    def test_a_load_that_never_takes_is_escalated_when_the_budget_runs_out(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An unrestored game is an error, not one info line saying "failed"."""
+        attempts: list[int] = []
+        monkeypatch.setattr(
+            emulator, "_load_state_locked", lambda slot: attempts.append(slot) or False
+        )
+
+        with caplog.at_level(logging.WARNING):
+            confirmed = emulator._load_until_confirmed(0, time.monotonic() + 0.3, emulator._launch_seq)
+
+        assert confirmed is False
+        assert len(attempts) > 1
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert errors and "running unrestored" in errors[0].getMessage()
+
+    def test_a_relaunch_stops_the_retries(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Retries for a session that has been relaunched must not keep firing at the new one."""
+        attempts: list[int] = []
+
+        def fail_and_relaunch(slot: int) -> bool:
+            attempts.append(slot)
+            emulator._launch_seq += 1
+            return False
+
+        monkeypatch.setattr(emulator, "_load_state_locked", fail_and_relaunch)
+
+        with caplog.at_level(logging.WARNING):
+            confirmed = emulator._load_until_confirmed(0, time.monotonic() + 5.0, emulator._launch_seq)
+
+        assert confirmed is False
+        assert attempts == [0]
+        assert "session ended before slot 0 could be loaded" in caplog.text
+
+    def test_a_slot_still_empty_on_the_first_attempt_is_waited_for_again(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A state RomM pushes late still lands, without one hold spanning the whole budget.
+
+        The wait for the state file is inside the tray hold, so it gets one
+        attempt's slice and then drops the tray for the next attempt.
+        """
+        appears = [False, True]
+        monkeypatch.setattr(emulator, "wait_for_state", lambda deadline: appears.pop(0))
+        loads: list[int] = []
+        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: loads.append(slot) or True)
+
+        with caplog.at_level(logging.WARNING):
+            confirmed = emulator._load_until_confirmed(0, time.monotonic() + 5.0, emulator._launch_seq)
+
+        assert confirmed is True
+        assert loads == [0]
+        assert "still holds no state file on attempt 1" in caplog.text
+
+    def test_the_state_file_wait_holds_the_tray_against_a_swap(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A save landing during the wait would create the very file the wait is looking for."""
+        in_wait = threading.Event()
+        release = threading.Event()
+
+        def blocking_wait(deadline: float) -> bool:
+            in_wait.set()
+            release.wait(timeout=2)
+            return True
+
+        monkeypatch.setattr(emulator, "wait_for_state", blocking_wait)
+        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: True)
+
+        t = threading.Thread(
+            target=emulator._load_until_confirmed,
+            args=(0, time.monotonic() + 5.0, emulator._launch_seq),
+        )
+        t.start()
+        try:
+            assert in_wait.wait(timeout=2)
+            assert emulator._disc_lock.acquire(blocking=False) is False
+        finally:
+            release.set()
+            t.join(timeout=2)
+
+    def test_the_deferred_load_retries_through_to_a_restore(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The deferred resume path itself retries, not just the helper under it."""
+        results = [False, False, True]
+        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: results.pop(0))
+        monkeypatch.setattr(
+            emulator, "_send", lambda cmd, wait_prefix, timeout: "GET_STATUS PLAYING psp,Game,0"
+        )
+
+        emulator._deferred_load_state(0, emulator._launch_seq)
+
+        assert results == []
+
+    def test_a_save_between_attempts_aborts_the_resume_instead_of_loading_the_wrong_state(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A save landing in the retry gap must not be loaded back as the resume.
+
+        The tray is free between attempts, so nothing stops a save from
+        overwriting the slot's state file with the running game's own (still
+        unrestored) state; loading that back on the next attempt would report
+        a successful resume that never actually happened.
+        """
+        original = emulator.state_path()
+        clobbered = tmp_path / "clobbered.state"
+        clobbered.write_bytes(b"a save that landed in the retry gap")
+        paths = [original, clobbered]
+        monkeypatch.setattr(emulator, "state_path", lambda: paths.pop(0))
+        attempts: list[int] = []
+        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: attempts.append(slot) or False)
+
+        with caplog.at_level(logging.ERROR):
+            confirmed = emulator._load_until_confirmed(0, time.monotonic() + 5.0, emulator._launch_seq)
+
+        assert confirmed is False
+        assert attempts == [0]
+        assert "changed since attempt" in caplog.text
+
+    def test_a_state_file_that_cannot_be_fingerprinted_is_not_treated_as_ready(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A stat failure right after the wait must not silently skip the fingerprint guard."""
+        monkeypatch.setattr(retroarch, "_state_identity", lambda path: None)
+        loads: list[int] = []
+        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: loads.append(slot) or True)
+
+        with caplog.at_level(logging.WARNING):
+            confirmed = emulator._load_until_confirmed(0, time.monotonic() + 0.3, emulator._launch_seq)
+
+        assert confirmed is False
+        assert loads == []
+        assert "could not be fingerprinted" in caplog.text
+
+
+class TestSaveAndExitSramFlush:
+    """`save_and_exit` must report whether `_flush_sram` actually landed, not discard it."""
+
+    @pytest.fixture
+    def emulator(self, monkeypatch: pytest.MonkeyPatch) -> retroarch.Retroarch:
+        """A live Retroarch with `_quit` reduced to a no-op and no state save requested.
+
+        Args:
+            monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            A Retroarch ready for `save_and_exit(None)`, which skips the
+            state-save path entirely and leaves only the SRAM flush to check.
+        """
+        emulator = retroarch.Retroarch()
+        emulator.platform = "gc"
+        emulator._rom_base = "Game"
+        monkeypatch.setattr(emulator, "alive", lambda: True)
+        monkeypatch.setattr(emulator, "_quit", lambda: None)
+        return emulator
+
+    def test_a_refused_sram_flush_is_reported_not_silently_dropped(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`_flush_sram`'s False return must survive into the exit report."""
+        monkeypatch.setattr(emulator, "_flush_sram", lambda: False)
+
+        result = emulator.save_and_exit(None)
+
+        assert result["sram_flushed"] is False
+
+    def test_a_confirmed_sram_flush_is_reported_true(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A successful flush is threaded through the same way."""
+        monkeypatch.setattr(emulator, "_flush_sram", lambda: True)
+
+        result = emulator.save_and_exit(None)
+
+        assert result["sram_flushed"] is True
+
+    def test_sram_flush_is_not_attempted_when_the_process_is_already_gone(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No process, nothing to flush: report None rather than a stale True or False."""
+        monkeypatch.setattr(emulator, "alive", lambda: False)
+        flush_calls: list[int] = []
+        monkeypatch.setattr(emulator, "_flush_sram", lambda: flush_calls.append(1) or True)
+
+        result = emulator.save_and_exit(None)
+
+        assert result["sram_flushed"] is None
+        assert flush_calls == []
+
+
+class TestLoadStateBackdateFailure:
+    """A state that cannot be stamped, on a mount that does track access times."""
+
+    @pytest.fixture
+    def emulator(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> retroarch.Retroarch:
+        """A live Retroarch with a state file in the broker's slot.
+
+        Args:
+            tmp_path: Backs the savestate directory.
+            monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            A Retroarch whose `state_path` resolves and whose commands are all
+            echoed back.
+        """
+        states = tmp_path / "states"
+        states.mkdir()
+        (states / "Game.state").write_bytes(b"savedata")
+        monkeypatch.setattr(retroarch, "STATE_DIR", states)
+        monkeypatch.setattr(retroarch, "STATE_SLOT", 0)
+        emulator = retroarch.Retroarch()
+        emulator.platform = "snes"
+        emulator._rom_base = "Game"
+        monkeypatch.setattr(emulator, "alive", lambda: True)
+        monkeypatch.setattr(emulator, "_send", lambda cmd, wait_prefix, timeout: cmd)
+        return emulator
+
+    def test_a_failed_backdate_is_not_reported_as_an_untracked_mount(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The stamp failing on a tracking mount is a fault on the file, not the mount."""
+        monkeypatch.setattr(retroarch, "_atime_tracked", lambda d: True)
+        monkeypatch.setattr(retroarch, "_backdate_atime", lambda p: None)
+
+        with caplog.at_level(logging.WARNING):
+            loaded = emulator.load_state(0)
+
+        assert loaded is False
+        assert "could not backdate" in caplog.text
+        assert "access times are not tracked" not in caplog.text

@@ -61,6 +61,27 @@ LOAD_KEY = f"F{STATE_SLOT}"
 
 STATE_WAIT = float(os.environ.get("DOLPHIN_STATE_WAIT", "20.0"))
 """Seconds a save state has to land on disk after the save hotkey (env `DOLPHIN_STATE_WAIT`, default 20)."""
+LOAD_WAIT = float(os.environ.get("DOLPHIN_LOAD_WAIT", "20.0"))
+"""Seconds Dolphin has to read the state back after the load hotkey (env `DOLPHIN_LOAD_WAIT`, default 20)."""
+LOAD_SETTLE = float(os.environ.get("DOLPHIN_LOAD_SETTLE", "2.0"))
+"""Seconds a load gets to deserialize after the state file has been read (env `DOLPHIN_LOAD_SETTLE`).
+
+Nothing observable marks the end of the deserialize, only the read that starts
+it, so this is the one bounded guess in the load path. Defaults to 2 seconds.
+"""
+_ATIME_BACKDATE = 1.0
+"""Seconds a state's access time is set behind its mtime, so the next read of it stands out."""
+_ATIME_PROBE_PREFIX = ".atime-probe."
+"""Name prefix of the scratch file the access-time probe measures on.
+
+The probe has to sit on the same mount as the states to measure anything, and
+that mount is inside the tree the exit archive is built from. The dot prefix
+is what keeps it out of a dump: `saves._iter_save_files` skips every
+dot-prefixed name. `_clear_atime_probes` sweeps the rest, for a probe whose
+own cleanup never ran because the broker was killed mid-measurement.
+"""
+_UNDO_BUFFER_NAME = "lastState.sav"
+"""The undo-load buffer Dolphin rewrites in the state directory on every state load."""
 RESUME_LOAD_WAIT = float(os.environ.get("DOLPHIN_RESUME_LOAD_WAIT", "90.0"))
 """Seconds a deferred resume waits for a state file to arrive (env `DOLPHIN_RESUME_LOAD_WAIT`, default 90)."""
 RESUME_LOAD_SETTLE = float(os.environ.get("DOLPHIN_RESUME_LOAD_SETTLE", "5.0"))
@@ -433,6 +454,164 @@ def _wait_for_state_write(
     return False
 
 
+def _backdate_atime(path: Path) -> Optional[float]:
+    """Stamp `path`'s access time behind its own mtime and return what was written.
+
+    Under `relatime`, the mount default, the kernel refreshes an access time
+    only while it still sits at or behind the file's mtime. A state loaded
+    twice in one session would already carry an atime past its mtime by the
+    second load, and that read would leave no trace at all, so the stamp goes
+    back behind the mtime before every load.
+
+    Args:
+        path: The state file about to be loaded.
+
+    Returns:
+        The access time stamped on, or None when it could not be read or set.
+    """
+    try:
+        st = path.stat()
+        marker = st.st_mtime - _ATIME_BACKDATE
+        os.utime(path, (marker, st.st_mtime))
+    except OSError as exc:
+        log.warning("could not backdate the access time of the state %s: %s", path, exc)
+        return None
+    return marker
+
+
+def _atime_probe_path(dir_path: Path) -> Path:
+    """The scratch file this process probes access-time tracking with, inside `dir_path`.
+
+    Args:
+        dir_path: The directory being measured.
+
+    Returns:
+        The probe path, named per process so two brokers never share one.
+    """
+    return dir_path / f"{_ATIME_PROBE_PREFIX}{os.getpid()}"
+
+
+def _clear_atime_probes(dir_path: Path) -> None:
+    """Remove every access-time probe left in `dir_path`.
+
+    Run before the save archive is built, so a probe a kill stranded there is
+    gone by the time anything walks the tree. A removal failure is logged, not
+    raised.
+
+    Args:
+        dir_path: The directory to sweep.
+    """
+    if not dir_path.is_dir():
+        return
+    for probe in dir_path.glob(f"{_ATIME_PROBE_PREFIX}*"):
+        try:
+            probe.unlink()
+            log.info("cleared a stranded access-time probe %s", probe.name)
+        except OSError as exc:
+            log.warning("could not clear the access-time probe %s: %s", probe, exc)
+
+
+def _atime_tracked(dir_path: Path) -> bool:
+    """Tell whether reading a file in `dir_path` moves its access time.
+
+    A `noatime` mount records nothing, and on one of those the read a load
+    makes is invisible: without this the broker would report every load as
+    failed. Measured on a scratch file, because the probe's own read is the
+    thing being measured and making it against the state would spend the
+    backdated marker the load itself needs.
+
+    Args:
+        dir_path: The directory the state file lives in.
+
+    Returns:
+        True only when the probe's read demonstrably moved the access time.
+    """
+    probe = _atime_probe_path(dir_path)
+    try:
+        probe.write_bytes(b"probe")
+        st = probe.stat()
+        marker = st.st_mtime - _ATIME_BACKDATE
+        os.utime(probe, (marker, st.st_mtime))
+        with probe.open("rb") as fh:
+            fh.read(1)
+        moved = probe.stat().st_atime > marker
+    except OSError as exc:
+        log.warning("could not probe access-time tracking in %s: %s", dir_path, exc)
+        return False
+    finally:
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("could not remove the access-time probe %s: %s", probe, exc)
+    return moved
+
+
+def _wait_for_state_read(path: Path, marker: float, deadline: float) -> bool:
+    """Poll until `path`'s access time moves past `marker`, or the deadline passes.
+
+    Args:
+        path: The state file whose access time was backdated to `marker`.
+        marker: The access time stamped on before the load hotkey was sent.
+        deadline: A `time.monotonic()` value to give up at.
+
+    Returns:
+        True once the access time has moved past `marker`, False on timeout or
+        if the file goes away first.
+    """
+    POLL_SECS = 0.1
+    while time.monotonic() < deadline:
+        try:
+            if path.stat().st_atime > marker:
+                return True
+        except OSError as exc:
+            log.warning("state %s went away while waiting for the load to read it: %s", path, exc)
+            return False
+        time.sleep(POLL_SECS)
+    return False
+
+
+def _undo_buffer_stamp() -> Optional[tuple[int, int]]:
+    """Snapshot the undo-load buffer, for telling a rewrite of it apart from the copy already there.
+
+    Returns:
+        Its `(size, mtime_ns)`, or None when it is absent or cannot be read.
+    """
+    path = STATE_DIR / _UNDO_BUFFER_NAME
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        log.warning("could not stat the undo state buffer %s: %s", path, exc)
+        return None
+    return st.st_size, st.st_mtime_ns
+
+
+def _wait_for_undo_write(before: Optional[tuple[int, int]], deadline: float) -> bool:
+    """Poll until Dolphin rewrites the undo-load buffer, or the deadline passes.
+
+    Dolphin dumps the pre-load machine state into the undo buffer as part of
+    every state load, so a rewrite of it is a load that reached the core. This
+    is the confirmation the load path falls back to where the state's own read
+    leaves no trace, on a `noatime` mount or when the access-time marker could
+    not be stamped.
+
+    Args:
+        before: `_undo_buffer_stamp` taken before the load hotkey was sent.
+        deadline: A `time.monotonic()` value to give up at.
+
+    Returns:
+        True once the buffer exists and differs from `before`, False on timeout.
+    """
+    POLL_SECS = 0.1
+    while time.monotonic() < deadline:
+        current = _undo_buffer_stamp()
+        if current is not None and current != before:
+            return True
+        time.sleep(POLL_SECS)
+    return False
+
+
 def _restamp_slot(filename: str, slot: int) -> Optional[str]:
     """Rename a state for `slot`, keeping the game id that ties it to its disc.
 
@@ -468,7 +647,10 @@ class Dolphin(Emulator):
     over the load hotkey instead. Saving is hotkey only: this launch's own
     render window is activated, `SAVE_KEY` is sent through XTEST, and the state
     directory is polled until the file settles, since the hotkey gives no
-    acknowledgement.
+    acknowledgement. A hotkey load is confirmed the other way round, off the
+    access time of the state Dolphin has to read to deserialize it, or off the
+    undo buffer it rewrites on every load where the mount records no access
+    times.
 
     Save data rides the save archive: `GC` holds the memory cards as loose
     `.gci` files, `Wii` the NAND, so nothing here needs the whole-card
@@ -754,21 +936,59 @@ class Dolphin(Emulator):
         return _wait_for_state_write(before, time.monotonic() + STATE_WAIT, pid)
 
     def load_state(self, slot: int) -> bool:
-        """Load the broker's slot over the hotkey.
+        """Load the broker's slot over the hotkey and confirm Dolphin read the state back.
 
         The hotkey is silent on an empty slot, so an absent file has to be
-        caught here or the caller reads a no-op as success.
+        caught here or the caller reads a no-op as success. A hotkey that was
+        sent is no proof either: Dolphin drops one that lands before the core
+        is running and says nothing about it, so the state's access time is
+        backdated first and the load only counts once a read has moved it.
+        Where that read leaves no trace, on a `noatime` mount or when the
+        marker could not be stamped, the undo buffer Dolphin rewrites as part
+        of a load is what confirms it; an unconfirmable load is reported as a
+        failure rather than taken on trust, since the caller would otherwise
+        hand the player a session still sitting where it was.
+        The deserialize the load starts is unobservable, and `LOAD_SETTLE`
+        covers it rather than handing the caller a session mid-restore.
 
         Args:
             slot: The slot RomM requested; the broker's `STATE_SLOT` is what gets loaded.
 
         Returns:
-            True when a state file exists and the hotkey was sent, False otherwise.
+            True once the load has been confirmed and settled, False when the slot is empty,
+            the hotkey could not be sent, or nothing confirmed the load within `LOAD_WAIT`.
         """
-        if self.state_path() is None:
+        state = self.state_path()
+        if state is None:
             log.warning("load state: slot %d holds no state file", STATE_SLOT)
             return False
-        return self._send_key(LOAD_KEY)
+        undo_before = _undo_buffer_stamp()
+        marker = _backdate_atime(state) if _atime_tracked(STATE_DIR) else None
+        if not self._send_key(LOAD_KEY):
+            log.warning("load state: could not send the load hotkey for %s", state.name)
+            return False
+        deadline = time.monotonic() + LOAD_WAIT
+        if marker is None:
+            if not _wait_for_undo_write(undo_before, deadline):
+                log.warning(
+                    "load state: %s could not be confirmed, no access time moved under %s "
+                    "and the undo buffer was not rewritten within %.1fs",
+                    state.name,
+                    STATE_DIR,
+                    LOAD_WAIT,
+                )
+                return False
+            confirmed_by = "the undo buffer"
+        else:
+            if not _wait_for_state_read(state, marker, deadline):
+                log.warning(
+                    "load state: dolphin never read %s back within %.1fs", state.name, LOAD_WAIT
+                )
+                return False
+            confirmed_by = "its access time"
+        time.sleep(LOAD_SETTLE)
+        log.info("load state: %s confirmed by %s and settled", state.name, confirmed_by)
+        return True
 
     def state_path(self) -> Optional[Path]:
         """Return the newest state file in the broker's slot, or None when it holds nothing."""
@@ -823,14 +1043,18 @@ class Dolphin(Emulator):
         of an undo hotkey a streaming session has no way to press. A failure
         to remove it is logged, not raised.
         """
-        undo = STATE_DIR / "lastState.sav"
+        undo = STATE_DIR / _UNDO_BUFFER_NAME
         try:
             undo.unlink(missing_ok=True)
         except OSError as exc:
             log.warning("could not drop the undo state buffer: %s", exc)
 
     def save_and_exit(self, slot: Optional[int]) -> dict[str, Any]:
-        """Save a state if asked, stop the emulator, and drop the undo buffer.
+        """Save a state if asked, stop the emulator, and clear what the archive must not carry.
+
+        The undo buffer and any stranded access-time probe both live in the
+        state directory the exit archive is built from, and neither is save
+        data, so both go before the dump runs.
 
         Args:
             slot: Slot RomM asked to save into (resolved to `STATE_SLOT`), or None to exit
@@ -857,6 +1081,7 @@ class Dolphin(Emulator):
                         state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
         self.stop()
         self._drop_undo_buffer()
+        _clear_atime_probes(STATE_DIR)
         return {
             "state_saved": saved,
             "state_slot": STATE_SLOT if slot is not None else None,

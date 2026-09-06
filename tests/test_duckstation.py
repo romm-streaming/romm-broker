@@ -508,14 +508,15 @@ def test_exit_with_a_slot_reports_no_save_when_no_new_state_appears(
     assert "no resume state written during shutdown" in caplog.text
 
 
-def test_exit_with_a_slot_discards_a_state_from_a_force_killed_process(
+def test_exit_with_a_slot_sets_aside_a_state_from_a_force_killed_process(
     duckstation_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """SIGKILL escalation (term_timeout exceeded) can cut the resume state write off mid-flight.
 
-    Such a file must not just go unreported: since the save archive dump sweeps up anything
-    with a fresh mtime regardless of what this method reports, the incomplete file has to be
-    removed outright or it ships to RomM anyway and gets booted next session.
+    Such a file must not just go unreported: the save archive dump sweeps up anything with a
+    fresh mtime regardless of what this method reports, so it has to leave the resume path.
+    It is only suspected of being torn, though, and can be the player's only copy, so it is
+    renamed to a sidecar rather than deleted.
     """
     written = duckstation.SSTATE_DIR / "SLUS-00001_resume.sav"
 
@@ -524,7 +525,7 @@ def test_exit_with_a_slot_discards_a_state_from_a_force_killed_process(
 
     def fake_stop(self: duckstation.Duckstation) -> None:
         # Simulates a partial write landing before the kill lands.
-        _touch(written)
+        _touch(written, content=b"maybe torn, maybe a whole session")
 
     monkeypatch.setattr(duckstation.Duckstation, "stop", fake_stop)
     emu = duckstation.Duckstation()
@@ -536,10 +537,103 @@ def test_exit_with_a_slot_discards_a_state_from_a_force_killed_process(
 
     assert report == {"state_saved": False, "state_slot": 1, "state_file": None}
     assert not written.exists()
+    aside = written.with_name(written.name + duckstation.UNTRUSTED_SUFFIX)
+    assert aside.read_bytes() == b"maybe torn, maybe a whole session"
+    assert "force-killed" in caplog.text
+    assert "set aside untrusted resume state" in caplog.text
+
+
+@pytest.mark.parametrize("returncode", [-15, -6, -11])
+def test_exit_with_a_slot_sets_aside_a_state_from_a_process_killed_by_any_signal(
+    returncode: int,
+    duckstation_dirs: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Any signal death, not just the SIGKILL escalation, can cut the resume state write short.
+
+    A negative returncode is the POSIX marker for that. SIGTERM's own graceful shutdown counts:
+    stop() escalates to an OS-level SIGKILL once term_timeout expires, and the wait then reports
+    the signal that actually landed.
+    """
+    written = duckstation.SSTATE_DIR / "SLUS-00001_resume.sav"
+
+    class FakeProc:
+        pass
+
+    proc = FakeProc()
+    proc.returncode = returncode
+
+    def fake_stop(self: duckstation.Duckstation) -> None:
+        # Simulates a partial write landing before the signal lands.
+        _touch(written)
+
+    monkeypatch.setattr(duckstation.Duckstation, "stop", fake_stop)
+    emu = duckstation.Duckstation()
+    emu._proc = proc
+    monkeypatch.setattr(emu, "alive", lambda: True)
+
+    with caplog.at_level("WARNING"):
+        report = emu.save_and_exit(1)
+
+    assert report == {"state_saved": False, "state_slot": 1, "state_file": None}
+    assert not written.exists()
+    assert written.with_name(written.name + duckstation.UNTRUSTED_SUFFIX).exists()
     assert "force-killed" in caplog.text
 
 
-def test_exit_with_a_slot_discards_a_state_when_stop_never_confirms_the_exit(
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_exit_with_a_slot_trusts_a_state_from_a_process_that_exited_on_its_own(
+    returncode: int, duckstation_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-negative returncode means the shutdown ran to completion, so its write is kept."""
+    written = _touch(duckstation.SSTATE_DIR / "SLUS-00001_resume.sav")
+
+    class FakeProc:
+        pass
+
+    proc = FakeProc()
+    proc.returncode = returncode
+
+    def fake_stop(self: duckstation.Duckstation) -> None:
+        written.write_bytes(b"a fresh resume state")
+
+    monkeypatch.setattr(duckstation.Duckstation, "stop", fake_stop)
+    emu = duckstation.Duckstation()
+    emu._proc = proc
+    monkeypatch.setattr(emu, "alive", lambda: True)
+
+    report = emu.save_and_exit(1)
+
+    assert report["state_saved"] is True
+    assert written.exists()
+
+
+def test_exit_without_a_slot_still_sets_aside_a_state_from_a_killed_process(
+    duckstation_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The set-aside is independent of the slot: the dump sweeps by mtime whatever this reports."""
+    written = duckstation.SSTATE_DIR / "SLUS-00001_resume.sav"
+
+    class FakeProc:
+        returncode = -15
+
+    def fake_stop(self: duckstation.Duckstation) -> None:
+        _touch(written)
+
+    monkeypatch.setattr(duckstation.Duckstation, "stop", fake_stop)
+    emu = duckstation.Duckstation()
+    emu._proc = FakeProc()
+    monkeypatch.setattr(emu, "alive", lambda: True)
+
+    report = emu.save_and_exit(None)
+
+    assert report == {"state_saved": False, "state_slot": None, "state_file": None}
+    assert not written.exists()
+    assert written.with_name(written.name + duckstation.UNTRUSTED_SUFFIX).exists()
+
+
+def test_exit_with_a_slot_sets_aside_a_state_when_stop_never_confirms_the_exit(
     duckstation_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """proc.returncode left None by a timed-out wait is treated as a confirmed kill, not trusted."""
@@ -560,6 +654,7 @@ def test_exit_with_a_slot_discards_a_state_when_stop_never_confirms_the_exit(
 
     assert report == {"state_saved": False, "state_slot": 1, "state_file": None}
     assert not written.exists()
+    assert written.with_name(written.name + duckstation.UNTRUSTED_SUFFIX).exists()
 
 
 def test_exit_with_a_slot_but_not_alive_reports_nothing(
@@ -574,6 +669,251 @@ def test_exit_with_a_slot_but_not_alive_reports_nothing(
     report = emu.save_and_exit(1)
 
     assert report == {"state_saved": False, "state_slot": 1, "state_file": None}
+
+
+# ── untrusted sidecars ───────────────────────────────────────────────────
+
+
+def _kill_after_writing(
+    monkeypatch: pytest.MonkeyPatch, state: Path, content: bytes = b"state"
+) -> duckstation.Duckstation:
+    """Build an emulator whose stop() writes `state` and then reports a SIGKILL."""
+
+    class FakeProc:
+        returncode = -9  # -signal.SIGKILL
+
+    def fake_stop(self: duckstation.Duckstation) -> None:
+        _touch(state, content=content)
+
+    monkeypatch.setattr(duckstation.Duckstation, "stop", fake_stop)
+    emu = duckstation.Duckstation()
+    emu._proc = FakeProc()
+    monkeypatch.setattr(emu, "alive", lambda: True)
+    return emu
+
+
+def test_a_set_aside_state_is_replaced_rather_than_piling_up(
+    duckstation_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second force-killed exit for the same serial replaces the earlier sidecar."""
+    state = duckstation.SSTATE_DIR / "SLUS-00001_resume.sav"
+    aside = state.with_name(state.name + duckstation.UNTRUSTED_SUFFIX)
+    _touch(aside, content=b"from the last kill")
+
+    _kill_after_writing(monkeypatch, state, b"from this kill").save_and_exit(1)
+
+    assert aside.read_bytes() == b"from this kill"
+    assert sorted(p.name for p in duckstation.SSTATE_DIR.iterdir()) == [aside.name]
+
+
+def test_a_set_aside_state_survives_a_restore_and_is_invisible_to_a_resume(
+    duckstation_dirs: dict[str, Path], rom_root: Path
+) -> None:
+    """A sidecar outlives clear_working_slot and is never offered back as a resume state."""
+    state = duckstation.SSTATE_DIR / "SLUS-00001_resume.sav"
+    aside = _touch(state.with_name(state.name + duckstation.UNTRUSTED_SUFFIX), content=b"kept")
+    rom = rom_root / "game.chd"
+    rom.write_bytes(b"")
+
+    duckstation.Duckstation().clear_working_slot()
+
+    assert aside.read_bytes() == b"kept"
+    assert duckstation._resume_snapshot() == {}
+    assert duckstation._resume_state_for(rom) is None
+
+
+def test_a_set_aside_state_takes_its_owner_marker_with_it(
+    duckstation_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A marker left behind would claim the next state DuckStation writes under that serial."""
+    state = duckstation.SSTATE_DIR / "SLUS-00001_resume.sav"
+    _touch(duckstation._owner_marker(state), content=b"/romm/psx/game.chd\n")
+
+    _kill_after_writing(monkeypatch, state).save_and_exit(1)
+
+    aside = state.with_name(state.name + duckstation.UNTRUSTED_SUFFIX)
+    assert not duckstation._owner_marker(state).exists()
+    assert duckstation._owner_marker(aside).read_text() == "/romm/psx/game.chd\n"
+
+
+def test_a_state_that_cannot_be_set_aside_is_left_alone_and_logged(
+    duckstation_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A rename that fails leaves the state in place rather than losing it, and is logged."""
+    state = duckstation.SSTATE_DIR / "SLUS-00001_resume.sav"
+    emu = _kill_after_writing(monkeypatch, state, b"still the player's only copy")
+
+    def boom(self: Path, target: Path) -> NoReturn:
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(Path, "replace", boom)
+
+    with caplog.at_level("WARNING"):
+        report = emu.save_and_exit(1)
+
+    assert report["state_saved"] is False
+    assert state.read_bytes() == b"still the player's only copy"
+    assert "could not set aside untrusted resume state" in caplog.text
+
+
+def test_save_file_kind_keeps_markers_and_sidecars_out_of_the_state_picker(
+    duckstation_dirs: dict[str, Path]
+) -> None:
+    """Neither a marker nor a sidecar is loadable, so RomM must not offer either as a state."""
+    emu = duckstation.Duckstation()
+
+    assert emu.save_file_kind("savestates/SLUS-00001_resume.sav") == "state"
+    assert emu.save_file_kind("savestates/SLUS-00001_resume.sav.rom") == "save"
+    assert emu.save_file_kind("savestates/SLUS-00001_resume.sav.untrusted") == "save"
+    assert emu.save_file_kind("savestates/SLUS-00001_resume.sav.untrusted.rom") == "save"
+
+
+# ── owner markers ────────────────────────────────────────────────────────
+
+
+def test_launch_records_the_disc_the_exits_marker_will_name(
+    duckstation_dirs: dict[str, Path], rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without the disc recorded at launch the exit has nothing to mark its state with."""
+    monkeypatch.setattr(duckstation.Duckstation, "stop", lambda self: None)
+    monkeypatch.setattr(duckstation, "_patch_ini", lambda: None)
+    monkeypatch.setattr(
+        duckstation.Duckstation,
+        "_spawn",
+        lambda self, cmd, env, stdin_pipe=False: None,
+    )
+    rom = rom_root / "game.chd"
+    rom.write_bytes(b"")
+
+    emu = duckstation.Duckstation()
+    emu.launch(rom, resume_slot=None)
+
+    assert emu._rom_path == rom
+
+
+def test_a_graceful_exit_marks_its_state_as_belonging_to_the_booted_disc(
+    duckstation_dirs: dict[str, Path], rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The marker, not the filename, is what a later resume matches on."""
+    rom = rom_root / "game.chd"
+    rom.write_bytes(b"")
+    written = duckstation.SSTATE_DIR / "SLUS-00001_resume.sav"
+
+    class FakeProc:
+        returncode = 0
+
+    monkeypatch.setattr(duckstation.Duckstation, "stop", lambda self: _touch(written))
+    emu = duckstation.Duckstation()
+    emu._rom_path = rom
+    emu._proc = FakeProc()
+    monkeypatch.setattr(emu, "alive", lambda: True)
+
+    assert emu.save_and_exit(1)["state_saved"] is True
+    assert duckstation._state_owner(written) == str(rom.resolve())
+    assert duckstation._resume_state_for(rom) == written
+
+
+def test_a_graceful_exit_marks_its_state_even_with_no_slot_requested(
+    duckstation_dirs: dict[str, Path], rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DuckStation writes the state either way and the dump ships it, so it needs an owner either way."""
+    rom = rom_root / "game.chd"
+    rom.write_bytes(b"")
+    written = duckstation.SSTATE_DIR / "SLUS-00001_resume.sav"
+
+    class FakeProc:
+        returncode = 0
+
+    monkeypatch.setattr(duckstation.Duckstation, "stop", lambda self: _touch(written))
+    emu = duckstation.Duckstation()
+    emu._rom_path = rom
+    emu._proc = FakeProc()
+    monkeypatch.setattr(emu, "alive", lambda: True)
+
+    report = emu.save_and_exit(None)
+
+    assert report == {"state_saved": False, "state_slot": None, "state_file": None}
+    assert duckstation._state_owner(written) == str(rom.resolve())
+
+
+def test_an_unmarkable_exit_is_logged_and_leaves_the_state_usable(
+    duckstation_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No disc on the instance costs the state its marker, never the save itself."""
+    written = duckstation.SSTATE_DIR / "SLUS-00001_resume.sav"
+
+    class FakeProc:
+        returncode = 0
+
+    monkeypatch.setattr(duckstation.Duckstation, "stop", lambda self: _touch(written))
+    emu = duckstation.Duckstation()
+    emu._proc = FakeProc()
+    monkeypatch.setattr(emu, "alive", lambda: True)
+
+    with caplog.at_level("WARNING"):
+        report = emu.save_and_exit(1)
+
+    assert report["state_saved"] is True
+    assert not duckstation._owner_marker(written).exists()
+    assert "no rom recorded for this session" in caplog.text
+
+
+def test_resume_picks_the_state_marked_for_this_disc_out_of_several(
+    duckstation_dirs: dict[str, Path], rom_root: Path
+) -> None:
+    """A flat savestates directory shared by every title is exactly what the marker disambiguates."""
+    mine = rom_root / "mine.chd"
+    mine.write_bytes(b"")
+    theirs = rom_root / "theirs.chd"
+    theirs.write_bytes(b"")
+    wanted = _touch(duckstation.SSTATE_DIR / "SLUS-00001_resume.sav", mtime=1000)
+    other = _touch(duckstation.SSTATE_DIR / "SLUS-00002_resume.sav", mtime=9000)
+    duckstation._write_owner_marker(wanted, mine)
+    duckstation._write_owner_marker(other, theirs)
+
+    assert duckstation._resume_state_for(mine) == wanted
+    assert duckstation._resume_state_for(theirs) == other
+
+
+def test_resume_refuses_a_lone_state_marked_for_another_disc(
+    duckstation_dirs: dict[str, Path], rom_root: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Booting clean costs a resume; handing DuckStation another game's state costs the save."""
+    mine = rom_root / "mine.chd"
+    mine.write_bytes(b"")
+    theirs = rom_root / "theirs.chd"
+    theirs.write_bytes(b"")
+    state = _touch(duckstation.SSTATE_DIR / "SLUS-00002_resume.sav")
+    duckstation._write_owner_marker(state, theirs)
+
+    with caplog.at_level("ERROR"):
+        assert duckstation._resume_state_for(mine) is None
+
+    assert "none is marked for" in caplog.text
+
+
+def test_resume_still_takes_a_lone_unmarked_state(
+    duckstation_dirs: dict[str, Path], rom_root: Path
+) -> None:
+    """Archives written before markers existed carry a single unmarked state and must still resume."""
+    rom = rom_root / "game.chd"
+    rom.write_bytes(b"")
+    state = _touch(duckstation.SSTATE_DIR / "SLUS-00001_resume.sav")
+
+    assert duckstation._resume_state_for(rom) == state
+
+
+def test_clear_working_slot_drops_a_marker_along_with_its_state(
+    duckstation_dirs: dict[str, Path]
+) -> None:
+    """A marker outliving its state would claim the next state written under the same serial."""
+    state = _touch(duckstation.SSTATE_DIR / "SLUS-00001_resume.sav")
+    marker = _touch(duckstation._owner_marker(state), content=b"/romm/psx/game.chd\n")
+
+    duckstation.Duckstation().clear_working_slot()
+
+    assert not state.exists()
+    assert not marker.exists()
 
 
 # ── class attributes (API surface parity with the other exit-only emulators) ──

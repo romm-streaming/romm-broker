@@ -130,45 +130,6 @@ Do not attach a `stripPrefix` middleware.
 </Tab>
 </Tabs>
 
-## Zoraxy: use a host rule, never a virtual directory
-
-Zoraxy's only path based routing is the **Virtual Directory**, which is an
-Apache style alias rather than an nginx location: it strips the matched prefix
-and appends the remainder to whatever path the target names. Naming the prefix
-in the target as well
-([wiki](https://github.com/tobychui/zoraxy/wiki/How-to-use-Virtual-Directory))
-does put it back, and plain HTTP then works end to end:
-
-| Match | Target | `/streaming/api/health` reaches the container as |
-| --- | --- | --- |
-| `/streaming` | `10.0.1.56:3009` | `/api/health`, which matches no location, so nginx serves its default "Welcome to nginx" root |
-| `/streaming` | `10.0.1.56:3009/streaming` | `/streaming/api/health`, correct |
-
-**Websockets do not follow that rewrite.** The upgrade path only strips, so with
-the working target above, `/streaming/ws/room` still arrives as `/ws/room` and
-nginx answers 404. Same for `/streaming/stream/websocket`. Reported as
-[tobychui/zoraxy#882](https://github.com/tobychui/zoraxy/issues/882) and closed
-without a fix. Measure it rather than trusting the rule looks right, and force
-HTTP/1.1 or the upgrade headers never leave curl:
-
-```bash
-curl -sk -i --http1.1 -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
-  -H 'Sec-WebSocket-Version: 13' -H "Sec-WebSocket-Key: $(head -c 16 /dev/urandom | base64)" \
-  https://romm.example.com/streaming/stream/websocket | head -1
-```
-
-`101 Switching Protocols` is a working mount. A `404` from nginx means the
-upgrade was forwarded without the rewrite, and there is no virtual directory
-setting that repairs it. The stream, the collab room and the input channel are
-all websockets, so the room loads and then immediately shows "Session Ended".
-
-**Only the virtual directory is affected.** A plain Zoraxy host rule forwards
-websocket upgrades correctly, measured with the same handshake above. So Zoraxy
-stays in front: point the host rule at something that can do the mount (nginx or
-Caddy from the recipes above, on the same origin as the parent), and delete the
-virtual directory so the prefix reaches that proxy untouched. Giving the
-container its own hostname and running it cross origin also works, and costs the
-in frame pointer tracking and nothing else.
 
 ## Verifying
 

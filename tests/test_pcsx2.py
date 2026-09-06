@@ -504,3 +504,202 @@ def test_resolve_refuses_a_direct_path_that_is_a_symlink_out_of_the_library(
     linked.symlink_to(outside)
 
     assert pcsx2.Pcsx2().resolve_rom_file(linked) is None
+
+
+def test_two_sessions_keep_their_own_working_slot(sstate_dir: Path) -> None:
+    """Each instance resolves, targets and clears its own slot, not a shared one."""
+    first = pcsx2.Pcsx2()
+    second = pcsx2.Pcsx2()
+    first.state_slot = 3
+    second.state_slot = 7
+    mine = _touch(sstate_dir / "SLUS-20946 (7D3A8B4E).03.p2s")
+    theirs = _touch(sstate_dir / "SLUS-20946 (7D3A8B4E).07.p2s")
+
+    assert first.state_path() == mine
+    assert second.state_path() == theirs
+    assert first.state_target("SLUS-20946 (7D3A8B4E).01.p2s") == mine
+    assert second.state_target("SLUS-20946 (7D3A8B4E).01.p2s") == theirs
+
+    first.clear_working_slot()
+
+    assert not mine.exists()
+    assert theirs.exists()
+
+
+def test_a_save_addresses_the_slot_of_the_instance_that_asked(
+    sstate_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The PINE save payload and the reported slot both come off the instance."""
+    sent: list[bytes] = []
+    monkeypatch.setattr(
+        pcsx2, "_pine_request", lambda opcode, payload=b"", timeout=5.0: sent.append(payload) or b""
+    )
+    monkeypatch.setattr(
+        pcsx2, "_wait_for_sstate_write", lambda before, deadline, slot=None, pid=None: True
+    )
+    monkeypatch.setattr(pcsx2.Pcsx2, "alive", lambda self: True)
+    monkeypatch.setattr(pcsx2.Pcsx2, "stop", lambda self: None)
+    emu = pcsx2.Pcsx2()
+    emu.state_slot = 4
+    _touch(sstate_dir / "SLUS-20946 (7D3A8B4E).04.p2s")
+
+    result = emu.save_and_exit(1)
+
+    assert sent == [bytes([4])]
+    assert result["state_slot"] == 4
+    assert result["state_saved"] is True
+
+
+def test_a_save_that_never_lands_is_discarded_instead_of_shipped(
+    sstate_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write that never settles is deleted, so the exit archive cannot ship a torn state."""
+    monkeypatch.setattr(pcsx2, "_pine_request", lambda opcode, payload=b"", timeout=5.0: b"")
+    monkeypatch.setattr(pcsx2.Pcsx2, "alive", lambda self: True)
+    monkeypatch.setattr(pcsx2.Pcsx2, "stop", lambda self: None)
+    emu = pcsx2.Pcsx2()
+    emu.state_slot = 10
+    survivor = _touch(sstate_dir / "SLUS-20946 (7D3A8B4E).02.p2s")
+
+    def half_write(
+        before: dict[Path, tuple[int, float]],
+        deadline: float,
+        slot: Optional[int] = None,
+        pid: Optional[int] = None,
+    ) -> bool:
+        """Leave a truncated state behind the way a stalled PCSX2 save does."""
+        (sstate_dir / "SLUS-20946 (7D3A8B4E).10.p2s").write_bytes(b"torn")
+        return False
+
+    monkeypatch.setattr(pcsx2, "_wait_for_sstate_write", half_write)
+
+    result = emu.save_and_exit(1)
+
+    assert result["state_saved"] is False
+    assert result["state_file"] is None
+    assert not (sstate_dir / "SLUS-20946 (7D3A8B4E).10.p2s").exists()
+    # Only what the failed save touched goes; the other slot is untouched.
+    assert survivor.exists()
+
+
+def test_a_state_already_in_the_slot_survives_a_failed_save(
+    sstate_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed save never deletes the good state the slot already held."""
+    monkeypatch.setattr(pcsx2, "_pine_request", lambda opcode, payload=b"", timeout=5.0: b"")
+    monkeypatch.setattr(
+        pcsx2, "_wait_for_sstate_write", lambda before, deadline, slot=None, pid=None: False
+    )
+    emu = pcsx2.Pcsx2()
+    emu.state_slot = 10
+    existing = _touch(sstate_dir / "SLUS-20946 (7D3A8B4E).10.p2s", mtime=1000)
+
+    assert emu.save_state(1) is False
+    assert existing.exists()
+
+
+def test_a_load_is_refused_when_the_state_belongs_to_another_disc(
+    sstate_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A state captured from another disc is not loaded, however PINE would ack it."""
+    loads: list[int] = []
+    monkeypatch.setattr(pcsx2, "_pine_game_serial", lambda: "SLES-51234")
+    monkeypatch.setattr(
+        pcsx2, "_pine_request", lambda opcode, payload=b"", timeout=5.0: loads.append(opcode) or b""
+    )
+    emu = pcsx2.Pcsx2()
+    emu.state_slot = 10
+    _touch(sstate_dir / "SLUS-20946 (7D3A8B4E).10.p2s")
+
+    assert emu.load_state(1) is False
+    assert loads == []
+
+
+def test_a_load_goes_through_for_the_disc_the_state_came_from(
+    sstate_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A state whose serial matches the running disc is loaded from the instance's slot."""
+    sent: list[tuple[int, bytes]] = []
+    monkeypatch.setattr(pcsx2, "_pine_game_serial", lambda: "SLUS-20946")
+    monkeypatch.setattr(
+        pcsx2,
+        "_pine_request",
+        lambda opcode, payload=b"", timeout=5.0: sent.append((opcode, payload)) or b"",
+    )
+    emu = pcsx2.Pcsx2()
+    emu.state_slot = 6
+    _touch(sstate_dir / "SLUS-20946 (7D3A8B4E).06.p2s")
+
+    assert emu.load_state(1) is True
+    assert sent == [(pcsx2._PINE_MSG_LOAD_STATE, bytes([6]))]
+
+
+def test_a_load_still_goes_through_when_pcsx2_names_no_disc(
+    sstate_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unavailable serial skips the check rather than costing the player the resume."""
+    monkeypatch.setattr(pcsx2, "_pine_game_serial", lambda: None)
+    monkeypatch.setattr(pcsx2, "_pine_request", lambda opcode, payload=b"", timeout=5.0: b"")
+    emu = pcsx2.Pcsx2()
+    emu.state_slot = 10
+    _touch(sstate_dir / "SLUS-20946 (7D3A8B4E).10.p2s")
+
+    assert emu.load_state(1) is True
+
+
+def test_the_running_serial_is_read_off_the_pine_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The game-id reply's length-prefixed, null-terminated string is decoded to a serial."""
+    serial = b"SLUS-20946\x00"
+    body = struct.pack("<I", len(serial)) + serial
+    sock = _FakePineSocket(struct.pack("<IB", 5 + len(body), 0) + body)
+    monkeypatch.setattr(pcsx2._socket, "socket", lambda family, kind: sock)
+
+    assert pcsx2._pine_game_serial() == "SLUS-20946"
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [
+        ("SLUS-20946 (7D3A8B4E).10.p2s", "SLUS-20946"),
+        ("SLUS-20946.10.p2s", "SLUS-20946"),
+        ("card.bin", None),
+    ],
+)
+def test_the_captured_serial_drops_the_crc_pcsx2_appends(
+    filename: str, expected: Optional[str]
+) -> None:
+    """A state name yields the bare serial, which is what PINE reports for the disc."""
+    assert pcsx2._state_serial(filename) == expected
+
+
+def test_same_second_writes_are_broken_by_size_not_left_to_chance(sstate_dir: Path) -> None:
+    """Two states sharing an mtime resolve to the larger, never to the truncated one."""
+    torn = sstate_dir / "SLUS-1.10.p2s"
+    torn.write_bytes(b"x")
+    whole = sstate_dir / "SLUS-2.10.p2s"
+    whole.write_bytes(b"a whole state")
+    for p in (torn, whole):
+        os.utime(p, (5000, 5000))
+
+    assert pcsx2.newest_state_for_slot(10) == whole
+
+
+def test_a_state_that_cannot_be_stated_is_logged_not_swallowed(
+    sstate_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A stat failure while scanning the slot leaves a log line behind."""
+    _touch(sstate_dir / "SLUS-20946.10.p2s")
+    real_stat = Path.stat
+
+    def refuse(self: Path, **kwargs: object) -> os.stat_result:
+        """Fail only on state files, so the directory checks around them still work."""
+        if self.suffix == ".p2s":
+            raise OSError("gone")
+        return real_stat(self, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", refuse)
+
+    with caplog.at_level("WARNING", logger=pcsx2.log.name):
+        assert pcsx2.newest_state_for_slot(10) is None
+
+    assert any("could not stat the state" in r.message for r in caplog.records)

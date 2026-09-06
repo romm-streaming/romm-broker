@@ -544,3 +544,70 @@ async def test_a_token_push_that_fails_everywhere_is_logged_and_retried_once(
     assert attempted == ["http://first/tokens", "http://second/tokens", "http://first/tokens"]
     assert "connection refused" in caplog.text
     assert any(r.levelname == "ERROR" for r in caplog.records)
+
+
+async def test_a_slot_change_selkies_refused_is_logged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A gamepad assignment selkies would not take is an input route the room only thinks it has."""
+
+    async def _refuse(_session: dict[str, Any]) -> bool:
+        """Fail the push the way a selkies that is down does.
+
+        Args:
+            _session: The session whose tokens would have been pushed.
+
+        Returns:
+            Always False.
+        """
+        return False
+
+    monkeypatch.setattr(selkies, "push_tokens", _refuse)
+    sess = _activate()
+    viewer = await session.add_viewer("participant")
+
+    with caplog.at_level("ERROR", logger="webstation_broker.session"):
+        await session.handle_assign_slot(viewer["token"], 2)
+
+    assert sess["viewers"][0]["slot"] == 2
+    assert "selkies kept the old token map" in caplog.text
+    assert any(r.levelname == "ERROR" for r in caplog.records)
+
+
+async def test_an_mk_handover_selkies_refused_is_logged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Mouse and keyboard control keeps routing to whoever held it, so a refused push has to say so."""
+
+    async def _refuse(_session: dict[str, Any]) -> bool:
+        """Fail the push the way a selkies that is down does.
+
+        Args:
+            _session: The session whose tokens would have been pushed.
+
+        Returns:
+            Always False.
+        """
+        return False
+
+    monkeypatch.setattr(selkies, "push_tokens", _refuse)
+    sess = _activate()
+    viewer = await session.add_viewer("participant")
+
+    with caplog.at_level("ERROR", logger="webstation_broker.session"):
+        await session.handle_assign_mk(viewer["token"])
+
+    assert sess["mk_owner_token"] == viewer["token"]
+    assert "selkies kept the old token map" in caplog.text
+    assert any(r.levelname == "ERROR" for r in caplog.records)
+
+
+def test_a_session_with_no_bootable_rom_file_records_none() -> None:
+    """Activate resolves no rom file for some launches, and the session has to carry that through."""
+    sess = session.new_session(
+        {"session_id": "sess-noboot", "emulator": "fake", "rom": {"name": "Game"}},
+        FakeEmulator(),
+        None,
+    )
+
+    assert sess["rom_file"] is None

@@ -40,6 +40,16 @@ _SENSITIVE_ENV_SUFFIXES = ("_SECRET", "_TOKEN", "_PASSWORD", "_KEY")
 _DEFAULT_TERM_TIMEOUT = 5.0
 """Seconds SIGTERM gets before SIGKILL when nothing names a longer grace."""
 
+_DEFAULT_KILL_TIMEOUT = 10.0
+"""Seconds SIGKILL gets to land before the emulator is written off as unkillable.
+
+Only spent on a process that already ignored SIGTERM for its whole
+`term_timeout`, so this is the uninterruptible-sleep case (a stuck FUSE or NFS
+read), not a slow shutdown: nothing the emulator does with the time can change
+the outcome. Long enough for that I/O to come back, short enough that the exit
+route still answers.
+"""
+
 
 def base_launch_env() -> dict[str, str]:
     """Build the environment apps are launched into.
@@ -233,20 +243,24 @@ class Emulator:
     here. Everything else is an optional hook with a safe default:
 
     * `save_state`, `load_state`, `state_path`, `state_screenshot_path`,
-      `state_target`, `clear_working_slot` and `wait_for_state` are the
-      save-state hooks. The broker only calls the first two when
-      `supports_states` is on; the defaults report an empty slot.
+      `state_target` and `wait_for_state` are the save-state hooks. The broker
+      only calls the first two when `supports_states` is on; the defaults
+      report an empty slot.
     * `swap_disc` is only called when `supports_disc_swap` is on.
     * `memory_card_path` pairs with `memory_card_subtree` for emulators whose
       whole memory card travels on its own routes.
-    * `prepare_restore` runs before a save archive is extracted.
+    * `clear_working_slot` and `prepare_restore` both run at every activate.
+      Any subclass with real save data has to clear the previous session's
+      saves in one of them and declare `clears_stale_saves`; see
+      `clear_working_slot` for the contract.
     * `save_and_exit` is the exit path; the default writes no state.
 
     The lifecycle as the broker drives it:
 
     1. Activate: `clear_working_slot` drops the previous session's leftover
-       state, `prepare_restore` runs, and the incoming save archive is
-       extracted into `save_root`, scoped to `save_subtrees`.
+       saves and states, `prepare_restore` runs (always, archive or not), and
+       the incoming save archive is extracted into `save_root`, scoped to
+       `save_subtrees`.
     2. `launch` spawns the process through `_spawn`, which captures output to
        `log_path`, starts it in its own session and records its pid so a later
        broker process can reap it (see `reap_orphan`).
@@ -281,6 +295,9 @@ class Emulator:
         state_dir: Where that slot's file lives.
         log_path: Where the emulator's stdout and stderr are appended.
         term_timeout: Seconds SIGTERM gets before escalating to SIGKILL.
+        kill_timeout: Seconds SIGKILL gets before the process is written off.
+        clears_stale_saves: The subclass's declaration that it wipes the
+            previous session's save data before a restore.
         memory_card_subtree: The save subtree holding the whole memory card, or
             None for emulators without one.
         memory_card_marker: A file the emulator needs inside the card directory
@@ -366,6 +383,22 @@ class Emulator:
 
     Recorded alongside the pid so `reap_orphan` gives an orphan of this
     emulator the same grace a live `stop` would.
+    """
+    kill_timeout: float = _DEFAULT_KILL_TIMEOUT
+    """Seconds SIGKILL gets before the process is written off as unkillable.
+
+    Raise it for an emulator whose shutdown blocks on storage that can stall
+    for longer than `_DEFAULT_KILL_TIMEOUT`.
+    """
+    clears_stale_saves: bool = False
+    """Whether this emulator wipes the previous session's save data at activate.
+
+    Set it True in a subclass whose `clear_working_slot` (or another activate
+    hook) clears the whole save tree the archive restores into. See
+    `clear_working_slot` for the contract itself; the flag is what the registry
+    tests assert on, so an emulator that carries real save data and leaves both
+    the flag and the hook alone is caught rather than silently leaking one
+    player's saves into the next player's session.
     """
     memory_card_subtree: Optional[str] = None
     """The save subtree holding the whole memory card, for emulators that have one.
@@ -462,7 +495,8 @@ class Emulator:
         """Terminate the running emulator, if any, and forget it.
 
         The process group gets SIGTERM, escalating to SIGKILL once
-        `term_timeout` passes. A process that is already gone is a no-op.
+        `term_timeout` passes, and SIGKILL gets `kill_timeout` to land. A
+        process that is already gone is a no-op.
 
         The handle and the pid record are only dropped once the process is
         confirmed gone. An emulator that outlived SIGKILL, or that refused the
@@ -486,7 +520,7 @@ class Emulator:
             except subprocess.TimeoutExpired:
                 os.killpg(pgid, signal.SIGKILL)
                 try:
-                    proc.wait(timeout=10)
+                    proc.wait(timeout=self.kill_timeout)
                     gone = True
                 except subprocess.TimeoutExpired:
                     log.error(
@@ -507,11 +541,15 @@ class Emulator:
             self._forget()
 
     def prepare_restore(self) -> None:
-        """Hook run before a save archive is extracted into `save_root`.
+        """Hook run at activate, after `clear_working_slot` and before any extract.
 
-        Default: nothing. Override to clear anything that would block the
-        restore: a process holding a save file open, or an existing file the
-        newer-file guard would wrongly keep over the archived one.
+        Called on every activate, whether or not there is an archive to
+        restore: a session that starts with no archive is exactly the one where
+        a stale save left in place would be picked up as the player's own.
+
+        Default: nothing. Override to clear anything that would block or
+        outrank the restore: a process holding a save file open, or an existing
+        file the newer-file guard would wrongly keep over the archived one.
         """
 
     def launch(self, rom_path: Optional[Path], resume_slot: Optional[int]) -> None:
@@ -575,6 +613,44 @@ class Emulator:
         """
         return None
 
+    def note_state_handout(self) -> None:
+        """Record that the state-file GET route is about to read the file `state_path` returned.
+
+        That read moves the file's access time, which some implementations
+        also watch to confirm a load actually happened. Called before the
+        route reads the file's bytes, so the window it opens covers that read
+        instead of starting after the access time has already moved; callers
+        of `load_state` can then tell their own load's read from this one.
+        The default does nothing, for implementations that confirm loads some
+        other way.
+        """
+        return None
+
+    def lock_for_state_write(self) -> bool:
+        """Take whatever lock a pushed state file should hold before it overwrites the working slot.
+
+        A push lands as a raw file replace with no confirmation step of its
+        own, so nothing else stops it landing in the middle of another
+        implementation's own confirmation window for that same file (a resume
+        retry, an in-flight load) and being mistaken for whatever that other
+        read or write was watching for. The default has no such window to
+        protect and always succeeds.
+
+        Returns:
+            True once locked (or when there is nothing to lock); False when
+            an implementation's lock could not be taken in time, in which case
+            the caller must not write the file and must not call
+            `unlock_state_write`.
+        """
+        return True
+
+    def unlock_state_write(self) -> None:
+        """Release whatever `lock_for_state_write` took. No-op by default.
+
+        Only called after a `lock_for_state_write` call that returned True.
+        """
+        return None
+
     def state_screenshot_path(self) -> Optional[Path]:
         """The frame captured alongside the working slot's state, or None.
 
@@ -588,13 +664,35 @@ class Emulator:
         return None
 
     def clear_working_slot(self) -> None:
-        """Drop whatever the working slot holds from an earlier session.
+        """Drop what an earlier session left in the save tree, before the restore.
 
-        Called at activate, before the incoming save archive is restored, so
-        only the container's own leftovers go. Emulators that name a state
-        after the loaded content can tell a stale one apart on sight and leave
-        this alone; the override exists for the ones that cannot.
+        Every subclass that carries real save data MUST empty the save tree
+        here (or in `prepare_restore`) and declare `clears_stale_saves`. This
+        is not an optimisation and not optional. The restore only overwrites
+        the members the incoming archive happens to carry, so anything the
+        previous session wrote and this one's archive does not name survives
+        untouched: on a pooled or shared container that is one player's saves
+        left readable, and mixed into the dump, in the next player's session. A
+        clear scoped to a state slot or to one title is not enough on its own
+        unless nothing else under `save_subtrees` can hold another player's
+        data.
+
+        Deleting more than the container's own leftovers is the failure in the
+        other direction, so the clear is scoped to `save_subtrees` and runs
+        before the archive is extracted, never after.
+
+        The default only reports the gap: the base class cannot know which
+        paths are safe to delete, so an emulator with save data that reaches
+        this warns rather than silently starting a session on the last
+        player's files.
         """
+        if self.save_subtrees and not self.clears_stale_saves:
+            log.warning(
+                "%s holds save data in %s but clears none of it at activate: "
+                "an earlier session's saves may survive into this one",
+                self.name,
+                ", ".join(self.save_subtrees),
+            )
 
     def memory_card_path(self, platform: Optional[str] = None) -> Optional[Path]:
         """The directory holding the card the memory-card routes sync, or None.
@@ -643,6 +741,27 @@ class Emulator:
             # parent shows it rather than restoring it.
             return "state_screenshot" if rel.lower().endswith((".png", ".jpg")) else "state"
         return "save"
+
+    def always_restore(self, rel: str) -> bool:
+        """Whether an archive member outranks whatever sits on disk at activate.
+
+        The restore skips a member the disk already holds a newer copy of, so
+        it can never roll back progress made since the archive was taken. That
+        reasoning only holds for files whose mtime records this player's own
+        saving. An emulator with a file the container writes on behalf of
+        whoever is using it (a signed-in profile package, an account store)
+        overrides this: the freshest copy of one of those is the last player's,
+        and passing over the incoming one silently runs the session under their
+        identity.
+
+        Args:
+            rel: The member path, relative to `save_root` and posix-separated.
+
+        Returns:
+            True to restore the member unconditionally. The default exempts
+            nothing, so every member stays under the guard.
+        """
+        return False
 
     def state_target(self, filename: str) -> Optional[Path]:
         """Where a pushed state called `filename` belongs.
@@ -699,13 +818,20 @@ class Emulator:
                 state save.
 
         Returns:
-            A dict with `{"state_saved", "state_slot", "state_file"}`:
-            whether a state was written, the effective slot, and the written
-            file's `{"path", "size", "mtime"}`. The default reports all three
-            as None.
+            A dict with `{"state_saved", "state_slot", "state_file",
+            "sram_flushed"}`: whether a state was written, the effective
+            slot, the written file's `{"path", "size", "mtime"}`, and whether
+            the game's own save data was confirmed flushed before exit
+            (None where an implementation has no such confirmation to give).
+            The default reports all four as None.
         """
         self.stop()
-        return {"state_saved": None, "state_slot": None, "state_file": None}
+        return {
+            "state_saved": None,
+            "state_slot": None,
+            "state_file": None,
+            "sram_flushed": None,
+        }
 
     def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """File the emulator should boot for `path` (folder or file).

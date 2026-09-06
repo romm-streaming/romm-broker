@@ -452,27 +452,47 @@ class Cemu(Emulator):
     def _modified_title_saves(self) -> list[Path]:
         """Title save dirs holding a file written while the session ran.
 
+        A listing that fails is logged and skipped rather than raised: the MLC
+        can vanish under the walk, and the exit path calling this still has a
+        process to stop and a report to hand back.
+
+        Only `<8 hex>/<8 hex>` pairs count. `usr/save` also holds the `system`
+        tree, and both halves feed the restamp walk, so a name that is not a
+        title id half is not a title save dir.
+
         Returns:
             The `usr/save/<titleHigh>/<titleLow>` directories touched since
             launch, or nothing at all when no launch set a baseline.
         """
-        selected = []
+        selected: list[Path] = []
         if not SAVE_DIR.is_dir():
             return selected
-        for high in sorted(SAVE_DIR.iterdir()):
-            if not high.is_dir() or not _HEX8_RE.match(high.name):
-                continue
-            for title in sorted(high.iterdir()):
-                if not title.is_dir():
+        try:
+            for high in sorted(SAVE_DIR.iterdir()):
+                if not high.is_dir() or not _HEX8_RE.match(high.name):
                     continue
-                try:
-                    if any(
-                        p.is_file() and p.stat().st_mtime >= self._session_start
-                        for p in title.rglob("*")
-                    ):
-                        selected.append(title)
-                except OSError:
-                    continue
+                for title in sorted(high.iterdir()):
+                    if not title.is_dir() or not _HEX8_RE.match(title.name):
+                        continue
+                    try:
+                        if any(
+                            p.is_file() and p.stat().st_mtime >= self._session_start
+                            for p in title.rglob("*")
+                        ):
+                            selected.append(title)
+                    except OSError as exc:
+                        log.warning(
+                            "cemu: could not walk %s, its saves may be dropped from the dump: %s",
+                            title,
+                            exc,
+                        )
+                        continue
+        except OSError as exc:
+            log.warning(
+                "cemu: could not list the save tree at %s, the dump may be incomplete: %s",
+                SAVE_DIR,
+                exc,
+            )
         return selected
 
     def save_and_exit(self, slot: int) -> dict[str, Any]:

@@ -31,6 +31,30 @@ def _zip(members: dict[str, bytes]) -> bytes:
     return buf.getvalue()
 
 
+def _zip_with_bad_crc(name: str, content: bytes) -> bytes:
+    """Build a zip whose one member fails its CRC-32 check when read.
+
+    Writes uncompressed so the on-disk bytes are the plaintext payload, then
+    flips one of those bytes in place without touching any declared size or
+    the stored CRC, so `ZipFile.read()` raises `zipfile.BadZipFile` on that
+    member while the archive still opens and lists normally.
+
+    Args:
+        name: The archive member name to corrupt.
+        content: The member's original content.
+
+    Returns:
+        The zip file contents with that member's payload corrupted.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        zf.writestr(name, content)
+    raw = bytearray(buf.getvalue())
+    idx = raw.index(content)
+    raw[idx] ^= 0xFF
+    return bytes(raw)
+
+
 def _names(archive: bytes) -> list[str]:
     """List the member names of a zip archive in sorted order.
 
@@ -185,6 +209,35 @@ def test_replace_refuses_an_archive_with_too_many_entries(
 
     assert "more than 2 entries" in result
     assert not card.exists()
+
+
+def test_replace_recovers_when_a_member_fails_its_crc_check(tmp_path: Path) -> None:
+    """A CRC mismatch mid-extract is reported like any other write failure, not left to crash uncaught."""
+    card = tmp_path / "Slot 1"
+    memcard.ensure_card(card, MARKER)
+    bad = _zip_with_bad_crc("BMINE-00001/save.bin", b"minedata")
+
+    result = memcard.replace(card, bad, MARKER)
+
+    assert isinstance(result, str)
+    assert "could not write the memory card" in result
+    assert card.is_dir()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["Slot 1"]
+
+
+def test_replace_clears_a_stale_backup_left_by_a_previous_crash(tmp_path: Path) -> None:
+    """A `.card.old` left behind when a prior swap's cleanup never ran should not block the next replace."""
+    card = tmp_path / "Slot 1"
+    memcard.ensure_card(card, MARKER)
+    stale_backup = tmp_path / ".Slot 1.old"
+    stale_backup.mkdir()
+    (stale_backup / "leftover.bin").write_bytes(b"stale")
+
+    result = memcard.replace(card, _zip({"BMINE-00001/save.bin": b"mine"}), MARKER)
+
+    assert result == 1
+    assert not stale_backup.exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["Slot 1"]
 
 
 def test_a_replaced_card_captures_back_to_the_same_members(tmp_path: Path) -> None:

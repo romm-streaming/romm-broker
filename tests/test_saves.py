@@ -11,7 +11,7 @@ import os
 import time
 import zipfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pytest
 
@@ -116,6 +116,43 @@ def test_build_refuses_a_dump_over_the_size_limit(tmp_path: Path, monkeypatch: p
     assert "size limit" in report["error"]
 
 
+def test_a_size_limit_failure_carries_no_unrelated_skip_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A stat failure elsewhere in the walk must not dress up a size-limit failure.
+
+    The two have nothing to do with each other, and a "could not be read" line
+    logged alongside the size-limit error reads as its explanation to whoever
+    is debugging the failed exit.
+    """
+    monkeypatch.setattr(saves, "SAVE_FILE_MAX_BYTES", 8)
+    big = _write(tmp_path / "sstates" / "big.p2s", b"x" * 16, mtime=NEW)
+    vanished = tmp_path / "sstates" / "gone.p2s"
+
+    def _listing(root: Path, subtrees: tuple[str, ...]) -> list[Path]:
+        """List the oversized file and one removed between walk and stat.
+
+        Args:
+            root: The save data root, unused.
+            subtrees: The subtree names, unused.
+
+        Returns:
+            The two paths, the second of which no longer exists.
+        """
+        return [big, vanished]
+
+    monkeypatch.setattr(saves, "_iter_save_files", _listing)
+
+    with caplog.at_level(logging.WARNING):
+        report = saves.build_save_archive(tmp_path, ("sstates",), baseline=BASELINE)
+
+    assert report["error"] == "changed saves exceed size limit (16 bytes)"
+    assert report["zip_bytes"] is None
+    assert report["skipped_files"] == ["sstates/gone.p2s"]
+    assert "could not stat" in caplog.text
+    assert "could not be read" not in caplog.text
+
+
 def test_build_reports_a_missing_save_root(tmp_path: Path) -> None:
     """Build reports a missing save root."""
     report = saves.build_save_archive(tmp_path / "gone", ("sstates",), baseline=0)
@@ -135,6 +172,155 @@ def test_build_produces_nothing_when_the_session_wrote_nothing(tmp_path: Path) -
     assert report["error"] is None
 
 
+def test_a_stat_failure_alone_is_not_a_failed_dump(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A file that vanishes mid-walk cannot fail a session that changed nothing.
+
+    Its mtime is unknowable once the stat fails, so there is no evidence it was
+    even touched this session; erroring would report a clean no-op exit as a
+    lost save and have RomM treat the session as failed.
+    """
+    kept = _write(tmp_path / "memcards" / "old.bin", b"old", mtime=OLD)
+    vanished = tmp_path / "memcards" / "gone.bin"
+
+    def _listing(root: Path, subtrees: tuple[str, ...]) -> list[Path]:
+        """List one real file plus one already removed between walk and stat.
+
+        Args:
+            root: The save data root, unused.
+            subtrees: The subtree names, unused.
+
+        Returns:
+            The two paths, the second of which no longer exists.
+        """
+        return [kept, vanished]
+
+    monkeypatch.setattr(saves, "_iter_save_files", _listing)
+
+    with caplog.at_level(logging.WARNING):
+        report = saves.build_save_archive(tmp_path, ("memcards",), baseline=BASELINE)
+
+    assert report["error"] is None
+    assert report["skipped"] == 1
+    assert report["skipped_files"] == ["memcards/gone.bin"]
+    assert report["zip_bytes"] is None
+    # The stat failure is logged where it happens, naming the file it dropped.
+    assert "could not stat" in caplog.text
+    assert str(vanished) in caplog.text
+
+
+def test_a_dump_where_every_candidate_fails_to_stat_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When every save-file candidate fails to stat, there is no evidence anything was unchanged.
+
+    A single stray stat failure among otherwise-stattable files is tolerated
+    (see test_a_stat_failure_alone_is_not_a_failed_dump), but when the walk
+    turns up candidates and *none* of them can be stat'd, "nothing changed"
+    was never actually established and must not be reported as a clean no-op.
+    """
+    first = tmp_path / "memcards" / "gone1.bin"
+    second = tmp_path / "memcards" / "gone2.bin"
+
+    def _listing(root: Path, subtrees: tuple[str, ...]) -> list[Path]:
+        """List two paths, both already removed between walk and stat.
+
+        Args:
+            root: The save data root, unused.
+            subtrees: The subtree names, unused.
+
+        Returns:
+            The two vanished paths.
+        """
+        return [first, second]
+
+    monkeypatch.setattr(saves, "_iter_save_files", _listing)
+
+    with caplog.at_level(logging.ERROR):
+        report = saves.build_save_archive(tmp_path, ("memcards",), baseline=BASELINE)
+
+    assert report["zip_bytes"] is None
+    assert report["skipped"] == 2
+    assert report["skipped_files"] == ["memcards/gone1.bin", "memcards/gone2.bin"]
+    assert "could not stat any of the 2 save file(s)" in report["error"]
+    assert "could not stat any of the 2 save file(s)" in caplog.text
+
+
+def test_a_dump_whose_every_changed_file_is_unreadable_still_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A changed save that could not be read fails the dump rather than reading as a no-op."""
+    _write(tmp_path / "memcards" / "card.bin", b"new", mtime=NEW)
+
+    def _unreadable(p: Path, retries: int = 4, settle: float = 0.5) -> None:
+        """Fail the read the way a file still being written does.
+
+        Args:
+            p: The file to read.
+            retries: How many reads to attempt, unused.
+            settle: Seconds between attempts, unused.
+
+        Returns:
+            None, always.
+        """
+        return None
+
+    monkeypatch.setattr(saves, "_read_file_stable", _unreadable)
+
+    report = saves.build_save_archive(tmp_path, ("memcards",), baseline=BASELINE)
+
+    assert "none of the 1 changed save file(s) could be read" in report["error"]
+    assert report["skipped_files"] == ["memcards/card.bin"]
+
+
+def test_skipped_files_stay_root_relative_in_both_skip_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both skip paths name the file the same way, since one list feeds one error string."""
+    torn = _write(tmp_path / "memcards" / "torn.bin", b"new", mtime=NEW)
+    vanished = tmp_path / "memcards" / "gone.bin"
+
+    def _listing(root: Path, subtrees: tuple[str, ...]) -> list[Path]:
+        """List the readable file and one removed between walk and stat.
+
+        Args:
+            root: The save data root, unused.
+            subtrees: The subtree names, unused.
+
+        Returns:
+            The two paths, the second of which no longer exists.
+        """
+        return [torn, vanished]
+
+    def _unreadable(p: Path, retries: int = 4, settle: float = 0.5) -> None:
+        """Fail the read the way a file still being written does.
+
+        Args:
+            p: The file to read.
+            retries: How many reads to attempt, unused.
+            settle: Seconds between attempts, unused.
+
+        Returns:
+            None, always.
+        """
+        return None
+
+    monkeypatch.setattr(saves, "_iter_save_files", _listing)
+    monkeypatch.setattr(saves, "_read_file_stable", _unreadable)
+
+    report = saves.build_save_archive(tmp_path, ("memcards",), baseline=BASELINE)
+
+    assert report["skipped_files"] == ["memcards/gone.bin", "memcards/torn.bin"]
+    assert report["skipped"] == 2
+    # Only the file confirmed changed counts towards the failure, and the error
+    # names exactly the files it counted: a stat failure has no evidence behind
+    # it, so listing it under that count would overstate what was lost.
+    assert (
+        report["error"] == "none of the 1 changed save file(s) could be read: memcards/torn.bin"
+    )
+
+
 def test_archive_round_trips_through_a_restore(tmp_path: Path) -> None:
     """An archive round-trips through a restore."""
     source = tmp_path / "source"
@@ -149,12 +335,64 @@ def test_archive_round_trips_through_a_restore(tmp_path: Path) -> None:
     assert (target / "GC" / "card.raw").read_bytes() == b"payload"
 
 
+def test_restore_counts_a_corrupt_member_as_failed_not_a_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A member with a bad CRC is counted as failed, not left to crash the restore.
+
+    `zipfile.BadZipFile` is not an `OSError` or `ValueError`, so it slips past
+    the per-member except clause unless it is caught alongside them; the rest
+    of the archive still has to land instead of aborting half-applied.
+    """
+    content = _zip({"GC/good.bin": b"fine", "GC/bad.bin": b"corrupt"})
+    original_read = zipfile.ZipFile.read
+
+    def flaky_read(self: zipfile.ZipFile, name: Any, *args: Any, **kwargs: Any) -> bytes:
+        filename = name.filename if isinstance(name, zipfile.ZipInfo) else name
+        if filename == "GC/bad.bin":
+            raise zipfile.BadZipFile("Bad CRC-32 for file 'GC/bad.bin'")
+        return original_read(self, name, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile.ZipFile, "read", flaky_read)
+
+    result = saves.extract_save_archive(content, tmp_path, ("GC",))
+
+    assert result["error"] is None
+    assert result["written"] == 1
+    assert result["failed"] == 1
+    assert (tmp_path / "GC" / "good.bin").read_bytes() == b"fine"
+    assert not (tmp_path / "GC" / "bad.bin").exists()
+
+
 def test_restore_refuses_a_member_outside_the_save_subtrees(tmp_path: Path) -> None:
     """Restore refuses a member outside the save subtrees."""
     result = saves.extract_save_archive(_zip({"etc/passwd": b"x"}), tmp_path, ("GC",))
 
     assert "outside save subtrees" in result["error"]
     assert not (tmp_path / "etc").exists()
+
+
+def test_restore_refuses_a_member_named_for_a_save_subtree(tmp_path: Path) -> None:
+    """A member named for a subtree itself is refused before it can land as a file.
+
+    Writing one would leave a plain file where the emulator keeps its states,
+    and the mkdir on its next launch would raise FileExistsError.
+    """
+    result = saves.extract_save_archive(_zip({"states": b"x"}), tmp_path, ("states", "saves"))
+
+    assert "names a save subtree" in result["error"]
+    assert not (tmp_path / "states").exists()
+
+
+def test_restore_refuses_a_member_named_for_an_excluded_subtree(tmp_path: Path) -> None:
+    """An excluded subtree's own name is refused too, not quietly counted as excluded."""
+    result = saves.extract_save_archive(
+        _zip({"memcards": b"x"}), tmp_path, ("sstates",), excluded=("memcards",)
+    )
+
+    assert "names a save subtree" in result["error"]
+    assert result["excluded"] == 0
+    assert not (tmp_path / "memcards").exists()
 
 
 def test_restore_refuses_a_member_that_escapes_the_root(tmp_path: Path) -> None:
