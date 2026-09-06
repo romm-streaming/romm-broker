@@ -368,6 +368,38 @@ def test_the_state_file_is_served_with_the_name_and_slot_romm_files_it_under(
     assert response.headers["X-State-Slot"] == "3"
 
 
+def test_note_state_handout_fires_before_the_read_that_moves_the_access_time(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator],
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The handout hook must arm before the read, not after it.
+
+    A load's confirmation wait can sample the access-time move the instant it
+    happens; arming the taint window only after the read returns leaves a gap
+    where that same move reads as the load's own and confirms a resume that
+    never actually landed.
+    """
+    _activate(client, broker_dirs)
+    state = tmp_path / "GAME.03.p2s"
+    state.write_bytes(b"state bytes")
+    fake_emulator[0].state_file = state
+
+    events: list[str] = []
+    fake_emulator[0].note_state_handout = lambda: events.append("handout")
+    original_read_bytes = Path.read_bytes
+
+    def recording_read_bytes(self: Path) -> bytes:
+        events.append("read")
+        return original_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", recording_read_bytes)
+
+    response = client.get(f"{API}/session/state-file")
+
+    assert response.status_code == 200
+    assert events == ["handout", "read"]
+
+
 def test_an_empty_working_slot_serves_no_state_file(
     client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
 ) -> None:
@@ -597,6 +629,31 @@ def test_exit_dumps_the_save_delta_and_retires_the_session(
     assert body["upload"]["mode"] == "report-only"
     assert fake_emulator[0].running is False
     assert session.SESSION is None
+
+
+def test_exit_reports_files_skipped_during_the_dump(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Files skipped mid-dump are named in the exit report, not just logged server-side."""
+    monkeypatch.setattr(settings, "DEV_MODE", True)
+    _activate(client, broker_dirs)
+    root = fake_emulator[0].save_root
+    kept = root / "saves" / "card.bin"
+    _write_save_after_launch(kept, b"played")
+    gone = root / "saves" / "gone.bin"
+
+    def _listing(walk_root: Path, subtrees: tuple[str, ...]) -> list[Path]:
+        return [kept, gone]
+
+    monkeypatch.setattr(saves, "_iter_save_files", _listing)
+
+    body = client.post(f"{API}/session/exit").json()
+
+    assert body["save_dump"]["skipped_files"] == ["saves/gone.bin"]
+    assert [f["path"] for f in body["save_dump"]["files"]] == ["saves/card.bin"]
 
 
 def test_the_exit_archive_carries_a_manifest_romm_can_sort_by(
@@ -1323,6 +1380,13 @@ def test_a_failed_save_dump_is_not_reported_as_a_successful_no_op(
     assert body["save_dump"]["error"]
 
 
+def test_the_empty_dump_report_matches_the_build_save_archive_shape(tmp_path: Path) -> None:
+    """The two report shapes stay identical, since the exit path reads them interchangeably."""
+    real = saves.build_save_archive(tmp_path, ("saves",), baseline=0)
+
+    assert api._empty_dump("boom").keys() == real.keys()
+
+
 def test_a_session_that_saved_nothing_still_reports_a_clean_exit(
     client: TestClient,
     broker_dirs: dict[str, Path],
@@ -1520,6 +1584,37 @@ def test_the_exit_summary_keeps_paths_urls_and_errors_off_the_invite_seats(
     seen_by_controller = " ".join(_chat_messages(controller))
     assert archive_path in seen_by_controller
     assert "connection refused" in seen_by_controller
+
+
+def test_a_refused_sram_flush_is_flagged_to_the_controller(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exit report with `sram_flushed: False` tells the controller the upload may be stale.
+
+    The dump ships whatever is already on disk either way, so a refused
+    flush means the room's "saves uploaded" message would otherwise read as
+    success while shipping save data from before this session.
+    """
+    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(settings, "DEV_MODE", True)
+    _activate(client, broker_dirs)
+    real_save_and_exit = fake_emulator[0].save_and_exit
+
+    def _refused_flush(slot: Optional[int]) -> dict[str, Any]:
+        return {**real_save_and_exit(slot), "sram_flushed": False}
+
+    monkeypatch.setattr(fake_emulator[0], "save_and_exit", _refused_flush)
+    controller, guest = _seat_room_sockets()
+
+    body = client.post(f"{API}/session/exit").json()
+
+    assert body["sram_flushed"] is False
+    seen_by_controller = " ".join(_chat_messages(controller))
+    assert "refused to flush" in seen_by_controller
+    assert "refused to flush" not in " ".join(_chat_messages(guest))
 
 
 def test_two_state_pushes_never_share_a_staging_file(
@@ -1811,3 +1906,445 @@ def test_an_archive_that_cannot_be_kept_still_finishes_the_teardown(
     assert body["upload"]["ok"] is False
     assert body["upload"]["archive_path"] is None
     assert session.SESSION is None
+
+
+# ── the teardown always finishes, whatever the dump does ────────────────
+
+
+def test_a_save_dump_that_raises_still_retires_the_session(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dump that raises is reported, and the session is still torn down.
+
+    The emulator is already stopped by the time the dump runs, so an escaping
+    exception would leave the session marked active with its stream tokens
+    live, nothing able to exit it and every later activate refused.
+    """
+    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
+    _activate(client, broker_dirs)
+    _write_save_after_launch(fake_emulator[0].save_root / "saves" / "card.bin", b"played")
+
+    def _explode(*args: object, **kwargs: object) -> dict[str, Any]:
+        """Fail the way an unreadable save tree would.
+
+        Raises:
+            OSError: Always.
+        """
+        raise OSError("input/output error")
+
+    monkeypatch.setattr(saves, "build_save_archive", _explode)
+
+    response = client.post(f"{API}/session/exit")
+    body = response.json()
+
+    assert response.status_code == 200
+    assert body["save_dump"]["error"] == "input/output error"
+    assert body["upload"]["mode"] == "failed"
+    assert body["upload"]["ok"] is False
+    assert body["selkies_tokens_cleared"] is True
+    assert session.SESSION is None
+
+
+def test_a_session_whose_dump_raised_can_be_activated_again(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dump failure does not wedge the container on 409 forever."""
+    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
+    _activate(client, broker_dirs)
+
+    def _explode(*args: object, **kwargs: object) -> dict[str, Any]:
+        """Fail the way an unreadable save tree would.
+
+        Raises:
+            OSError: Always.
+        """
+        raise OSError("input/output error")
+
+    monkeypatch.setattr(saves, "build_save_archive", _explode)
+    client.post(f"{API}/session/exit")
+
+    assert _activate(client, broker_dirs).status_code == 200
+
+
+def test_an_emulator_still_up_after_its_exit_is_stopped_before_the_dump(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An emulator whose exit left it running is stopped before its saves are walked.
+
+    `Emulator.stop` can return with the process still up, so a teardown that
+    took its return as proof would zip the save tree mid-write.
+    """
+    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(settings, "DEV_MODE", True)
+    _activate(client, broker_dirs)
+    _write_save_after_launch(fake_emulator[0].save_root / "saves" / "card.bin", b"played")
+
+    def _exit_without_stopping(self: FakeEmulator, slot: Optional[int]) -> dict[str, Any]:
+        """Return from the exit with the process still running.
+
+        Args:
+            self: The emulator being exited.
+            slot: The slot the exit asked for.
+
+        Returns:
+            A state report claiming nothing was saved.
+        """
+        return {"state_saved": False, "state_slot": None, "state_file": None}
+
+    monkeypatch.setattr(type(fake_emulator[0]), "save_and_exit", _exit_without_stopping)
+
+    body = client.post(f"{API}/session/exit").json()
+
+    assert fake_emulator[0].running is False
+    assert [f["path"] for f in body["save_dump"]["files"]] == ["saves/card.bin"]
+    assert body["save_dump"]["error"] is None
+    assert session.SESSION is None
+
+
+def test_an_emulator_that_outlives_its_stop_has_its_save_tree_left_alone(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A process that refused SIGKILL is not dumped mid-write, and the session still retires.
+
+    Zipping a live emulator's save tree files a half-written file in RomM over
+    the save the player actually has, which is worse than reporting no archive.
+    """
+    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
+    _activate(client, broker_dirs)
+    _write_save_after_launch(fake_emulator[0].save_root / "saves" / "card.bin", b"played")
+
+    def _unkillable(self: FakeEmulator) -> None:
+        """Return from the stop with the process still running.
+
+        Args:
+            self: The emulator that will not go down.
+        """
+
+    monkeypatch.setattr(type(fake_emulator[0]), "stop", _unkillable)
+
+    response = client.post(f"{API}/session/exit")
+    body = response.json()
+
+    assert response.status_code == 200
+    assert fake_emulator[0].running is True
+    assert body["save_dump"]["files"] == []
+    assert "still running" in body["save_dump"]["error"]
+    assert body["upload"]["mode"] == "failed"
+    assert session.SESSION is None
+
+
+# ── an archive with nowhere to go is reported, not dropped ─────────────
+
+
+def test_an_archive_with_no_subtree_to_restore_into_is_reported(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An archive that cannot be restored is named in the response, not silently dropped.
+
+    Answering "launching" with no restore and no word of it is how a player
+    boots a fresh save with no way to tell it happened.
+    """
+    from webstation_broker import emulators
+
+    monkeypatch.setattr(emulators.REGISTRY["fake"], "save_subtrees", ())
+    archive = broker_dirs["imports"] / "sess-1.zip"
+    archive.write_bytes(_zip({"saves/card.bin": b"stored"}))
+
+    body = _activate(client, broker_dirs, save={"archive": str(archive)}).json()
+
+    assert body["status"] == "launching"
+    assert body["save_restore"] is None
+    assert "no save subtree" in body["save_restore_skipped"]
+
+
+def test_an_archive_held_back_by_the_card_sync_is_reported(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An archive whose only subtree travels on the card routes is named in the response."""
+    from webstation_broker import emulators
+
+    monkeypatch.setattr(emulators.REGISTRY["fake"], "save_subtrees", ("saves",))
+    monkeypatch.setattr(emulators.REGISTRY["fake"], "memory_card_subtree", "saves")
+    archive = broker_dirs["imports"] / "sess-1.zip"
+    archive.write_bytes(_zip({"saves/card.bin": b"stored"}))
+
+    body = _activate(
+        client,
+        broker_dirs,
+        save={"archive": str(archive), "memory_card_synced": True},
+    ).json()
+
+    assert body["save_restore"] is None
+    assert "memory-card routes" in body["save_restore_skipped"]
+
+
+def test_a_fully_failed_restore_is_reported_not_launched(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restore where every member failed to write must not answer "launching".
+
+    `error` only covers whole-archive problems; a member-by-member write
+    failure only shows up as `failed`, and letting that field through
+    unchecked is how a player boots a fresh save while the response still
+    calls it a restore.
+    """
+    def _all_fail(*args: object, **kwargs: object) -> dict[str, Any]:
+        return {"written": 0, "skipped": 0, "excluded": 0, "failed": 2, "error": None}
+
+    monkeypatch.setattr(saves, "extract_save_archive", _all_fail)
+    archive = broker_dirs["imports"] / "sess-1.zip"
+    archive.write_bytes(_zip({"saves/card.bin": b"stored"}))
+
+    response = _activate(client, broker_dirs, save={"archive": str(archive)})
+
+    assert response.status_code == 422
+    assert "member(s) failed to write" in response.json()["detail"]
+
+
+def test_a_partially_failed_restore_is_reported_not_launched(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restore where only some members failed to write must still not launch.
+
+    A `.srm` that failed to restore boots the game with no in-game save; the
+    exit dump then ships the fresh one it wrote during play back over the
+    archive, wiping whatever progress the failed member actually held, even
+    though the rest of the archive landed fine.
+    """
+    def _partial_fail(*args: object, **kwargs: object) -> dict[str, Any]:
+        return {"written": 3, "skipped": 0, "excluded": 0, "failed": 1, "error": None}
+
+    monkeypatch.setattr(saves, "extract_save_archive", _partial_fail)
+    archive = broker_dirs["imports"] / "sess-1.zip"
+    archive.write_bytes(_zip({"saves/card.bin": b"stored"}))
+
+    response = _activate(client, broker_dirs, save={"archive": str(archive)})
+
+    assert response.status_code == 422
+    assert "member(s) failed to write" in response.json()["detail"]
+
+
+def test_a_restored_archive_reports_no_skip(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """An archive that was restored reports nothing skipped."""
+    archive = broker_dirs["imports"] / "sess-1.zip"
+    archive.write_bytes(_zip({"saves/card.bin": b"stored"}))
+
+    body = _activate(client, broker_dirs, save={"archive": str(archive)}).json()
+
+    assert body["save_restore_skipped"] is None
+    assert body["save_restore"]["error"] is None
+
+
+# ── the activate hooks run on every launch ─────────────────────────────
+
+
+def _record_activate_hooks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[str]:
+    """Record the order the fake emulator's activate hooks are called in.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher, undone when the test ends.
+
+    Returns:
+        The list each hook appends its name to as the route calls it.
+    """
+    from webstation_broker import emulators
+
+    calls: list[str] = []
+
+    def _clear(self: FakeEmulator) -> None:
+        """Record the working-slot clear.
+
+        Args:
+            self: The emulator being cleared.
+        """
+        calls.append("clear_working_slot")
+
+    def _prepare(self: FakeEmulator) -> None:
+        """Record the restore preparation.
+
+        Args:
+            self: The emulator being prepared.
+        """
+        calls.append("prepare_restore")
+
+    monkeypatch.setattr(emulators.REGISTRY["fake"], "clear_working_slot", _clear)
+    monkeypatch.setattr(emulators.REGISTRY["fake"], "prepare_restore", _prepare)
+    return calls
+
+
+def test_prepare_restore_runs_even_with_no_archive_to_restore(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The restore hooks run on a launch with no archive.
+
+    That launch is exactly the one where a stale save left in place gets picked
+    up as the player's own, because nothing else overwrites it.
+    """
+    calls = _record_activate_hooks(monkeypatch)
+
+    _activate(client, broker_dirs)
+
+    assert calls == ["clear_working_slot", "prepare_restore"]
+
+
+def test_the_activate_hooks_run_in_order_before_an_archive_is_extracted(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both restore hooks run, in order, before the archive lands."""
+    calls = _record_activate_hooks(monkeypatch)
+    archive = broker_dirs["imports"] / "sess-1.zip"
+    archive.write_bytes(_zip({"saves/card.bin": b"stored"}))
+
+    _activate(client, broker_dirs, save={"archive": str(archive)})
+
+    assert calls == ["clear_working_slot", "prepare_restore"]
+    assert (fake_emulator[0].save_root / "saves" / "card.bin").read_bytes() == b"stored"
+
+
+# ── seats are minted under the session lock ────────────────────────────
+
+
+def test_a_join_arriving_mid_teardown_is_refused(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """No seat is minted while another session operation is part way through.
+
+    Holding the lock stands in for an exit inside its token-clear grace: a seat
+    minted there publishes its token to selkies after the clear has run, and
+    leaves a live stream credential against whatever launches next.
+    """
+    _activate(client, broker_dirs)
+    assert api._SESSION_LOCK.acquire(blocking=False)
+    try:
+        response = client.post(f"{API}/session/join", json={"permission": "participant"})
+    finally:
+        api._SESSION_LOCK.release()
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "another session operation is in progress"
+    assert session.ROOM["viewers"] == {}
+
+
+def test_an_invite_arrival_mid_teardown_is_refused(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """An invite link seats nobody while another session operation is in flight."""
+    token = _activate(client, broker_dirs).json()["url"].split("token=")[1]
+    url = client.post(
+        f"{API}/session/invite", params={"token": token}, json={"permission": "participant"}
+    ).json()["url"]
+    invite = url.split("invite=")[1]
+
+    assert api._SESSION_LOCK.acquire(blocking=False)
+    try:
+        response = client.get(f"{API}/session/context", params={"invite": invite})
+    finally:
+        api._SESSION_LOCK.release()
+
+    assert response.status_code == 409
+    assert session.ROOM["viewers"] == {}
+
+
+def test_a_seated_caller_still_bootstraps_mid_operation(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """Context for a token that already holds a seat mints nothing, so it needs no lock.
+
+    Refusing it would break the room's own reload during any launch or state
+    push, for a read that touches neither the save data nor the token set.
+    """
+    token = _activate(client, broker_dirs).json()["url"].split("token=")[1]
+
+    assert api._SESSION_LOCK.acquire(blocking=False)
+    try:
+        response = client.get(f"{API}/session/context", params={"token": token})
+    finally:
+        api._SESSION_LOCK.release()
+
+    assert response.status_code == 200
+    assert response.json()["userRole"] == "controller"
+
+
+# ── the served state body is read while the lock is held ───────────────
+
+
+async def test_the_state_body_is_read_before_the_session_lock_is_released(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    tmp_path: Path,
+) -> None:
+    """The state file is read under the lock, not streamed open after it.
+
+    A FileResponse is only opened once the handler has returned and the lock is
+    long gone, which puts the read back in the window the lock exists to close.
+    Deleting the file the moment the route returns stands in for the exit or
+    push that would otherwise rewrite it mid-send.
+    """
+    _activate(client, broker_dirs)
+    state = tmp_path / "GAME.03.p2s"
+    state.write_bytes(b"state bytes")
+    fake_emulator[0].state_file = state
+
+    response = await api.get_state_file()
+    state.unlink()
+
+    assert response.body == b"state bytes"
+    assert response.headers["X-State-Filename"] == "GAME.03.p2s"
+    assert api._SESSION_LOCK.acquire(blocking=False)
+    api._SESSION_LOCK.release()
+
+
+async def test_the_screenshot_body_is_read_before_the_session_lock_is_released(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The state screenshot is read under the lock the same way the state is."""
+    _activate(client, broker_dirs)
+    shot = tmp_path / "GAME.03.png"
+    shot.write_bytes(b"png bytes")
+    monkeypatch.setattr(
+        type(fake_emulator[0]), "state_screenshot_path", lambda self: shot
+    )
+
+    response = await api.get_state_screenshot()
+    shot.unlink()
+
+    assert response.body == b"png bytes"

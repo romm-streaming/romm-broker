@@ -542,29 +542,57 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     # Read before the working slot is emptied: an archive that is not there
     # has to fail with the slot still holding whatever it held.
     content = None
-    if save and save.archive and subtrees:
-        archive_path = Path(save.archive)
-        if not archive_path.is_file():
-            log.warning("activate: save archive not found: %s", save.archive)
-            raise HTTPException(
-                status_code=404, detail=f"save archive not found: {save.archive}"
+    restore_skipped = None
+    if save and save.archive:
+        if subtrees:
+            archive_path = Path(save.archive)
+            if not archive_path.is_file():
+                log.warning("activate: save archive not found: %s", save.archive)
+                raise HTTPException(
+                    status_code=404, detail=f"save archive not found: {save.archive}"
+                )
+            content = await anyio.to_thread.run_sync(archive_path.read_bytes)
+        else:
+            # Dropping the archive and still answering "launching" is how a
+            # player ends up booting a fresh save with nothing to tell them.
+            restore_skipped = (
+                f"{emulator.name} ships its whole save tree on the memory-card routes"
+                if excluded
+                else f"{emulator.name} names no save subtree to restore into"
             )
-        content = await anyio.to_thread.run_sync(archive_path.read_bytes)
+            log.warning(
+                "activate: save archive %s was not restored: %s",
+                save.archive,
+                restore_skipped,
+            )
 
     await anyio.to_thread.run_sync(emulator.clear_working_slot)
+    # Unconditional: the hook is where a subclass drops a stale save that would
+    # otherwise be picked up as this session's own, and a session with no
+    # archive is exactly the one where nothing else would overwrite it.
+    await anyio.to_thread.run_sync(emulator.prepare_restore)
     restore_report = None
     if content is not None:
-        await anyio.to_thread.run_sync(emulator.prepare_restore)
         restore_report = await anyio.to_thread.run_sync(
             saves.extract_save_archive,
             content,
             emulator.save_root,
             subtrees,
             excluded,
+            emulator.always_restore,
         )
         if restore_report["error"]:
             raise HTTPException(
                 status_code=422, detail=f"save restore failed: {restore_report['error']}"
+            )
+        # `error` only covers whole-archive problems; a member that fails to
+        # write leaves `error` unset, and the exit dump only ships files this
+        # session wrote, so a save the game recreates from scratch after a
+        # failed restore ships back over the archive as if it were current.
+        if restore_report["failed"] > 0:
+            raise HTTPException(
+                status_code=422,
+                detail=f"save restore failed: {restore_report['failed']} member(s) failed to write",
             )
         log.info("save restore: %s", restore_report)
 
@@ -600,6 +628,7 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
         "session_id": sess["id"],
         "rom_file": str(rom_file) if rom_file else None,
         "save_restore": restore_report,
+        "save_restore_skipped": restore_skipped,
         "selkies_tokens_pushed": tokens_pushed,
         "url": _landing_url(sess["controller_token"]),
     }
@@ -613,6 +642,12 @@ async def _mint_viewer(
     Shared by the RomM-facing join route and the controller's invite route so
     token creation, the selkies push and the room broadcast stay in one place.
 
+    Held under `_SESSION_LOCK` for the same reason the exit route is: an exit
+    waits out `TOKEN_CLEAR_GRACE_SECONDS` before emptying the token set, and a
+    seat minted inside that window would publish its token to selkies after the
+    clear had already run, leaving a stream credential live against whatever
+    launches next.
+
     Args:
         permission: Either `participant` or `readonly`.
         user: The RomM user taking the seat, or None for an anonymous invite.
@@ -623,24 +658,26 @@ async def _mint_viewer(
         still a seat, but it cannot open the stream until a later push lands.
 
     Raises:
-        HTTPException: 409 when no session is active; 422 for an unknown
-            permission; 429 when the room is already at its seat cap.
+        HTTPException: 409 when no session is active or another session
+            operation is in flight; 422 for an unknown permission; 429 when the
+            room is already at its seat cap.
     """
-    sess = session.SESSION
-    if sess is None or not sess.get("active"):
-        raise HTTPException(status_code=409, detail="no active session to join")
+    with _session_operation(f"seat a {permission}"):
+        sess = session.SESSION
+        if sess is None or not sess.get("active"):
+            raise HTTPException(status_code=409, detail="no active session to join")
 
-    if permission not in ("participant", "readonly"):
-        raise HTTPException(
-            status_code=422, detail="permission must be participant or readonly"
-        )
+        if permission not in ("participant", "readonly"):
+            raise HTTPException(
+                status_code=422, detail="permission must be participant or readonly"
+            )
 
-    viewer = await session.add_viewer(permission, user)
-    if viewer is None:
-        raise HTTPException(status_code=429, detail="room is full")
-    tokens_pushed = await _push_seat_tokens(sess, f"seat a {permission}")
-    await session.broadcast_state()
-    return viewer, tokens_pushed
+        viewer = await session.add_viewer(permission, user)
+        if viewer is None:
+            raise HTTPException(status_code=429, detail="room is full")
+        tokens_pushed = await _push_seat_tokens(sess, f"seat a {permission}")
+        await session.broadcast_state()
+        return viewer, tokens_pushed
 
 
 @router.post("/api/session/join")
@@ -659,9 +696,9 @@ async def join(body: JoinIn, x_broker_secret: Optional[str] = Header(default=Non
         `selkies_tokens_pushed` and the seat's landing `url`.
 
     Raises:
-        HTTPException: 403 on a bad secret; 409 when no session is active; 422
-            for an unknown permission; 429 when the room is already at its
-            seat cap.
+        HTTPException: 403 on a bad secret; 409 when no session is active or
+            another session operation is in flight; 422 for an unknown
+            permission; 429 when the room is already at its seat cap.
     """
     _check_secret(x_broker_secret)
 
@@ -764,7 +801,7 @@ def _exit_outcomes(
 
 
 async def _stop_after_failed_exit(emulator: Emulator, session_id: str) -> None:
-    """Put down an emulator whose `save_and_exit` raised part way through.
+    """Put down an emulator that is still up once its exit has been asked for.
 
     The save dump that follows walks the tree the emulator writes its saves
     into, so a process still running through it would be dumped mid-write.
@@ -781,6 +818,99 @@ async def _stop_after_failed_exit(emulator: Emulator, session_id: str) -> None:
             session_id,
             exc_info=True,
         )
+
+
+async def _confirm_stopped(emulator: Emulator, session_id: str) -> bool:
+    """Establish that the emulator is really gone before its save tree is walked.
+
+    `Emulator.stop` returns normally on a process that outlived SIGKILL or that
+    refused the signal outright, so a teardown taking its return as proof would
+    zip the save tree while the emulator is still writing into it, and file the
+    half-written result in RomM over the save the player actually has. One more
+    stop is tried first: a subclass exit drives its own control channel, and the
+    signal path can still take down a process that channel could not.
+
+    Args:
+        emulator: The emulator whose exit has already been asked for.
+        session_id: The session being torn down, named in the failure log.
+
+    Returns:
+        True once the process is confirmed gone, False when it is still running.
+    """
+    if not emulator.alive():
+        return True
+    log.warning(
+        "session %s: %s is still running after its exit, stopping it again",
+        session_id,
+        emulator.name,
+    )
+    await _stop_after_failed_exit(emulator, session_id)
+    if emulator.alive():
+        log.error(
+            "session %s: %s outlived its stop, so its save tree cannot be dumped",
+            session_id,
+            emulator.name,
+        )
+        return False
+    return True
+
+
+def _empty_dump(error: str) -> dict[str, Any]:
+    """A dump report in `build_save_archive`'s shape carrying only why it is empty.
+
+    Args:
+        error: Why there is no archive, reported to the caller and the room.
+
+    Returns:
+        A report with no files, no bytes and no archive, and `error` set.
+    """
+    return {
+        "files": [],
+        "skipped": 0,
+        "skipped_files": [],
+        "total_bytes": 0,
+        "zip_bytes": None,
+        "error": error,
+    }
+
+
+async def _dump_saves(emulator: Emulator, sess: dict[str, Any]) -> dict[str, Any]:
+    """Zip this session's save delta, reporting rather than raising on failure.
+
+    The dump runs with the emulator already stopped, so an exception escaping
+    here would take the whole teardown with it: the session would stay marked
+    active with its stream tokens live, nothing could exit it, and every later
+    activate would be refused. A raise is turned into the same error report
+    `build_save_archive` returns for the failures it does anticipate, so one
+    path reports both.
+
+    Args:
+        emulator: The emulator whose save tree is dumped.
+        sess: The session being torn down, for its baseline and its manifest.
+
+    Returns:
+        The dump report: `files`, `skipped`, `skipped_files`, `total_bytes`,
+        `zip_bytes` and `error`.
+    """
+    try:
+        dump_subtrees, _ = _archive_subtrees(
+            emulator, bool((sess.get("save") or {}).get("memory_card_synced"))
+        )
+        return await anyio.to_thread.run_sync(
+            saves.build_save_archive,
+            emulator.save_root,
+            dump_subtrees,
+            sess["save_baseline"],
+            _archive_identity(sess, emulator),
+            emulator.save_file_kind,
+        )
+    except Exception as exc:
+        log.error(
+            "session %s: the save dump raised, reporting it as a failed dump",
+            sess["id"],
+            exc_info=True,
+        )
+        return _empty_dump(str(exc) or exc.__class__.__name__)
 
 
 async def _keep_archive(zip_bytes: bytes, name: str, session_id: str) -> Optional[str]:
@@ -817,7 +947,10 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
     A `save_slot` of None exits without writing a state. The save dump still
     runs: the game's own save data belongs to the player either way, so an
     emulator that failed outright on the state is stopped and dumped anyway
-    rather than allowed to abort the teardown. In dev mode nothing is uploaded
+    rather than allowed to abort the teardown. The dump only goes ahead once
+    the process is confirmed gone, and a dump that fails is reported rather
+    than raised, so the tokens are cleared and the session retired either way.
+    In dev mode nothing is uploaded
     and the archive is written to EXPORT_DIR instead; a failed push also keeps
     the archive on disk so save data is never lost. The room is told the
     outcome in a broker chat message, and the controller gets a second one
@@ -857,17 +990,12 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
             "exit_error": str(exc),
         }
 
-    dump_subtrees, _ = _archive_subtrees(
-        emulator, bool((sess.get("save") or {}).get("memory_card_synced"))
-    )
-    dump = await anyio.to_thread.run_sync(
-        saves.build_save_archive,
-        emulator.save_root,
-        dump_subtrees,
-        sess["save_baseline"],
-        _archive_identity(sess, emulator),
-        emulator.save_file_kind,
-    )
+    if await _confirm_stopped(emulator, sess["id"]):
+        dump = await _dump_saves(emulator, sess)
+    else:
+        dump = _empty_dump(
+            f"{emulator.name} was still running, so its save tree was left alone"
+        )
     cb = sess.get("callback")
     archive_name = f"{sess['id']}-{int(time.time())}.zip"
     archive_path = None
@@ -917,6 +1045,7 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
         "save_dump": {
             "files": dump["files"],
             "skipped": dump["skipped"],
+            "skipped_files": dump["skipped_files"],
             "total_bytes": dump["total_bytes"],
             "archive_path": archive_path,
             "error": dump["error"],
@@ -925,6 +1054,12 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
     }
 
     outcome, detail = _exit_outcomes(upload, archive_path, cb, dump["error"])
+    if exit_report.get("sram_flushed") is False:
+        # The dump above ships whatever was already on disk either way, so a
+        # refused flush means it shipped stale save data even though the
+        # upload itself went fine and would otherwise report success.
+        stale_note = "The emulator refused to flush save data before exit; the upload may be stale."
+        detail = f"{detail} {stale_note}" if detail else stale_note
     now_ms = int(time.time() * 1000)
     summary = (
         f"Session ended. Dumped {len(dump['files'])} save file(s), "
@@ -1185,7 +1320,7 @@ def _header_token(value: str, fallback: str) -> str:
 
 
 @router.get("/api/session/state-file")
-async def get_state_file(x_broker_secret: Optional[str] = Header(default=None)) -> FileResponse:
+async def get_state_file(x_broker_secret: Optional[str] = Header(default=None)) -> Response:
     """Serve the working slot's state file so RomM can file it in the library.
 
     The slot is the emulator's own, not the caller's: `slot` is accepted for
@@ -1209,7 +1344,10 @@ async def get_state_file(x_broker_secret: Optional[str] = Header(default=None)) 
     _check_secret(x_broker_secret)
     # Under the session lock so the read never starts on a slot an exit or a
     # push is part way through writing: half a state serves as a whole one, and
-    # RomM would file it over the state the player actually has.
+    # RomM would file it over the state the player actually has. The body is
+    # read here rather than streamed: a FileResponse is only opened once the
+    # lock is long gone, which is the same race one step later. The size check
+    # above is what makes holding it in memory bounded.
     with _session_operation("state-file read"):
         emulator = _readable_emulator()
         path = await anyio.to_thread.run_sync(emulator.state_path)
@@ -1222,9 +1360,18 @@ async def get_state_file(x_broker_secret: Optional[str] = Header(default=None)) 
             raise HTTPException(status_code=500, detail="could not read state file")
         if size > settings.STATE_FILE_MAX_BYTES:
             raise HTTPException(status_code=413, detail="state file exceeds size limit")
-        log.info("state-file: serving %s (%d bytes)", path.name, size)
-        return FileResponse(
-            path,
+        # Before the read: the read itself is what moves the file's access
+        # time, and a load's confirmation wait can sample that move the
+        # instant it happens, before this line would otherwise run.
+        emulator.note_state_handout()
+        try:
+            body = await anyio.to_thread.run_sync(path.read_bytes)
+        except OSError as exc:
+            log.warning("state-file: could not read %s: %s", path, exc)
+            raise HTTPException(status_code=500, detail="could not read state file")
+        log.info("state-file: serving %s (%d bytes)", path.name, len(body))
+        return Response(
+            content=body,
             media_type="application/octet-stream",
             headers={
                 "X-State-Filename": _header_token(path.name, "state"),
@@ -1234,7 +1381,7 @@ async def get_state_file(x_broker_secret: Optional[str] = Header(default=None)) 
 
 
 @router.get("/api/session/state-screenshot")
-async def get_state_screenshot(x_broker_secret: Optional[str] = Header(default=None)) -> FileResponse:
+async def get_state_screenshot(x_broker_secret: Optional[str] = Header(default=None)) -> Response:
     """Serve the frame captured with the working slot's state.
 
     Only for emulators that write the thumbnail as its own file; the ones that
@@ -1268,8 +1415,13 @@ async def get_state_screenshot(x_broker_secret: Optional[str] = Header(default=N
             raise HTTPException(status_code=500, detail="could not read screenshot")
         if size > settings.STATE_SCREENSHOT_MAX_BYTES:
             raise HTTPException(status_code=413, detail="screenshot exceeds size limit")
-        log.info("state-screenshot: serving %s (%d bytes)", path.name, size)
-        return FileResponse(path, media_type="image/png")
+        try:
+            body = await anyio.to_thread.run_sync(path.read_bytes)
+        except OSError as exc:
+            log.warning("state-screenshot: could not read %s: %s", path, exc)
+            raise HTTPException(status_code=500, detail="could not read screenshot")
+        log.info("state-screenshot: serving %s (%d bytes)", path.name, len(body))
+        return Response(content=body, media_type="image/png")
 
 
 def _unlink_best_effort(path: Path) -> None:
@@ -1342,7 +1494,18 @@ async def put_state_file(
                     await anyio.to_thread.run_sync(out.write, chunk)
             if written == 0:
                 raise HTTPException(status_code=400, detail="empty request body")
-            os.replace(tmp, target)
+            # Locked only for the rename: an in-flight resume or manual load
+            # backdates and polls this same path to confirm its own read, and
+            # a push landing mid-poll would be mistaken for that read's target
+            # changing out from under it.
+            if not await anyio.to_thread.run_sync(emulator.lock_for_state_write):
+                raise HTTPException(
+                    status_code=409, detail="another state operation is in progress"
+                )
+            try:
+                os.replace(tmp, target)
+            finally:
+                await anyio.to_thread.run_sync(emulator.unlock_state_write)
         except HTTPException:
             _unlink_best_effort(tmp)
             raise
@@ -1808,9 +1971,10 @@ async def context(
         `multiplayer` and the stream `iframeSrc`.
 
     Raises:
-        HTTPException: 409 when no session is active; 401 when neither token is
-            given or the one given is unknown; 429 when an invite arrival finds
-            the room already at its seat cap.
+        HTTPException: 409 when no session is active, or when an invite arrival
+            lands while another session operation is in flight; 401 when
+            neither token is given or the one given is unknown; 429 when an
+            invite arrival finds the room already at its seat cap.
     """
     sess = session.SESSION
     if sess is None or not sess.get("active"):
