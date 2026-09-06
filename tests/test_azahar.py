@@ -170,6 +170,49 @@ def test_resolve_accepts_a_rom_that_symlinks_inside_rom_root(rom_root: Path) -> 
     assert azahar.Azahar().resolve_rom_file(folder) == real
 
 
+def test_resolve_keeps_candidates_when_one_search_pattern_fails(
+    monkeypatch: pytest.MonkeyPatch, rom_root: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unreadable subdirectory is logged, and the other patterns' candidates still count."""
+    folder = rom_root / "MyGame"
+    folder.mkdir()
+    rom = folder / "game.3ds"
+    rom.write_bytes(b"")
+    real_glob = Path.glob
+
+    def flaky_glob(self: Path, pattern: str) -> object:
+        if pattern == "*/*":
+            raise OSError("permission denied")
+        return real_glob(self, pattern)
+
+    monkeypatch.setattr(Path, "glob", flaky_glob)
+
+    with caplog.at_level("WARNING"):
+        resolved = azahar.Azahar().resolve_rom_file(folder)
+
+    assert resolved == rom
+    assert "search of" in caplog.text
+    assert "permission denied" in caplog.text
+
+
+def test_resolve_logs_when_every_search_pattern_fails(
+    monkeypatch: pytest.MonkeyPatch, rom_root: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A folder whose every search fails reports no ROM, but says why in the log."""
+    folder = rom_root / "MyGame"
+    folder.mkdir()
+
+    def fail_glob(self: Path, pattern: str) -> NoReturn:
+        raise OSError("stale file handle")
+
+    monkeypatch.setattr(Path, "glob", fail_glob)
+
+    with caplog.at_level("WARNING"):
+        assert azahar.Azahar().resolve_rom_file(folder) is None
+
+    assert "stale file handle" in caplog.text
+
+
 def test_resolve_ignores_a_dangling_symlink(rom_root: Path) -> None:
     """A symlink pointing at a nonexistent target is not a candidate."""
     folder = rom_root / "MyGame"
@@ -252,17 +295,36 @@ def test_patch_config_reseeds_a_file_that_fails_to_decode(config_path: Path) -> 
     assert parser["UI"]["confirmClose"] == "false"
 
 
-def test_patch_config_does_not_raise_when_the_directory_cannot_be_created(
-    monkeypatch: pytest.MonkeyPatch, config_path: Path
+def test_patch_config_raises_when_the_directory_cannot_be_created(
+    monkeypatch: pytest.MonkeyPatch, config_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A failure to create the config directory is swallowed, not raised."""
+    """A failure to create the config directory is logged and raised, not swallowed."""
 
     def fail_mkdir(*a: object, **k: object) -> NoReturn:
         raise OSError("no space left on device")
 
     monkeypatch.setattr(Path, "mkdir", fail_mkdir)
 
-    azahar._patch_config()  # must not raise
+    with caplog.at_level("ERROR"), pytest.raises(OSError):
+        azahar._patch_config()
+
+    assert "refusing to launch" in caplog.text
+
+
+def test_patch_config_raises_when_the_file_cannot_be_written(
+    monkeypatch: pytest.MonkeyPatch, config_path: Path
+) -> None:
+    """A failure to write the patched config is raised rather than launched past."""
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("[UI]\nconfirmClose=true\n")
+
+    def fail_open(*a: object, **k: object) -> NoReturn:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr("builtins.open", fail_open)
+
+    with pytest.raises(OSError):
+        azahar._patch_config()
 
 
 # ---- launch ----
@@ -340,6 +402,48 @@ def test_launch_logs_and_ignores_a_resume_slot(
         emu.launch(rom, resume_slot=4)
 
     assert "resume_slot 4 ignored" in caplog.text
+
+
+def test_launch_logs_and_ignores_the_zero_resume_slot(
+    monkeypatch: pytest.MonkeyPatch,
+    rom_root: Path,
+    config_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Slot 0 is a requested slot like any other, so it is logged rather than passed over."""
+    monkeypatch.setattr(azahar.Azahar, "stop", lambda self: None)
+    monkeypatch.setattr(azahar, "_patch_config", lambda: None)
+    monkeypatch.setattr(azahar.Azahar, "_spawn", lambda self, cmd, env: None)
+    rom = rom_root / "game.3ds"
+    rom.write_bytes(b"")
+
+    with caplog.at_level("INFO"):
+        azahar.Azahar().launch(rom, resume_slot=0)
+
+    assert "resume_slot 0 ignored" in caplog.text
+
+
+def test_launch_does_not_spawn_when_the_config_patch_fails(
+    monkeypatch: pytest.MonkeyPatch, rom_root: Path, config_path: Path
+) -> None:
+    """A failed config patch aborts the launch instead of booting on unpatched settings."""
+    monkeypatch.setattr(azahar.Azahar, "stop", lambda self: None)
+
+    def fail_patch() -> NoReturn:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(azahar, "_patch_config", fail_patch)
+    spawned = []
+    monkeypatch.setattr(
+        azahar.Azahar, "_spawn", lambda self, cmd, env: spawned.append(cmd)
+    )
+    rom = rom_root / "game.3ds"
+    rom.write_bytes(b"")
+
+    with pytest.raises(OSError):
+        azahar.Azahar().launch(rom, resume_slot=None)
+
+    assert spawned == []
 
 
 def test_launch_records_the_session_start_time(
@@ -495,6 +599,58 @@ def test_modified_title_saves_covers_every_save_group_root(
     assert sorted(emu._modified_title_saves()) == sorted(titles)
 
 
+def test_modified_title_saves_logs_when_a_save_root_cannot_be_listed(
+    monkeypatch: pytest.MonkeyPatch,
+    save_roots: Tuple[Path, Path, Path, Path],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A save root that cannot be listed is logged, since its saves silently miss the dump."""
+
+    def fail_iterdir(self: Path) -> NoReturn:
+        raise OSError("stale file handle")
+
+    monkeypatch.setattr(Path, "iterdir", fail_iterdir)
+    emu = azahar.Azahar()
+    emu._session_start = 0.0
+
+    with caplog.at_level("WARNING"):
+        assert emu._modified_title_saves() == []
+
+    assert "could not list the save tree" in caplog.text
+
+
+def test_modified_title_saves_logs_when_a_title_dir_cannot_be_scanned(
+    monkeypatch: pytest.MonkeyPatch,
+    save_roots: Tuple[Path, Path, Path, Path],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A title dir that cannot be walked is logged rather than dropped in silence."""
+    root = save_roots[0]
+    title = root / "00010032" / "00040000"
+    title.mkdir(parents=True)
+    (title / "save.bin").write_bytes(b"data")
+
+    def fail_rglob(self: Path, pattern: str) -> NoReturn:
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(Path, "rglob", fail_rglob)
+    emu = azahar.Azahar()
+    emu._session_start = 0.0
+
+    with caplog.at_level("WARNING"):
+        assert emu._modified_title_saves() == []
+
+    assert "could not scan the title save dir" in caplog.text
+
+
+def test_instance_keeps_no_restamp_log(save_roots: Tuple[Path, Path, Path, Path]) -> None:
+    """The exit route keeps no restamp log, so nothing promises a revert that does not exist."""
+    emu = azahar.Azahar()
+
+    assert not hasattr(emu, "_restamped")
+    assert not hasattr(emu, "revert_restamps")
+
+
 def test_save_and_exit_stops_the_emulator(
     monkeypatch: pytest.MonkeyPatch, save_roots: Tuple[Path, Path, Path, Path]
 ) -> None:
@@ -520,6 +676,27 @@ def test_save_and_exit_returns_no_state_shape(
     result = emu.save_and_exit(slot=1)
 
     assert result == {"state_saved": None, "state_slot": None, "state_file": None}
+
+
+def test_save_and_exit_accepts_a_none_slot_and_still_restamps(
+    monkeypatch: pytest.MonkeyPatch, save_roots: Tuple[Path, Path, Path, Path]
+) -> None:
+    """A None slot, the base contract's exit-without-saving, still ships this session's save data."""
+    monkeypatch.setattr(azahar.Azahar, "stop", lambda self: None)
+    root = save_roots[0]
+    title = root / "00010032" / "00040000"
+    title.mkdir(parents=True)
+    f = title / "save.bin"
+    f.write_bytes(b"data")
+    old = time.time() - 10_000
+    os.utime(f, (old, old))
+    emu = azahar.Azahar()
+    emu._session_start = 0.0
+
+    result = emu.save_and_exit(slot=None)
+
+    assert result == {"state_saved": None, "state_slot": None, "state_file": None}
+    assert os.stat(f).st_mtime > old
 
 
 def test_save_and_exit_restamps_every_file_in_a_touched_title_dir(
