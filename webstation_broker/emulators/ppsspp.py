@@ -104,6 +104,18 @@ Shorter than `STATE_STABLE`: a jpeg thumbnail is orders of magnitude smaller
 than the state it belongs to.
 """
 
+LOAD_WAIT = float(os.environ.get("PPSSPP_LOAD_WAIT", "20.0"))
+"""Seconds PPSSPP has to read the state back after the load hotkey (env `PPSSPP_LOAD_WAIT`, default 20)."""
+LOAD_SETTLE = float(os.environ.get("PPSSPP_LOAD_SETTLE", "2.0"))
+"""Seconds a load gets to deserialize once the state file has been read.
+
+From env `PPSSPP_LOAD_SETTLE`, default 2. The deserialize itself is
+unobservable from outside the process, so this is the one bounded guess in
+the load path.
+"""
+_ATIME_BACKDATE = 1.0
+"""Seconds a state's access time is set behind its mtime, so the next read of it stands out."""
+
 RESUME_LOAD_WAIT = float(os.environ.get("PPSSPP_RESUME_LOAD_WAIT", "90.0"))
 """Seconds a deferred resume has to find both a state file and a game window (env `PPSSPP_RESUME_LOAD_WAIT`).
 
@@ -239,8 +251,7 @@ def _patch_ini_file(
     `[section]` line and never match it. A missing file is seeded with just
     the forced settings and PPSSPP fills in the rest. Existing keys are
     rewritten in place, missing ones are added under their section (created
-    when absent), and the result is written through a temp file. Any failure
-    is logged rather than raised so the launch still goes ahead.
+    when absent), and the result is written through a temp file.
 
     Args:
         path: The ini file to patch.
@@ -250,6 +261,14 @@ def _patch_ini_file(
             add the broker's value to it instead of replacing the line. Set
             for controls.ini, where the line is the player's whole mapping for
             that action, not a setting the broker owns.
+
+    Raises:
+        RuntimeError: When the file could not be read or rewritten. Launching
+            on an unpatched config is worse than not launching: ppsspp.ini
+            unpatched parks the session on the setup wizard nobody can click
+            through, and controls.ini unpatched leaves the bracket keys
+            unbound, so every save and load hotkey the broker sends does
+            nothing while the routes still report success.
     """
     try:
         if not path.exists():
@@ -305,12 +324,17 @@ def _patch_ini_file(
         tmp = path.with_suffix(".tmp")
         tmp.write_text("﻿" + "\n".join(new_lines) + "\n", encoding="utf-8")
         tmp.replace(path)
-    except Exception:
-        log.exception("%s patch failed, broker settings NOT applied", path.name)
+    except (OSError, UnicodeDecodeError) as exc:
+        log.exception("ppsspp: %s patch failed at %s, refusing to launch", path.name, path)
+        raise RuntimeError(f"could not apply broker settings to {path}: {exc}") from exc
 
 
 def _patch_config() -> None:
-    """Patch both ppsspp.ini and controls.ini with the broker's forced settings."""
+    """Patch both ppsspp.ini and controls.ini with the broker's forced settings.
+
+    Raises:
+        RuntimeError: When either ini could not be patched; see `_patch_ini_file`.
+    """
     _patch_ini_file(INI_PATH, _INI_SECTION, _INI_PATCHES)
     _patch_ini_file(CONTROLS_INI_PATH, _CONTROLS_SECTION, _CONTROLS_PATCHES, merge_existing=True)
 
@@ -466,6 +490,90 @@ def _wait_for_screenshot(state: Path, deadline: float) -> None:
     log.warning("save state screenshot %s never settled; the state itself is good", shot.name)
 
 
+def _backdate_atime(path: Path) -> Optional[float]:
+    """Stamp `path`'s access time behind its own mtime and return what was written.
+
+    Under `relatime`, the mount default, the kernel refreshes an access time
+    only while it still sits at or behind the file's mtime. A state loaded
+    twice in one session would already carry an atime past its mtime by the
+    second load, and that read would leave no trace at all, so the stamp goes
+    back behind the mtime before every load.
+
+    Args:
+        path: The state file about to be loaded.
+
+    Returns:
+        The access time stamped on, or None when it could not be read or set.
+    """
+    try:
+        st = path.stat()
+        marker = st.st_mtime - _ATIME_BACKDATE
+        os.utime(path, (marker, st.st_mtime))
+    except OSError as exc:
+        log.warning("could not backdate the access time of the state %s: %s", path, exc)
+        return None
+    return marker
+
+
+def _atime_tracked(dir_path: Path) -> bool:
+    """Tell whether reading a file in `dir_path` moves its access time.
+
+    A `noatime` mount records nothing, and on one of those the read a load
+    makes is invisible: without this the broker would report every load as
+    failed. Measured on a scratch file, because the probe's own read is the
+    thing being measured and making it against the state would spend the
+    backdated marker the load itself needs.
+
+    Args:
+        dir_path: The directory the state file lives in.
+
+    Returns:
+        True only when the probe's read demonstrably moved the access time.
+    """
+    probe = dir_path / f".atime-probe.{os.getpid()}"
+    try:
+        probe.write_bytes(b"probe")
+        st = probe.stat()
+        marker = st.st_mtime - _ATIME_BACKDATE
+        os.utime(probe, (marker, st.st_mtime))
+        with probe.open("rb") as fh:
+            fh.read(1)
+        moved = probe.stat().st_atime > marker
+    except OSError as exc:
+        log.warning("could not probe access-time tracking in %s: %s", dir_path, exc)
+        return False
+    finally:
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("could not remove the access-time probe %s: %s", probe, exc)
+    return moved
+
+
+def _wait_for_state_read(path: Path, marker: float, deadline: float) -> bool:
+    """Poll until `path`'s access time moves past `marker`, or the deadline passes.
+
+    Args:
+        path: The state file whose access time was backdated to `marker`.
+        marker: The access time stamped on before the load hotkey was sent.
+        deadline: `time.monotonic` value to give up at.
+
+    Returns:
+        True once the access time has moved past `marker`, False on timeout or if the file goes
+        away first.
+    """
+    POLL_SECS = 0.1
+    while time.monotonic() < deadline:
+        try:
+            if path.stat().st_atime > marker:
+                return True
+        except OSError as exc:
+            log.warning("state %s went away while waiting for the load to read it: %s", path, exc)
+            return False
+        time.sleep(POLL_SECS)
+    return False
+
+
 def _restamp_slot(filename: str, slot: int) -> Optional[str]:
     """Rename a state for `slot`, keeping the game id and version that tie it to its game.
 
@@ -496,8 +604,9 @@ class Ppsspp(Emulator):
     the only hotkeys that reach PPSSPP through this container's input stack.
     Both files carry a UTF-8 BOM that the patcher strips and restores. Save
     and load are hotkey only: the game window is activated, the key is sent
-    through XTEST, and for a save the state directory is polled until the
-    file settles, since the hotkey gives no acknowledgement. There is no
+    through XTEST, and because the hotkey gives no acknowledgement, a save
+    polls the state directory until the file settles and a load watches the
+    state's access time until PPSSPP reads it back. There is no
     boot-time state-load flag, so a resume always goes through a deferred
     thread that waits for the state file, polls for the game window, and only
     then sends the load hotkey.
@@ -679,6 +788,10 @@ class Ppsspp(Emulator):
         Args:
             rom_path: The ROM to boot.
             resume_slot: Slot to resume from, or None to boot clean.
+
+        Raises:
+            RuntimeError: When either ini could not be patched, so nothing is
+                spawned; see `_patch_ini_file`.
         """
         self.stop()
         _patch_config()
@@ -761,21 +874,46 @@ class Ppsspp(Emulator):
         return True
 
     def load_state(self, slot: int) -> bool:
-        """Load the broker's slot over the hotkey.
+        """Load the broker's slot over the hotkey and confirm PPSSPP read the state back.
 
         The hotkey is silent on an empty slot, so an absent file has to be
-        caught here or the caller reads a no-op as success.
+        caught here or the caller reads a no-op as success. A hotkey that was
+        sent is no proof either: PPSSPP swallows one that lands on an
+        unfocused window or a core still registering HLE modules, so the
+        state's access time is backdated first and the load only counts once a
+        read has moved it. The deserialize that read starts is unobservable,
+        and `LOAD_SETTLE` covers it rather than handing the caller a session
+        mid-restore.
 
         Args:
             slot: The slot RomM requested; the broker's `STATE_SLOT` is what gets loaded.
 
         Returns:
-            True when a state file exists and the hotkey was sent, False otherwise.
+            True once the state has been read back and settled, False when the slot is empty,
+            the hotkey could not be sent, or nothing read the state within `LOAD_WAIT`.
         """
-        if self.state_path() is None:
+        state = self.state_path()
+        if state is None:
             log.warning("load state: slot %d holds no state file", STATE_SLOT)
             return False
-        return self._send_key(LOAD_KEY)
+        marker = _backdate_atime(state) if _atime_tracked(STATE_DIR) else None
+        if not self._send_key(LOAD_KEY):
+            log.warning("load state: could not send the load hotkey for %s", state.name)
+            return False
+        if marker is None:
+            log.warning(
+                "load state: %s cannot be confirmed, nothing tracks access times under %s",
+                state.name,
+                STATE_DIR,
+            )
+            time.sleep(LOAD_SETTLE)
+            return True
+        if not _wait_for_state_read(state, marker, time.monotonic() + LOAD_WAIT):
+            log.warning("load state: ppsspp never read %s back within %.1fs", state.name, LOAD_WAIT)
+            return False
+        time.sleep(LOAD_SETTLE)
+        log.info("load state: %s read back and settled", state.name)
+        return True
 
     def state_path(self) -> Optional[Path]:
         """Return the newest state file in the broker's slot, or None when it holds nothing."""

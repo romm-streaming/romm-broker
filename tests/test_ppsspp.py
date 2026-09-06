@@ -5,6 +5,7 @@ naming contract, and finding the game window among PPSSPP's windows.
 """
 
 import os
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Optional
@@ -373,6 +374,45 @@ def test_the_broker_owned_settings_are_still_written_over(config_inis: tuple[Pat
     assert "StateSlot = 4" not in body
 
 
+def test_a_config_the_patcher_cannot_read_fails_the_patch(
+    config_inis: tuple[Path, Path], caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unpatched controls.ini leaves the bracket keys unbound, so the failure has to surface."""
+    _ini, controls = config_inis
+    controls.mkdir()
+
+    with caplog.at_level("ERROR"):
+        with pytest.raises(RuntimeError, match="could not apply broker settings"):
+            ppsspp._patch_config()
+
+    assert "patch failed" in caplog.text
+
+
+def test_a_config_that_is_not_decodable_text_fails_the_patch(
+    config_inis: tuple[Path, Path],
+) -> None:
+    """A corrupt ini is not silently launched past: nothing the broker forces would be applied."""
+    ini, _controls = config_inis
+    ini.write_bytes(b"\xff\xfe[General]\n")
+
+    with pytest.raises(RuntimeError, match="could not apply broker settings"):
+        ppsspp._patch_config()
+
+
+def test_a_launch_whose_config_cannot_be_patched_never_spawns(
+    config_inis: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """A session on an unpatched config parks on the setup wizard with dead hotkeys, so it is refused."""
+    ini, _controls = config_inis
+    ini.mkdir()
+    emu = ppsspp.Ppsspp()
+    emu.stop = lambda: None
+    emu._spawn = lambda cmd, env: pytest.fail("ppsspp spawned with its config unpatched")
+
+    with pytest.raises(RuntimeError):
+        emu.launch(tmp_path / "Game.iso", None)
+
+
 class _FakeProc:
     """Stand-in for a spawned emulator process, carrying only the pid the window search matches on."""
 
@@ -570,6 +610,134 @@ def test_load_state_refuses_an_empty_slot(state_dir: Path) -> None:
     emu._send_key = lambda key: pytest.fail("hotkey sent at an empty slot")
 
     assert emu.load_state(1) is False
+
+
+def test_backdating_puts_the_access_time_behind_the_mtime(state_dir: Path) -> None:
+    """A state's access time is stamped behind its own mtime, which is left alone."""
+    state = _touch(state_dir / "ULUS10041_1_1.ppst", mtime=5000)
+
+    marker = ppsspp._backdate_atime(state)
+
+    assert marker == 5000 - ppsspp._ATIME_BACKDATE
+    st = state.stat()
+    assert st.st_atime == marker
+    assert st.st_mtime == 5000
+
+
+def test_backdating_a_state_that_is_not_there_reports_no_marker(state_dir: Path) -> None:
+    """A state that vanished before the load leaves no marker to watch."""
+    assert ppsspp._backdate_atime(state_dir / "gone_1_1.ppst") is None
+
+
+def test_the_access_time_probe_measures_the_filesystem_and_cleans_up(tmp_path: Path) -> None:
+    """The probe agrees with what a read actually does to an access time, and leaves nothing."""
+    probe = tmp_path / "probe"
+    probe.write_bytes(b"x")
+    marker = probe.stat().st_mtime - ppsspp._ATIME_BACKDATE
+    os.utime(probe, (marker, probe.stat().st_mtime))
+    probe.read_bytes()
+    if probe.stat().st_atime <= marker:
+        pytest.skip("the test filesystem does not record access times")
+    probe.unlink()
+
+    assert ppsspp._atime_tracked(tmp_path) is True
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_access_time_probe_fails_closed_on_a_directory_that_is_not_there(
+    tmp_path: Path,
+) -> None:
+    """A state directory the probe cannot write to reports no access-time tracking."""
+    assert ppsspp._atime_tracked(tmp_path / "gone") is False
+
+
+def test_a_read_of_the_state_confirms_the_load(state_dir: Path) -> None:
+    """The load is confirmed once something moves the state's access time past the marker."""
+    state = _touch(state_dir / "ULUS10041_1_1.ppst", mtime=5000)
+    marker = ppsspp._backdate_atime(state)
+    os.utime(state, (5000, 5000))
+
+    assert ppsspp._wait_for_state_read(state, marker, time.monotonic() + 0.5) is True
+
+
+def test_a_state_nothing_ever_read_is_not_a_load(state_dir: Path) -> None:
+    """An access time that never moves means the hotkey never reached the core."""
+    state = _touch(state_dir / "ULUS10041_1_1.ppst", mtime=5000)
+    marker = ppsspp._backdate_atime(state)
+
+    assert ppsspp._wait_for_state_read(state, marker, time.monotonic() + 0.3) is False
+
+
+def _loadable(
+    monkeypatch: pytest.MonkeyPatch, state_dir: Path, reads: bool, tracked: bool = True
+) -> ppsspp.Ppsspp:
+    """Build an emulator whose load hotkey optionally reads the state back.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        state_dir: The state directory holding the working slot.
+        reads: Whether the hotkey moves the state's access time, as a real load would.
+        tracked: What the access-time probe reports for the state directory.
+
+    Returns:
+        The emulator, with a state already in the working slot.
+    """
+    monkeypatch.setattr(ppsspp, "STATE_SLOT", 1)
+    monkeypatch.setattr(ppsspp, "LOAD_WAIT", 0.5)
+    monkeypatch.setattr(ppsspp, "LOAD_SETTLE", 0.0)
+    monkeypatch.setattr(ppsspp, "_atime_tracked", lambda d: tracked)
+    state = _touch(state_dir / "ULUS10041_1_1.ppst", mtime=5000)
+    emu = ppsspp.Ppsspp()
+
+    def fake_send(key: str) -> bool:
+        """Send the load hotkey, reading the state back when the emulator would."""
+        assert key == ppsspp.LOAD_KEY
+        if reads:
+            os.utime(state, (time.time(), 5000))
+        return True
+
+    emu._send_key = fake_send
+    return emu
+
+
+def test_load_state_waits_for_ppsspp_to_read_the_state_back(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A load whose state was read back reports success."""
+    emu = _loadable(monkeypatch, state_dir, reads=True)
+
+    assert emu.load_state(1) is True
+
+
+def test_a_dropped_load_hotkey_is_not_reported_as_a_load(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A hotkey an unfocused or still-booting PPSSPP swallowed never reads the state, so it fails."""
+    emu = _loadable(monkeypatch, state_dir, reads=False)
+
+    with caplog.at_level("WARNING"):
+        assert emu.load_state(1) is False
+
+    assert "never read" in caplog.text
+
+
+def test_a_load_hotkey_that_could_not_be_sent_fails(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A load with no game window to send the hotkey at fails without waiting it out."""
+    emu = _loadable(monkeypatch, state_dir, reads=False)
+    emu._send_key = lambda key: False
+
+    assert emu.load_state(1) is False
+
+
+def test_a_load_is_taken_on_trust_where_access_times_are_not_recorded(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a noatime mount the read cannot be seen, so a sent hotkey is not called a failure."""
+    emu = _loadable(monkeypatch, state_dir, reads=False, tracked=False)
+
+    assert emu.load_state(1) is True
 
 
 def test_exit_reports_the_working_slot_without_a_running_emulator(
