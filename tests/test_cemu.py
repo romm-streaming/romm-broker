@@ -4,6 +4,7 @@ Covers picking a bootable title out of a folder, the settings keys the broker
 pins, the GamePad profile it seeds, and which saves exit re-stamps.
 """
 
+import logging
 import os
 import time
 import xml.etree.ElementTree as ET
@@ -339,6 +340,69 @@ def test_exit_without_a_launch_restamps_nothing(save_dir: Path) -> None:
     cemu.Cemu().save_and_exit(10)
 
     assert other.stat().st_mtime == before
+
+
+def test_exit_skips_a_save_dir_whose_low_half_is_not_a_title_id(save_dir: Path) -> None:
+    """A `usr/save/<high>/<name>` whose low half is not 8 hex is not a title save.
+
+    Both halves feed the restamp walk, so an unvalidated low half hands
+    whatever name is on disk straight to it.
+    """
+    emu = cemu.Cemu()
+    emu._session_start = time.time() - 100
+
+    stray = _touch(
+        save_dir / "00050000" / "not-a-title-id" / "old.dat",
+        mtime=emu._session_start - 500,
+    )
+    _touch(save_dir / "00050000" / "not-a-title-id" / "new.dat")
+
+    emu.save_and_exit(10)
+
+    assert stray.stat().st_mtime < emu._session_start
+
+
+def test_exit_survives_a_save_tree_that_cannot_be_listed(
+    save_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A save tree that fails to list is logged, not raised through the exit path.
+
+    The MLC can vanish under the walk, and the caller still has a process to
+    stop and a report to hand back.
+    """
+
+    def boom(self: Path) -> None:
+        raise OSError("mlc went away")
+
+    monkeypatch.setattr(Path, "iterdir", boom)
+    emu = cemu.Cemu()
+    emu._session_start = time.time() - 100
+
+    with caplog.at_level(logging.WARNING, logger="webstation_broker.emulators.cemu"):
+        report = emu.save_and_exit(10)
+
+    assert report == {"state_saved": None, "state_slot": None, "state_file": None}
+    assert any("could not list the save tree" in r.getMessage() for r in caplog.records)
+
+
+def test_exit_survives_a_title_dir_that_cannot_be_walked(
+    save_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A title dir that fails to walk is logged and stepped over, not raised."""
+    _touch(save_dir / "00050000" / "aaaaaaaa" / "user" / "80000001" / "old.dat")
+
+    def boom(self: Path, pattern: str) -> None:
+        raise OSError("save vanished")
+
+    monkeypatch.setattr(Path, "rglob", boom)
+    emu = cemu.Cemu()
+    emu._session_start = time.time() - 100
+
+    with caplog.at_level(logging.WARNING, logger="webstation_broker.emulators.cemu"):
+        report = emu.save_and_exit(10)
+
+    assert report == {"state_saved": None, "state_slot": None, "state_file": None}
+    assert any("could not walk" in r.getMessage() for r in caplog.records)
 
 
 def test_exit_reports_no_state(save_dir: Path) -> None:
