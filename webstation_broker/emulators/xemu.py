@@ -798,12 +798,14 @@ class Xemu(Emulator):
         staging_dir: Host-side directory the dump and restore read and write.
         save_root: The image's parent directory, which the save subtrees hang off.
         save_subtrees: The staging directory name, scoping dump and restore to it.
+        clears_stale_saves: True; `prepare_restore` empties the staging dir.
     """
 
     name = "xemu"
     display_name = "xemu"
     rom_extensions = ROM_EXTENSIONS
     log_path = XEMU_LOG_PATH
+    clears_stale_saves = True
     term_timeout = float(os.environ.get("XEMU_STOP_WAIT", "15"))
     """SIGTERM grace before SIGKILL (env `XEMU_STOP_WAIT`, default 15).
 
@@ -813,11 +815,7 @@ class Xemu(Emulator):
     """
 
     def __init__(self) -> None:
-        """Resolve the HDD image and staging directory for this session.
-
-        An image parked under `.<name>.prev` by a previous broker version is
-        moved back into place when the configured image is missing.
-        """
+        """Resolve the HDD image and staging directory for this session."""
         super().__init__()
         # Resolved once per session so the whole activate/exit round trip
         # sees one image, even if xemu rewrites its config mid-session.
@@ -826,29 +824,59 @@ class Xemu(Emulator):
         self.save_root = self.hdd_image.parent
         self.save_subtrees = (SAVE_STAGING_DIRNAME,)
         self._restore_pending = False
+        # Set when the archive never reached the image, so the exit path knows
+        # what is on the disk is not this session's save set.
+        self._restore_failed = False
+        # Set when xemu had to be killed, which skips QEMU's image flush.
+        self._forced_exit = False
         self._title_id: Optional[str] = None
-        parked = self.hdd_image.with_name(f".{self.hdd_image.name}.prev")
-        if not self.hdd_image.exists() and parked.is_file():
-            log.info("recovering HDD image parked by a previous version")
-            try:
-                os.replace(parked, self.hdd_image)
-            except OSError as exc:
-                log.error("could not recover parked image %s: %s", parked, exc)
         log.info("xemu hdd image: %s (save staging %s)", self.hdd_image, self.staging_dir)
 
     def _clear_staging(self) -> None:
         """Remove the staging directory and everything under it, logging a failure."""
         _remove_tree(self.staging_dir)
 
-    def _inject_saves(self) -> int:
+    def stop(self) -> None:
+        """Stop xemu, recording whether it had to be killed rather than asked.
+
+        QEMU flushes the HDD image on the clean shutdown SIGTERM starts and not
+        on SIGKILL, so an escalation leaves the image holding whatever happened
+        to be written through when the process died. The post-close extraction
+        reads that same image seconds later and cannot tell the difference on
+        its own, so the escalation is recorded here for it.
+        """
+        proc = self._proc
+        super().stop()
+        if proc is None:
+            return
+        code = proc.poll()
+        if code is None:
+            log.error("xemu (pid %d) is still running after stop(); %s was never "
+                      "flushed and anything extracted from it may be stale",
+                      proc.pid, self.hdd_image)
+            self._forced_exit = True
+        elif code == -signal.SIGKILL:
+            log.error("xemu (pid %d) ignored SIGTERM for %.0fs and was killed; %s "
+                      "was not flushed cleanly",
+                      proc.pid, self.term_timeout, self.hdd_image)
+            self._forced_exit = True
+
+    def _inject_saves(self) -> Optional[int]:
         """Pre-launch hook: write every staged file into the FATX E partition.
 
         Hidden entries and symlinks in the staging dir are skipped. Directory
         components are matched case-insensitively against the disk so an
         archive whose case differs lands in the existing directory.
 
+        A failed injection is reported apart from an empty one rather than as
+        another zero: the two look identical to the caller, but a session whose
+        restore never reached the image must not archive over the player's
+        saves at exit, and one that simply had nothing to restore may.
+
         Returns:
-            The number of files that landed on the image.
+            The number of files that landed on the image, 0 when nothing was
+            staged, or None when the injection failed, meaning the partition
+            would not open or at least one staged file did not land.
         """
         if not self.staging_dir.is_dir():
             return 0
@@ -861,8 +889,11 @@ class Xemu(Emulator):
             return 0
         fs = _open_fatx_e(self.hdd_image)
         if fs is None:
-            return 0
+            log.error("could not open %s to inject %d restored save file(s)",
+                      self.hdd_image, len(files))
+            return None
         written = 0
+        failed = 0
         # Directory paths as they exist on the image, keyed by the staged
         # (case-bearing) components, so an archive whose case differs from the
         # disk's lands in the existing directory instead of a twin beside it.
@@ -886,13 +917,19 @@ class Xemu(Emulator):
                     _fatx_write_file(fs, f"{parent}/{parts[-1]}", p.read_bytes())
                     written += 1
                 except (AssertionError, OSError, RuntimeError) as exc:
-                    log.warning("could not inject %s into the HDD image %s: %s",
-                                "/".join(parts), self.hdd_image, exc)
+                    failed += 1
+                    log.error("could not inject %s into the HDD image %s: %s",
+                              "/".join(parts), self.hdd_image, exc)
         finally:
             # pyfatx has no close()/flush(); dropping the handle is the only
             # way to trigger fatx_close_device and commit these writes, so an
             # exception on the way out must not skip it.
             del fs
+        if failed:
+            log.error("%d of %d restored save file(s) did not reach %s; the "
+                      "image does not hold this session's save set",
+                      failed, len(files), self.hdd_image)
+            return None
         return written
 
     def _save_roots(self, fs: Fatx) -> Optional[list[str]]:
@@ -1011,13 +1048,20 @@ class Xemu(Emulator):
         restored files in place instead means the dump finds nothing newer than
         the launch baseline and uploads nothing at all.
 
+        An extraction that finds nothing is treated the same way: swapping the
+        empty result in would drop whatever the activate restored into staging
+        earlier in the session, which is the one copy of the player's saves the
+        broker still holds. Reporting zero and leaving staging alone costs at
+        most a session of progress; the swap costs the save.
+
         Files land carrying fresh mtimes, so that baseline filter ships all of
         them: the archive is the title's complete save set, not a delta.
         Without a title id nothing is extracted; see `_save_roots`.
 
         Returns:
-            The number of files staged, or None when the image could not be
-            read, in which case the staging directory is left as it was.
+            The number of files staged, 0 when there was nothing on the image
+            to extract, or None when the image could not be read. The staging
+            directory is only replaced when something was actually extracted.
         """
         fs = _open_fatx_e(self.hdd_image)
         if fs is None:
@@ -1039,7 +1083,17 @@ class Xemu(Emulator):
             # way to trigger fatx_close_device and release the image, so an
             # exception on the way out must not skip it.
             del fs
-        if extracted is None or not self._swap_staging(scratch):
+        if extracted is None:
+            _remove_tree(scratch)
+            return None
+        if not extracted:
+            _remove_tree(scratch)
+            log.warning("nothing was extracted from %s for title %s; keeping what "
+                        "this session restored in %s rather than replacing it with "
+                        "an empty extraction",
+                        self.hdd_image, self._title_id or "<unknown>", self.staging_dir)
+            return 0
+        if not self._swap_staging(scratch):
             _remove_tree(scratch)
             return None
         return extracted
@@ -1091,6 +1145,8 @@ class Xemu(Emulator):
         _ensure_raw_image(self.hdd_image)
         self._clear_staging()
         self._restore_pending = True
+        self._restore_failed = False
+        self._forced_exit = False
 
     def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
         """Inject any restored saves, pin display settings and boot the disc.
@@ -1112,11 +1168,20 @@ class Xemu(Emulator):
 
         if self._restore_pending:
             self._restore_pending = False
-            if raw_ok:
-                injected = self._inject_saves()
-                log.info("pre-launch: injected %d save file(s) into the HDD image", injected)
+            if not raw_ok:
+                self._restore_failed = True
+                log.error("pre-launch: HDD image %s is not raw; the restored saves "
+                          "were NOT injected", self.hdd_image)
             else:
-                log.error("pre-launch: HDD image is not raw; restored saves were NOT injected")
+                injected = self._inject_saves()
+                if injected is None:
+                    self._restore_failed = True
+                    log.error("pre-launch: the restored saves did not reach %s; this "
+                              "session will not archive over them at exit",
+                              self.hdd_image)
+                else:
+                    log.info("pre-launch: injected %d save file(s) into the HDD image",
+                             injected)
 
         if resume_slot is not None:
             log.warning("resume: save states are not supported on a raw HDD "
@@ -1125,6 +1190,8 @@ class Xemu(Emulator):
         _pin_display_settings()
 
         log.info("launching xemu (rom=%s)", rom_path)
+        # Only an exit that ends this process counts against this session.
+        self._forced_exit = False
         self._spawn([XEMU_BIN, "-dvd_path", str(rom_path)], _launch_env())
 
     def save_and_exit(self, slot: Optional[int]) -> dict[str, Any]:
@@ -1135,20 +1202,38 @@ class Xemu(Emulator):
 
         A failed extraction leaves the staging directory alone rather than
         emptying it, so the dump uploads nothing instead of an empty archive
-        over the title's real saves.
+        over the title's real saves. A session whose restore never reached the
+        image is not extracted at all for the same reason: the disk holds the
+        pre-restore save set, and archiving that would overwrite the player's
+        own with an older one.
+
+        A forced exit is reported rather than allowed to skip the extraction.
+        SIGKILL costs the guest's unflushed writes, so what comes off the image
+        can be stale, but it is still the only copy of the session and the
+        dump's newer-file baseline keeps it from replacing anything untouched.
 
         Returns:
             The state fields all None (`state_saved`, `state_slot`,
-            `state_file`), plus `title_id` and `saves_extracted`, the number
-            of files staged.
+            `state_file`), plus `title_id`, `saves_extracted` (the number of
+            files staged), `forced_exit` and `restore_failed`.
         """
         self.stop()
         _reap_strays()
         extracted = 0
-        if not self.hdd_image.is_file():
+        if self._restore_failed:
+            log.error("post-close: the restored saves never reached %s, so its "
+                      "contents are not title %s's save set for this session; "
+                      "extracting nothing so the dump cannot ship them",
+                      self.hdd_image, self._title_id or "<unknown>")
+        elif not self.hdd_image.is_file():
             log.error("post-close: HDD image %s is missing; nothing to extract",
                       self.hdd_image)
         else:
+            if self._forced_exit:
+                log.warning("post-close: xemu was killed rather than shut down, so "
+                            "%s may not carry every write title %s made; the "
+                            "extracted saves may be stale or torn",
+                            self.hdd_image, self._title_id or "<unknown>")
             staged = self._extract_saves()
             if staged is None:
                 log.error("post-close: could not read saves out of %s for title %s; "
@@ -1165,4 +1250,6 @@ class Xemu(Emulator):
             "state_file": None,
             "title_id": self._title_id,
             "saves_extracted": extracted,
+            "forced_exit": self._forced_exit,
+            "restore_failed": self._restore_failed,
         }

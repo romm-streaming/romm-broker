@@ -991,7 +991,7 @@ def test_a_failed_write_leaves_no_half_written_save_behind(
     _stage(emulator, "UDATA/4D530064/saved.dat", b"short")
     calls, _released, handle = _proxy_fatx(monkeypatch, fail="write")
 
-    assert emulator._inject_saves() == 0
+    assert emulator._inject_saves() is None
     assert calls.index("write") < calls.index("unlink")
     # Closing the image is what makes the removal visible to a second handle.
     handle.clear()
