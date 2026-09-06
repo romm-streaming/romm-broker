@@ -328,3 +328,29 @@ written once, on exit. Use standalone Flycast for its own interface and
 settings, and pick `retroarch` if you'd rather manage Dreamcast alongside your
 other RetroArch cores.
 </Callout>
+
+## ScummVM
+
+Nothing to install: ScummVM ships its own engines and needs no BIOS, firmware
+or keys. The games are the setup. A ScummVM game is a *folder* of data files
+rather than a single image, so the entries in your RomM library for this
+platform have to be directories, one per game, and the platform's `fs_path`
+has to resolve to the same files inside the container.
+
+There is no controller step either. These are mouse-and-keyboard games, and the
+stream's own pointer and keyboard are what play them.
+
+Worth doing once from the desktop: open ScummVM, set the GUI language you want
+and play a game to confirm the pointer tracks. The broker follows that language
+when it drives the save menu, and it pins the renderer and windowing settings
+the stream needs on every launch, so a game that behaves in a desktop session
+behaves in a streamed one.
+
+<Callout type="info">
+Not every engine can save mid-game. The broker's save and load drive ScummVM's
+Global Main Menu, and an engine that does not implement runtime saving declines
+it: Gobliiins is the canonical case, since its gob engine has no save handler
+at all and passwords are the game's own progression system. Save state then
+reports a failure rather than pretending, while the game's own saves still
+travel in the archive and a boot-time resume still works.
+</Callout>

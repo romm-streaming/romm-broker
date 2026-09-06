@@ -19,6 +19,7 @@ from .pcsx2 import Pcsx2
 from .ppsspp import Ppsspp
 from .retroarch import Retroarch
 from .rpcs3 import Rpcs3
+from .scummvm import Scummvm
 from .shadps4 import Shadps4
 from .xemu import Xemu
 from .xenia import Xenia
@@ -37,6 +38,7 @@ REGISTRY: dict[str, type[Emulator]] = {
     "xemu": Xemu,
     "xenia": Xenia,
     "ppsspp": Ppsspp,
+    "scummvm": Scummvm,
     "desktop": Desktop,
 }
 """Emulator name to launcher class, the names the activate payload may ask for."""

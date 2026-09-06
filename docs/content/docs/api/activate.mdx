@@ -29,7 +29,8 @@ The payload fields:
 | Field | Required | Purpose |
 | --- | --- | --- |
 | `emulator` | yes | A registry key from [Supported emulators](/docs/emulators). |
-| `rom` | unless the emulator is `desktop` | `path` is the container path; `id`, `name` and `platform` are echoed in the exit upload and, for `retroarch`, `platform` picks the core. |
+| `rom` | unless the emulator is `desktop` | `path` is the container path; `id`, `name` and `platform` are echoed in the exit upload and, for `retroarch`, `platform` picks the core. The optional `language` is the rom's own language, for an emulator whose games ship several of them in one folder: ScummVM registers one target per language it detects and the target is what boots, so without it a multilingual game starts in whichever language sorts first. An unrecognised code is ignored rather than failing the launch. |
+| `gui_language` | no | The player's own interface language, not the rom's. An emulator with a translated UI follows it (ScummVM pins it in `scummvm.ini`, which is also where its in-game menu macros read their keyboard shortcuts), and a multilingual game folder falls back to it when `rom.language` is absent: RomM rarely knows a game's language, and the player's is then the only thing saying which variant they want. Sent for the `desktop` session too, which has no rom at all. An unrecognised code is ignored. |
 | `user` | no | `id`, `username`, `display_name` of the controller. Joins and re-joins match on `id`, then `username`. |
 | `session_id` | no | A caller-supplied id, reduced to what is safe in a filename; the broker mints one otherwise. |
 | `save` | no | See below. |

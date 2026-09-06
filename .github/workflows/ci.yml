@@ -29,6 +29,8 @@ jobs:
       # Catches the failure mode that actually bites: a bad import or syntax
       # error only surfacing when s6 restarts the service in the container.
       - name: Build the app
+        env:
+          BROKER_DEV_MODE: "true"
         run: python -c "from webstation_broker.app import create_app; create_app()"
 
       - name: Test
