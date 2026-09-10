@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.8.0](https://github.com/romm-streaming/romm-broker/compare/v0.7.0...v0.8.0) (2026-09-06)
+
+
+### Features
+
+* **scummvm:** add a ScummVM launcher ([7057270](https://github.com/romm-streaming/romm-broker/commit/7057270ab5f690ddb13e2b21e16f89aead1d4b5b))
+
+
+### Bug Fixes
+
+* **api:** guard restore failures and read state files under lock ([5387b03](https://github.com/romm-streaming/romm-broker/commit/5387b03a751321412669ffdbdede177960a7ecfd))
+* **api:** serialize session operations under one lock and guard exit failures ([cc7feea](https://github.com/romm-streaming/romm-broker/commit/cc7feea7de049332ff56ff886a3c1a24289a87e1))
+* **azahar:** abort launch when the config patch fails instead of booting past it ([f2ae5b7](https://github.com/romm-streaming/romm-broker/commit/f2ae5b7548d483737c858608a3080f146434191a))
+* **base:** require save-clearing emulators to declare it, add lock/handout hooks ([95303cb](https://github.com/romm-streaming/romm-broker/commit/95303cbb0f97eeb636116539cee37c1d594a6435))
+* **cemu:** validate both title-id halves and log save-tree walk failures ([e00be28](https://github.com/romm-streaming/romm-broker/commit/e00be2896a5071c4cf01cf9ae098c627446926e7))
+* **ci:** let the build-app smoke test run without BROKER_SECRET ([0ba1a9f](https://github.com/romm-streaming/romm-broker/commit/0ba1a9f19e083e043c46ca7f3a2c732cc0cfc4be))
+* **ci:** let the build-app smoke test run without BROKER_SECRET ([6585f05](https://github.com/romm-streaming/romm-broker/commit/6585f0535f2c7fb2e792a189e83558f23193f98c))
+* **desktop:** log and reraise a launch spawn failure instead of dropping it ([db85e7f](https://github.com/romm-streaming/romm-broker/commit/db85e7ffe4a314c92e504b413d90793454b0fba9))
+* **dolphin:** confirm a load on noatime mounts instead of taking it on trust ([eb1fc00](https://github.com/romm-streaming/romm-broker/commit/eb1fc003d14cf9cae557d5bda4e020f91c4699e1))
+* **dolphin:** confirm state loads and saves via atime/settle polling instead of blind sleeps ([1582b75](https://github.com/romm-streaming/romm-broker/commit/1582b751b10754c075a02a2c210e7f7e36d19ec3))
+* **duckstation:** correctly detect a killed process on exit ([af190d6](https://github.com/romm-streaming/romm-broker/commit/af190d69138d8cc2ef2c7bab195a45bf150378ec))
+* **duckstation:** mark resume states by owner instead of matching on serial ([c6afecd](https://github.com/romm-streaming/romm-broker/commit/c6afecdad6a48d365ec21776e29f8dfbfb57b284))
+* **eden:** clear stale save data at activate and restamp whole titles at exit ([a566b3e](https://github.com/romm-streaming/romm-broker/commit/a566b3e28c959431851582cf000acbb4b14ea280))
+* **flycast:** confirm savestate writes and gate resume on a loadable state ([ce66972](https://github.com/romm-streaming/romm-broker/commit/ce669723230c79b90a634c56f250cfd9e3c98655))
+* **flycast:** mark resume state ownership and sweep loose save data at activate ([b5cbe05](https://github.com/romm-streaming/romm-broker/commit/b5cbe054ab0c26f995ca78c745b65b8011203b14))
+* **memcard:** clear a stale backup and catch a corrupt member during replace ([c7e1273](https://github.com/romm-streaming/romm-broker/commit/c7e1273ecfa57d681b25830073e44011cc8e036e))
+* **memcard:** log instead of silently swallowing stat/size OSErrors ([aaa5331](https://github.com/romm-streaming/romm-broker/commit/aaa53312cdc6884be35324af84b9375b6ed73a17))
+* **pcsx2:** scope the working slot per instance and verify loads by disc serial ([a5ba381](https://github.com/romm-streaming/romm-broker/commit/a5ba3815809405764968c36c8bc8b9c672eed20c))
+* **ppsspp:** confirm a load by watching the state's access time, not the hotkey send ([ab4da5b](https://github.com/romm-streaming/romm-broker/commit/ab4da5bd6e81d64c848fe56b7e0a26dfcd0bbefc))
+* **ppsspp:** wait for the game window before firing a deferred resume load ([854f433](https://github.com/romm-streaming/romm-broker/commit/854f433451c7bbd8b500cacbb5e88d56da20957d))
+* **retroarch:** confirm a load actually happened instead of trusting the echo ([b5f53f4](https://github.com/romm-streaming/romm-broker/commit/b5f53f4a5357393e4b4a68f20740ab859f2ab813))
+* **retroarch:** fix zero-byte state races and PPSSPP resume timing ([8fd7ff1](https://github.com/romm-streaming/romm-broker/commit/8fd7ff1fbd5e0b27ad15805a895b773b3a0be123))
+* **rpcs3:** clear stale save data at activate and verify the final boot target ([a72b61d](https://github.com/romm-streaming/romm-broker/commit/a72b61d20290975f979c3ce5ba0375c4eaef380a))
+* **rpcs3:** wire up write confirmation and the deferred leftover-savestate clear ([47083a4](https://github.com/romm-streaming/romm-broker/commit/47083a4ed7d42a811040f27f41a134fc7cf1f01a))
+* **saves:** stop misreporting stat/read failures as a clean no-op dump ([3593ea1](https://github.com/romm-streaming/romm-broker/commit/3593ea1eabe8ea137db472ea3b3b30a97778d330))
+* **session:** log a refused selkies token push instead of dropping it silently ([58d1e20](https://github.com/romm-streaming/romm-broker/commit/58d1e2010a3bd2b7714189db715cd66186aad6b9))
+* **shadps4:** clear stale save data at activate and key extraction cache more tightly ([b031dc7](https://github.com/romm-streaming/romm-broker/commit/b031dc7098e43fdb12d4b28dcc8502bb6ebd9739))
+* **shadps4:** guard symlink escapes and detect saves left unmounted by a kill ([3807ddc](https://github.com/romm-streaming/romm-broker/commit/3807ddc15b0e0e153b5daa04651ac0d59eae81c6))
+* **xemu:** distinguish a failed save injection/extraction from an empty one ([bd40c99](https://github.com/romm-streaming/romm-broker/commit/bd40c9969a64b4397728a414448f461f31357a7e))
+* **xemu:** stop scoping saves to every title on the drive when the id is unknown ([39fca36](https://github.com/romm-streaming/romm-broker/commit/39fca3680331eca84684c93a4262a944922ab47d))
+* **xenia:** clear stale save data at activate and restamp whole titles at exit ([55b4b30](https://github.com/romm-streaming/romm-broker/commit/55b4b305a148f85d2aadc4a2867eb8e075ce9a60))
+
+
+### Documentation
+
+* finish webstation-broker to romm-broker console script rename ([ef5c4b3](https://github.com/romm-streaming/romm-broker/commit/ef5c4b3fa7612caca9d9ac6d6111518f90ed55c3))
+* point migration guide at docs.romm.app, not the deleted app-repo file ([2f93036](https://github.com/romm-streaming/romm-broker/commit/2f93036394a63b01bcf1bb806cf3298ab643b598))
+* remove zoraxy note ([8892905](https://github.com/romm-streaming/romm-broker/commit/8892905968685116cea6c27b4a832ce3f4b3cede))
+* update name ([ec38d80](https://github.com/romm-streaming/romm-broker/commit/ec38d80b0ca0dbf04210c825b5c2d898219048dc))
+
 ## [0.7.0](https://github.com/romm-streaming/romm-broker/compare/v0.6.0...v0.7.0) (2026-08-30)
 
 
