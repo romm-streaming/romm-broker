@@ -100,7 +100,10 @@ def _configured_dir(setting: str) -> Optional[Path]:
     """
     try:
         text = (RA_CONFIG_DIR / "retroarch.cfg").read_text(errors="replace")
-    except OSError:
+    except OSError as exc:
+        log.debug(
+            "retroarch: could not read retroarch.cfg for %s, treating as unconfigured: %s", setting, exc
+        )
         return None
     for line in text.splitlines():
         key, sep, value = line.partition("=")
@@ -928,7 +931,7 @@ def _wait_for_state_read(
     which knows who was handed the path: `tainted_until` names a window, as of
     the moment it is called, inside which some other reader touched the file.
     An access-time move seen inside that window taints this call for good,
-    not just until the window closes — under `relatime` a second, genuine
+    not just until the window closes: under `relatime` a second, genuine
     read by the load does not move the access time again once the handout's
     read has already pushed it past the mtime, so there is no later move left
     to wait for. A tainted call reports `None` rather than `False`, so the
@@ -1080,7 +1083,8 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path, extensions: tuple[str
                 continue
             real = p.resolve()
             rel = p.relative_to(base)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            log.debug("retroarch: skipping candidate %s, could not resolve it: %s", p, exc)
             continue
         if not real.is_relative_to(ROM_ROOT):
             continue
@@ -1300,7 +1304,8 @@ class Retroarch(Emulator):
             try:
                 if not path.resolve().is_relative_to(ROM_ROOT):
                     return None
-            except OSError:
+            except OSError as exc:
+                log.debug("retroarch: could not resolve rom candidate %s: %s", path, exc)
                 return None
             return path
         if not path.is_dir():
@@ -1309,7 +1314,8 @@ class Retroarch(Emulator):
         for pattern in _ROM_SEARCH_GLOBS:
             try:
                 candidates.extend(path.glob(pattern))
-            except OSError:
+            except OSError as exc:
+                log.debug("retroarch: could not scan rom folder %s for %r: %s", path, pattern, exc)
                 return None
         return _pick_rom_file(candidates, path, info["extensions"])
 
@@ -1331,7 +1337,13 @@ class Retroarch(Emulator):
             log_fh.write(
                 f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} launch ({' '.join(cmd)}) ===\n".encode()
             )
-        except OSError:
+        except OSError as exc:
+            log.warning(
+                "could not open %s for %s launch output, discarding it: %s",
+                self.log_path,
+                self.name,
+                exc,
+            )
             log_fh = None
         try:
             self._proc = subprocess.Popen(
@@ -1363,8 +1375,8 @@ class Retroarch(Emulator):
                     break
                 with self._stdout_lock:
                     self._stdout_buf.extend(chunk)
-        except (OSError, ValueError):
-            pass
+        except (OSError, ValueError) as exc:
+            log.debug("retroarch: stdout reader stopped draining (platform=%s): %s", self.platform, exc)
 
     def _wait_for_reply(self, prefixes: tuple[str, ...], timeout: float) -> Optional[str]:
         """Poll the reply buffer for a line beginning with one of `prefixes`.
@@ -2338,15 +2350,21 @@ class Retroarch(Emulator):
             try:
                 proc.stdin.write(b"QUIT\n")
                 proc.stdin.flush()
-            except (BrokenPipeError, OSError):
-                pass
+            except (BrokenPipeError, OSError) as exc:
+                log.debug(
+                    "retroarch: first QUIT write failed for pid %d, likely already exiting: %s",
+                    proc.pid, exc,
+                )
             try:
                 proc.wait(timeout=QUIT_CONFIRM_GAP)
                 self._forget()
                 log.info("%s exited gracefully", self.name)
                 return
-            except subprocess.TimeoutExpired:
-                pass
+            except subprocess.TimeoutExpired as exc:
+                log.debug(
+                    "retroarch: pid %d still up %.1fs after first QUIT: %s",
+                    proc.pid, QUIT_CONFIRM_GAP, exc,
+                )
             if proc.poll() is None:
                 log.info(
                     "%s (pid %d) still up after first QUIT, pressing again",
@@ -2355,8 +2373,11 @@ class Retroarch(Emulator):
                 try:
                     proc.stdin.write(b"QUIT\n")
                     proc.stdin.flush()
-                except (BrokenPipeError, OSError):
-                    pass
+                except (BrokenPipeError, OSError) as exc:
+                    log.debug(
+                        "retroarch: second QUIT write failed for pid %d, likely already exiting: %s",
+                        proc.pid, exc,
+                    )
             try:
                 proc.wait(timeout=QUIT_WAIT)
                 self._forget()

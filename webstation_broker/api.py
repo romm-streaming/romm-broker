@@ -256,6 +256,7 @@ def _check_secret(header_value: Optional[str]) -> None:
     if not settings.BROKER_SECRET:
         return
     if not header_value or not _ct_eq(header_value, settings.BROKER_SECRET):
+        log.warning("rejected request: bad or missing broker secret")
         raise HTTPException(status_code=403, detail="bad broker secret")
 
 
@@ -288,6 +289,9 @@ def _check_callback_scheme(base_url: str) -> None:
     """
     scheme = urlsplit(base_url).scheme.lower()
     if scheme not in ("http", "https"):
+        log.warning(
+            "activate: rejected callback.base_url with a non-http(s) scheme: %s", base_url
+        )
         raise HTTPException(
             status_code=422, detail=f"callback.base_url must be http(s): {base_url!r}"
         )
@@ -510,6 +514,9 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
             archive that does not exist.
     """
     if session.SESSION is not None and session.SESSION.get("active"):
+        log.warning(
+            "activate refused: session %s is already active", session.SESSION.get("id")
+        )
         raise HTTPException(
             status_code=409,
             detail="a session is already active; exit it before activating a new one",
@@ -523,6 +530,7 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
 
     emulator = get_emulator(body.emulator)
     if emulator is None:
+        log.debug("activate: unknown emulator: %s", body.emulator)
         raise HTTPException(status_code=422, detail=f"unknown emulator: {body.emulator}")
     # General-purpose emulators (retroarch) pick their core from the platform,
     # and a multilingual folder (ScummVM) picks its target from the language.
@@ -536,22 +544,29 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     rom_file = None
     if emulator.requires_rom:
         if body.rom is None:
+            log.debug("activate: emulator %s requires a rom, none was given", body.emulator)
             raise HTTPException(
                 status_code=422, detail=f"emulator {body.emulator} requires a rom"
             )
         try:
             rom_path = Path(body.rom.path).resolve()
-        except OSError:
+        except OSError as exc:
+            log.error("activate: could not resolve rom path %s: %s", body.rom.path, exc)
             raise HTTPException(status_code=400, detail="invalid rom path")
         rom_root = settings.rom_root()
         if not rom_path.is_relative_to(rom_root):
+            log.warning("activate: rom path %s resolved outside %s", rom_path, rom_root)
             raise HTTPException(
                 status_code=400, detail=f"rom path must live under {rom_root}"
             )
         if not rom_path.exists():
+            log.debug("activate: rom path does not exist: %s", rom_path)
             raise HTTPException(status_code=404, detail="rom path does not exist")
         rom_file = emulator.resolve_rom_file(rom_path)
         if rom_file is None:
+            log.debug(
+                "activate: no bootable file found under %s for %s", rom_path, body.emulator
+            )
             raise HTTPException(
                 status_code=422,
                 detail={
@@ -607,6 +622,11 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
             emulator.always_restore,
         )
         if restore_report["error"]:
+            log.error(
+                "activate: save restore from %s failed: %s",
+                save.archive,
+                restore_report["error"],
+            )
             raise HTTPException(
                 status_code=422, detail=f"save restore failed: {restore_report['error']}"
             )
@@ -615,6 +635,11 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
         # session wrote, so a save the game recreates from scratch after a
         # failed restore ships back over the archive as if it were current.
         if restore_report["failed"] > 0:
+            log.error(
+                "activate: save restore from %s had %d member(s) fail to write",
+                save.archive,
+                restore_report["failed"],
+            )
             raise HTTPException(
                 status_code=422,
                 detail=f"save restore failed: {restore_report['failed']} member(s) failed to write",
@@ -690,15 +715,18 @@ async def _mint_viewer(
     with _session_operation(f"seat a {permission}"):
         sess = session.SESSION
         if sess is None or not sess.get("active"):
+            log.debug("seat a %s refused: no active session", permission)
             raise HTTPException(status_code=409, detail="no active session to join")
 
         if permission not in ("participant", "readonly"):
+            log.debug("seat a %s refused: unknown permission", permission)
             raise HTTPException(
                 status_code=422, detail="permission must be participant or readonly"
             )
 
         viewer = await session.add_viewer(permission, user)
         if viewer is None:
+            log.debug("seat a %s refused: room is full (session %s)", permission, sess["id"])
             raise HTTPException(status_code=429, detail="room is full")
         tokens_pushed = await _push_seat_tokens(sess, f"seat a {permission}")
         await session.broadcast_state()
@@ -729,6 +757,9 @@ async def join(body: JoinIn, x_broker_secret: Optional[str] = Header(default=Non
 
     viewer, tokens_pushed = await _mint_viewer(body.permission, body.user)
     sess = session.SESSION
+    log.info(
+        "join: seated %s as %s (session %s)", viewer["username"], body.permission, sess["id"]
+    )
     return {
         "status": "joined",
         "session_id": sess["id"],
@@ -765,14 +796,20 @@ async def invite(body: InviteIn, token: str = Query()) -> dict[str, Any]:
     """
     sess = session.SESSION
     if sess is None or not sess.get("active"):
+        log.debug("invite refused: no active session")
         raise HTTPException(status_code=409, detail="no active session")
     if not _ct_eq(token, sess["controller_token"]):
+        log.warning("invite refused: bad controller token (session %s)", sess["id"])
         raise HTTPException(status_code=403, detail="controller token required")
     if body.permission not in ("participant", "readonly"):
+        log.debug(
+            "invite refused: unknown permission %s (session %s)", body.permission, sess["id"]
+        )
         raise HTTPException(
             status_code=422, detail="permission must be participant or readonly"
         )
 
+    log.info("invite: issued a %s link (session %s)", body.permission, sess["id"])
     return {
         "status": "invited",
         "session_id": sess["id"],
@@ -996,6 +1033,7 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
     """
     sess = session.SESSION
     if sess is None or not sess.get("active"):
+        log.debug("exit refused: no active session")
         raise HTTPException(status_code=409, detail="no active session")
 
     emulator = sess["emulator_obj"]
@@ -1168,14 +1206,19 @@ def _state_emulator() -> Emulator:
     """
     sess = session.SESSION
     if sess is None or not sess.get("active"):
+        log.debug("state operation refused: no active session")
         raise HTTPException(status_code=409, detail="no active session")
     emulator = sess["emulator_obj"]
     if not emulator.supports_states:
+        log.debug("state operation refused: %s has no save states", emulator.display_name)
         raise HTTPException(
             status_code=400,
             detail=f"{emulator.display_name} has no save states",
         )
     if not emulator.alive():
+        log.warning(
+            "state operation refused: %s is not running (session %s)", emulator.name, sess["id"]
+        )
         raise HTTPException(status_code=409, detail="emulator is not running")
     return emulator
 
@@ -1192,14 +1235,19 @@ def _swap_emulator() -> Emulator:
     """
     sess = session.SESSION
     if sess is None or not sess.get("active"):
+        log.debug("swap-disc refused: no active session")
         raise HTTPException(status_code=409, detail="no active session")
     emulator = sess["emulator_obj"]
     if not emulator.supports_disc_swap:
+        log.debug("swap-disc refused: %s cannot swap discs", emulator.display_name)
         raise HTTPException(
             status_code=400,
             detail=f"{emulator.display_name} cannot swap discs",
         )
     if not emulator.alive():
+        log.warning(
+            "swap-disc refused: %s is not running (session %s)", emulator.name, sess["id"]
+        )
         raise HTTPException(status_code=409, detail="emulator is not running")
     return emulator
 
@@ -1222,6 +1270,7 @@ def _readable_emulator() -> Emulator:
         return sess["emulator_obj"]
     retired = session.LAST_EXIT
     if retired is None:
+        log.debug("state read refused: no session to read a state from")
         raise HTTPException(status_code=409, detail="no session to read a state from")
     return retired["emulator_obj"]
 
@@ -1250,7 +1299,10 @@ async def save_state(body: StateIn, x_broker_secret: Optional[str] = Header(defa
         emulator = _state_emulator()
         saved = await anyio.to_thread.run_sync(emulator.save_state, body.slot)
         slot = emulator.state_slot
-    log.info("save state slot %d: %s", slot, "ok" if saved else "failed")
+    if saved:
+        log.info("save state slot %d: ok", slot)
+    else:
+        log.error("save state slot %d: failed", slot)
     return {"status": "saved" if saved else "failed", "slot": slot, "saved": saved}
 
 
@@ -1278,7 +1330,10 @@ async def load_state(body: StateIn, x_broker_secret: Optional[str] = Header(defa
         emulator = _state_emulator()
         loaded = await anyio.to_thread.run_sync(emulator.load_state, body.slot)
         slot = emulator.state_slot
-    log.info("load state slot %d: %s", slot, "ok" if loaded else "failed")
+    if loaded:
+        log.info("load state slot %d: ok", slot)
+    else:
+        log.error("load state slot %d: failed", slot)
     return {
         "status": "loaded" if loaded else "failed",
         "slot": slot,
@@ -1309,18 +1364,22 @@ async def swap_disc(body: DiscIn, x_broker_secret: Optional[str] = Header(defaul
         emulator = _swap_emulator()
         try:
             disc_path = Path(body.path).resolve()
-        except OSError:
+        except OSError as exc:
+            log.error("swap-disc: could not resolve disc path %s: %s", body.path, exc)
             raise HTTPException(status_code=400, detail="invalid disc path")
         rom_root = settings.rom_root()
         if not disc_path.is_relative_to(rom_root):
+            log.warning("swap-disc: disc path %s resolved outside %s", disc_path, rom_root)
             raise HTTPException(
                 status_code=400, detail=f"disc path must live under {rom_root}"
             )
         if not disc_path.exists():
+            log.debug("swap-disc: disc path does not exist: %s", disc_path)
             raise HTTPException(status_code=404, detail="disc path does not exist")
 
         swapped = await anyio.to_thread.run_sync(emulator.swap_disc, disc_path)
     if not swapped:
+        log.error("swap-disc: emulator refused the disc swap to %s", disc_path.name)
         raise HTTPException(status_code=502, detail="emulator refused the disc swap")
     log.info("disc swapped to %s", disc_path.name)
     return {"status": "ok", "path": str(disc_path)}
@@ -1377,13 +1436,15 @@ async def get_state_file(x_broker_secret: Optional[str] = Header(default=None)) 
         emulator = _readable_emulator()
         path = await anyio.to_thread.run_sync(emulator.state_path)
         if path is None:
+            log.debug("state-file: no state file for slot")
             raise HTTPException(status_code=404, detail="no state file for slot")
         try:
             size = path.stat().st_size
         except OSError as exc:
-            log.warning("state-file: could not stat %s: %s", path, exc)
+            log.error("state-file: could not stat %s: %s", path, exc)
             raise HTTPException(status_code=500, detail="could not read state file")
         if size > settings.STATE_FILE_MAX_BYTES:
+            log.debug("state-file: %s exceeds size limit (%d bytes)", path, size)
             raise HTTPException(status_code=413, detail="state file exceeds size limit")
         # Before the read: the read itself is what moves the file's access
         # time, and a load's confirmation wait can sample that move the
@@ -1392,7 +1453,7 @@ async def get_state_file(x_broker_secret: Optional[str] = Header(default=None)) 
         try:
             body = await anyio.to_thread.run_sync(path.read_bytes)
         except OSError as exc:
-            log.warning("state-file: could not read %s: %s", path, exc)
+            log.error("state-file: could not read %s: %s", path, exc)
             raise HTTPException(status_code=500, detail="could not read state file")
         log.info("state-file: serving %s (%d bytes)", path.name, len(body))
         return Response(
@@ -1432,18 +1493,20 @@ async def get_state_screenshot(x_broker_secret: Optional[str] = Header(default=N
         emulator = _readable_emulator()
         path = await anyio.to_thread.run_sync(emulator.state_screenshot_path)
         if path is None:
+            log.debug("state-screenshot: no screenshot for slot")
             raise HTTPException(status_code=404, detail="no state screenshot for slot")
         try:
             size = path.stat().st_size
         except OSError as exc:
-            log.warning("state-screenshot: could not stat %s: %s", path, exc)
+            log.error("state-screenshot: could not stat %s: %s", path, exc)
             raise HTTPException(status_code=500, detail="could not read screenshot")
         if size > settings.STATE_SCREENSHOT_MAX_BYTES:
+            log.debug("state-screenshot: %s exceeds size limit (%d bytes)", path, size)
             raise HTTPException(status_code=413, detail="screenshot exceeds size limit")
         try:
             body = await anyio.to_thread.run_sync(path.read_bytes)
         except OSError as exc:
-            log.warning("state-screenshot: could not read %s: %s", path, exc)
+            log.error("state-screenshot: could not read %s: %s", path, exc)
             raise HTTPException(status_code=500, detail="could not read screenshot")
         log.info("state-screenshot: serving %s (%d bytes)", path.name, len(body))
         return Response(content=body, media_type="image/png")
@@ -1500,6 +1563,9 @@ async def put_state_file(
         name = Path(filename).name
         target = emulator.state_target(name)
         if target is None:
+            log.debug(
+                "state-file push refused: %s is not a state %s would write", name, emulator.name
+            )
             raise HTTPException(status_code=400, detail="filename is not a state this emulator would write")
 
         # Unique per request: two pushes sharing one temp name interleave their
@@ -1515,15 +1581,18 @@ async def put_state_file(
                 async for chunk in request.stream():
                     written += len(chunk)
                     if written > settings.STATE_FILE_MAX_BYTES:
+                        log.debug("state-file push: %s exceeds size limit", target.name)
                         raise HTTPException(status_code=413, detail="state file exceeds size limit")
                     await anyio.to_thread.run_sync(out.write, chunk)
             if written == 0:
+                log.debug("state-file push: empty request body for %s", target.name)
                 raise HTTPException(status_code=400, detail="empty request body")
             # Locked only for the rename: an in-flight resume or manual load
             # backdates and polls this same path to confirm its own read, and
             # a push landing mid-poll would be mistaken for that read's target
             # changing out from under it.
             if not await anyio.to_thread.run_sync(emulator.lock_for_state_write):
+                log.warning("state-file push refused: another state operation is in progress")
                 raise HTTPException(
                     status_code=409, detail="another state operation is in progress"
                 )
@@ -1536,7 +1605,7 @@ async def put_state_file(
             raise
         except OSError as exc:
             _unlink_best_effort(tmp)
-            log.warning("state-file: could not write %s: %s", target, exc)
+            log.error("state-file: could not write %s: %s", target, exc)
             raise HTTPException(status_code=500, detail="could not write state file")
 
         log.info("state-file: stored %s (%d bytes)", target.name, written)
@@ -1578,6 +1647,9 @@ def _refuse_while_session_active(action: str) -> None:
     """
     sess = session.SESSION
     if sess is not None and sess.get("active"):
+        log.warning(
+            "memory-card: refused to %s while session %s is active", action, sess["id"]
+        )
         raise HTTPException(
             status_code=409,
             detail=f"cannot {action} the memory card while a session is active",
@@ -1605,9 +1677,11 @@ def _memory_card(name: str, platform: Optional[str]) -> tuple[Path, Optional[str
     """
     emulator = get_emulator(name)
     if emulator is None:
+        log.debug("memory-card: unknown emulator: %s", name)
         raise HTTPException(status_code=422, detail=f"unknown emulator: {name}")
     card = emulator.memory_card_path(platform)
     if card is None:
+        log.debug("memory-card: %s has no memory card to sync", emulator.display_name)
         raise HTTPException(
             status_code=400,
             detail=f"{emulator.display_name} has no memory card to sync",
@@ -1649,6 +1723,9 @@ async def get_memory_card(
     # Contention on either means the caller should come back rather than queue.
     with _session_operation("memory-card capture"):
         if not memcard.LOCK.acquire(blocking=False):
+            log.warning(
+                "memory-card capture refused: another memory card operation is in progress"
+            )
             raise HTTPException(status_code=409, detail="a memory card operation is in progress")
         try:
             _refuse_while_session_active("capture")
@@ -1656,8 +1733,10 @@ async def get_memory_card(
         finally:
             memcard.LOCK.release()
     if isinstance(result, str):
+        log.warning("memory-card: could not capture slot 1 at %s: %s", card, result)
         raise HTTPException(status_code=409, detail=result)
     if result is None:
+        log.debug("memory-card: no memory card in slot 1 at %s", card)
         raise HTTPException(
             status_code=404,
             detail="no memory card in slot 1",
@@ -1714,15 +1793,20 @@ async def put_memory_card(
             async for chunk in request.stream():
                 written += len(chunk)
                 if written > saves.SAVE_FILE_MAX_BYTES:
+                    log.debug("memory-card: upload exceeds size limit")
                     raise HTTPException(status_code=413, detail="memory card exceeds size limit")
                 await anyio.to_thread.run_sync(out.write, chunk)
         if written == 0:
+            log.debug("memory-card: empty request body")
             raise HTTPException(status_code=400, detail="empty request body")
 
         # Taken only once the whole body is staged, so a slow upload never
         # holds the lock a launch or a teardown is waiting on.
         with _session_operation("memory-card replace"):
             if not memcard.LOCK.acquire(blocking=False):
+                log.warning(
+                    "memory-card replace refused: another memory card operation is in progress"
+                )
                 raise HTTPException(status_code=409, detail="a memory card operation is in progress")
             try:
                 _refuse_while_session_active("replace")
@@ -1736,6 +1820,7 @@ async def put_memory_card(
     finally:
         _unlink_best_effort(tmp)
     if isinstance(result, str):
+        log.error("memory-card: could not replace slot 1 at %s: %s", card, result)
         raise HTTPException(status_code=400, detail=result)
     log.info("memory-card: replaced slot 1, %d file(s)", result)
     return {"status": "ok", "written": result, "slot": 1}
@@ -1809,6 +1894,7 @@ def _archive_name(name: str) -> str:
     """
     safe = Path(name).name
     if safe != name or not safe.endswith(".zip") or safe.startswith("."):
+        log.debug("rejected invalid archive name: %s", name)
         raise HTTPException(status_code=400, detail="invalid archive name")
     return safe
 
@@ -1828,8 +1914,10 @@ def _export_file(name: str) -> Path:
     """
     candidate = (settings.EXPORT_DIR / _archive_name(name)).resolve()
     if candidate.parent != settings.EXPORT_DIR.resolve():
+        log.warning("export: name %s resolved outside %s", name, settings.EXPORT_DIR)
         raise HTTPException(status_code=400, detail="invalid export name")
     if not candidate.is_file():
+        log.debug("export: no such export: %s", name)
         raise HTTPException(status_code=404, detail=f"no such export: {name}")
     return candidate
 
@@ -1876,12 +1964,15 @@ async def upload_import(
                     # Refused on the first bytes, so a huge non-zip body is not
                     # written to disk in full before being rejected.
                     if not b"PK".startswith(header):
+                        log.debug("import %s: not a zip", safe)
                         raise HTTPException(status_code=422, detail="archive is not a zip")
                 total += len(chunk)
                 if total > saves.SAVE_FILE_MAX_BYTES:
+                    log.debug("import %s: exceeds size limit", safe)
                     raise HTTPException(status_code=413, detail="archive too large")
                 await anyio.to_thread.run_sync(out.write, chunk)
         if header != b"PK":
+            log.debug("import %s: not a zip", safe)
             raise HTTPException(status_code=422, detail="archive is not a zip")
         os.replace(tmp, target)
     except HTTPException:
@@ -1916,7 +2007,8 @@ async def list_exports(x_broker_secret: Optional[str] = Header(default=None)) ->
     for p in settings.EXPORT_DIR.glob("*.zip"):
         try:
             st = p.stat()
-        except OSError:
+        except OSError as exc:
+            log.debug("list_exports: skipping %s, could not stat: %s", p, exc)
             continue
         items.append({"name": p.name, "size": st.st_size, "mtime": st.st_mtime})
     items.sort(key=lambda i: i["mtime"], reverse=True)
@@ -2003,15 +2095,18 @@ async def context(
     """
     sess = session.SESSION
     if sess is None or not sess.get("active"):
+        log.debug("context refused: no active session")
         raise HTTPException(status_code=409, detail="no active session")
     if not token and invite:
         permission = session.find_invite(invite)
         if permission is None:
+            log.warning("context: invalid or expired invite token")
             raise HTTPException(status_code=401, detail="invalid invite")
         viewer, _ = await _mint_viewer(permission, None)
         token = viewer["token"]
         log.info("seated an arrival from the %s invite link", permission)
     if not token:
+        log.warning("context: request carried neither a token nor an invite")
         raise HTTPException(status_code=401, detail="missing token")
 
     role = None
@@ -2031,8 +2126,10 @@ async def context(
             username = viewer.get("username")
 
     if role is None:
+        log.warning("context: unknown token presented (session %s)", sess["id"])
         raise HTTPException(status_code=401, detail="invalid token")
 
+    log.debug("context: resolved %s as %s (session %s)", role, username, sess["id"])
     return {
         "sessionId": sess["id"],
         "userRole": role,

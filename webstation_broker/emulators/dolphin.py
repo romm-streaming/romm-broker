@@ -147,6 +147,7 @@ def _game_id_at(path: Path, offset: int) -> Optional[str]:
     try:
         game_id = raw.decode("ascii")
     except UnicodeDecodeError:
+        log.debug("game id at %s offset %d was not ascii", path, offset)
         return None
     return game_id if _GAME_ID_RE.match(game_id) else None
 
@@ -219,7 +220,8 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
                 continue
             real = p.resolve()
             rel = p.relative_to(base)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            log.debug("skipping rom candidate %s: %s", p, exc)
             continue
         if not real.is_relative_to(ROM_ROOT):
             continue
@@ -300,8 +302,8 @@ def _state_for_slot(slot: int) -> Optional[Path]:
     for p in STATE_DIR.glob(f"*.s{slot:02d}"):
         try:
             candidates.append((p.stat().st_mtime, p))
-        except OSError:
-            pass
+        except OSError as exc:
+            log.debug("could not stat state candidate %s in slot %d: %s", p, slot, exc)
     if not candidates:
         return None
     return max(candidates)[1]
@@ -355,8 +357,8 @@ def _snapshot() -> dict[Path, tuple[int, float]]:
         try:
             st = p.stat()
             snap[p] = (st.st_size, st.st_mtime)
-        except OSError:
-            pass
+        except OSError as exc:
+            log.debug("could not stat %s during state snapshot: %s", p, exc)
     return snap
 
 
@@ -385,7 +387,8 @@ def _holds_open(pid: Optional[int], path: Path) -> bool:
             try:
                 if os.path.realpath(fd) == target:
                     return True
-            except OSError:
+            except OSError as exc:
+                log.debug("could not resolve fd %s for dolphin pid %s: %s", fd, pid, exc)
                 continue
     except OSError as exc:
         log.debug("could not read the open files of dolphin pid %s for %s: %s", pid, path, exc)
@@ -580,6 +583,7 @@ def _undo_buffer_stamp() -> Optional[tuple[int, int]]:
     try:
         st = path.stat()
     except FileNotFoundError:
+        log.debug("undo state buffer %s does not exist yet", path)
         return None
     except OSError as exc:
         log.warning("could not stat the undo state buffer %s: %s", path, exc)
@@ -735,7 +739,8 @@ class Dolphin(Emulator):
             try:
                 if not path.resolve().is_relative_to(ROM_ROOT):
                     return None
-            except OSError:
+            except OSError as exc:
+                log.debug("could not resolve rom path %s: %s", path, exc)
                 return None
             return path
         if not path.is_dir():
@@ -744,9 +749,13 @@ class Dolphin(Emulator):
         for pattern in _ROM_SEARCH_GLOBS:
             try:
                 candidates.extend(path.glob(pattern))
-            except OSError:
+            except OSError as exc:
+                log.debug("could not search %s for pattern %s: %s", path, pattern, exc)
                 return None
-        return _pick_rom_file(candidates, path)
+        picked = _pick_rom_file(candidates, path)
+        if picked is not None:
+            log.debug("resolved rom file: %s", picked)
+        return picked
 
     def _xdotool(self, *args: str) -> Optional[str]:
         """Run one xdotool command against the session display.

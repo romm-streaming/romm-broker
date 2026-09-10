@@ -148,7 +148,8 @@ def _pick_rom_file(candidates: list[Path], base: Path) -> Optional[Path]:
                 continue
             real = p.resolve()
             rel = p.relative_to(base)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            log.debug("xenia: skipping rom candidate %s: %s", p, exc)
             continue
         if not real.is_relative_to(ROM_ROOT):
             continue
@@ -189,7 +190,8 @@ def _is_stfs_package(path: Path) -> bool:
     try:
         with path.open("rb") as fh:
             return fh.read(4) in _STFS_MAGICS
-    except OSError:
+    except OSError as exc:
+        log.debug("xenia: could not sniff %s for an STFS magic: %s", path, exc)
         return False
 
 
@@ -218,7 +220,8 @@ def _find_container(base: Path) -> Optional[Path]:
                     continue
                 real = p.resolve()
                 rel = p.relative_to(base)
-            except (OSError, ValueError):
+            except (OSError, ValueError) as exc:
+                log.debug("xenia: skipping container candidate %s: %s", p, exc)
                 continue
             if not real.is_relative_to(ROM_ROOT) or not _is_stfs_package(real):
                 continue
@@ -454,6 +457,7 @@ class Xenia(Emulator):
         try:
             if default_xex.is_file():
                 if default_xex.resolve().is_relative_to(ROM_ROOT):
+                    log.debug("resolved %s to its default.xex", path)
                     return default_xex
                 return None  # symlink escapes ROM_ROOT
             if default_xex.exists() or default_xex.is_symlink():
@@ -462,7 +466,8 @@ class Xenia(Emulator):
                 # and falling through to the candidate search would silently
                 # boot something else instead of the dump's own executable.
                 return None
-        except OSError:
+        except OSError as exc:
+            log.debug("xenia: could not check %s for a default.xex: %s", path, exc)
             return None
         candidates: list[Path] = []
         for pattern in _ROM_SEARCH_GLOBS:
@@ -474,10 +479,14 @@ class Xenia(Emulator):
                 log.warning("xenia: search of %s for %s failed: %s", path, pattern, exc)
         rom = _pick_rom_file(candidates, path)
         if rom is not None:
+            log.debug("resolved %s to %s", path, rom)
             return rom
         # No disc or executable: an XBLA or GoD container, if the layout
         # holds one.
-        return _find_container(path)
+        container = _find_container(path)
+        if container is not None:
+            log.debug("resolved %s to STFS container %s", path, container)
+        return container
 
     def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
         """Stop any running instance and launch Xenia against a ROM.

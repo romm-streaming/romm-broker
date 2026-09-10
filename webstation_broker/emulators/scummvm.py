@@ -347,6 +347,7 @@ def _ini_domains() -> dict[str, dict[str, str]]:
     try:
         lines = INI_PATH.read_text(errors="replace").splitlines()
     except FileNotFoundError:
+        log.debug("scummvm: %s does not exist yet", INI_PATH)
         return domains
     except OSError as exc:
         log.error("scummvm: could not read %s: %s", INI_PATH, exc)
@@ -472,6 +473,8 @@ def patch_ini(gui_language: Optional[str] = None) -> None:
         INI_PATH.write_text("\n".join(out) + "\n")
     except OSError as exc:
         log.error("scummvm: could not write %s: %s, ini not pinned", INI_PATH, exc)
+    else:
+        log.debug("scummvm: patched %s with the broker's settings", INI_PATH)
 
 
 def gmm_hotkeys() -> tuple[str, str]:
@@ -523,7 +526,10 @@ def target_for_path(rom_dir: Path, language: Optional[str] = None) -> Optional[s
         try:
             if Path(keys["path"]) == rom_dir:
                 targets.append(name)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            log.debug(
+                "scummvm: skipping domain %s, bad path %r: %s", name, keys.get("path"), exc
+            )
             continue
     if not targets:
         return None
@@ -620,6 +626,8 @@ def register_target(rom_dir: Path, language: Optional[str] = None) -> Optional[s
             INI_PATH,
             CONFIG_DIR,
         )
+    if target is not None:
+        log.debug("scummvm: registered %s as target %s", rom_dir, target)
     return target
 
 
@@ -645,7 +653,10 @@ def _drop_dead_domains(gameid: str) -> int:
         try:
             if not Path(keys["path"]).is_dir():
                 doomed.add(name)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            log.warning(
+                "scummvm: domain %s path unreadable, dropping it as dead: %s", name, exc
+            )
             doomed.add(name)
     if not doomed:
         return 0
@@ -711,7 +722,8 @@ def slot_file(target: Optional[str], slot: int) -> Optional[Path]:
         path = SAVE_DIR / name
         try:
             found.append((path.stat().st_mtime, path))
-        except OSError:
+        except OSError as exc:
+            log.debug("scummvm: skipping %s, could not stat: %s", path, exc)
             continue
     return max(found)[1] if found else None
 
@@ -730,9 +742,11 @@ def _slot_stamp(target: Optional[str], slot: int) -> dict[str, tuple[float, int]
     if target is None:
         return stamp
     for name in slot_names(target, slot):
+        path = SAVE_DIR / name
         try:
-            st = (SAVE_DIR / name).stat()
-        except OSError:
+            st = path.stat()
+        except OSError as exc:
+            log.debug("scummvm: skipping %s, could not stat: %s", path, exc)
             continue
         stamp[name] = (st.st_mtime, st.st_size)
     return stamp
@@ -857,6 +871,7 @@ class Scummvm(Emulator):
             log.warning("scummvm: could not read %s: %s", rom_dir, exc)
             return None
         self._rom_dir = resolved
+        log.debug("scummvm: resolved rom folder %s", resolved)
         return resolved
 
     def _xdotool(self, *args: str, quiet: bool = False) -> Optional[str]:
@@ -1253,7 +1268,10 @@ class Scummvm(Emulator):
         if not self._type(load_key):
             return False
         time.sleep(KEY_DELAY)
-        return self._keys(win_id, ["Down"] * (STATE_SLOT + 1) + ["Return"])
+        ok = self._keys(win_id, ["Down"] * (STATE_SLOT + 1) + ["Return"])
+        if ok:
+            log.info("scummvm: loaded %s from slot %d", self._target, STATE_SLOT)
+        return ok
 
     def state_path(self) -> Optional[Path]:
         """The working slot's save file for the booted target, or None when empty."""

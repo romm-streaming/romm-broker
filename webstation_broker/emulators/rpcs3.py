@@ -246,7 +246,8 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
                 continue
             real = p.resolve()
             rel = p.relative_to(base)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            log.debug("rpcs3: skipping unusable boot candidate %s: %s", p, exc)
             continue
         if not real.is_relative_to(ROM_ROOT):
             continue
@@ -416,7 +417,13 @@ def _run_headless(args: list[str], what: str) -> None:
         log_fh.write(
             f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} {what} ({' '.join(cmd)}) ===\n".encode()
         )
-    except OSError:
+    except OSError as exc:
+        log.warning(
+            "rpcs3 %s: could not open %s for launch output, discarding it: %s",
+            what,
+            RPCS3_LOG_PATH,
+            exc,
+        )
         log_fh = None
     try:
         proc = subprocess.Popen(
@@ -487,7 +494,8 @@ def _sfo_title_id(sfo: Path) -> Optional[str]:
     """TITLE_ID string from a PARAM.SFO (key/data table pairs indexed from a fixed-size header)."""
     try:
         data = sfo.read_bytes()
-    except OSError:
+    except OSError as exc:
+        log.debug("rpcs3: could not read %s for its title id: %s", sfo, exc)
         return None
     if len(data) < 0x14 or data[:4] != b"\x00PSF":
         return None
@@ -517,7 +525,8 @@ def _archive_dir_size(path: Path) -> int:
         try:
             if f.is_file():
                 total += f.stat().st_size
-        except OSError:
+        except OSError as exc:
+            log.debug("rpcs3 cache: skipping unreadable %s while sizing %s: %s", f, path, exc)
             continue
     return total
 
@@ -622,7 +631,11 @@ def _evict_lru(needed_bytes: int, keep: str) -> None:
             marker = game_dir / _LAST_ACCESSED_MARKER
             try:
                 mtime = marker.stat().st_mtime if marker.exists() else 0.0
-            except OSError:
+            except OSError as exc:
+                log.debug(
+                    "rpcs3 cache: could not read last-accessed marker for %s, treating as oldest: %s",
+                    game_dir, exc,
+                )
                 mtime = 0.0
             candidates.append((mtime, game_dir))
         if not candidates:
@@ -649,7 +662,8 @@ def _is_safe_boot_candidate(candidate: Path, root_real: Path) -> bool:
     """
     try:
         return candidate.is_file() and candidate.resolve().is_relative_to(root_real)
-    except OSError:
+    except OSError as exc:
+        log.debug("rpcs3: could not resolve boot candidate %s: %s", candidate, exc)
         return False
 
 
@@ -674,6 +688,7 @@ def _run_extractor(cmd: list[str], what: str) -> str:
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=INSTALL_TIMEOUT)
     except (OSError, subprocess.TimeoutExpired) as exc:
+        log.error("rpcs3: %s failed to run: %s", what, exc)
         raise RuntimeError(f"{what} failed to run: {exc}") from exc
     if result.returncode != 0:
         raise RuntimeError(f"{what} exited {result.returncode}: {result.stderr.strip()}")
@@ -753,6 +768,7 @@ def _reject_escaped_tree(dest: Path) -> None:
             try:
                 target_real = p.resolve()
             except OSError as exc:
+                log.error("rpcs3: could not resolve extracted member %s under %s: %s", p, dest, exc)
                 raise RuntimeError(f"could not resolve extracted member {p}: {exc}") from exc
             if target_real != dest_real and dest_real not in target_real.parents:
                 raise RuntimeError(f"extracted member escapes cache dir: {p}")
@@ -766,6 +782,7 @@ def _extract_archive(archive: Path, dest: Path) -> None:
             with zipfile.ZipFile(archive) as zf:
                 _safe_extract_zip(zf, dest)
         except (zipfile.BadZipFile, OSError) as exc:
+            log.error("rpcs3: zip extraction of %s failed: %s", archive.name, exc)
             raise RuntimeError(f"zip extraction of {archive.name} failed: {exc}") from exc
     elif ext == ".rar":
         _reject_unsafe_members(dest, _rar_member_paths(archive))
@@ -997,7 +1014,8 @@ def _pkg_title_id(pkg: Path) -> Optional[str]:
     try:
         with open(pkg, "rb") as f:
             header = f.read(0x60)
-    except OSError:
+    except OSError as exc:
+        log.debug("rpcs3: could not read %s for its title id: %s", pkg, exc)
         return None
     if len(header) < 0x60 or header[:4] != b"\x7fPKG":
         return None
@@ -1192,8 +1210,8 @@ def _state_snapshot(serial: Optional[str]) -> dict:
             try:
                 st = p.stat()
                 snap[p] = (st.st_size, st.st_mtime)
-            except OSError:
-                pass
+            except OSError as exc:
+                log.debug("rpcs3: could not stat state file %s: %s", p, exc)
     return snap
 
 
@@ -1393,7 +1411,8 @@ def _launch_pids(pid: Optional[int]) -> list[int]:
             try:
                 if os.getpgid(candidate) == pgid:
                     found.append(candidate)
-            except OSError:
+            except OSError as exc:
+                log.debug("rpcs3: could not read process group of pid %d: %s", candidate, exc)
                 continue
     except OSError as exc:
         log.debug("rpcs3: could not scan /proc for the process group of pid %s: %s", pid, exc)
@@ -1425,7 +1444,8 @@ def _holds_open(pid: Optional[int], path: Path) -> bool:
                 try:
                     if os.path.realpath(fd) == target:
                         return True
-                except OSError:
+                except OSError as exc:
+                    log.debug("rpcs3: could not resolve fd %s of pid %s: %s", fd, candidate, exc)
                     continue
         except OSError as exc:
             log.debug(
@@ -1472,7 +1492,8 @@ def _wait_for_state_write(
             continue
         try:
             size = p.stat().st_size
-        except OSError:
+        except OSError as exc:
+            log.debug("rpcs3: could not stat in-progress state %s, retrying: %s", p, exc)
             time.sleep(POLL_SECS)
             continue
         if target != p:
@@ -1759,7 +1780,8 @@ class Rpcs3(Emulator):
         for pattern in _ROM_SEARCH_GLOBS:
             try:
                 candidates.extend(path.glob(pattern))
-            except OSError:
+            except OSError as exc:
+                log.debug("rpcs3: could not search %s for a boot target (%s): %s", path, pattern, exc)
                 return None
         picked = _pick_rom_file(candidates, path)
         self._pending_rom = picked
@@ -1953,6 +1975,10 @@ class Rpcs3(Emulator):
                         if self._leftover_snapshot is not None:
                             _clear_leftover_states(title, self._leftover_snapshot)
                             self._leftover_snapshot = None
+                else:
+                    log.debug(
+                        "boot watchdog: %s confirmed running via PINE", self._session_serial
+                    )
                 return
             time.sleep(1.0)
 

@@ -119,7 +119,7 @@ def _clear_pid_record() -> None:
     try:
         PID_FILE.unlink()
     except FileNotFoundError:
-        pass
+        log.debug("no emulator pid record to clear")
     except OSError as exc:
         log.warning("could not clear emulator pid record: %s", exc)
 
@@ -136,7 +136,8 @@ def _cmdline(pid: int) -> list[str]:
     """
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
+    except OSError as exc:
+        log.debug("could not read cmdline for pid %d: %s", pid, exc)
         return []
     return [part for part in raw.decode(errors="replace").split("\0") if part]
 
@@ -185,7 +186,10 @@ def reap_orphan() -> Optional[dict[str, Any]]:
     """
     try:
         record = json.loads(PID_FILE.read_text())
-    except (FileNotFoundError, ValueError):
+    except FileNotFoundError:
+        return None
+    except ValueError as exc:
+        log.warning("emulator pid record is corrupt, ignoring: %s", exc)
         return None
     except OSError as exc:
         log.warning("could not read emulator pid record: %s", exc)
@@ -454,7 +458,13 @@ class Emulator:
             log_fh.write(
                 f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} launch ({' '.join(cmd)}) ===\n".encode()
             )
-        except OSError:
+        except OSError as exc:
+            log.warning(
+                "could not open %s for %s launch output, discarding it: %s",
+                self.log_path,
+                self.name,
+                exc,
+            )
             log_fh = None
         try:
             self._proc = subprocess.Popen(
@@ -529,6 +539,7 @@ class Emulator:
                         proc.pid,
                     )
         except ProcessLookupError:
+            log.debug("%s (pid %d) was already gone", self.name, proc.pid)
             gone = True
         except PermissionError as exc:
             log.error(

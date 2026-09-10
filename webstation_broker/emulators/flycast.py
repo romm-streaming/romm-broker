@@ -120,7 +120,8 @@ def _pick_rom_file(candidates: list[Path], base: Path) -> Optional[Path]:
                 continue
             real = p.resolve()
             rel = p.relative_to(base)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            log.debug("skipping rom candidate %s: %s", p, exc)
             continue
         if not real.is_relative_to(ROM_ROOT):
             continue
@@ -215,6 +216,7 @@ def _state_owner(state: Path) -> Optional[str]:
     try:
         recorded = marker.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
+        log.debug("no state marker at %s, treating %s as unmarked", marker, state.name)
         return None
     except (OSError, ValueError) as exc:
         log.warning("could not read the state marker %s: %s", marker, exc)
@@ -287,6 +289,7 @@ def _state_is_loadable(path: Path) -> bool:
     try:
         st = path.stat()
     except FileNotFoundError:
+        log.debug("no resume state at %s, nothing to load", path)
         return False
     except OSError as exc:
         log.warning("could not check the resume state at %s: %s", path, exc)
@@ -322,11 +325,17 @@ def _wait_for_state_write(
     last: Optional[tuple[int, float]] = None
     stable_since = 0.0
     reason = ""
+    stat_error_logged = False
     while True:
         try:
             st = path.stat()
-        except OSError:
+        except OSError as exc:
             cur = None
+            if not stat_error_logged:
+                stat_error_logged = True
+                log.warning(
+                    "could not stat resume state %s while waiting for its write: %s", path, exc
+                )
         else:
             cur = (st.st_size, st.st_mtime)
         if cur is None:
@@ -419,7 +428,10 @@ class Flycast(Emulator):
                 candidates.extend(path.glob(pattern))
             except OSError as exc:
                 log.warning("rom search %r under %s failed: %s", pattern, path, exc)
-        return _pick_rom_file(candidates, path)
+        picked = _pick_rom_file(candidates, path)
+        if picked is not None:
+            log.debug("resolved rom directory %s to %s", path, picked)
+        return picked
 
     def _xdotool(self, *args: str) -> Optional[str]:
         """Run xdotool, returning its stdout, or None if it failed."""
