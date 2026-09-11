@@ -272,15 +272,28 @@ SLOT_HOME_STEPS = int(os.environ.get("RETROARCH_SLOT_HOME_STEPS", "24"))
 The step count has to outrun any slot the player could have cycled to.
 """
 FIRST_SAVE_SETTLE = float(os.environ.get("RETROARCH_FIRST_SAVE_SETTLE", "3.0"))
-"""Seconds a session's first save waits after launch, from `RETROARCH_FIRST_SAVE_SETTLE` (default 3).
+"""Seconds a session's first save waits after PLAYING, from `RETROARCH_FIRST_SAVE_SETTLE` (default 3).
 
-A fast-booting core (gambatte) can still be showing its boot-transition frame
-(a flat, single-colour screen, before the game's own first real frame) when
-the very first save of a session reaches `_try_save`: the state file confirms
-fine, but RetroArch's savestate thumbnail grabs that flat frame instead of
-gameplay. Only the first save pays this cost, since `_slot_homed` is already
-true for every later one; a session whose first save comes later than this
-naturally owes no wait at all.
+A fast-booting core (gambatte) can still be showing its own boot sequence
+(the Nintendo logo scroll, or a flat boot-transition frame) rather than the
+game's first real frame when the very first save of a session reaches
+`_try_save`: the state file confirms fine, but RetroArch's savestate
+thumbnail grabs whatever is on screen at that instant. Counted from PLAYING
+rather than from process spawn, since core load and ROM load between spawn
+and PLAYING are themselves variable and would otherwise eat into (or blow
+past) the budget before the game has actually started. Only the first save
+pays this cost, since `_slot_homed` is already true for every later one; a
+session whose first save comes well after PLAYING naturally owes no wait
+at all.
+"""
+FIRST_SAVE_SETTLE_WAIT = float(os.environ.get("RETROARCH_FIRST_SAVE_SETTLE_WAIT", "20.0"))
+"""Seconds `_wait_for_first_save_settle` waits for a PLAYING timestamp, from
+`RETROARCH_FIRST_SAVE_SETTLE_WAIT` (default 20).
+
+Covers a save requested before `_track_first_playing` has observed PLAYING
+even once, e.g. a very fast player or a slow-booting core; past this the
+save proceeds unsettled rather than blocking indefinitely on a core that
+never came up.
 """
 DISC_TRAY_SETTLE = float(os.environ.get("RETROARCH_DISC_TRAY_SETTLE", "1.5"))
 """Seconds the tray gets to open before discs are stepped, from `RETROARCH_DISC_TRAY_SETTLE` (default 1.5).
@@ -1205,8 +1218,11 @@ class Retroarch(Emulator):
         """The loaded content's basename, which RetroArch names its state and SRAM files after."""
         self._slot_homed = False
         """Whether the current slot has been parked on `STATE_SLOT` since launch."""
-        self._launch_monotonic: float = 0.0
-        """`time.monotonic()` when the current process was spawned; anchors `_wait_for_first_save_settle`."""
+        self._playing_monotonic: Optional[float] = None
+        """`time.monotonic()` when `_track_first_playing` first saw PLAYING; None until then.
+
+        Anchors `_wait_for_first_save_settle`. Reset to None on every launch.
+        """
         self._launch_seq = 0
         """Launch generation, bumped on every launch and stop so stale background waits bail out."""
         self._thumbnail_enabled = True
@@ -1538,7 +1554,8 @@ class Retroarch(Emulator):
             resume_slot,
         )
         self._spawn_ra(cmd, env)
-        self._launch_monotonic = time.monotonic()
+        self._playing_monotonic = None
+        threading.Thread(target=self._track_first_playing, args=(seq,), daemon=True).start()
 
         # Slot 0 is a real slot here, so the gate is on the request, not on the
         # number: `if resume_slot` would drop every resume this broker asks for.
@@ -1814,16 +1831,46 @@ class Retroarch(Emulator):
         finally:
             self._disc_lock.release()
 
+    def _track_first_playing(self, seq: int) -> None:
+        """Record the moment GET_STATUS first reports PLAYING, for `_wait_for_first_save_settle`.
+
+        Runs from `launch` in the background, polling tightly so the recorded
+        timestamp tracks the real transition closely rather than lagging it by
+        a coarse poll interval. `_send` is safe to call concurrently with the
+        rest of the session (see `_reply_lock`/`_stdout_lock`), so this can run
+        alongside a deferred resume load's own PLAYING poll without colliding.
+
+        Args:
+            seq: The launch generation this belongs to; a relaunch or stop
+                bumps `_launch_seq` and ends the wait.
+        """
+        while self._launch_seq == seq and self.alive():
+            reply = self._send("GET_STATUS", wait_prefix="GET_STATUS", timeout=2.0)
+            if reply and reply.startswith("GET_STATUS PLAYING"):
+                self._playing_monotonic = time.monotonic()
+                return
+            time.sleep(0.2)
+
     def _wait_for_first_save_settle(self) -> None:
-        """Sleep off whatever is left of `FIRST_SAVE_SETTLE` since launch.
+        """Sleep off whatever is left of `FIRST_SAVE_SETTLE` since PLAYING.
 
         Called once, right before a session's first `_home_state_slot()`. A
         fast-booting core can already be running well past its own boot
-        transition by the time the player's first save request arrives, in
+        sequence by the time the player's first save request arrives, in
         which case this is a no-op; only a save requested within
-        `FIRST_SAVE_SETTLE` of launch actually waits.
+        `FIRST_SAVE_SETTLE` of PLAYING actually waits.
+
+        If `_track_first_playing` has not observed PLAYING yet (a very fast
+        first save, or a slow-booting core), this waits up to
+        `FIRST_SAVE_SETTLE_WAIT` for it before giving up and proceeding
+        unsettled.
         """
-        remaining = FIRST_SAVE_SETTLE - (time.monotonic() - self._launch_monotonic)
+        deadline = time.monotonic() + FIRST_SAVE_SETTLE_WAIT
+        while self._playing_monotonic is None:
+            if not self.alive() or time.monotonic() >= deadline:
+                return
+            time.sleep(0.1)
+        remaining = FIRST_SAVE_SETTLE - (time.monotonic() - self._playing_monotonic)
         if remaining > 0:
             time.sleep(remaining)
 
