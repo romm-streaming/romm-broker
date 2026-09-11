@@ -271,6 +271,17 @@ SLOT_HOME_STEPS = int(os.environ.get("RETROARCH_SLOT_HOME_STEPS", "24"))
 
 The step count has to outrun any slot the player could have cycled to.
 """
+FIRST_SAVE_SETTLE = float(os.environ.get("RETROARCH_FIRST_SAVE_SETTLE", "3.0"))
+"""Seconds a session's first save waits after launch, from `RETROARCH_FIRST_SAVE_SETTLE` (default 3).
+
+A fast-booting core (gambatte) can still be showing its boot-transition frame
+(a flat, single-colour screen, before the game's own first real frame) when
+the very first save of a session reaches `_try_save`: the state file confirms
+fine, but RetroArch's savestate thumbnail grabs that flat frame instead of
+gameplay. Only the first save pays this cost, since `_slot_homed` is already
+true for every later one; a session whose first save comes later than this
+naturally owes no wait at all.
+"""
 DISC_TRAY_SETTLE = float(os.environ.get("RETROARCH_DISC_TRAY_SETTLE", "1.5"))
 """Seconds the tray gets to open before discs are stepped, from `RETROARCH_DISC_TRAY_SETTLE` (default 1.5).
 
@@ -1194,6 +1205,8 @@ class Retroarch(Emulator):
         """The loaded content's basename, which RetroArch names its state and SRAM files after."""
         self._slot_homed = False
         """Whether the current slot has been parked on `STATE_SLOT` since launch."""
+        self._launch_monotonic: float = 0.0
+        """`time.monotonic()` when the current process was spawned; anchors `_wait_for_first_save_settle`."""
         self._launch_seq = 0
         """Launch generation, bumped on every launch and stop so stale background waits bail out."""
         self._thumbnail_enabled = True
@@ -1525,6 +1538,7 @@ class Retroarch(Emulator):
             resume_slot,
         )
         self._spawn_ra(cmd, env)
+        self._launch_monotonic = time.monotonic()
 
         # Slot 0 is a real slot here, so the gate is on the request, not on the
         # number: `if resume_slot` would drop every resume this broker asks for.
@@ -1800,6 +1814,19 @@ class Retroarch(Emulator):
         finally:
             self._disc_lock.release()
 
+    def _wait_for_first_save_settle(self) -> None:
+        """Sleep off whatever is left of `FIRST_SAVE_SETTLE` since launch.
+
+        Called once, right before a session's first `_home_state_slot()`. A
+        fast-booting core can already be running well past its own boot
+        transition by the time the player's first save request arrives, in
+        which case this is a no-op; only a save requested within
+        `FIRST_SAVE_SETTLE` of launch actually waits.
+        """
+        remaining = FIRST_SAVE_SETTLE - (time.monotonic() - self._launch_monotonic)
+        if remaining > 0:
+            time.sleep(remaining)
+
     def _home_state_slot(self) -> bool:
         """Park RetroArch's current state slot on `STATE_SLOT`.
 
@@ -1931,6 +1958,8 @@ class Retroarch(Emulator):
                     STATE_SLOT, self.platform, self._rom_base,
                 )
                 return False
+            if not self._slot_homed:
+                self._wait_for_first_save_settle()
             if not self._slot_homed and not self._home_state_slot():
                 log.warning(
                     "retroarch: state slot not parked on %d, saving into whatever slot is current "
