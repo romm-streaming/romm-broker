@@ -55,6 +55,7 @@ a real stdout pipe drained by a reader thread, unlike the shared `_spawn`
 which merges stderr into stdout (that would corrupt the reply stream).
 """
 
+import glob
 import io
 import json
 import logging
@@ -843,7 +844,12 @@ def _newest_state(dir_path: Path, base: str, slot: int) -> Optional[Path]:
     name = _state_name(base, slot)
     best: Optional[tuple[float, Path]] = None
     try:
-        for p in dir_path.rglob(f"{base}.state*"):
+        # `base` is a ROM content basename, not a pattern: bracketed region
+        # tags like "[USA]" are near-universal in ROM sets and glob.escape is
+        # what keeps a `[U]` character class from swallowing them, the same
+        # way a plain `*` or `?` in a title would otherwise silently make the
+        # glob match nothing (or the wrong thing) instead of raising.
+        for p in dir_path.rglob(f"{glob.escape(base)}.state*"):
             if not p.is_file() or p.name != name:
                 continue
             st = p.stat()

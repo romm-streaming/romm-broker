@@ -1112,6 +1112,66 @@ class TestWaitForStateFile:
         assert settled is True
 
 
+class TestNewestState:
+    """Finding the state file `state_path()` serves back to RomM for the library."""
+
+    @pytest.fixture
+    def state_dir(self, tmp_path: Path) -> Path:
+        """A throwaway savestate directory."""
+        states = tmp_path / "states"
+        states.mkdir()
+        return states
+
+    def test_finds_a_state_for_a_plain_basename(self, state_dir: Path) -> None:
+        """The ordinary case: no glob metacharacters in the basename."""
+        (state_dir / "Game.state").write_bytes(b"savedata")
+
+        found = retroarch._newest_state(state_dir, "Game", 0)
+
+        assert found == state_dir / "Game.state"
+
+    def test_finds_a_state_whose_basename_has_a_bracketed_region_tag(
+        self, state_dir: Path
+    ) -> None:
+        """A ROM basename like "Game [USA]" must be matched literally.
+
+        Region tags in square brackets are near-universal in ROM sets, and a
+        naive glob pattern built from the basename treats `[USA]` as a
+        character class (any one of U, S or A) instead of four literal
+        characters, so it never matches the real file: RomM would never see
+        the state, the exact bug this guards against.
+        """
+        (state_dir / "Game [USA].state").write_bytes(b"savedata")
+
+        found = retroarch._newest_state(state_dir, "Game [USA]", 0)
+
+        assert found == state_dir / "Game [USA].state"
+
+    def test_finds_a_state_whose_basename_has_other_glob_metacharacters(
+        self, state_dir: Path
+    ) -> None:
+        """`*` and `?` in a title are rarer than `[...]` but just as literal."""
+        (state_dir / "Game? *.state").write_bytes(b"savedata")
+
+        found = retroarch._newest_state(state_dir, "Game? *", 0)
+
+        assert found == state_dir / "Game? *.state"
+
+    def test_finds_a_state_redirected_into_a_core_subdir(self, state_dir: Path) -> None:
+        """PPSSPP (and others) write into a per-core subdir under `STATE_DIR`."""
+        subdir = state_dir / "PPSSPP"
+        subdir.mkdir()
+        (subdir / "Game [USA].state").write_bytes(b"savedata")
+
+        found = retroarch._newest_state(state_dir, "Game [USA]", 0)
+
+        assert found == subdir / "Game [USA].state"
+
+    def test_returns_none_when_no_state_exists(self, state_dir: Path) -> None:
+        """An empty state dir is a slot nobody has saved into yet, not an error."""
+        assert retroarch._newest_state(state_dir, "Game [USA]", 0) is None
+
+
 def _write_after(path: Path, data: bytes, delay: float) -> None:
     """Write `data` to `path` after `delay` seconds, from a background thread.
 
