@@ -248,14 +248,19 @@ class TestResumeGate:
 
     @pytest.fixture(autouse=True)
     def _stub_launch(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
-        """Stub everything launch() touches and capture the threads it starts.
+        """Stub everything launch() touches and capture its deferred-load thread.
+
+        launch() also unconditionally starts a `_track_first_playing` thread,
+        which this gate doesn't care about, so the stand-in only records
+        starts targeting `_deferred_load_state` — the thread this class is
+        actually about.
 
         Args:
             tmp_path: The per-test temporary directory.
             monkeypatch: The pytest monkeypatch fixture.
 
         Returns:
-            The args tuple of every thread launch() started, in order.
+            The args tuple of every deferred-load thread launch() started, in order.
         """
         monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
         monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
@@ -281,18 +286,20 @@ class TestResumeGate:
                 args: tuple[object, ...] = (),
                 daemon: bool = False,
             ) -> None:
-                """Remember the args; the target is never run.
+                """Remember the target and args; the target is never run.
 
                 Args:
                     target: The callable the real thread would run.
                     args: Positional arguments for the target.
                     daemon: Whether the real thread would be a daemon.
                 """
+                self.target = target
                 self.args = args
 
             def start(self) -> None:
-                """Record the args in place of starting a thread."""
-                started.append(self.args)
+                """Record deferred-load starts in place of starting a thread."""
+                if getattr(self.target, "__name__", None) == "_deferred_load_state":
+                    started.append(self.args)
 
         monkeypatch.setattr(retroarch.threading, "Thread", FakeThread)
         return started
