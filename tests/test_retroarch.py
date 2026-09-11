@@ -401,6 +401,30 @@ class TestResumeGate:
         assert emu._resume_settle == retroarch.PLATFORMS["psp"]["resume_settle"]
         assert emu._resume_settle != retroarch.RESUME_LOAD_SETTLE
 
+    def test_a_platform_without_an_override_uses_the_default_confirm_wait(
+        self, tmp_path: Path, _stub_launch: list[tuple[Any, ...]]
+    ) -> None:
+        """A platform with no state_confirm_wait entry keeps the module default."""
+        emu = self._launch(tmp_path, 0)
+
+        assert emu._state_confirm_wait == retroarch.STATE_CONFIRM_WAIT
+
+    def test_a_platform_override_replaces_the_default_confirm_wait(
+        self, tmp_path: Path, _stub_launch: list[tuple[Any, ...]]
+    ) -> None:
+        """PPSSPP's multi-megabyte states need longer than the default confirm wait.
+
+        A save that has not finished landing on disk by the default window
+        reads as a failed save, so psp asks for a longer wait via its
+        platform table entry.
+        """
+        emu = retroarch.Retroarch()
+        emu.platform = "psp"
+        emu.launch(tmp_path / "game.iso", 0)
+
+        assert emu._state_confirm_wait == retroarch.PLATFORMS["psp"]["state_confirm_wait"]
+        assert emu._state_confirm_wait != retroarch.STATE_CONFIRM_WAIT
+
 
 class TestPlaylistPreference:
     """A folder holding a playlist and its discs boots the playlist.
@@ -1155,13 +1179,13 @@ class TestSaveStateThumbnail:
         """The thumbnail gets its own `STATE_THUMBNAIL_WAIT`, not whatever the state wait left behind.
 
         The state file lands late enough that only a sliver of
-        `STATE_CONFIRM_WAIT` remains once it is confirmed — too little for
+        `_state_confirm_wait` remains once it is confirmed — too little for
         the thumbnail's own 0.5s stability requirement. If the thumbnail
         wait were still carved out of that same, nearly-spent deadline (the
         pre-fix behaviour), a thumbnail landing shortly after would be
         reported missing even though it arrived in plenty of time.
         """
-        monkeypatch.setattr(retroarch, "STATE_CONFIRM_WAIT", 1.0)
+        emulator._state_confirm_wait = 1.0
         monkeypatch.setattr(retroarch, "STATE_THUMBNAIL_WAIT", 1.0)
         threading.Thread(
             target=_write_after, args=(retroarch.STATE_DIR / "Game.state", b"savedata", 0.2), daemon=True
@@ -1177,10 +1201,10 @@ class TestSaveStateThumbnail:
         assert (retroarch.STATE_DIR / "Game.state.png").exists()
 
     def test_a_missing_thumbnail_does_not_fail_the_save(
-        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+        self, emulator: retroarch.Retroarch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """No .png ever lands; the state save itself still reports success, with a warning logged."""
-        monkeypatch.setattr(retroarch, "STATE_CONFIRM_WAIT", 1.0)
+        emulator._state_confirm_wait = 1.0
         threading.Thread(
             target=_write_after, args=(retroarch.STATE_DIR / "Game.state", b"savedata", 0.05), daemon=True
         ).start()

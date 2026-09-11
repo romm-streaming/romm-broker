@@ -173,7 +173,11 @@ RA_LOG_PATH = Path(os.environ.get("RETROARCH_LOG_PATH", "/config/retroarch.log")
 SAVE_FILES_WAIT = float(os.environ.get("RETROARCH_SAVE_FILES_WAIT", "10.0"))
 """Seconds to wait for the `SAVE_FILES` reply at exit, from `RETROARCH_SAVE_FILES_WAIT` (default 10)."""
 STATE_CONFIRM_WAIT = float(os.environ.get("RETROARCH_STATE_CONFIRM_WAIT", "10.0"))
-"""Seconds a save gets to land on disk, from `RETROARCH_STATE_CONFIRM_WAIT` (default 10)."""
+"""Seconds a save gets to land on disk, from `RETROARCH_STATE_CONFIRM_WAIT` (default 10).
+
+The platform table's `state_confirm_wait` overrides this per platform, for
+cores whose state files are large enough that this default is too tight.
+"""
 STATE_THUMBNAIL_WAIT = float(os.environ.get("RETROARCH_STATE_THUMBNAIL_WAIT", "3.0"))
 """Seconds a save thumbnail gets to land on disk, from `RETROARCH_STATE_THUMBNAIL_WAIT` (default 3).
 
@@ -218,9 +222,12 @@ the next attempt is worth spacing out rather than firing back immediately.
 RESUME_ATTEMPT_LOCK_WAIT = float(os.environ.get("RETROARCH_RESUME_LOCK_WAIT", "15.0"))
 """Seconds one resume load attempt waits for the tray, from `RETROARCH_RESUME_LOCK_WAIT`.
 
-Defaults to 15, which covers a save running to its own confirmation timeout.
-The retries drop the tray between attempts, so this bounds a single attempt
-rather than the whole resume budget.
+Defaults to 15, which covers a save running to its own confirmation timeout
+at the global `STATE_CONFIRM_WAIT` default. A platform whose
+`state_confirm_wait` override runs longer than that can make one attempt
+give up on a save still in flight; the retries drop the tray between
+attempts, so this bounds a single attempt rather than the whole resume
+budget, and the next attempt picks the tray up once the save releases it.
 """
 LOAD_ACK_WAIT = float(os.environ.get("RETROARCH_LOAD_ACK_WAIT", "10.0"))
 """Seconds to wait for the `LOAD_STATE_SLOT` echo, from `RETROARCH_LOAD_ACK_WAIT` (default 10)."""
@@ -363,6 +370,10 @@ image holding those files, for cores that need data the .so does not carry.
 `core_source` names where a core the buildbot does not carry comes from, and
 `save_subtrees` narrows the save archive for cores whose savefile dir is also
 their app-data dir.
+
+`resume_settle` and `state_confirm_wait` override `RESUME_LOAD_SETTLE` and
+`STATE_CONFIRM_WAIT` for cores that are slower than the defaults assume,
+such as PPSSPP's multi-megabyte state files.
 """
 
 _ROM_SEARCH_GLOBS = ("*", "*/*")
@@ -1229,6 +1240,8 @@ class Retroarch(Emulator):
         """Whether the loaded platform writes a save thumbnail; set from the platform table at launch."""
         self._resume_settle = RESUME_LOAD_SETTLE
         """Seconds between PLAYING and a deferred resume load; set from the platform table at launch."""
+        self._state_confirm_wait = STATE_CONFIRM_WAIT
+        """Seconds a save gets to land on disk; set from the platform table at launch."""
         self._stdout_buf = bytearray()
         """Replies read off RetroArch's stdout and not yet consumed."""
         self._stdout_lock = threading.Lock()
@@ -1520,6 +1533,7 @@ class Retroarch(Emulator):
         _ensure_core_assets(info.get("assets", {}))
         self._thumbnail_enabled = info.get("thumbnail", True)
         self._resume_settle = info.get("resume_settle", RESUME_LOAD_SETTLE)
+        self._state_confirm_wait = info.get("state_confirm_wait", STATE_CONFIRM_WAIT)
         cfg_path = _write_broker_cfg(self._thumbnail_enabled)
 
         env = base_launch_env()
@@ -1918,12 +1932,14 @@ class Retroarch(Emulator):
 
         Returns:
             True when the slot's state file changed on disk, is non-empty,
-            and held a stable size within `STATE_CONFIRM_WAIT`.
+            and held a stable size within `_state_confirm_wait`.
         """
         before = _state_snapshot(STATE_DIR, self._rom_base)
         if not self._write_cmd("SAVE_STATE"):
             return False
-        if not _wait_for_state_file(before, STATE_DIR, self._rom_base, STATE_SLOT, STATE_CONFIRM_WAIT):
+        if not _wait_for_state_file(
+            before, STATE_DIR, self._rom_base, STATE_SLOT, self._state_confirm_wait
+        ):
             return False
         if self._thumbnail_enabled:
             self._wait_for_state_thumbnail(before)
