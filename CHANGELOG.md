@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.8.1](https://github.com/romm-streaming/romm-broker/compare/v0.8.0...v0.8.1) (2026-09-12)
+
+
+### Bug Fixes
+
+* escape glob metacharacters in save-state filename lookup ([88e2366](https://github.com/romm-streaming/romm-broker/commit/88e23668619a59ff61b5ae2c5c81d84e9ce22b82))
+* give PSP a longer state-save confirmation window ([c6dac1e](https://github.com/romm-streaming/romm-broker/commit/c6dac1e7c037844a2de02a9d5375f3730a9f1ca8))
+* **retroarch:** anchor first-save settle to PLAYING, not process spawn ([915f50f](https://github.com/romm-streaming/romm-broker/commit/915f50ffd619b9ec167c5c0c60a7a53bec6cfb96))
+* **retroarch:** detect the wayland display selkies is capturing ([a30df05](https://github.com/romm-streaming/romm-broker/commit/a30df05a0f9648acceebaf92d87901c07916f890))
+* **retroarch:** settle first save until a real frame renders ([ab9b42f](https://github.com/romm-streaming/romm-broker/commit/ab9b42f61cc8fa1485d96adec0647e2a7a544867))
+* **test:** filter TestResumeGate's thread stub to the deferred-load thread ([46c9a9c](https://github.com/romm-streaming/romm-broker/commit/46c9a9cad86267607be974415936851cd14c15f8))
+
+
+### Documentation
+
+* document the /dev/nvidia-modeset node NVIDIA presentation needs ([4e0ed6f](https://github.com/romm-streaming/romm-broker/commit/4e0ed6fe379467e5b64d039ca3f7c569a5e3e4ff)), closes [#32](https://github.com/romm-streaming/romm-broker/issues/32)
+* record the stale audio.lock that kills Selkies audio on restart ([d6868bf](https://github.com/romm-streaming/romm-broker/commit/d6868bfb75872bff9a6bf7a412b515dfce57f237))
+
 ## [0.8.0](https://github.com/romm-streaming/romm-broker/compare/v0.7.0...v0.8.0) (2026-09-06)
 
 
