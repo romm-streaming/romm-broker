@@ -55,6 +55,7 @@ a real stdout pipe drained by a reader thread, unlike the shared `_spawn`
 which merges stderr into stdout (that would corrupt the reply stream).
 """
 
+import glob
 import io
 import json
 import logging
@@ -173,7 +174,11 @@ RA_LOG_PATH = Path(os.environ.get("RETROARCH_LOG_PATH", "/config/retroarch.log")
 SAVE_FILES_WAIT = float(os.environ.get("RETROARCH_SAVE_FILES_WAIT", "10.0"))
 """Seconds to wait for the `SAVE_FILES` reply at exit, from `RETROARCH_SAVE_FILES_WAIT` (default 10)."""
 STATE_CONFIRM_WAIT = float(os.environ.get("RETROARCH_STATE_CONFIRM_WAIT", "10.0"))
-"""Seconds a save gets to land on disk, from `RETROARCH_STATE_CONFIRM_WAIT` (default 10)."""
+"""Seconds a save gets to land on disk, from `RETROARCH_STATE_CONFIRM_WAIT` (default 10).
+
+The platform table's `state_confirm_wait` overrides this per platform, for
+cores whose state files are large enough that this default is too tight.
+"""
 STATE_THUMBNAIL_WAIT = float(os.environ.get("RETROARCH_STATE_THUMBNAIL_WAIT", "3.0"))
 """Seconds a save thumbnail gets to land on disk, from `RETROARCH_STATE_THUMBNAIL_WAIT` (default 3).
 
@@ -218,9 +223,12 @@ the next attempt is worth spacing out rather than firing back immediately.
 RESUME_ATTEMPT_LOCK_WAIT = float(os.environ.get("RETROARCH_RESUME_LOCK_WAIT", "15.0"))
 """Seconds one resume load attempt waits for the tray, from `RETROARCH_RESUME_LOCK_WAIT`.
 
-Defaults to 15, which covers a save running to its own confirmation timeout.
-The retries drop the tray between attempts, so this bounds a single attempt
-rather than the whole resume budget.
+Defaults to 15, which covers a save running to its own confirmation timeout
+at the global `STATE_CONFIRM_WAIT` default. A platform whose
+`state_confirm_wait` override runs longer than that can make one attempt
+give up on a save still in flight; the retries drop the tray between
+attempts, so this bounds a single attempt rather than the whole resume
+budget, and the next attempt picks the tray up once the save releases it.
 """
 LOAD_ACK_WAIT = float(os.environ.get("RETROARCH_LOAD_ACK_WAIT", "10.0"))
 """Seconds to wait for the `LOAD_STATE_SLOT` echo, from `RETROARCH_LOAD_ACK_WAIT` (default 10)."""
@@ -270,6 +278,30 @@ SLOT_HOME_STEPS = int(os.environ.get("RETROARCH_SLOT_HOME_STEPS", "24"))
 """`STATE_SLOT_MINUS` presses used to home the slot, from `RETROARCH_SLOT_HOME_STEPS` (default 24).
 
 The step count has to outrun any slot the player could have cycled to.
+"""
+FIRST_SAVE_SETTLE = float(os.environ.get("RETROARCH_FIRST_SAVE_SETTLE", "3.0"))
+"""Seconds a session's first save waits after PLAYING, from `RETROARCH_FIRST_SAVE_SETTLE` (default 3).
+
+A fast-booting core (gambatte) can still be showing its own boot sequence
+(the Nintendo logo scroll, or a flat boot-transition frame) rather than the
+game's first real frame when the very first save of a session reaches
+`_try_save`: the state file confirms fine, but RetroArch's savestate
+thumbnail grabs whatever is on screen at that instant. Counted from PLAYING
+rather than from process spawn, since core load and ROM load between spawn
+and PLAYING are themselves variable and would otherwise eat into (or blow
+past) the budget before the game has actually started. Only the first save
+pays this cost, since `_slot_homed` is already true for every later one; a
+session whose first save comes well after PLAYING naturally owes no wait
+at all.
+"""
+FIRST_SAVE_SETTLE_WAIT = float(os.environ.get("RETROARCH_FIRST_SAVE_SETTLE_WAIT", "20.0"))
+"""Seconds `_wait_for_first_save_settle` waits for a PLAYING timestamp, from
+`RETROARCH_FIRST_SAVE_SETTLE_WAIT` (default 20).
+
+Covers a save requested before `_track_first_playing` has observed PLAYING
+even once, e.g. a very fast player or a slow-booting core; past this the
+save proceeds unsettled rather than blocking indefinitely on a core that
+never came up.
 """
 DISC_TRAY_SETTLE = float(os.environ.get("RETROARCH_DISC_TRAY_SETTLE", "1.5"))
 """Seconds the tray gets to open before discs are stepped, from `RETROARCH_DISC_TRAY_SETTLE` (default 1.5).
@@ -339,6 +371,10 @@ image holding those files, for cores that need data the .so does not carry.
 `core_source` names where a core the buildbot does not carry comes from, and
 `save_subtrees` narrows the save archive for cores whose savefile dir is also
 their app-data dir.
+
+`resume_settle` and `state_confirm_wait` override `RESUME_LOAD_SETTLE` and
+`STATE_CONFIRM_WAIT` for cores that are slower than the defaults assume,
+such as PPSSPP's multi-megabyte state files.
 """
 
 _ROM_SEARCH_GLOBS = ("*", "*/*")
@@ -808,7 +844,12 @@ def _newest_state(dir_path: Path, base: str, slot: int) -> Optional[Path]:
     name = _state_name(base, slot)
     best: Optional[tuple[float, Path]] = None
     try:
-        for p in dir_path.rglob(f"{base}.state*"):
+        # `base` is a ROM content basename, not a pattern: bracketed region
+        # tags like "[USA]" are near-universal in ROM sets and glob.escape is
+        # what keeps a `[U]` character class from swallowing them, the same
+        # way a plain `*` or `?` in a title would otherwise silently make the
+        # glob match nothing (or the wrong thing) instead of raising.
+        for p in dir_path.rglob(f"{glob.escape(base)}.state*"):
             if not p.is_file() or p.name != name:
                 continue
             st = p.stat()
@@ -1194,12 +1235,19 @@ class Retroarch(Emulator):
         """The loaded content's basename, which RetroArch names its state and SRAM files after."""
         self._slot_homed = False
         """Whether the current slot has been parked on `STATE_SLOT` since launch."""
+        self._playing_monotonic: Optional[float] = None
+        """`time.monotonic()` when `_track_first_playing` first saw PLAYING; None until then.
+
+        Anchors `_wait_for_first_save_settle`. Reset to None on every launch.
+        """
         self._launch_seq = 0
         """Launch generation, bumped on every launch and stop so stale background waits bail out."""
         self._thumbnail_enabled = True
         """Whether the loaded platform writes a save thumbnail; set from the platform table at launch."""
         self._resume_settle = RESUME_LOAD_SETTLE
         """Seconds between PLAYING and a deferred resume load; set from the platform table at launch."""
+        self._state_confirm_wait = STATE_CONFIRM_WAIT
+        """Seconds a save gets to land on disk; set from the platform table at launch."""
         self._stdout_buf = bytearray()
         """Replies read off RetroArch's stdout and not yet consumed."""
         self._stdout_lock = threading.Lock()
@@ -1491,6 +1539,7 @@ class Retroarch(Emulator):
         _ensure_core_assets(info.get("assets", {}))
         self._thumbnail_enabled = info.get("thumbnail", True)
         self._resume_settle = info.get("resume_settle", RESUME_LOAD_SETTLE)
+        self._state_confirm_wait = info.get("state_confirm_wait", STATE_CONFIRM_WAIT)
         cfg_path = _write_broker_cfg(self._thumbnail_enabled)
 
         env = base_launch_env()
@@ -1525,6 +1574,8 @@ class Retroarch(Emulator):
             resume_slot,
         )
         self._spawn_ra(cmd, env)
+        self._playing_monotonic = None
+        threading.Thread(target=self._track_first_playing, args=(seq,), daemon=True).start()
 
         # Slot 0 is a real slot here, so the gate is on the request, not on the
         # number: `if resume_slot` would drop every resume this broker asks for.
@@ -1800,6 +1851,49 @@ class Retroarch(Emulator):
         finally:
             self._disc_lock.release()
 
+    def _track_first_playing(self, seq: int) -> None:
+        """Record the moment GET_STATUS first reports PLAYING, for `_wait_for_first_save_settle`.
+
+        Runs from `launch` in the background, polling tightly so the recorded
+        timestamp tracks the real transition closely rather than lagging it by
+        a coarse poll interval. `_send` is safe to call concurrently with the
+        rest of the session (see `_reply_lock`/`_stdout_lock`), so this can run
+        alongside a deferred resume load's own PLAYING poll without colliding.
+
+        Args:
+            seq: The launch generation this belongs to; a relaunch or stop
+                bumps `_launch_seq` and ends the wait.
+        """
+        while self._launch_seq == seq and self.alive():
+            reply = self._send("GET_STATUS", wait_prefix="GET_STATUS", timeout=2.0)
+            if reply and reply.startswith("GET_STATUS PLAYING"):
+                self._playing_monotonic = time.monotonic()
+                return
+            time.sleep(0.2)
+
+    def _wait_for_first_save_settle(self) -> None:
+        """Sleep off whatever is left of `FIRST_SAVE_SETTLE` since PLAYING.
+
+        Called once, right before a session's first `_home_state_slot()`. A
+        fast-booting core can already be running well past its own boot
+        sequence by the time the player's first save request arrives, in
+        which case this is a no-op; only a save requested within
+        `FIRST_SAVE_SETTLE` of PLAYING actually waits.
+
+        If `_track_first_playing` has not observed PLAYING yet (a very fast
+        first save, or a slow-booting core), this waits up to
+        `FIRST_SAVE_SETTLE_WAIT` for it before giving up and proceeding
+        unsettled.
+        """
+        deadline = time.monotonic() + FIRST_SAVE_SETTLE_WAIT
+        while self._playing_monotonic is None:
+            if not self.alive() or time.monotonic() >= deadline:
+                return
+            time.sleep(0.1)
+        remaining = FIRST_SAVE_SETTLE - (time.monotonic() - self._playing_monotonic)
+        if remaining > 0:
+            time.sleep(remaining)
+
     def _home_state_slot(self) -> bool:
         """Park RetroArch's current state slot on `STATE_SLOT`.
 
@@ -1844,12 +1938,14 @@ class Retroarch(Emulator):
 
         Returns:
             True when the slot's state file changed on disk, is non-empty,
-            and held a stable size within `STATE_CONFIRM_WAIT`.
+            and held a stable size within `_state_confirm_wait`.
         """
         before = _state_snapshot(STATE_DIR, self._rom_base)
         if not self._write_cmd("SAVE_STATE"):
             return False
-        if not _wait_for_state_file(before, STATE_DIR, self._rom_base, STATE_SLOT, STATE_CONFIRM_WAIT):
+        if not _wait_for_state_file(
+            before, STATE_DIR, self._rom_base, STATE_SLOT, self._state_confirm_wait
+        ):
             return False
         if self._thumbnail_enabled:
             self._wait_for_state_thumbnail(before)
@@ -1931,6 +2027,8 @@ class Retroarch(Emulator):
                     STATE_SLOT, self.platform, self._rom_base,
                 )
                 return False
+            if not self._slot_homed:
+                self._wait_for_first_save_settle()
             if not self._slot_homed and not self._home_state_slot():
                 log.warning(
                     "retroarch: state slot not parked on %d, saving into whatever slot is current "

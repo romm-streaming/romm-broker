@@ -129,13 +129,45 @@ Needs the NVIDIA container runtime on the host (driver 595.80 or newer).
             - driver: nvidia
               count: 1
               capabilities: [compute,video,graphics,utility]
+    devices:
+      - /dev/nvidia-modeset:/dev/nvidia-modeset
 ```
 
 ```bash title="docker cli"
   --runtime nvidia \
   --gpus all \
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,video,graphics,utility \
   --device /dev/nvidia-modeset \
 ```
+
+`/dev/nvidia-modeset` is the part that is easy to miss. The toolkit injects
+`nvidia0`, `nvidiactl` and `uvm`, but not the modeset node, and without it the
+GPU enumerates, computes and encodes while no Vulkan client can create a
+swapchain on the compositor's surfaces. Emulators then render without ever
+reaching the screen and the browser shows a black canvas. If the node does not
+exist on the host, `nvidia-modprobe --modeset` creates it.
+
+`--gpus all` also defaults `NVIDIA_DRIVER_CAPABILITIES` to `compute,utility`,
+so the cli sets `graphics` explicitly to match the compose `capabilities` list.
+
+<Callout type="warn" title="Unprivileged LXC needs more than this">
+Proxmox LXC is not a tested or certified target for selkies based images, and
+a dedicated VM running Docker is the supported way to run these containers
+from Proxmox. One confirmed setup (RTX 4060, driver 595.80, Open Kernel
+Module) needed all of the following on top of the device mapping above:
+
+- `chmod 666 /dev/dri/* /dev/nvidia-modeset` from a `/custom-cont-init.d`
+  script. The LXC passes them through at `0660` and the host resets the modes
+  on every reboot, so `abc` cannot open them otherwise.
+- Bind-mounts from the LXC for what the toolkit skips:
+  `/usr/lib/x86_64-linux-gnu/gbm/`, `/usr/share/egl/egl_external_platform.d/`,
+  `libnvidia-egl-gbm.so.1*` and `/usr/share/glvnd/egl_vendor.d/10_nvidia.json`.
+  Without these the compositor falls back to Pixman software rendering.
+- `PIXELFLUX_WAYLAND=true`.
+
+[Issue #32](https://github.com/romm-streaming/romm-broker/issues/32) has the
+full diagnosis.
+</Callout>
 
 </Tab>
 </Tabs>
@@ -175,3 +207,30 @@ streaming:
 server to server, and `subfolder` is the container's `SUBFOLDER`. The full
 story, including why `host` is a path, is in
 [Reverse proxy](/docs/deployment/reverse-proxy).
+
+## Known issues
+
+<Callout type="warn" title="Lost audio after a container restart">
+Selkies captures from a PulseAudio null sink named `output`, created once on
+boot and gated behind `/dev/shm/audio.lock`. Docker serves `/dev/shm` from a
+per-container directory on the host that a restart reuses, so the lock outlives
+`docker restart` while PulseAudio itself comes back with no modules loaded. The
+lock then suppresses sink creation, `output.monitor` never exists, and audio
+stops reaching the browser even though the emulator is producing it.
+
+Recreate the container (`docker compose down && docker compose up -d`) instead
+of restarting it. A `docker stop` with `restart: unless-stopped` is the same
+container, so it hits the same stale lock.
+
+To recover a running session without recreating anything, load the sinks by
+hand and bounce only Selkies:
+
+```bash
+docker exec <name> s6-setuidgid abc with-contenv pactl load-module module-null-sink sink_name=output sink_properties=device.description=output
+docker exec <name> s6-setuidgid abc with-contenv pactl load-module module-null-sink sink_name=input sink_properties=device.description=input
+docker exec <name> s6-rc -d change svc-selkies && docker exec <name> s6-rc -u change svc-selkies
+```
+
+The real fix belongs upstream: the check should test actual PulseAudio state
+rather than the presence of a lock file.
+</Callout>

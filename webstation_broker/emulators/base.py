@@ -50,14 +50,75 @@ the outcome. Long enough for that I/O to come back, short enough that the exit
 route still answers.
 """
 
+_PROC_NET_UNIX = Path("/proc/net/unix")
+_PROC_DIR = Path("/proc")
+
+
+def _listening_wayland_sockets() -> dict[str, str]:
+    """Map each listening `wayland-*` socket under `XDG_RUNTIME_DIR` to its inode.
+
+    The inode is read from `/proc/net/unix`'s `St` column (`01` == listening).
+    `stat()` on the socket's path returns the filesystem's own inode for that
+    dentry, not the kernel's identifier for the socket object, so it never
+    matches the `socket:[N]` fd targets in `/proc/<pid>/fd`. `/proc/net/unix`
+    is the one table that has both the bound path and that kernel inode
+    together.
+    """
+    runtime_dir = os.path.realpath(XDG_RUNTIME_DIR)
+    sockets: dict[str, str] = {}
+    try:
+        with open(_PROC_NET_UNIX) as f:
+            next(f)  # header
+            for line in f:
+                fields = line.split(None, 7)
+                if len(fields) < 8 or fields[5] != "01":  # St: listening
+                    continue
+                path = fields[7].strip()
+                name = os.path.basename(path)
+                if os.path.dirname(path) == runtime_dir and name.startswith("wayland-"):
+                    sockets[fields[6]] = name  # Inode -> socket name
+    except OSError:
+        return {}
+    return sockets
+
+
+def _detect_wayland_display() -> Optional[str]:
+    """Find the `wayland-*` socket that Selkies is actually capturing.
+
+    The desktop session never exports `WAYLAND_DISPLAY`, and labwc's own socket
+    isn't the one apps must render into: Selkies opens a second `wayland-*`
+    socket in `XDG_RUNTIME_DIR` and only that one gets captured into the
+    stream, so a fixed guess (`wayland-0`, `wayland-1`, ...) breaks the moment
+    the compositor picks a different number. Selkies runs as the same user as
+    the broker, so its open sockets can be inspected without extra privileges.
+
+    Returns:
+        The matching socket's name (e.g. `wayland-1`), or None if no `selkies`
+        process or matching socket fd was found.
+    """
+    sockets = _listening_wayland_sockets()
+    if not sockets:
+        return None
+    for proc_dir in _PROC_DIR.glob("[0-9]*"):
+        try:
+            if b"selkies" not in proc_dir.joinpath("cmdline").read_bytes():
+                continue
+            fd_targets = {os.readlink(fd) for fd in proc_dir.joinpath("fd").iterdir()}
+        except OSError:
+            continue
+        for inode, name in sockets.items():
+            if f"socket:[{inode}]" in fd_targets:
+                return name
+    return None
+
 
 def base_launch_env() -> dict[str, str]:
     """Build the environment apps are launched into.
 
-    This is the broker's own environment, pointed at the running labwc session's
-    displays (`BROKER_WAYLAND_DISPLAY` and `BROKER_DISPLAY`, defaulting to
-    `wayland-0` and `:0`), with secret-shaped variables stripped out (see
-    `_SENSITIVE_ENV_VARS`).
+    This is the broker's own environment, pointed at the display Selkies is
+    capturing (`BROKER_WAYLAND_DISPLAY`/`BROKER_DISPLAY` if set, else whatever
+    is inherited, else autodetected, see `_detect_wayland_display`), with
+    secret-shaped variables stripped out (see `_SENSITIVE_ENV_VARS`).
 
     Returns:
         A copy of the broker's environment with the display variables set and
@@ -68,8 +129,13 @@ def base_launch_env() -> dict[str, str]:
         for k, v in os.environ.items()
         if k not in _SENSITIVE_ENV_VARS and not k.endswith(_SENSITIVE_ENV_SUFFIXES)
     }
-    env["WAYLAND_DISPLAY"] = os.environ.get("BROKER_WAYLAND_DISPLAY", "wayland-0")
-    env["DISPLAY"] = os.environ.get("BROKER_DISPLAY", ":0")
+    env["WAYLAND_DISPLAY"] = (
+        os.environ.get("BROKER_WAYLAND_DISPLAY")
+        or os.environ.get("WAYLAND_DISPLAY")
+        or _detect_wayland_display()
+        or "wayland-0"
+    )
+    env["DISPLAY"] = os.environ.get("BROKER_DISPLAY") or os.environ.get("DISPLAY") or ":0"
     # s6 services get a minimal PATH; emulator binaries live in /usr/games.
     path = env.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
     for extra in ("/usr/local/bin", "/usr/bin", "/usr/games", "/usr/local/games"):

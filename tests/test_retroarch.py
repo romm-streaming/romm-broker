@@ -248,14 +248,19 @@ class TestResumeGate:
 
     @pytest.fixture(autouse=True)
     def _stub_launch(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
-        """Stub everything launch() touches and capture the threads it starts.
+        """Stub everything launch() touches and capture its deferred-load thread.
+
+        launch() also unconditionally starts a `_track_first_playing` thread,
+        which this gate doesn't care about, so the stand-in only records
+        starts targeting `_deferred_load_state` — the thread this class is
+        actually about.
 
         Args:
             tmp_path: The per-test temporary directory.
             monkeypatch: The pytest monkeypatch fixture.
 
         Returns:
-            The args tuple of every thread launch() started, in order.
+            The args tuple of every deferred-load thread launch() started, in order.
         """
         monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
         monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
@@ -281,18 +286,20 @@ class TestResumeGate:
                 args: tuple[object, ...] = (),
                 daemon: bool = False,
             ) -> None:
-                """Remember the args; the target is never run.
+                """Remember the target and args; the target is never run.
 
                 Args:
                     target: The callable the real thread would run.
                     args: Positional arguments for the target.
                     daemon: Whether the real thread would be a daemon.
                 """
+                self.target = target
                 self.args = args
 
             def start(self) -> None:
-                """Record the args in place of starting a thread."""
-                started.append(self.args)
+                """Record deferred-load starts in place of starting a thread."""
+                if getattr(self.target, "__name__", None) == "_deferred_load_state":
+                    started.append(self.args)
 
         monkeypatch.setattr(retroarch.threading, "Thread", FakeThread)
         return started
@@ -400,6 +407,30 @@ class TestResumeGate:
 
         assert emu._resume_settle == retroarch.PLATFORMS["psp"]["resume_settle"]
         assert emu._resume_settle != retroarch.RESUME_LOAD_SETTLE
+
+    def test_a_platform_without_an_override_uses_the_default_confirm_wait(
+        self, tmp_path: Path, _stub_launch: list[tuple[Any, ...]]
+    ) -> None:
+        """A platform with no state_confirm_wait entry keeps the module default."""
+        emu = self._launch(tmp_path, 0)
+
+        assert emu._state_confirm_wait == retroarch.STATE_CONFIRM_WAIT
+
+    def test_a_platform_override_replaces_the_default_confirm_wait(
+        self, tmp_path: Path, _stub_launch: list[tuple[Any, ...]]
+    ) -> None:
+        """PPSSPP's multi-megabyte states need longer than the default confirm wait.
+
+        A save that has not finished landing on disk by the default window
+        reads as a failed save, so psp asks for a longer wait via its
+        platform table entry.
+        """
+        emu = retroarch.Retroarch()
+        emu.platform = "psp"
+        emu.launch(tmp_path / "game.iso", 0)
+
+        assert emu._state_confirm_wait == retroarch.PLATFORMS["psp"]["state_confirm_wait"]
+        assert emu._state_confirm_wait != retroarch.STATE_CONFIRM_WAIT
 
 
 class TestPlaylistPreference:
@@ -1088,6 +1119,66 @@ class TestWaitForStateFile:
         assert settled is True
 
 
+class TestNewestState:
+    """Finding the state file `state_path()` serves back to RomM for the library."""
+
+    @pytest.fixture
+    def state_dir(self, tmp_path: Path) -> Path:
+        """A throwaway savestate directory."""
+        states = tmp_path / "states"
+        states.mkdir()
+        return states
+
+    def test_finds_a_state_for_a_plain_basename(self, state_dir: Path) -> None:
+        """The ordinary case: no glob metacharacters in the basename."""
+        (state_dir / "Game.state").write_bytes(b"savedata")
+
+        found = retroarch._newest_state(state_dir, "Game", 0)
+
+        assert found == state_dir / "Game.state"
+
+    def test_finds_a_state_whose_basename_has_a_bracketed_region_tag(
+        self, state_dir: Path
+    ) -> None:
+        """A ROM basename like "Game [USA]" must be matched literally.
+
+        Region tags in square brackets are near-universal in ROM sets, and a
+        naive glob pattern built from the basename treats `[USA]` as a
+        character class (any one of U, S or A) instead of four literal
+        characters, so it never matches the real file: RomM would never see
+        the state, the exact bug this guards against.
+        """
+        (state_dir / "Game [USA].state").write_bytes(b"savedata")
+
+        found = retroarch._newest_state(state_dir, "Game [USA]", 0)
+
+        assert found == state_dir / "Game [USA].state"
+
+    def test_finds_a_state_whose_basename_has_other_glob_metacharacters(
+        self, state_dir: Path
+    ) -> None:
+        """`*` and `?` in a title are rarer than `[...]` but just as literal."""
+        (state_dir / "Game? *.state").write_bytes(b"savedata")
+
+        found = retroarch._newest_state(state_dir, "Game? *", 0)
+
+        assert found == state_dir / "Game? *.state"
+
+    def test_finds_a_state_redirected_into_a_core_subdir(self, state_dir: Path) -> None:
+        """PPSSPP (and others) write into a per-core subdir under `STATE_DIR`."""
+        subdir = state_dir / "PPSSPP"
+        subdir.mkdir()
+        (subdir / "Game [USA].state").write_bytes(b"savedata")
+
+        found = retroarch._newest_state(state_dir, "Game [USA]", 0)
+
+        assert found == subdir / "Game [USA].state"
+
+    def test_returns_none_when_no_state_exists(self, state_dir: Path) -> None:
+        """An empty state dir is a slot nobody has saved into yet, not an error."""
+        assert retroarch._newest_state(state_dir, "Game [USA]", 0) is None
+
+
 def _write_after(path: Path, data: bytes, delay: float) -> None:
     """Write `data` to `path` after `delay` seconds, from a background thread.
 
@@ -1155,13 +1246,13 @@ class TestSaveStateThumbnail:
         """The thumbnail gets its own `STATE_THUMBNAIL_WAIT`, not whatever the state wait left behind.
 
         The state file lands late enough that only a sliver of
-        `STATE_CONFIRM_WAIT` remains once it is confirmed — too little for
+        `_state_confirm_wait` remains once it is confirmed — too little for
         the thumbnail's own 0.5s stability requirement. If the thumbnail
         wait were still carved out of that same, nearly-spent deadline (the
         pre-fix behaviour), a thumbnail landing shortly after would be
         reported missing even though it arrived in plenty of time.
         """
-        monkeypatch.setattr(retroarch, "STATE_CONFIRM_WAIT", 1.0)
+        emulator._state_confirm_wait = 1.0
         monkeypatch.setattr(retroarch, "STATE_THUMBNAIL_WAIT", 1.0)
         threading.Thread(
             target=_write_after, args=(retroarch.STATE_DIR / "Game.state", b"savedata", 0.2), daemon=True
@@ -1177,10 +1268,10 @@ class TestSaveStateThumbnail:
         assert (retroarch.STATE_DIR / "Game.state.png").exists()
 
     def test_a_missing_thumbnail_does_not_fail_the_save(
-        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+        self, emulator: retroarch.Retroarch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """No .png ever lands; the state save itself still reports success, with a warning logged."""
-        monkeypatch.setattr(retroarch, "STATE_CONFIRM_WAIT", 1.0)
+        emulator._state_confirm_wait = 1.0
         threading.Thread(
             target=_write_after, args=(retroarch.STATE_DIR / "Game.state", b"savedata", 0.05), daemon=True
         ).start()

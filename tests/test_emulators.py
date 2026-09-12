@@ -305,3 +305,137 @@ def test_the_launch_env_keeps_ordinary_variables(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("SOME_HARMLESS_VAR", "keep-me")
 
     assert base.base_launch_env()["SOME_HARMLESS_VAR"] == "keep-me"
+
+
+def _no_wayland_display_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Clear every source `base_launch_env` reads for the display vars.
+
+    Leaves `_detect_wayland_display` pointed at paths that don't exist, so it
+    returns None instead of picking up whatever is actually running on the
+    machine running the tests.
+    """
+    monkeypatch.delenv("BROKER_WAYLAND_DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.delenv("BROKER_DISPLAY", raising=False)
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.setattr(base, "_PROC_NET_UNIX", tmp_path / "no-such-file")
+    monkeypatch.setattr(base, "_PROC_DIR", tmp_path / "no-such-proc")
+
+
+def test_the_launch_env_prefers_the_broker_override_display(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The launch env prefers the broker override display over everything else."""
+    _no_wayland_display_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("BROKER_WAYLAND_DISPLAY", "wayland-9")
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-5")
+    monkeypatch.setenv("BROKER_DISPLAY", ":9")
+    monkeypatch.setenv("DISPLAY", ":5")
+
+    env = base.base_launch_env()
+
+    assert env["WAYLAND_DISPLAY"] == "wayland-9"
+    assert env["DISPLAY"] == ":9"
+
+
+def test_the_launch_env_falls_back_to_the_inherited_display(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The launch env falls back to the inherited display when there is no override."""
+    _no_wayland_display_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-5")
+    monkeypatch.setenv("DISPLAY", ":5")
+
+    env = base.base_launch_env()
+
+    assert env["WAYLAND_DISPLAY"] == "wayland-5"
+    assert env["DISPLAY"] == ":5"
+
+
+def test_the_launch_env_falls_back_to_a_default_display(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The launch env falls back to a hardcoded default when nothing else resolves."""
+    _no_wayland_display_env(monkeypatch, tmp_path)
+
+    env = base.base_launch_env()
+
+    assert env["WAYLAND_DISPLAY"] == "wayland-0"
+    assert env["DISPLAY"] == ":0"
+
+
+def test_the_launch_env_detects_the_wayland_display_selkies_is_capturing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The launch env detects the display when no override or inherited value is set."""
+    _no_wayland_display_env(monkeypatch, tmp_path)
+    _fake_selkies_wayland_socket(monkeypatch, tmp_path, socket_name="wayland-7")
+
+    assert base.base_launch_env()["WAYLAND_DISPLAY"] == "wayland-7"
+
+
+def _fake_selkies_wayland_socket(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, socket_name: str
+) -> None:
+    """Fake a `/proc/net/unix` and a `/proc/<pid>/fd` that agree on a socket.
+
+    Registers a listening `wayland-*` socket in a fake `/proc/net/unix` and a
+    fake `selkies` process whose fd table holds that same socket's inode, the
+    two things `_detect_wayland_display` cross-references.
+    """
+    runtime_dir = tmp_path / "xdg"
+    runtime_dir.mkdir()
+    monkeypatch.setattr(base, "XDG_RUNTIME_DIR", str(runtime_dir))
+
+    inode = "123456"
+    net_unix = tmp_path / "net_unix"
+    net_unix.write_text(
+        "Num       RefCount Protocol Flags    Type St Inode Path\n"
+        f"0: 00000002 00000000 00010000 0001 01 {inode} {runtime_dir / socket_name}\n"
+    )
+    monkeypatch.setattr(base, "_PROC_NET_UNIX", net_unix)
+
+    proc_dir = tmp_path / "proc"
+    selkies_dir = proc_dir / "42"
+    fd_dir = selkies_dir / "fd"
+    fd_dir.mkdir(parents=True)
+    selkies_dir.joinpath("cmdline").write_bytes(b"/lsiopy/bin/python3\x00/lsiopy/bin/selkies\x00")
+    fd_dir.joinpath("5").symlink_to(f"socket:[{inode}]")
+    monkeypatch.setattr(base, "_PROC_DIR", proc_dir)
+
+
+def test_listening_wayland_sockets_ignores_a_socket_that_is_not_listening(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A `wayland-*` socket that isn't in the listening state is not returned."""
+    runtime_dir = tmp_path / "xdg"
+    runtime_dir.mkdir()
+    monkeypatch.setattr(base, "XDG_RUNTIME_DIR", str(runtime_dir))
+
+    net_unix = tmp_path / "net_unix"
+    net_unix.write_text(
+        "Num       RefCount Protocol Flags    Type St Inode Path\n"
+        f"0: 00000003 00000000 00000000 0001 03 999 {runtime_dir / 'wayland-1'}\n"
+    )
+    monkeypatch.setattr(base, "_PROC_NET_UNIX", net_unix)
+
+    assert base._listening_wayland_sockets() == {}
+
+
+def test_detecting_the_wayland_display_finds_nothing_without_a_selkies_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Detection finds nothing when no process holds a listening socket open."""
+    runtime_dir = tmp_path / "xdg"
+    runtime_dir.mkdir()
+    monkeypatch.setattr(base, "XDG_RUNTIME_DIR", str(runtime_dir))
+
+    net_unix = tmp_path / "net_unix"
+    net_unix.write_text(
+        "Num       RefCount Protocol Flags    Type St Inode Path\n"
+        f"0: 00000002 00000000 00010000 0001 01 111 {runtime_dir / 'wayland-0'}\n"
+    )
+    monkeypatch.setattr(base, "_PROC_NET_UNIX", net_unix)
+    monkeypatch.setattr(base, "_PROC_DIR", tmp_path / "empty-proc")
+
+    assert base._detect_wayland_display() is None
