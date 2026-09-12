@@ -43,8 +43,9 @@ services:
 docker compose up -d
 ```
 
-`/dev/dri` is GPU passthrough for Intel/AMD; NVIDIA needs the container
-runtime instead of a device mount, covered in the docs. BIOS and firmware can
+`/dev/dri` is GPU passthrough for Intel/AMD. NVIDIA needs the container
+runtime *and* the `/dev/nvidia-modeset` node; without that node emulators
+render but never present, so the stream stays black. BIOS and firmware can
 also be pre-seeded with an optional volume mount instead of dragging files
 into the desktop; see [Running the container](https://romm-streaming.github.io/romm-broker/docs/container).
 
