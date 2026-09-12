@@ -1251,27 +1251,23 @@ document.addEventListener('DOMContentLoaded', async () => {
         streamMuteBtn.classList.toggle('inactive', isIframeMuted);
         streamVolumeSlider.value = isIframeMuted ? 0 : lastKnownVolume;
     };
-    if (inviteToken) {
-        document.body.classList.add('invited');
-        streamVolume.classList.remove('hidden');
+    if (inviteToken) document.body.classList.add('invited');
+    syncStreamVolumeControls();
+    streamVolumeSlider.addEventListener('input', (e) => {
+        const value = parseFloat(e.target.value);
+        isIframeMuted = value === 0;
+        if (!isIframeMuted) {
+            lastKnownVolume = value;
+            localStorage.setItem('collab_iframe_volume', lastKnownVolume);
+        }
         syncStreamVolumeControls();
-        // Dragging to the bottom is a mute, not a volume of zero to remember.
-        streamVolumeSlider.addEventListener('input', (e) => {
-            const value = parseFloat(e.target.value);
-            isIframeMuted = value === 0;
-            if (!isIframeMuted) {
-                lastKnownVolume = value;
-                localStorage.setItem('collab_iframe_volume', lastKnownVolume);
-            }
-            syncStreamVolumeControls();
-            sendVolumeToIframe();
-        });
-        streamMuteBtn.addEventListener('click', () => {
-            isIframeMuted = !isIframeMuted;
-            syncStreamVolumeControls();
-            sendVolumeToIframe();
-        });
-    }
+        sendVolumeToIframe();
+    });
+    streamMuteBtn.addEventListener('click', () => {
+        isIframeMuted = !isIframeMuted;
+        syncStreamVolumeControls();
+        sendVolumeToIframe();
+    });
 
     // RomM's control bar owns game volume: it sits outside this frame and
     // cannot reach the stream across origins, so its volume and mute arrive
@@ -1376,6 +1372,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     const audioInputSelect = document.getElementById('audio-input-select');
     const videoInputSelect = document.getElementById('video-input-select');
     const reloadStreamBtn = document.getElementById('reload-stream-btn');
+    const gamingModeBtn = document.getElementById('gaming-mode-btn');
+    // Read-only viewers never hold input; controllers get it back with M/K.
+    if (COLLAB_DATA.userRole !== 'controller' && COLLAB_DATA.userPermission !== 'readonly') {
+        gamingModeBtn.classList.remove('hidden');
+    }
     const videoGrid = document.getElementById('video-grid');
     const videoStrip = document.getElementById('video-strip');
     const videoGridContent = document.getElementById('video-grid-content');
@@ -1405,20 +1406,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     };
 
-    let isAudioUnlocked = false;
+    // Tile contexts start suspended until a gesture; any gesture wakes them.
     const unlockAllAudio = () => {
-        if (isAudioUnlocked) return;
-        console.log("Attempting to unlock media stream audio contexts.");
-        
         Object.values(remoteStreams).forEach(stream => {
-            if (stream.audioContext && stream.audioContext.state === 'suspended') {
-                stream.audioContext.resume().then(() => {
-                    console.log(`Resumed audio for ${stream.username}`);
-                });
+            if (stream.audioContext && !stream.audioMuted && stream.audioContext.state === 'suspended') {
+                stream.audioContext.resume().catch(() => {});
             }
         });
-        isAudioUnlocked = true;
     };
+    document.addEventListener('pointerdown', unlockAllAudio, true);
+    document.addEventListener('keydown', unlockAllAudio, true);
 
 
     const audioWorkletCode = `
@@ -2144,9 +2141,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         let analyser;
         try {
             audioContext = new AudioContext({ sampleRate: 48000 });
-            if (isAudioUnlocked && audioContext.state === 'suspended') {
-                audioContext.resume();
-            }
+            if (audioContext.state === 'suspended') audioContext.resume().catch(() => {});
 
             const workletBlob = new Blob([audioWorkletCode], { type: 'application/javascript' });
             const workletURL = URL.createObjectURL(workletBlob);
@@ -2564,6 +2559,11 @@ document.addEventListener('DOMContentLoaded', async () => {
                         const mkOwnerUser = data.viewers.find(u => u.has_mk);
                         const newMkOwner = mkOwnerUser ? mkOwnerUser.publicId : COLLAB_DATA.userPublicId;
 
+                        const iHaveMk = (mkOwnerUser && mkOwnerUser.publicId === COLLAB_DATA.userPublicId)
+                            || (!mkOwnerUser && COLLAB_DATA.userRole === 'controller');
+                        gamingModeBtn.classList.toggle('hidden', COLLAB_DATA.userPermission === 'readonly'
+                            || (COLLAB_DATA.userRole === 'controller' && !iHaveMk));
+
                         if (COLLAB_DATA.userRole === 'controller' && currentMkOwner !== newMkOwner) {
                             currentMkOwner = newMkOwner;
                             if (!isResolutionLocked) {
@@ -2851,8 +2851,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                     iframe.src = currentSrc.toString();
                 }
             }
-            closeModal();
         });
+
+        gamingModeBtn.addEventListener('click', () => gamingMode.toggle());
 
         // The open chat, the invite tile and the self-view controls all
         // minimize the same way: interacting anywhere outside them. Captured
@@ -3477,7 +3478,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const iframeEl = document.getElementById('session-frame');
     if (iframeEl) {
-        const resizeObserver = new ResizeObserver(() => {
+        // Trailing debounce: fullscreen entry and edge drags pass through
+        // intermediate sizes, each of which would restart the stream.
+        const RESIZE_SETTLE_MS = 250;
+        let resizeTimer = null;
+        const reportResolution = () => {
+            resizeTimer = null;
             if (ws && ws.readyState === WebSocket.OPEN) {
                 const width = iframeEl.clientWidth;
                 const height = iframeEl.clientHeight;
@@ -3489,15 +3495,165 @@ document.addEventListener('DOMContentLoaded', async () => {
                     }
                 }
             }
+        };
+        const resizeObserver = new ResizeObserver(() => {
+            if (resizeTimer) clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(reportResolution, RESIZE_SETTLE_MS);
         });
         resizeObserver.observe(iframeEl);
         // Re-applied on every stream (re)load so a reload keeps RomM's volume.
         iframeEl.addEventListener('load', sendVolumeToIframe);
     }
 
-    document.addEventListener('fullscreenchange', () => {
-        if (!document.fullscreenElement && COLLAB_DATA.userRole !== 'controller' && ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ action: 'force_cursor_render', state: 0 }));
+    // Replicates selkies gaming mode from the top-level page: fullscreen the
+    // frame, pointer lock the core's overlay inside it, keyboard lock from here.
+    // Avoids the permission click-through of activating it in the child frame.
+    const gamingMode = (() => {
+        const LOCKED_KEYS = ['AltLeft', 'AltRight', 'Tab', 'Escape', 'MetaLeft', 'MetaRight', 'ContextMenu'];
+        const LOCK_RETRY_MS = 60;
+        const LOCK_RETRIES = 5;
+        const ESCAPE_PRESSES = 3;
+        const ESCAPE_WINDOW_MS = 1000;
+        let boundDoc = null;
+        let active = false;
+        let escapePresses = 0;
+        let lastEscapeAt = 0;
+
+        const frame = () => document.getElementById('session-frame');
+        const isFullscreen = () => {
+            const el = frame();
+            return !!el && document.fullscreenElement === el;
+        };
+        const frameDoc = () => {
+            const el = frame();
+            try { return el ? el.contentDocument : null; } catch (err) { return null; }
+        };
+        const lockTarget = () => {
+            const el = frame();
+            const doc = frameDoc();
+            if (!el || !doc) return null;
+            const input = el.contentWindow && el.contentWindow.webrtcInput;
+            return (input && input.element) || doc.getElementById('overlayInput');
+        };
+
+        const requestLock = (attempt = 0) => {
+            if (!isFullscreen()) return;
+            const doc = frameDoc();
+            const target = lockTarget();
+            if (!doc || !target || typeof target.requestPointerLock !== 'function') return;
+            if (doc.pointerLockElement === target) return;
+            let request;
+            try {
+                request = target.requestPointerLock();
+            } catch (err) {
+                request = Promise.reject(err);
+            }
+            if (!request || typeof request.catch !== 'function') return;
+            request.catch((err) => {
+                // Chrome refuses a lock while fullscreen is still settling.
+                if (attempt < LOCK_RETRIES) {
+                    setTimeout(() => requestLock(attempt + 1), LOCK_RETRY_MS);
+                } else {
+                    console.warn('[Gaming] Pointer lock refused:', err);
+                }
+            });
+        };
+        const releaseLock = () => {
+            const doc = frameDoc();
+            if (doc && doc.pointerLockElement && typeof doc.exitPointerLock === 'function') doc.exitPointerLock();
+        };
+        const lockKeyboard = () => {
+            if (navigator.keyboard && typeof navigator.keyboard.lock === 'function') {
+                navigator.keyboard.lock(LOCKED_KEYS).catch((err) => console.warn('[Gaming] Keyboard lock refused:', err));
+            }
+        };
+        const unlockKeyboard = () => {
+            if (navigator.keyboard && typeof navigator.keyboard.unlock === 'function') {
+                try { navigator.keyboard.unlock(); } catch (err) { /* nothing was locked */ }
+            }
+        };
+
+        // Clicks in the stream wake audio and re-lock after an Escape release.
+        const onFrameMouseDown = (e) => {
+            unlockAllAudio();
+            if (e.button === 0) requestLock();
+        };
+        // Selkies escape hatch: three quick Escapes exit, third press swallowed.
+        // Bound at frame load so it runs before the core's keydown listener.
+        const onFrameKeyDown = (e) => {
+            if (!isFullscreen() || e.repeat) return;
+            const now = performance.now();
+            if (e.code !== 'Escape' || now - lastEscapeAt > ESCAPE_WINDOW_MS) escapePresses = 0;
+            lastEscapeAt = now;
+            if (e.code !== 'Escape') return;
+            escapePresses += 1;
+            if (escapePresses < ESCAPE_PRESSES) return;
+            escapePresses = 0;
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            leave();
+        };
+        // Keyed by document; the window proxy survives a reload, listeners do not.
+        const unbindFrame = () => {
+            if (!boundDoc) return;
+            try {
+                const win = boundDoc.defaultView;
+                if (win) win.removeEventListener('keydown', onFrameKeyDown, true);
+                boundDoc.removeEventListener('mousedown', onFrameMouseDown, true);
+            } catch (err) { /* frame gone */ }
+            boundDoc = null;
+        };
+        const bindFrame = () => {
+            const doc = frameDoc();
+            if (!doc || doc === boundDoc) return;
+            unbindFrame();
+            const win = doc.defaultView;
+            if (!win) return;
+            win.addEventListener('keydown', onFrameKeyDown, true);
+            doc.addEventListener('mousedown', onFrameMouseDown, true);
+            boundDoc = doc;
+        };
+
+        const setActive = (next) => {
+            if (active === next) return;
+            active = next;
+            if (COLLAB_DATA.userRole !== 'controller' && ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ action: 'force_cursor_render', state: next ? 1 : 0 }));
+            }
+        };
+
+        const enter = () => {
+            const el = frame();
+            if (!el || typeof el.requestFullscreen !== 'function') return;
+            // Locks are taken on fullscreenchange; the transition cancels an earlier lock.
+            el.requestFullscreen().catch((err) => console.error('[Gaming] Fullscreen refused:', err));
+            el.focus();
+        };
+        const leave = () => {
+            if (document.fullscreenElement && document.exitFullscreen) {
+                document.exitFullscreen().catch((err) => console.error(err));
+            }
+        };
+
+        document.addEventListener('fullscreenchange', () => {
+            if (isFullscreen()) {
+                bindFrame();
+                requestLock();
+                lockKeyboard();
+                setActive(true);
+            } else {
+                unlockKeyboard();
+                releaseLock();
+                setActive(false);
+            }
+        });
+        // Bind every frame document as it loads; handlers idle outside gaming mode.
+        const el = frame();
+        if (el) {
+            el.addEventListener('load', bindFrame);
+            bindFrame();
         }
-    });
+
+        return { toggle: () => (document.fullscreenElement ? leave() : enter()) };
+    })();
 });

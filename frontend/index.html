@@ -27,9 +27,18 @@
     </div>
 
     <div id="video-grid">
-        <div id="stream-volume" class="hidden">
+        <div id="stream-volume">
             <input type="range" id="stream-volume-slider" min="0" max="1" step="0.01" value="1" data-i18n-title="tooltips.sessionVolume">
-            <button id="stream-mute-btn" class="control-btn" data-i18n-title="tooltips.toggleSessionAudio"><i class="fas fa-volume-up"></i></button>
+            <div id="stream-buttons">
+                <button id="stream-mute-btn" class="control-btn" data-i18n-title="tooltips.toggleSessionAudio"><i class="fas fa-volume-up"></i></button>
+                <button id="reload-stream-btn" class="control-btn" data-i18n-title="tooltips.reloadStream"><i class="fas fa-sync"></i></button>
+                <button id="gaming-mode-btn" class="control-btn hidden" data-i18n-title="tooltips.gamingMode">
+                    <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" width="16" height="16">
+                        <circle cx="12" cy="12" r="1.5" fill="currentColor" />
+                        <path d="M12 5V9M12 15V19M5 12H9M15 12H19" stroke-linecap="round" />
+                    </svg>
+                </button>
+            </div>
         </div>
         <div id="video-strip">
             <div id="video-grid-content">
@@ -102,9 +111,6 @@
                 <div class="settings-group">
                     <label for="video-input-select" data-i18n="settings.webcamLabel"></label>
                     <select id="video-input-select"></select>
-                </div>
-                <div class="settings-group">
-                    <button id="reload-stream-btn" class="settings-action"><i class="fas fa-sync"></i><span data-i18n="tooltips.reloadStream"></span></button>
                 </div>
             </div>
         </div>

@@ -130,28 +130,29 @@ body {
 }
 
 /* ── Stream volume ─────────────────────────────────────────────────────── */
-/* A fader at the left edge of the bar for people who arrived on an invite
-   link: with no RomM window around the page, nothing else can turn the game
-   down for them. */
+/* Fader, mute, reload and gaming mode at the left edge of the bar. */
 #stream-volume {
   flex: 0 0 auto;
   align-self: stretch;
-  width: 40px;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  padding: 4px 0;
 }
 
-#stream-volume.hidden {
-  display: none;
+#stream-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex-shrink: 0;
 }
 
 #stream-volume .control-btn {
-  width: 40px;
-  height: 40px;
+  width: 28px;
+  height: 28px;
   flex-shrink: 0;
-  font-size: 1rem;
+  font-size: 0.8rem;
 }
 
 /* Vertical writing mode rather than a rotate so the track follows the bar's
@@ -161,8 +162,8 @@ body {
   appearance: none;
   writing-mode: vertical-lr;
   direction: rtl;
-  flex: 1 1 auto;
-  min-height: 60px;
+  flex: 1 1 0;
+  min-height: 24px;
   width: 8px;
   margin: 4px 0;
   background: var(--input-bg);
@@ -268,18 +269,21 @@ body {
   }
 
   #stream-volume {
-    width: 32px;
-    gap: 4px;
+    gap: 3px;
+  }
+
+  #stream-buttons {
+    gap: 2px;
   }
 
   #stream-volume .control-btn {
-    width: 32px;
-    height: 32px;
-    font-size: 0.85rem;
+    width: 24px;
+    height: 24px;
+    font-size: 0.7rem;
   }
 
   #stream-volume-slider {
-    min-height: 30px;
+    min-height: 16px;
     margin: 2px 0;
   }
 
@@ -1686,7 +1690,7 @@ body.solo-mode #invite-tile.open {
 /* An invitee left alone still needs the fader, so it floats in the corner
    and fades on the invite tile's rule. */
 body.solo-mode #stream-volume {
-  height: 120px;
+  height: 170px;
   align-self: flex-end;
   opacity: 0;
   transition: opacity 0.3s ease;
