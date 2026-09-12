@@ -207,3 +207,30 @@ streaming:
 server to server, and `subfolder` is the container's `SUBFOLDER`. The full
 story, including why `host` is a path, is in
 [Reverse proxy](/docs/deployment/reverse-proxy).
+
+## Known issues
+
+<Callout type="warn" title="Lost audio after a container restart">
+Selkies captures from a PulseAudio null sink named `output`, created once on
+boot and gated behind `/dev/shm/audio.lock`. Docker serves `/dev/shm` from a
+per-container directory on the host that a restart reuses, so the lock outlives
+`docker restart` while PulseAudio itself comes back with no modules loaded. The
+lock then suppresses sink creation, `output.monitor` never exists, and audio
+stops reaching the browser even though the emulator is producing it.
+
+Recreate the container (`docker compose down && docker compose up -d`) instead
+of restarting it. A `docker stop` with `restart: unless-stopped` is the same
+container, so it hits the same stale lock.
+
+To recover a running session without recreating anything, load the sinks by
+hand and bounce only Selkies:
+
+```bash
+docker exec <name> s6-setuidgid abc with-contenv pactl load-module module-null-sink sink_name=output sink_properties=device.description=output
+docker exec <name> s6-setuidgid abc with-contenv pactl load-module module-null-sink sink_name=input sink_properties=device.description=input
+docker exec <name> s6-rc -d change svc-selkies && docker exec <name> s6-rc -u change svc-selkies
+```
+
+The real fix belongs upstream: the check should test actual PulseAudio state
+rather than the presence of a lock file.
+</Callout>
