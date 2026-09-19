@@ -26,6 +26,10 @@ driven from outside the process:
   5 s; some need a protocol message first.
 - What `rom.path` looks like for its platform (a disc image, a folder, a
   package that has to be installed first).
+- Whether it can take saves the broker did not write. The default
+  `import_spec()` accepts none, so every declared import is refused; an
+  override reads the platform from `self.platform`. See
+  [Declared imports](/docs/api/imports).
 </Step>
 <Step>
 ### Write the launcher
@@ -55,8 +59,10 @@ class Newemu(Emulator):
 Use `base_launch_env()` for the environment so the process lands on the
 selkies display, and `_spawn` so output is captured and the pid recorded.
 Override `save_state`, `load_state`, `state_path` and `state_target` only if
-`supports_states` is on; override `save_and_exit` if a clean shutdown needs
-more than SIGTERM. Keep the rationale for every non-obvious choice in the
+`supports_states` is on. The one exception is an emulator that writes a
+state only on exit: it overrides `state_path` alone, to serve the state its
+exit confirmed so RomM can file it. Override `save_and_exit` if a clean
+shutdown needs more than SIGTERM. Keep the rationale for every non-obvious choice in the
 docstrings; the reference is generated from them.
 </Step>
 <Step>

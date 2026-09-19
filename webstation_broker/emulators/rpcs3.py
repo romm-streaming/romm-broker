@@ -22,7 +22,9 @@ than by keeping it running. States are per-title, at
 DATA_DIR/savestates/<title_id>/, which is a sibling of dev_hdd0 rather than
 something under it; a symlink into dev_hdd0/savestates is what lets the
 existing save archive (keyed to dev_hdd0-relative paths) carry it without
-moving save_root out from under the subtrees already archived.
+moving save_root out from under the subtrees already archived. The state a
+saving exit confirms is also what `state_path` serves, so RomM can file it in
+its state library.
 
 PINE: RPCS3's IPC is PINE-compatible but only implements the protocol's
 generic opcodes (memory access, version/title/status queries) - there is no
@@ -1640,6 +1642,8 @@ class Rpcs3(Emulator):
     clear to (a bare .iso or an archive). Consumed and cleared the moment
     this session's title id becomes known, by _clear_leftover_states.
     """
+    _exit_state: Optional[Path] = None
+    """The state the last saving exit confirmed, or None until one has since the last launch."""
     _session_start: Optional[float] = None
     """Wall clock at launch, or None when nothing has been launched in this process.
 
@@ -1739,10 +1743,23 @@ class Rpcs3(Emulator):
         yet, so the whole game/ prefix is declared to let them through.
         """
         if self._restoring:
-            return ("home/00000001/savedata", "game", "savestates")
+            return self.restore_subtrees
         subtrees = ["home/00000001/savedata", "savestates"]
         subtrees += [f"game/{d.name}" for d in _gamedata_dirs()]
         return tuple(subtrees)
+
+    @property
+    def restore_subtrees(self) -> tuple[str, ...]:
+        """The restore set, whatever `_restoring` says.
+
+        Preflight reads this before `clear_working_slot` has flipped
+        `_restoring`, and a restore needs the whole `game/` prefix: the dirs
+        it brings back do not exist on disk yet.
+
+        Returns:
+            Saves, the whole `game/` prefix, and savestates.
+        """
+        return ("home/00000001/savedata", "game", "savestates")
 
     def prepare_restore(self) -> None:
         """Stop any running instance and mark the session as archive-restoring."""
@@ -1887,6 +1904,7 @@ class Rpcs3(Emulator):
         """
         self.stop()
         self._restoring = False
+        self._exit_state = None
         self.boot_failed = False
         self._launch_seq += 1
         seq = self._launch_seq
@@ -2033,6 +2051,7 @@ class Rpcs3(Emulator):
                         else:
                             saved = True
                             state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
+                            self._exit_state = p
 
         # The dump ships files newer than the session baseline. A save is a
         # directory tree the game rewrites only partially, and sibling dirs
@@ -2049,6 +2068,20 @@ class Rpcs3(Emulator):
 
         self.stop()
         return {"state_saved": saved, "state_slot": slot, "state_file": state_file}
+
+    def state_path(self) -> Optional[Path]:
+        """Return the state the last saving exit confirmed, or None.
+
+        Only a confirmed exit state is served, never the newest file in the
+        title's savestates dir: until the exit's write settles, the newest
+        file there is an older one the archive brought in.
+
+        Returns:
+            The state file's path, or None when no saving exit has confirmed one
+            since the last launch or the file has since gone.
+        """
+        p = self._exit_state
+        return p if p is not None and p.is_file() else None
 
     def stop(self) -> None:
         """Kill the process, invalidating any in-flight boot watchdog first."""

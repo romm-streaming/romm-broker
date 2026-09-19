@@ -8,12 +8,17 @@ import calendar
 import io
 import json
 import logging
+import lzma
 import os
 import secrets
+import stat
 import time
 import zipfile
+import zlib
+from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
 
 from . import settings
 
@@ -29,6 +34,29 @@ and so a restore can tell the broker's own index from real save data.
 """
 MANIFEST_VERSION = 1
 """Schema version of the archive manifest, for a parent reading old archives."""
+IMPORT_PREFIX = ".import/"
+"""Archive prefix that marks a member as a declared import rather than a restored dump.
+
+The broker never dumps a dot-prefixed path, so no v1 archive can carry one. A
+member under it is placed by the emulator's own import rules, not by path.
+"""
+MANIFEST_MAX_BYTES = 1024 * 1024
+"""Largest manifest a restore will parse, and only when the archive holds imports.
+
+A v1 dump listing ten thousand files can pass this, which is why a v1-only
+archive never has its manifest parsed at all.
+"""
+ZIP_READ_ERRORS: tuple[type[Exception], ...] = (
+    OSError,
+    ValueError,
+    RuntimeError,
+    NotImplementedError,
+    EOFError,
+    zlib.error,
+    lzma.LZMAError,
+    zipfile.BadZipFile,
+)
+"""What reading a zip member's data can raise, under every compression method `zipfile` supports."""
 _SAVE_MTIME_SLACK = 2.0
 """Seconds of slack on the newer-file guard.
 
@@ -203,6 +231,8 @@ def build_save_archive(
     baseline: float,
     identity: Optional[dict[str, Any]] = None,
     classify: Optional[Callable[[str], str]] = None,
+    *,
+    always_include: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Zip every save file modified since `baseline` (the launch timestamp).
 
@@ -224,6 +254,10 @@ def build_save_archive(
             the manifest out entirely.
         classify: Maps a member path to its kind, usually
             `Emulator.save_file_kind`; members go in unlabelled without it.
+        always_include: Paths relative to `root` that ship whatever their
+            mtime: the files this session's declared imports placed. The walk
+            still decides what exists, so a placed file that was deleted or
+            set aside is simply absent.
 
     Returns:
         A report dict of the shape
@@ -267,7 +301,7 @@ def build_save_archive(
             report["skipped"] += 1
             report["skipped_files"].append(rel)
             continue
-        if st.st_mtime >= cutoff:
+        if st.st_mtime >= cutoff or rel in always_include:
             changed.append(p)
             total += st.st_size
     if not changed:
@@ -322,6 +356,9 @@ def build_save_archive(
                 "session": identity,
                 "files": manifest_files,
             }
+            imported = sorted(f["path"] for f in report["files"] if f["path"] in always_include)
+            if imported:
+                manifest["imported"] = imported
             zf.writestr(
                 zipfile.ZipInfo(MANIFEST_NAME, date_time=time.gmtime()[:6]),
                 json.dumps(manifest, indent=2),
@@ -332,11 +369,105 @@ def build_save_archive(
     return _finish_dump(report, changed_skipped)
 
 
-def _under(member: PurePosixPath, subtrees: tuple[str, ...]) -> bool:
+@dataclass(frozen=True)
+class ArchiveView:
+    """One pass over an archive's member list, taken before anything is cleared.
+
+    Attributes:
+        error: The legacy whole-archive error (not a zip, too large, too many
+            entries), or None.
+        v1: Non-directory members that are neither the manifest nor under
+            `IMPORT_PREFIX`, in zip order.
+        imports: Non-directory members under `IMPORT_PREFIX`, in zip order.
+        manifest: The parsed manifest, read only when `imports` is non-empty
+            and `error` is None.
+        manifest_error: Why the manifest could not be used, under the same
+            condition.
+    """
+
+    error: Optional[str]
+    v1: tuple[zipfile.ZipInfo, ...]
+    imports: tuple[zipfile.ZipInfo, ...]
+    manifest: Optional[Any] = None
+    manifest_error: Optional[str] = None
+
+
+def _read_manifest(zf: zipfile.ZipFile, info: zipfile.ZipInfo) -> tuple[Optional[Any], Optional[str]]:
+    """Parse the archive's manifest, reporting rather than raising on a bad one.
+
+    Args:
+        zf: The open archive.
+        info: The manifest's entry.
+
+    Returns:
+        The parsed JSON and None, or None and the reason it is unusable.
+    """
+    if info.file_size > MANIFEST_MAX_BYTES:
+        return None, f"manifest exceeds {MANIFEST_MAX_BYTES} bytes"
+    try:
+        raw = zf.read(info)
+    except ZIP_READ_ERRORS as exc:
+        return None, f"manifest unreadable: {exc}"
+    try:
+        return json.loads(raw), None
+    except (ValueError, RecursionError) as exc:
+        # JSONDecodeError and UnicodeDecodeError are both ValueErrors; a
+        # deeply nested document raises RecursionError.
+        return None, f"manifest is not JSON: {exc}"
+
+
+def read_archive(content: bytes) -> ArchiveView:
+    """Partition an archive's members and apply the whole-archive limits.
+
+    The members are split even when a limit trips, so the caller can still
+    tell whether the archive held imports and choose which kind of refusal
+    to answer with.
+
+    Args:
+        content: The zip archive body.
+
+    Returns:
+        The view. Its `error` uses the wording restores have always used, and
+        the manifest counts toward both limits, as it always has.
+    """
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(content))
+    except (zipfile.BadZipFile, ValueError, RuntimeError, NotImplementedError, EOFError) as exc:
+        # ValueError covers a UTF-8-flagged name that is not valid UTF-8.
+        log.debug("saves: archive could not be opened: %s", exc)
+        return ArchiveView("body is not a zip archive", (), ())
+    with zf:
+        infos = [i for i in zf.infolist() if not i.is_dir()]
+        manifest_info: Optional[zipfile.ZipInfo] = None
+        v1: list[zipfile.ZipInfo] = []
+        imports: list[zipfile.ZipInfo] = []
+        for info in infos:
+            if info.filename == MANIFEST_NAME:
+                manifest_info = info
+            elif info.filename.startswith(IMPORT_PREFIX):
+                imports.append(info)
+            else:
+                v1.append(info)
+        error: Optional[str] = None
+        if sum(i.file_size for i in infos) > SAVE_FILE_MAX_BYTES:
+            error = "archive exceeds size limit when extracted"
+        elif len(infos) > settings.SAVE_FILE_MAX_ENTRIES:
+            error = f"archive holds more than {settings.SAVE_FILE_MAX_ENTRIES} entries"
+        manifest: Optional[Any] = None
+        manifest_error: Optional[str] = None
+        if imports and error is None:
+            if manifest_info is None:
+                manifest_error = "archive has no manifest"
+            else:
+                manifest, manifest_error = _read_manifest(zf, manifest_info)
+    return ArchiveView(error, tuple(v1), tuple(imports), manifest, manifest_error)
+
+
+def under_subtrees(member: PurePosixPath, subtrees: tuple[str, ...]) -> bool:
     """Whether an archive member path lies strictly inside one of the subtrees.
 
     A member that is a subtree name rather than a path below one is refused
-    outright by `extract_save_archive` before it reaches here, so equality
+    outright by `plan_v1` before it reaches here, so equality
     never has to count as inside.
 
     Args:
@@ -348,6 +479,239 @@ def _under(member: PurePosixPath, subtrees: tuple[str, ...]) -> bool:
     """
     rel = member.as_posix()
     return any(rel.startswith(sub + "/") for sub in subtrees)
+
+
+V1Problem = Literal["escapes", "names_subtree", "outside", "symlink", "unreadable"]
+"""Why a v1 member was refused, so a v2 caller can fold it into a refusal code."""
+
+
+@dataclass(frozen=True)
+class V1Plan:
+    """What a v1 restore would write, decided before the working slot is cleared.
+
+    Attributes:
+        names: Member names to write, in zip order.
+        excluded_count: Members dropped because they sit under an excluded subtree.
+        problems: Every refused member as `(name, legacy message, kind)`, in zip order.
+    """
+
+    names: tuple[str, ...]
+    excluded_count: int
+    problems: tuple[tuple[str, str, V1Problem], ...]
+
+    @property
+    def error(self) -> Optional[str]:
+        """The first problem's legacy message, or None when there is none."""
+        return self.problems[0][1] if self.problems else None
+
+
+_READABLE_COMPRESSION = frozenset(
+    {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA}
+)
+"""Compression methods `zipfile` can decompress; any other raises on read."""
+_ZIP_ENCRYPTED_FLAG = 0x1
+"""Zip general-purpose flag bit marking an encrypted entry."""
+
+
+def member_problem(info: zipfile.ZipInfo, *, check_date: bool = True) -> Optional[str]:
+    """Find what would make a member fail to write, from its header alone.
+
+    Each of these raises only once the member is read or stamped, and a
+    restore reads after the working slot is cleared, so they are caught here
+    instead.
+
+    Args:
+        info: The member's zip entry.
+        check_date: Also check the stored timestamp, which only a v1 member's
+            write uses.
+
+    Returns:
+        What is wrong, phrased to follow "archive member", or None.
+    """
+    if info.flag_bits & _ZIP_ENCRYPTED_FLAG:
+        return "is encrypted"
+    if info.compress_type not in _READABLE_COMPRESSION:
+        return f"uses unsupported compression method {info.compress_type}"
+    if check_date:
+        try:
+            calendar.timegm(info.date_time)
+        except (ValueError, OverflowError):
+            return f"has an invalid timestamp {info.date_time}"
+    return None
+
+
+_VERIFY_CHUNK = 1024 * 1024
+"""Most bytes one `verify_members` read returns. It does not cap what bzip2 or lzma decompress to fill it."""
+
+
+def verify_members(content: bytes, names: Iterable[str]) -> tuple[tuple[Optional[str], str], ...]:
+    """Read every named member in full, before the working slot is cleared.
+
+    `plan_v1` and preflight judge a member by its headers. Corrupt data only
+    shows once the member is decompressed and its CRC checked, and the write
+    that would do that runs after the clear. Each member is read in full in
+    `_VERIFY_CHUNK` pieces, `zipfile` cuts its output at the declared size,
+    and every byte returned counts against `SAVE_FILE_MAX_BYTES`. For bzip2
+    and lzma, `zipfile` decompresses a whole compressed read at a time with no
+    output cap, so the budget bounds what is returned, not peak memory.
+
+    Args:
+        content: The zip archive body.
+        names: The members about to be written. A repeated name is read once.
+
+    Returns:
+        `(member, message)` for each member that fails, in `names` order, each
+        message phrased the way restores phrase theirs. A member of None is an
+        archive-level problem, and it ends the check.
+    """
+    problems: list[tuple[Optional[str], str]] = []
+    budget = SAVE_FILE_MAX_BYTES
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(content))
+    except (zipfile.BadZipFile, ValueError, RuntimeError, NotImplementedError, EOFError):
+        return ((None, "body is not a zip archive"),)
+    with zf:
+        for name in dict.fromkeys(names):
+            try:
+                with zf.open(name) as fh:
+                    while chunk := fh.read(_VERIFY_CHUNK):
+                        budget -= len(chunk)
+                        if budget < 0:
+                            problems.append((None, "archive exceeds size limit when extracted"))
+                            return tuple(problems)
+            except (KeyError, *ZIP_READ_ERRORS) as exc:
+                log.warning("saves: archive member %s failed its read check: %s", name, exc)
+                problems.append((name, f"archive member is corrupt: {name}"))
+    return tuple(problems)
+
+
+def _longest_subtree(rel: str, subtrees: tuple[str, ...]) -> Optional[str]:
+    """The deepest subtree `rel` sits strictly inside.
+
+    Args:
+        rel: A posix path relative to the save root.
+        subtrees: Subtree names to test.
+
+    Returns:
+        The longest matching subtree, or None.
+    """
+    hits = [s for s in subtrees if rel.startswith(s + "/")]
+    return max(hits, key=len) if hits else None
+
+
+def surviving_chain_escapes(root: Path, rel: PurePosixPath, subtrees: tuple[str, ...]) -> bool:
+    """Whether a directory the clear leaves standing links `rel` out of the save root.
+
+    Only the components from `root` down to and including the subtree
+    directory are checked, which the clear always leaves standing. A link
+    below the subtree can survive too (rpcs3, and clears with `keep`, retain
+    some entries), but `_write_member`'s resolve check catches it at write
+    time, as a 422 after the clear. A component that does not exist yet
+    cannot be a link, and the ones below it cannot exist either.
+
+    Args:
+        root: The emulator's save data root.
+        rel: The destination, relative to `root`.
+        subtrees: The subtrees `rel` may sit under; the longest match is used.
+
+    Returns:
+        True when a surviving component is a symlink that resolves outside
+        `root`, or when a component cannot be inspected. Refusing is the
+        choice that cannot write outside the save root.
+    """
+    sub = _longest_subtree(rel.as_posix(), subtrees)
+    if sub is None:
+        return False
+    try:
+        root_real = root.resolve()
+    except (OSError, RuntimeError):
+        return True
+    path = root
+    for part in PurePosixPath(sub).parts:
+        path = path / part
+        try:
+            st = path.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        if stat.S_ISLNK(st.st_mode):
+            try:
+                target = path.resolve()
+            except (OSError, RuntimeError):
+                return True
+            if not target.is_relative_to(root_real):
+                return True
+    return False
+
+
+def plan_v1(
+    view: ArchiveView,
+    root: Path,
+    subtrees: tuple[str, ...],
+    excluded: tuple[str, ...],
+    *,
+    include_imports: bool = False,
+) -> V1Plan:
+    """Run every per-member restore check on the v1 members, writing nothing.
+
+    The checks and their messages are the ones restores have always used,
+    in the same order, followed by two new ones: a member whose surviving
+    parent chain links out of `root`, and a member `member_problem` says
+    cannot be read or stamped, are refused here rather than failing to
+    write after the slot has already been cleared.
+
+    Args:
+        view: The archive, from `read_archive`.
+        root: The emulator's save data root.
+        subtrees: Subdirectory names members may be restored into.
+        excluded: Subdirectory names whose members are counted and dropped.
+        include_imports: Also check `.import/` members as if they were v1,
+            merged back in zip order, which is how the legacy
+            `extract_save_archive` path refuses them.
+
+    Returns:
+        The plan, with every problem collected.
+    """
+    infos = list(view.v1)
+    if include_imports and view.imports:
+        infos = sorted(infos + list(view.imports), key=lambda i: i.header_offset)
+    names: list[str] = []
+    problems: list[tuple[str, str, V1Problem]] = []
+    excluded_count = 0
+    escapes_by_subtree: dict[Optional[str], bool] = {}
+    for info in infos:
+        name = info.filename
+        member = PurePosixPath(name)
+        if member.is_absolute() or ".." in member.parts:
+            problems.append((name, f"archive member escapes save dir: {name}", "escapes"))
+            continue
+        rel = member.as_posix()
+        if rel in subtrees or rel in excluded:
+            # A save file always sits inside a subtree, never is one: a dump
+            # only ever walks below `root / sub`. Writing such a member would
+            # leave a plain file where the emulator expects its save
+            # directory, and the mkdir on its next launch would fail.
+            problems.append((name, f"archive member names a save subtree: {name}", "names_subtree"))
+            continue
+        if under_subtrees(member, excluded):
+            excluded_count += 1
+            continue
+        if not under_subtrees(member, subtrees):
+            problems.append((name, f"archive member outside save subtrees: {name}", "outside"))
+            continue
+        sub = _longest_subtree(rel, subtrees)
+        if sub not in escapes_by_subtree:
+            escapes_by_subtree[sub] = surviving_chain_escapes(root, member, subtrees)
+        if escapes_by_subtree[sub]:
+            problems.append((name, f"archive member resolves outside save dir: {name}", "symlink"))
+            continue
+        problem = member_problem(info)
+        if problem is not None:
+            problems.append((name, f"archive member {problem}: {name}", "unreadable"))
+            continue
+        names.append(name)
+    return V1Plan(tuple(names), excluded_count, tuple(problems))
 
 
 def _guard_exempt(always_restore: Optional[Callable[[str], bool]], rel: str) -> bool:
@@ -376,6 +740,168 @@ def _guard_exempt(always_restore: Optional[Callable[[str], bool]], rel: str) -> 
         return False
 
 
+@dataclass(frozen=True)
+class ArchivePlan:
+    """Everything a restore writes, fixed before the working slot is cleared.
+
+    Attributes:
+        v1: v1 member names, written to their own path under the newer-file guard.
+        excluded_count: v1 members dropped for sitting under an excluded subtree.
+        placed: `(member name, destination)` pairs for declared imports.
+        sidecars: `(destination, bytes)` pairs the broker writes beside placed members.
+    """
+
+    v1: tuple[str, ...]
+    excluded_count: int
+    placed: tuple[tuple[str, PurePosixPath], ...] = ()
+    sidecars: tuple[tuple[PurePosixPath, bytes], ...] = ()
+
+
+def _write_member(
+    root: Path,
+    root_real: Path,
+    rel: PurePosixPath,
+    read: Callable[[], bytes],
+    mtime: float,
+    *,
+    guard: bool,
+    label: str,
+) -> Literal["written", "skipped", "failed"]:
+    """Write one file into the save tree through a staging file.
+
+    Args:
+        root: The emulator's save data root.
+        root_real: `root` resolved, for the escape check.
+        rel: The destination, relative to `root`.
+        read: Returns the bytes to write.
+        mtime: The mtime to stamp on the written file.
+        guard: Whether a newer file already on disk is kept.
+        label: The name to log the file under.
+
+    Returns:
+        How the write went.
+    """
+    target = root / rel
+    tmp: Optional[Path] = None
+    try:
+        # Belt-and-suspenders on top of the member-path checks: confirms the
+        # resolved write location is still under root even if some ancestor
+        # directory turned out to be a symlink.
+        if not target.parent.resolve().is_relative_to(root_real):
+            log.warning("saves: %s resolves outside save dir, skipped", label)
+            return "failed"
+        if guard and target.exists() and target.stat().st_mtime > mtime + _SAVE_MTIME_SLACK:
+            return "skipped"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Unique per member: two restores sharing one staging name interleave
+        # their writes, and the os.replace below then publishes the mixture
+        # as the player's save.
+        tmp = target.parent / f".{target.name}.{secrets.token_hex(8)}.tmp"
+        tmp.write_bytes(read())
+        os.replace(tmp, target)
+        os.utime(target, (mtime, mtime))
+    except ZIP_READ_ERRORS as exc:
+        # `plan_v1` refuses what a header gives away; corrupt data only
+        # shows once it is read.
+        # This also catches filesystem errors from the write itself, so never narrow it to read errors.
+        log.warning("saves: could not restore %s: %s", label, exc)
+        # The staging file is dot-prefixed, so `_iter_save_files` never sees
+        # it and no later dump would ever carry it off the disk.
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError as cleanup_exc:
+                log.warning("saves: could not remove the staging file %s: %s", tmp, cleanup_exc)
+        return "failed"
+    return "written"
+
+
+def write_save_archive(
+    content: bytes,
+    root: Path,
+    plan: ArchivePlan,
+    always_restore: Optional[Callable[[str], bool]] = None,
+    *,
+    stamp: Optional[float] = None,
+) -> dict[str, Any]:
+    """Write a restore that `plan_v1` (and, for imports, preflight) already approved.
+
+    v1 members are restored as they always have been: existing files newer
+    than their member are skipped, so a restore can never roll back saves
+    made since the archive was taken, unless `always_restore` exempts the
+    member. Placed imports and sidecars skip that guard, because preflight
+    refused any collision, and are stamped with the write time rather than a
+    zip mtime.
+
+    Args:
+        content: The zip archive body, the same bytes the plan was made from.
+        root: The emulator's save data root.
+        plan: What to write.
+        always_restore: Maps a v1 member path to whether it is exempt from the
+            newer-file guard, usually `Emulator.always_restore`.
+        stamp: The mtime for placed members and sidecars; defaults to now.
+
+    Returns:
+        `{"written", "skipped", "excluded", "failed", "imported", "error"}`.
+        `written` and `skipped` count v1 members, `imported` counts placed
+        members written, `failed` counts every failed write, and `error` is
+        set only when the body is not a zip.
+    """
+    result: dict[str, Any] = {
+        "written": 0,
+        "skipped": 0,
+        "excluded": plan.excluded_count,
+        "failed": 0,
+        "imported": 0,
+        "error": None,
+    }
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile:
+        result["error"] = "body is not a zip archive"
+        return result
+    when = time.time() if stamp is None else stamp
+    root_real = root.resolve()
+    with zf:
+        for name in plan.v1:
+            try:
+                info = zf.getinfo(name)
+            except KeyError:
+                log.warning("saves: %s is not in the archive, skipped", name)
+                result["failed"] += 1
+                continue
+            try:
+                mtime = float(calendar.timegm(info.date_time))
+            except (ValueError, OverflowError) as exc:
+                log.warning("saves: %s has an unusable timestamp, stamping it now: %s", name, exc)
+                mtime = when
+            outcome = _write_member(
+                root,
+                root_real,
+                PurePosixPath(name),
+                lambda info=info: zf.read(info),
+                mtime,
+                guard=not _guard_exempt(always_restore, name),
+                label=name,
+            )
+            result[outcome] += 1
+        for name, dest in plan.placed:
+            outcome = _write_member(
+                root, root_real, dest, lambda name=name: zf.read(name), when, guard=False, label=name
+            )
+            if outcome == "written":
+                result["imported"] += 1
+            else:
+                result["failed"] += 1
+        for dest, data in plan.sidecars:
+            outcome = _write_member(
+                root, root_real, dest, lambda data=data: data, when, guard=False, label=dest.as_posix()
+            )
+            if outcome == "failed":
+                result["failed"] += 1
+    return result
+
+
 def extract_save_archive(
     content: bytes,
     root: Path,
@@ -383,22 +909,16 @@ def extract_save_archive(
     excluded: tuple[str, ...] = (),
     always_restore: Optional[Callable[[str], bool]] = None,
 ) -> dict[str, Any]:
-    """Restore an archive into the emulator's data dir.
+    """Restore an archive into the emulator's data dir in one call.
+
+    Composed from `read_archive`, `plan_v1` and `write_save_archive`. It is
+    kept for callers that validate and write in one step: activate uses the
+    pieces instead, so it can validate before the working slot is cleared.
+    `.import/` members are checked as v1 here and refused as lying outside
+    the subtrees, which is how this path has always treated them.
 
     `excluded` names subtrees the emulator owns but this session syncs some
-    other way. Those members are dropped rather than refused: archives taken
-    before that sync was turned on still carry them, and restoring one would
-    undo what the other route just wrote. A member under neither is still a
-    hard error, since that is the guard against an archive writing outside the
-    save area.
-
-    Existing files newer than their archive member are skipped so a restore
-    can never roll back saves made since the archive was taken. `always_restore`
-    exempts the members an emulator says that guard does not describe: a file
-    whose mtime on disk records which player last used the container rather
-    than progress this player would lose. Each file is written through a temp
-    file and renamed into place.
-
+    other way; their members are counted and dropped rather than refused.
     An archive's `MANIFEST_NAME` is dropped: it describes the archive for the
     parent and is not save data.
 
@@ -408,99 +928,29 @@ def extract_save_archive(
         subtrees: Subdirectory names under `root` that members may be restored into.
         excluded: Subdirectory names whose members are counted and dropped.
         always_restore: Maps a member path to whether it is exempt from the
-            newer-file guard, usually `Emulator.always_restore`; without it
-            every member is subject to the guard.
+            newer-file guard, usually `Emulator.always_restore`.
 
     Returns:
-        A dict of the shape `{"written", "skipped", "excluded", "failed", "error"}`
-        with counts for the first four and `error` set (and nothing written) when
-        the body is not a zip, the archive is too large, or a member escapes the
-        save dir, names a subtree itself, or lies outside the subtrees.
+        `{"written", "skipped", "excluded", "failed", "imported", "error"}`,
+        with `error` set (and nothing written) when the body is not a zip, the
+        archive is too large, or a member escapes the save dir, names a
+        subtree itself, lies outside the subtrees, resolves outside the
+        save dir through a surviving symlink, or is encrypted, compressed in
+        a way `zipfile` cannot read, or stamped with an impossible date.
     """
-    result = {"written": 0, "skipped": 0, "excluded": 0, "failed": 0, "error": None}
-    try:
-        zf = zipfile.ZipFile(io.BytesIO(content))
-    except zipfile.BadZipFile:
-        result["error"] = "body is not a zip archive"
-        return result
-    with zf:
-        infos = [i for i in zf.infolist() if not i.is_dir()]
-        if sum(i.file_size for i in infos) > SAVE_FILE_MAX_BYTES:
-            result["error"] = "archive exceeds size limit when extracted"
-            return result
-        if len(infos) > settings.SAVE_FILE_MAX_ENTRIES:
-            result["error"] = f"archive holds more than {settings.SAVE_FILE_MAX_ENTRIES} entries"
-            return result
-        wanted = []
-        for info in infos:
-            member = PurePosixPath(info.filename)
-            if member.is_absolute() or ".." in member.parts:
-                result["error"] = f"archive member escapes save dir: {info.filename}"
-                return result
-            if info.filename == MANIFEST_NAME:
-                # The broker's own index, not save data: it sits outside every
-                # subtree, so it has to be dropped before the subtree check.
-                continue
-            rel = member.as_posix()
-            if rel in subtrees or rel in excluded:
-                # A save file always sits inside a subtree, never is one: a dump
-                # only ever walks below `root / sub`. Writing such a member would
-                # leave a plain file where the emulator expects its save
-                # directory, and the mkdir on its next launch would fail.
-                result["error"] = f"archive member names a save subtree: {info.filename}"
-                return result
-            if _under(member, excluded):
-                result["excluded"] += 1
-                continue
-            if not _under(member, subtrees):
-                result["error"] = f"archive member outside save subtrees: {info.filename}"
-                return result
-            wanted.append(info)
-
-        root_real = root.resolve()
-        for info in wanted:
-            target = root / PurePosixPath(info.filename)
-            mtime = calendar.timegm(info.date_time)
-            exempt = _guard_exempt(always_restore, info.filename)
-            tmp: Optional[Path] = None
-            try:
-                # Belt-and-suspenders on top of the member-path check above:
-                # confirms the resolved write location is still under root
-                # even if some ancestor directory turned out to be a symlink.
-                if not target.parent.resolve().is_relative_to(root_real):
-                    log.warning("saves: %s resolves outside save dir, skipped", info.filename)
-                    result["failed"] += 1
-                    continue
-                if (
-                    not exempt
-                    and target.exists()
-                    and target.stat().st_mtime > mtime + _SAVE_MTIME_SLACK
-                ):
-                    result["skipped"] += 1
-                    continue
-                target.parent.mkdir(parents=True, exist_ok=True)
-                # Unique per member: two restores sharing one staging name
-                # interleave their writes, and the os.replace below then
-                # publishes the mixture as the player's save.
-                tmp = target.parent / f".{target.name}.{secrets.token_hex(8)}.tmp"
-                tmp.write_bytes(zf.read(info))
-                os.replace(tmp, target)
-                os.utime(target, (mtime, mtime))
-            except (OSError, ValueError, zipfile.BadZipFile) as exc:
-                log.warning("saves: could not restore %s: %s", info.filename, exc)
-                # The staging file is dot-prefixed, so `_iter_save_files` never
-                # sees it and no later dump would ever carry it off the disk.
-                if tmp is not None:
-                    try:
-                        tmp.unlink(missing_ok=True)
-                    except OSError as cleanup_exc:
-                        log.warning(
-                            "saves: could not remove the staging file %s: %s", tmp, cleanup_exc
-                        )
-                result["failed"] += 1
-                continue
-            result["written"] += 1
-    return result
+    view = read_archive(content)
+    error = view.error
+    plan: Optional[V1Plan] = None
+    if error is None:
+        plan = plan_v1(view, root, subtrees, excluded, include_imports=True)
+        error = plan.error
+    if error is not None or plan is None:
+        return {
+            "written": 0, "skipped": 0, "excluded": 0, "failed": 0, "imported": 0, "error": error
+        }
+    return write_save_archive(
+        content, root, ArchivePlan(plan.names, plan.excluded_count), always_restore
+    )
 
 
 def write_export(zip_bytes: bytes, name: str) -> str:

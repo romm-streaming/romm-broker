@@ -66,7 +66,7 @@ The response carries everything the parent needs to file the session:
 | --- | --- |
 | `status` | `exited` |
 | `session_id`, `emulator`, `rom` | Echoed from activate. |
-| `state_saved`, `state_slot`, `state_file` | Whether a final state was saved, which slot it went into, and its filename. `state_saved` is `false` when you passed `save=0`; you can still fetch that file through the state-file GET route until the next activate. |
+| `state_saved`, `state_slot`, `state_file` | Whether a final state was saved, which slot it went into, and its filename. `state_saved` is `false` when you passed `save=0`; you can still fetch the working slot's file through the state-file GET route until the next activate. DuckStation and RPCS3 are the exception: they only serve a state the exit confirmed as saved. |
 | `save_dump` | What got zipped up: the archive's name and size, plus the list of `files` with their paths relative to the save root. |
 | `upload` | The `mode` (`uploaded`, `failed`, `report-only`, or `skipped` - the last when the save dump succeeded but there were no save changes to upload), the target `url`, the HTTP status, and, if it failed, the `error` message and the `path` the archive was written to. |
 

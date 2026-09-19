@@ -9,13 +9,18 @@ import logging
 import os
 import threading
 import time
+import zipfile
 from collections.abc import Callable
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional, Union
 
 import pytest
+from fastapi.testclient import TestClient
 
+from webstation_broker import imports
 from webstation_broker.emulators import retroarch
+
+from .conftest import PREFIX, import_zip, preflight_import, restore_import
 
 
 def test_the_table_is_the_one_on_disk() -> None:
@@ -209,6 +214,31 @@ class TestBrokerConfig:
         assert f'savestate_directory = "{retroarch.STATE_DIR}"' in cfg
         assert f'savefile_directory = "{retroarch.SAVE_DIR}"' in cfg
 
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("sort_savefiles_enable", "true"),
+            ("sort_savestates_enable", "true"),
+            ("sort_savefiles_by_content_enable", "false"),
+            ("sort_savestates_by_content_enable", "false"),
+            ("savefiles_in_content_dir", "false"),
+            ("savestates_in_content_dir", "false"),
+        ],
+    )
+    def test_the_save_dir_layout_is_pinned_to_retroarch_s_defaults(self, key: str, value: str) -> None:
+        """The overlay states RetroArch's shipped sort settings, so a user config cannot move saves.
+
+        SRAM then loads from `saves/<library_name>/<content>.srm`, where every
+        archive already holds it and where an imported `.srm` is placed.
+
+        Args:
+            key: The retroarch.cfg key.
+            value: RetroArch 1.22.2's shipped default for it.
+        """
+        cfg = retroarch._write_broker_cfg().read_text()
+
+        assert f'{key} = "{value}"' in cfg
+
     def test_the_system_dir_is_stated_in_the_overlay(self) -> None:
         """The overlay names the system directory the broker fills.
 
@@ -237,6 +267,116 @@ def test_extensions_and_save_subtrees_survive_the_load_as_tuples() -> None:
         assert isinstance(info["extensions"], tuple), slug
         if "save_subtrees" in info:
             assert isinstance(info["save_subtrees"], tuple), slug
+
+
+@pytest.mark.parametrize(
+    ("platform", "name"),
+    [
+        ("gb", "Gambatte"),
+        ("GBC", "Gambatte"),
+        ("snes", "Snes9x"),
+        ("gba", "mGBA"),
+        ("ngc", "dolphin-emu"),
+        ("wii", "dolphin-emu"),
+        ("3ds", "Azahar"),
+        ("psp", "PPSSPP"),
+        ("psx", "SwanStation"),
+        ("vectrex", "VecX"),
+        ("intellivision", "freeintv"),
+        ("atari-st", "hatari"),
+    ],
+)
+def test_a_platform_names_the_sorted_dir_its_core_reports(platform: str, name: str) -> None:
+    """A platform's `library_name` is the name its core reports, not always the core's file name.
+
+    Args:
+        platform: The RomM platform slug.
+        name: The name the core reports in `retro_get_system_info`.
+    """
+    assert retroarch._library_name(platform) == name
+
+
+@pytest.mark.parametrize("platform", [None, "", "ps2"])
+def test_an_unmapped_platform_names_no_sorted_dir(platform: Optional[str]) -> None:
+    """No platform, or one with no core, has no library name.
+
+    Args:
+        platform: The slug, or None.
+    """
+    assert retroarch._library_name(platform) is None
+
+
+def test_every_library_name_is_one_safe_directory_name() -> None:
+    """Each `library_name` is a single, non-empty, non-hidden path component.
+
+    It names the directory under `saves/` that an imported `.srm` lands in.
+    """
+    for slug, info in retroarch.PLATFORMS.items():
+        name = info["library_name"]
+        assert name and name == name.strip(), slug
+        assert "/" not in name and "\\" not in name and not name.startswith("."), slug
+
+
+def test_one_core_reports_one_library_name() -> None:
+    """Every platform on one core names the same sorted dir: the name belongs to the core."""
+    names: dict[str, set[str]] = {}
+    for info in retroarch.PLATFORMS.values():
+        names.setdefault(info["core"], set()).add(info["library_name"])
+
+    assert {core: n for core, n in names.items() if len(n) > 1} == {}
+
+
+def test_a_scoped_platform_s_saves_sit_in_its_core_s_sorted_dir() -> None:
+    """The narrowed save subtrees of dolphin and azahar sit under `saves/<library_name>/`.
+
+    Both were written by hand before `library_name` existed; this ties the two together.
+    """
+    for slug, info in retroarch.PLATFORMS.items():
+        for subtree in info.get("save_subtrees", ()):
+            if subtree != "states":
+                assert subtree.startswith(f"saves/{info['library_name']}/"), (slug, subtree)
+
+
+_SRM_PLATFORMS = frozenset(
+    {
+        "nes", "famicom", "snes", "sfam", "n64", "gb", "gbc", "gba", "virtualboy", "genesis", "sms",
+        "gamegear", "sg1000", "sega32", "tg16", "turbografx-cd", "supergrafx", "neo-geo-cd",
+        "wonderswan", "wonderswan-color", "jaguar", "colecovision", "psx",
+    }
+)  # fmt: skip
+"""The 23 platforms whose core exposes `RETRO_MEMORY_SAVE_RAM`, per the 2026-09-18 source check."""
+
+
+def test_a_srm_is_taken_on_exactly_the_platforms_whose_core_loads_one() -> None:
+    """The `.srm` predicate answers yes on the 23 checked platforms, and the table's flags agree.
+
+    The second check keeps `save_ram` false on psp, dolphin and azahar too,
+    though the predicate refuses those for reasons of their own.
+    """
+    taken = {slug for slug in retroarch.PLATFORMS if isinstance(retroarch._srm_dir(slug), str)}
+
+    assert taken == _SRM_PLATFORMS
+    assert {slug for slug, info in retroarch.PLATFORMS.items() if info["save_ram"]} == _SRM_PLATFORMS
+
+
+@pytest.mark.parametrize("entry", [{}, {"save_ram": "true"}, {"save_ram": 1}, {"save_ram": None}])
+def test_a_platform_without_a_boolean_save_ram_fails_the_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, entry: dict[str, Any]
+) -> None:
+    """An entry that leaves `save_ram` out, or spells it as anything but a bool, stops the table loading.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher.
+        tmp_path: The per-test temporary directory.
+        entry: The `save_ram` part of the entry.
+    """
+    table = tmp_path / "platforms.json"
+    info = {"core": "snes9x", "library_name": "Snes9x", "extensions": [".sfc"], **entry}
+    table.write_text(json.dumps({"snes": info}))
+    monkeypatch.setattr(retroarch, "_PLATFORMS_FILE", table)
+
+    with pytest.raises(ValueError, match="platforms.json: snes needs a true or false save_ram"):
+        retroarch._load_platforms()
 
 
 class TestResumeGate:
@@ -2208,3 +2348,609 @@ def test_a_launch_tells_retroarch_which_config_the_broker_read(
     cmd = spawned[0]
     assert cmd[cmd.index("--config") + 1] == str(retroarch.RA_CONFIG_PATH)
 
+
+
+@pytest.mark.parametrize(
+    ("filename", "base", "expected"),
+    [
+        ("Game.state", "Game", True),
+        ("Game.state3", "Game", True),
+        ("Game.state99", "Game", True),
+        ("Game.state.auto", "Game", True),
+        ("Game [USA].state", "Game [USA]", True),
+        ("Game.state100", "Game", False),
+        ("Game.state\n", "Game", False),
+        ("Game.state1.state", "Game", False),
+        ("Game.state.foo.state", "Game", False),
+        ("Game.state\u0663", "Game", False),
+        ("sub/Game.state", "Game", False),
+        ("Other.state", "Game", False),
+    ],
+)
+def test_a_state_name_must_end_in_one_whole_suffix(filename: str, base: str, expected: bool) -> None:
+    """Only the base followed by one whole state suffix is a state RetroArch writes for that content.
+
+    The suffix used to be searched for at the end of the name, so anything
+    between the base and a trailing `.state` passed, and so did a trailing
+    newline or a non-ASCII digit.
+
+    Args:
+        filename: The pushed name.
+        base: The loaded content's basename.
+        expected: Whether it names one of that content's states.
+    """
+    assert retroarch._is_state_name(filename, base) is expected
+
+
+class TestStateTarget:
+    """Where a state pushed through PUT /api/session/state-file is written."""
+
+    @pytest.fixture
+    def emu(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> retroarch.Retroarch:
+        """A session with `Game (USA)` loaded on gb, and its state dir in tmp_path.
+
+        Args:
+            tmp_path: The per-test temporary directory.
+            monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            The session.
+        """
+        monkeypatch.setattr(retroarch, "STATE_DIR", tmp_path / "states")
+        monkeypatch.setattr(retroarch, "STATE_SLOT", 0)
+        retroarch.STATE_DIR.mkdir()
+        emu = retroarch.Retroarch()
+        emu.platform = "gb"
+        emu._rom_base = "Game (USA)"
+        return emu
+
+    def test_a_first_push_lands_in_the_core_s_sorted_dir(self, emu: retroarch.Retroarch) -> None:
+        """With no state yet, a push goes to `states/<library_name>/`, where the core reads it.
+
+        It used to go to the top of `STATE_DIR`, where no sorted core looks.
+        The pushed name's slot does not matter; the broker files it into its own.
+
+        Args:
+            emu: The session.
+        """
+        target = emu.state_target("Game (USA).state3")
+
+        assert target == retroarch.STATE_DIR / "Gambatte" / "Game (USA).state"
+
+    def test_a_push_replaces_the_state_already_in_the_slot(self, emu: retroarch.Retroarch) -> None:
+        """An existing slot file is where the push goes.
+
+        Args:
+            emu: The session.
+        """
+        existing = retroarch.STATE_DIR / "Gambatte" / "Game (USA).state"
+        existing.parent.mkdir()
+        existing.write_bytes(b"old")
+
+        assert emu.state_target("Game (USA).state") == existing
+
+    def test_no_platform_falls_back_to_the_top_of_the_state_dir(self, emu: retroarch.Retroarch) -> None:
+        """Without a platform there is no library name to sort by.
+
+        Args:
+            emu: The session.
+        """
+        emu.platform = None
+
+        assert emu.state_target("Game (USA).state") == retroarch.STATE_DIR / "Game (USA).state"
+
+    @pytest.mark.parametrize("filename", ["Other (USA).state", "Game (USA).state\n", "Game (USA).srm"])
+    def test_a_name_that_is_not_this_content_s_state_has_no_target(
+        self, emu: retroarch.Retroarch, filename: str
+    ) -> None:
+        """Another game's state, a name with a trailing newline, or an SRAM file is refused.
+
+        Args:
+            emu: The session.
+            filename: The pushed name.
+        """
+        assert emu.state_target(filename) is None
+
+
+@pytest.fixture
+def ra_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point RetroArch's data, state and save dirs, and its save root, at tmp_path.
+
+    Args:
+        tmp_path: The per-test temporary directory.
+        monkeypatch: The pytest monkeypatch fixture.
+
+    Returns:
+        The patched data root.
+    """
+    monkeypatch.setattr(retroarch, "RA_DATA_DIR", tmp_path)
+    monkeypatch.setattr(retroarch, "STATE_DIR", tmp_path / "states")
+    monkeypatch.setattr(retroarch, "SAVE_DIR", tmp_path / "saves")
+    monkeypatch.setattr(retroarch.Retroarch, "save_root", tmp_path)
+    return tmp_path
+
+
+def _on(platform: Optional[str]) -> retroarch.Retroarch:
+    """A RetroArch session set to one platform.
+
+    Args:
+        platform: The RomM platform slug, or None.
+
+    Returns:
+        The session.
+    """
+    emu = retroarch.Retroarch()
+    emu.platform = platform
+    return emu
+
+
+_SRM_EXPECTED = "one non-empty <name>.srm, the core's SRAM"
+"""The shape a refused save is told to take, spelled out so the tests do not lean on the module."""
+_STATE_AS_SAVE = "a RetroArch state, which is PUT to /api/session/state-file after activate"
+"""The detail a state sent as a save is refused with."""
+_PUSHED = "a state PUT to /api/session/state-file after activate, with resume_slot set"
+"""What the kind gate tells a state sent to an emulator that takes states through the push routes."""
+
+
+def _unconverted(suffix: str) -> str:
+    """The detail a save file with an unverified suffix is refused with.
+
+    Args:
+        suffix: The member's suffix, lower-cased.
+
+    Returns:
+        The detail.
+    """
+    return f"{suffix} files are not placed until each core's name for them is verified; send the core's .srm"
+
+
+def _own_folders(core: str) -> str:
+    """The detail a save for a core with its own save folders is refused with.
+
+    Args:
+        core: The core's name.
+
+    Returns:
+        The detail.
+    """
+    return f"the {core} core keeps its saves in its own folders, which imports do not place yet"
+
+
+def _no_srm(core: str, platform: str) -> str:
+    """The detail a save is refused with where the core loads no `.srm`.
+
+    Args:
+        core: The core's name.
+        platform: The RomM platform slug.
+
+    Returns:
+        The detail.
+    """
+    return (
+        f"the {core} core does not load a .srm on {platform}; "
+        "it keeps its save in a file of its own, or has none"
+    )
+
+
+def _member(tail: str, kind: str) -> imports.ImportMember:
+    """Build a hygienic member without an archive behind it.
+
+    Args:
+        tail: The path below `.import/<kind>/`.
+        kind: The declared kind.
+
+    Returns:
+        The member.
+    """
+    info = zipfile.ZipInfo(f".import/{kind}/{tail}")
+    info.file_size = 4
+    info.flag_bits |= 0x800
+    member = imports.normalise_member(info, imports.ManifestEntry(info.filename, kind, "unknown"), zf=None)
+    assert isinstance(member, imports.ImportMember)
+    return member
+
+
+@pytest.mark.parametrize(
+    ("platform", "shapes", "max_members", "channel"),
+    [
+        ("snes", ["<name>.srm"], 1, "push"),
+        ("psx", ["<name>.srm"], 1, "push"),
+        ("jaguar", ["<name>.srm"], 1, "none"),
+        ("dc", [], None, "push"),
+        ("arcade", [], None, "push"),
+        ("segacd", [], None, "push"),
+        ("psp", [], None, "push"),
+        ("ngc", [], None, "push"),
+        ("3ds", [], None, "push"),
+        ("ps2", [], None, "none"),
+        (None, [], None, "none"),
+    ],
+)
+def test_the_import_spec_follows_the_platform(
+    platform: Optional[str], shapes: list[str], max_members: Optional[int], channel: str
+) -> None:
+    """One `.srm` where the core loads SRAM from one, none elsewhere; states go through the push routes.
+
+    An empty shape list tells RomM the save is refused on that platform, and
+    `place_import` says why. Jaguar's core has no states, and nothing launches
+    on an unmapped platform, so neither takes a pushed state.
+
+    Args:
+        platform: The RomM platform slug, or None.
+        shapes: The save shapes discovery reports.
+        max_members: The most saves one archive may place.
+        channel: How states are taken.
+    """
+    spec = _on(platform).import_spec()
+
+    assert spec.as_dict() == {
+        "kinds": [
+            {"kind": "save", "shapes": shapes, "requires_resume_slot": False, "max_members": max_members}
+        ],
+        "state_channel": channel,
+        "card_subtree": None,
+    }
+    assert spec.protected == ()
+    save = spec.kind("save")
+    assert save is not None and save.counts_v1 is False
+
+
+@pytest.mark.parametrize(
+    ("platform", "rom", "name", "dest"),
+    [
+        ("snes", "Game (USA).sfc", "Game (USA).srm", "saves/Snes9x/Game (USA).srm"),
+        ("snes", "Game (USA).sfc", "whatever.SRM", "saves/Snes9x/Game (USA).srm"),
+        ("gb", "Game.gb", "Game.srm", "saves/Gambatte/Game.srm"),
+        ("psx", "Game (USA).m3u", "Game (USA) (Disc 1).srm", "saves/SwanStation/Game (USA).srm"),
+        ("genesis", "Sonic.md", "Sonic.srm", "saves/Genesis Plus GX/Sonic.srm"),
+    ],
+)
+def test_a_srm_lands_where_the_core_loads_sram_for_the_booted_content(
+    ra_dirs: Path, platform: str, rom: str, name: str, dest: str
+) -> None:
+    """The save is renamed to the booted content's stem, in the core's sorted dir.
+
+    For a playlist boot that is the playlist's stem, whichever disc the save was named for.
+
+    Args:
+        ra_dirs: The patched data root.
+        platform: The RomM platform slug.
+        rom: The booted file's name.
+        name: The member's file name.
+        dest: Where it must land, relative to `save_root`.
+    """
+    body = import_zip({f".import/save/{name}": b"sram"})
+
+    result = preflight_import(_on(platform), body, rom_file=ra_dirs / rom)
+
+    assert result.refusals == ()
+    assert [(p.dest, p.sidecars) for p in result.placements] == [(PurePosixPath(dest), ())]
+
+
+@pytest.mark.parametrize(
+    ("name", "size", "reason", "detail"),
+    [
+        ("sub/Game.srm", 4, "unrecognised_layout", "expected a single file"),
+        ("Game.srm", 0, "incomplete_unit", "the file is empty"),
+        ("Game.sav", 4, "needs_conversion", _unconverted(".sav")),
+        ("Game.RTC", 4, "needs_conversion", _unconverted(".rtc")),
+        ("Game.nv", 4, "needs_conversion", _unconverted(".nv")),
+        ("Game.eep", 4, "needs_conversion", _unconverted(".eep")),
+        ("Game.mpk", 4, "needs_conversion", _unconverted(".mpk")),
+        ("Game.state", 4, "unrecognised_layout", _STATE_AS_SAVE),
+        ("Game.state3", 4, "unrecognised_layout", _STATE_AS_SAVE),
+        ("Game.state.auto", 4, "unrecognised_layout", _STATE_AS_SAVE),
+        ("Game.bin", 4, "unrecognised_layout", None),
+    ],
+)
+def test_a_save_that_is_not_one_srm_is_refused(
+    ra_dirs: Path, name: str, size: int, reason: str, detail: Optional[str]
+) -> None:
+    """A nested file, an empty one, an unverified save file, a state or any other name is refused.
+
+    Args:
+        ra_dirs: The patched data root.
+        name: The member's path below `.import/save/`.
+        size: The member's size.
+        reason: The refusal code.
+        detail: The refusal's detail.
+    """
+    body = import_zip({f".import/save/{name}": b"\0" * size})
+
+    result = preflight_import(_on("snes"), body, rom_file=ra_dirs / "Game.sfc")
+
+    assert [(r.reason, r.member, r.expected, r.detail) for r in result.refusals] == [
+        (reason, f".import/save/{name}", _SRM_EXPECTED, detail)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("platform", "reason", "expected", "detail", "suggest"),
+    [
+        (
+            "psp",
+            "destination_unresolvable",
+            "a PSP SAVEDATA folder, launched on ppsspp",
+            "the PPSSPP core keeps saves as SAVEDATA folders, not a .srm",
+            "ppsspp",
+        ),
+        ("ngc", "shape_unverified", None, _own_folders("dolphin"), None),
+        ("wii", "shape_unverified", None, _own_folders("dolphin"), None),
+        ("3ds", "shape_unverified", None, _own_folders("azahar"), None),
+        ("dc", "destination_unresolvable", None, _no_srm("flycast", "dc"), None),
+        ("arcade", "destination_unresolvable", None, _no_srm("fbneo", "arcade"), None),
+        ("nds", "destination_unresolvable", None, _no_srm("melonds", "nds"), None),
+        ("fds", "destination_unresolvable", None, _no_srm("mesen", "fds"), None),
+        ("segacd", "destination_unresolvable", None, _no_srm("genesis_plus_gx", "segacd"), None),
+        ("atari5200", "destination_unresolvable", None, _no_srm("a5200", "atari5200"), None),
+        ("ps2", "destination_unresolvable", None, "RetroArch has no core for platform 'ps2'", None),
+        (None, "destination_unresolvable", None, "RetroArch has no core for platform None", None),
+    ],
+)
+def test_a_save_on_a_platform_without_a_srm_is_refused_with_the_reason(
+    ra_dirs: Path,
+    platform: Optional[str],
+    reason: str,
+    expected: Optional[str],
+    detail: str,
+    suggest: Optional[str],
+) -> None:
+    """A platform whose core loads no `.srm`, and an unmapped one, refuse it, each saying why.
+
+    fds and segacd share their core with nes and genesis, which take one: the
+    answer is per platform, not per core.
+
+    Args:
+        ra_dirs: The patched data root.
+        platform: The RomM platform slug, or None.
+        reason: The refusal code.
+        expected: The refusal's expected shape.
+        detail: The refusal's detail.
+        suggest: The emulator the refusal points at, or None.
+    """
+    body = import_zip({".import/save/Game.srm": b"sram"})
+
+    result = preflight_import(_on(platform), body, rom_file=ra_dirs / "Game.iso")
+
+    assert [(r.reason, r.expected, r.detail, r.suggest_emulator) for r in result.refusals] == [
+        (reason, expected, detail, suggest)
+    ]
+
+
+@pytest.mark.parametrize("platform", sorted(retroarch.PLATFORMS))
+def test_a_platform_advertises_a_srm_exactly_when_it_places_one(ra_dirs: Path, platform: str) -> None:
+    """The spec's save shapes and `place_import` agree on every platform in the table.
+
+    `suggest_for` reads the shapes, so a platform that advertised a `.srm`
+    it then refused would send players to a dead end.
+
+    Args:
+        ra_dirs: The patched data root.
+        platform: The RomM platform slug.
+    """
+    emu = _on(platform)
+    body = import_zip({".import/save/Game.srm": b"sram"})
+
+    result = preflight_import(emu, body, rom_file=ra_dirs / "Game.bin")
+
+    save = emu.import_spec().kind("save")
+    assert save is not None
+    assert bool(save.shapes) is (result.refusals == ()), [r.as_dict() for r in result.refusals]
+
+
+def test_a_srm_with_no_rom_to_name_it_after_is_refused(ra_dirs: Path) -> None:
+    """RetroArch names SRAM after the booted file, so without one there is nowhere to put it.
+
+    Args:
+        ra_dirs: The patched data root.
+    """
+    body = import_zip({".import/save/Game.srm": b"sram"})
+
+    result = preflight_import(_on("snes"), body, rom_file=None)
+
+    assert [(r.reason, r.detail) for r in result.refusals] == [
+        ("destination_unresolvable", "no rom file to name the save after")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("platform", "kind", "reason", "expected"),
+    [
+        ("snes", "state", "state_uses_push", _PUSHED),
+        ("jaguar", "state", "kind_not_accepted", "save"),
+        ("psx", "memcard", "kind_not_accepted", "save"),
+    ],
+)
+def test_a_state_or_a_card_is_refused_by_the_kind_gate(
+    ra_dirs: Path, platform: str, kind: str, reason: str, expected: str
+) -> None:
+    """A state is pushed where the core has states; a card is resent as the core's `.srm` save.
+
+    Args:
+        ra_dirs: The patched data root.
+        platform: The RomM platform slug.
+        kind: The member's declared kind.
+        reason: The refusal code.
+        expected: The refusal's expected shape.
+    """
+    body = import_zip({f".import/{kind}/Game.state": b"x"})
+
+    result = preflight_import(_on(platform), body, rom_file=ra_dirs / "Game.bin", resume_slot=0)
+
+    assert [(r.reason, r.expected) for r in result.refusals] == [(reason, expected)]
+
+
+def test_two_srm_members_are_both_refused(ra_dirs: Path) -> None:
+    """RetroArch loads one SRAM file per content, so two members would land on the same file.
+
+    Args:
+        ra_dirs: The patched data root.
+    """
+    body = import_zip({".import/save/A.srm": b"a", ".import/save/B.srm": b"b"})
+
+    result = preflight_import(_on("snes"), body, rom_file=ra_dirs / "Game.sfc")
+
+    assert [(r.reason, r.member, r.detail) for r in result.refusals] == [
+        ("destination_conflict", ".import/save/A.srm", "another member lands on the same file"),
+        ("destination_conflict", ".import/save/B.srm", "another member lands on the same file"),
+    ]
+
+
+def test_a_srm_the_archive_already_holds_for_the_content_is_a_conflict(ra_dirs: Path) -> None:
+    """An archived `.srm` at the import's destination is not silently overwritten.
+
+    Args:
+        ra_dirs: The patched data root.
+    """
+    body = import_zip({".import/save/Game.srm": b"new"}, v1={"saves/Snes9x/Game.srm": b"old"})
+
+    result = preflight_import(_on("snes"), body, rom_file=ra_dirs / "Game.sfc")
+
+    assert [(r.reason, r.member) for r in result.refusals] == [
+        ("destination_conflict", ".import/save/Game.srm")
+    ]
+
+
+def test_the_archive_s_other_save_files_do_not_count_against_the_one_srm(ra_dirs: Path) -> None:
+    """Another game's `.srm` or a clock file in the archive leaves room for the import.
+
+    Args:
+        ra_dirs: The patched data root.
+    """
+    body = import_zip(
+        {".import/save/Game.srm": b"new"},
+        v1={"saves/Snes9x/Other.srm": b"other", "saves/Snes9x/Game.rtc": b"clock"},
+    )
+
+    result = preflight_import(_on("snes"), body, rom_file=ra_dirs / "Game.sfc")
+
+    assert result.refusals == ()
+    assert [p.dest for p in result.placements] == [PurePosixPath("saves/Snes9x/Game.srm")]
+
+
+@pytest.mark.parametrize(("name", "logged"), [("Old Name.srm", True), ("Game.srm", False)])
+def test_a_srm_renamed_for_the_booted_content_is_logged(
+    ra_dirs: Path, caplog: pytest.LogCaptureFixture, name: str, logged: bool
+) -> None:
+    """The member's own stem is discarded, and the log says so when it differed.
+
+    Either way the save is accepted, so a missing log line is never a refusal.
+
+    Args:
+        ra_dirs: The patched data root.
+        caplog: Pytest's log capture.
+        name: The member's file name.
+        logged: Whether the rename is logged.
+    """
+    body = import_zip({f".import/save/{name}": b"sram"})
+
+    with caplog.at_level(logging.INFO, logger=retroarch.log.name):
+        result = preflight_import(_on("snes"), body, rom_file=ra_dirs / "Game.sfc")
+
+    assert result.refusals == ()
+    assert [p.dest.as_posix() for p in result.placements] == ["saves/Snes9x/Game.srm"]
+    assert (f"import .import/save/{name} placed as saves/Snes9x/Game.srm" in caplog.text) is logged
+
+
+@pytest.mark.parametrize(
+    ("platform", "tail", "kind", "suggestion"),
+    [
+        ("snes", "Game.srm", "save", "retroarch"),
+        ("gb", "Game.srm", "save", "retroarch"),
+        ("snes", "Game.state1", "state", "retroarch"),
+        ("jaguar", "Game.state", "state", None),
+        ("psp", "Game.srm", "save", None),
+        ("ngc", "Game.srm", "save", None),
+        ("3ds", "Game.srm", "save", None),
+        ("dc", "Game.srm", "save", None),
+        ("arcade", "Game.srm", "save", None),
+        ("ps2", "Game.srm", "save", None),
+        (None, "Game.srm", "save", None),
+    ],
+)
+def test_retroarch_is_suggested_only_where_it_would_take_the_member(
+    platform: Optional[str], tail: str, kind: str, suggestion: Optional[str]
+) -> None:
+    """Another emulator's refusal points at RetroArch only where RetroArch's spec takes the member.
+
+    Args:
+        platform: The RomM platform slug, or None.
+        tail: The member's path below `.import/<kind>/`.
+        kind: The member's declared kind.
+        suggestion: The emulator suggested, or None.
+    """
+    assert imports.suggest_for(_member(tail, kind), platform) == suggestion
+
+
+@pytest.mark.parametrize(
+    ("platform", "tail", "suggestion"),
+    [
+        ("snes", "Game.state1", "retroarch"),
+        ("psx", "Game.state1", "retroarch"),
+        ("psx", "Game.state.auto", "retroarch"),
+        ("psx", "Game.srm", None),
+        ("dc", "Game.srm", None),
+        ("snes", "Game.state", None),
+    ],
+)
+def test_a_state_suggests_retroarch_only_under_a_retroarch_slot_name(
+    platform: str, tail: str, suggestion: Optional[str]
+) -> None:
+    """A push channel is not enough: `state_target` would refuse a `.srm` declared as a state.
+
+    A bare `.state` is left out too, as `LIBRETRO_STATE_RE` leaves it out:
+    flycast takes that name as its own.
+
+    Args:
+        platform: The RomM platform slug.
+        tail: The member's path below `.import/state/`.
+        suggestion: The emulator suggested, or None.
+    """
+    assert imports.suggest_for(_member(tail, "state"), platform) == suggestion
+
+
+def test_an_imported_srm_is_written_where_the_core_loads_it(ra_dirs: Path) -> None:
+    """The restore writes the save into the core's sorted dir, byte for byte.
+
+    Args:
+        ra_dirs: The patched data root.
+    """
+    emu = _on("snes")
+    sram = bytes(range(256)) * 32
+    body = import_zip({".import/save/whatever.srm": sram})
+    result = preflight_import(emu, body, rom_file=ra_dirs / "Game (USA).sfc")
+
+    report = restore_import(emu, body, result)
+
+    assert (report["imported"], report["failed"]) == (1, 0)
+    assert (ra_dirs / "saves" / "Snes9x" / "Game (USA).srm").read_bytes() == sram
+
+
+@pytest.mark.parametrize(
+    ("platform", "shapes", "channel", "slot"),
+    [
+        ("snes", ["<name>.srm"], "push", retroarch.STATE_SLOT),
+        ("jaguar", ["<name>.srm"], "none", None),
+        ("dc", [], "push", retroarch.STATE_SLOT),
+    ],
+)
+def test_discovery_reports_the_srm_and_the_state_slot(
+    client: TestClient, platform: str, shapes: list[str], channel: str, slot: Optional[int]
+) -> None:
+    """Discovery answers the platform's spec, and names the slot only where the core has states.
+
+    On dc the Flycast core keeps VMU files rather than a `.srm`, so no save shape is offered.
+
+    Args:
+        client: The app, served without a secret.
+        platform: The RomM platform slug.
+        shapes: The save shapes it must report.
+        channel: The state channel it must report.
+        slot: The state slot it must report.
+    """
+    params = {"emulator": "retroarch", "platform": platform}
+    response = client.get(f"{PREFIX}/api/session/import-spec", params=params)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert (body["kinds"][0]["shapes"], body["state_channel"], body["state_slot"]) == (shapes, channel, slot)

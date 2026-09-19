@@ -115,10 +115,72 @@ that platform," not as settled fact.
 | MSX / MSX2 | `bluemsx` | Required | Machine-specific system ROMs (e.g. `MSX.ROM`, `MSX2.ROM`, `MSX2EXT.ROM`, `DISK.ROM`). Which ones you need varies by region. |
 | ZX Spectrum | `fuse` | None | ROM ships bundled with the core. |
 
+## Saves, states and imports
+
+RetroArch sorts each core's files into a folder named for the core. The
+folder takes the name the core reports about itself, which isn't always the
+core's file name: the `dolphin` core reports `dolphin-emu`.
+
+- In-game saves (SRAM) go in `saves/<core name>/<game>.srm`.
+- Save states go in `states/<core name>/`.
+
+The broker states these settings on every launch, so a setting in your own
+`retroarch.cfg` can't move saves away from where every save archive already
+keeps them. The platform table records each core's reported name as
+`library_name`.
+
+A [declared import](/docs/api/imports) can bring one `.srm` save into a
+session only on a platform whose core loads one. The platform table records
+this as `save_ram`, taken from a check of each core's source. These 23
+platforms take one:
+
+`nes`, `famicom`, `snes`, `sfam`, `n64`, `gb`, `gbc`, `gba`, `virtualboy`,
+`genesis`, `sms`, `gamegear`, `sg1000`, `sega32`, `tg16`, `turbografx-cd`,
+`supergrafx`, `neo-geo-cd`, `wonderswan`, `wonderswan-color`, `jaguar`,
+`colecovision` and `psx`.
+
+On `psx`, the `.srm` is the SwanStation core's first memory card. The core
+loads it only while its `swanstation_MemoryCards_Card1Type` option stays at
+the default, `Libretro`. The broker doesn't set core options, so an imported
+save won't load if that option has been changed in RetroArch.
+
+The other platforms refuse a `.srm`:
+
+- **PSP**: the PPSSPP core keeps saves as SAVEDATA folders, not a `.srm`.
+  The refusal names the standalone PPSSPP module instead.
+- **GameCube, Wii and 3DS**: these cores keep saves in their own folder
+  layouts, which imports don't place yet.
+- **The rest**: the core keeps its save in a file of its own, or has none,
+  so it would never read a `.srm`. The paths below are inside the core's
+  `saves/` folder unless noted.
+
+| Core (platforms) | Where the save is |
+| --- | --- |
+| `melonds` (nds) | `<game>.sav` |
+| `flycast` (dc) | VMU files in the system folder, `dc/vmu_save_<port>.bin`, shared by every game |
+| `fbneo` (arcade, cps1, cps2, cps3, neogeoaes, neogeomvs) | `fbneo/<driver>.fs` or `.nv`, named for the driver |
+| `mednafen_ngp` (neo-geo-pocket, neo-geo-pocket-color) | `<game>.flash` |
+| `handy` (lynx) | `<game>.eeprom` |
+| `bluemsx` (msx, msx2) | `<game>.sram` |
+| `opera` (3do) | `opera/per_game/<game>.0.srm` |
+| `dosbox_pure` (dos) | `<game>.pure.zip` |
+| `stella` (atari2600) | `stella/nvram/` |
+| `yabasanshiro` (saturn) | `yabasanshiro/backup.bin`, shared by every game |
+| `genesis_plus_gx` (segacd) | `scd_<region>.brm`, shared by every game of that region |
+| `mesen` (fds) | `<game>.ips`, a patch against the disk |
+| `puae`, `vice_x64`, `hatari` (amiga, c64, atari-st) | written into the disk image |
+| `a5200`, `prosystem`, `freeintv`, `vecx`, `o2em`, `fuse` | no battery save |
+
+The broker renames an imported save after the game being launched, whatever
+it was called before. It refuses a `.sav`, `.rtc`, `.nv`, `.eep` or `.mpk`
+file as needing conversion until each core's name for that file has been
+checked. A save state isn't imported as a save: send it to
+`PUT /api/session/state-file` after activate.
+
 ## Source
 
 Generated from `webstation_broker/emulators/retroarch_platforms.json` and
 `webstation_broker/emulators/retroarch.py`, cross-referenced against
 libretro's BIOS Information Hub. Update this table if platform mappings,
-`core_source` overrides, `assets`, `save_subtrees`, or `savestate` fields
-change in `retroarch_platforms.json`.
+`core_source` overrides, `assets`, `save_subtrees`, `library_name`,
+`save_ram`, or `savestate` fields change in `retroarch_platforms.json`.

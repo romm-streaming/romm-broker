@@ -6,6 +6,7 @@ exports, context, exit and disc swap.
 
 import io
 import json
+import logging
 import os
 import shutil
 import signal
@@ -13,19 +14,19 @@ import subprocess
 import time
 import zipfile
 from collections.abc import Callable
-from pathlib import Path
-from typing import Any, Optional
+from pathlib import Path, PurePosixPath
+from typing import Any, Optional, Union
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketState
 
-from webstation_broker import api, callback, saves, screenshot, selkies, session, settings
+from webstation_broker import api, callback, imports, saves, screenshot, selkies, session, settings
 from webstation_broker.app import create_app
 from webstation_broker.emulators import base, rpcs3, shadps4
 
-from .conftest import PREFIX, SLEEPER_CMD, FakeEmulator
+from .conftest import PREFIX, SLEEPER_CMD, FakeEmulator, corrupt_zip_member, mangle_zip_member
 
 API = f"{PREFIX}/api"
 
@@ -2232,6 +2233,53 @@ def test_an_archive_held_back_by_the_card_sync_is_reported(
     assert "memory-card routes" in body["save_restore_skipped"]
 
 
+@pytest.mark.parametrize("bad", ["unreadable-zip", "read-raises"])
+def test_a_skipped_archive_that_cannot_be_read_is_still_just_skipped(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+    bad: str,
+) -> None:
+    """The look for imports in a skipped archive never turns the old skip into a crash.
+
+    Args:
+        client: The app client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The instances the registry built.
+        monkeypatch: Pytest's attribute patcher.
+        bad: How the read fails: a body `zipfile` chokes on, or a reader that raises.
+    """
+    from webstation_broker import emulators
+
+    monkeypatch.setattr(emulators.REGISTRY["fake"], "save_subtrees", ())
+    archive = broker_dirs["imports"] / "sess-1.zip"
+    body = _zip({"saves/X": b"stored"})
+    if bad == "unreadable-zip":
+        body = mangle_zip_member(body, "saves/X", flags=0x800, raw_name=b"saves/\xff")
+    else:
+
+        def _boom(content: bytes) -> saves.ArchiveView:
+            """Fail the way an unforeseen zip defect would.
+
+            Args:
+                content: The archive body.
+
+            Raises:
+                RuntimeError: Always.
+            """
+            raise RuntimeError("unforeseen")
+
+        monkeypatch.setattr(saves, "read_archive", _boom)
+    archive.write_bytes(body)
+
+    response = _activate(client, broker_dirs, save={"archive": str(archive)})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "launching"
+    assert "no save subtree" in response.json()["save_restore_skipped"]
+
+
 def test_the_clear_is_told_which_subtree_the_card_routes_carry(
     client: TestClient,
     broker_dirs: dict[str, Path],
@@ -2276,9 +2324,9 @@ def test_a_fully_failed_restore_is_reported_not_launched(
     calls it a restore.
     """
     def _all_fail(*args: object, **kwargs: object) -> dict[str, Any]:
-        return {"written": 0, "skipped": 0, "excluded": 0, "failed": 2, "error": None}
+        return {"written": 0, "skipped": 0, "excluded": 0, "failed": 2, "imported": 0, "error": None}
 
-    monkeypatch.setattr(saves, "extract_save_archive", _all_fail)
+    monkeypatch.setattr(saves, "write_save_archive", _all_fail)
     archive = broker_dirs["imports"] / "sess-1.zip"
     archive.write_bytes(_zip({"saves/card.bin": b"stored"}))
 
@@ -2302,9 +2350,9 @@ def test_a_partially_failed_restore_is_reported_not_launched(
     though the rest of the archive landed fine.
     """
     def _partial_fail(*args: object, **kwargs: object) -> dict[str, Any]:
-        return {"written": 3, "skipped": 0, "excluded": 0, "failed": 1, "error": None}
+        return {"written": 3, "skipped": 0, "excluded": 0, "failed": 1, "imported": 0, "error": None}
 
-    monkeypatch.setattr(saves, "extract_save_archive", _partial_fail)
+    monkeypatch.setattr(saves, "write_save_archive", _partial_fail)
     archive = broker_dirs["imports"] / "sess-1.zip"
     archive.write_bytes(_zip({"saves/card.bin": b"stored"}))
 
@@ -2325,6 +2373,181 @@ def test_a_restored_archive_reports_no_skip(
 
     assert body["save_restore_skipped"] is None
     assert body["save_restore"]["error"] is None
+
+
+@pytest.mark.parametrize(
+    ("body", "patch", "link_states", "fragment"),
+    [
+        (b"not a zip", None, False, "body is not a zip archive"),
+        (_zip({"../escape": b"x"}), None, False, "archive member escapes save dir"),
+        (_zip({"elsewhere/x": b"x"}), None, False, "archive member outside save subtrees"),
+        (_zip({"saves": b"x"}), None, False, "archive member names a save subtree"),
+        (_zip({"saves/a": b"xxxx"}), ("SAVE_FILE_MAX_BYTES", 2), False, "archive exceeds size limit"),
+        (
+            _zip({"saves/a": b"a", "saves/b": b"b"}),
+            ("SAVE_FILE_MAX_ENTRIES", 1),
+            False,
+            "more than 1 entries",
+        ),
+        (_zip({"states/x": b"x"}), None, True, "archive member resolves outside save dir"),
+        (
+            mangle_zip_member(_zip({"saves/a": b"a"}), "saves/a", flags=0x1),
+            None,
+            False,
+            "archive member is encrypted",
+        ),
+        (
+            mangle_zip_member(_zip({"saves/a": b"a"}), "saves/a", method=99),
+            None,
+            False,
+            "archive member uses unsupported compression method 99",
+        ),
+        (
+            mangle_zip_member(_zip({"saves/a": b"a"}), "saves/a", dos_date=0),
+            None,
+            False,
+            "archive member has an invalid timestamp",
+        ),
+        (
+            mangle_zip_member(_zip({"saves/X": b"a"}), "saves/X", flags=0x800, raw_name=b"saves/\xff"),
+            None,
+            False,
+            "body is not a zip archive",
+        ),
+        (
+            corrupt_zip_member(_zip({"saves/a": bytes(range(256)) * 64}), "saves/a"),
+            None,
+            False,
+            "archive member is corrupt: saves/a",
+        ),
+    ],
+    ids=[
+        "not-a-zip",
+        "escape",
+        "outside",
+        "names-subtree",
+        "size",
+        "entries",
+        "symlink-escape",
+        "encrypted",
+        "compression",
+        "bad-date",
+        "bad-utf8-name",
+        "corrupt",
+    ],
+)
+def test_a_bad_archive_is_refused_before_the_slot_is_cleared(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    body: bytes,
+    patch: Optional[tuple[str, int]],
+    link_states: bool,
+    fragment: str,
+) -> None:
+    """Every whole-archive or member problem answers 422 with the slot byte-identical.
+
+    Refusing after the clear left the player with an emptied slot and no
+    restore: the saves the slot held were gone before the archive was
+    ever checked. The clear here really empties the slot, so a refusal that
+    came too late would show in the seeded file.
+
+    Args:
+        client: The app client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The instances the registry built.
+        monkeypatch: Pytest's attribute patcher.
+        tmp_path: The per-test temporary directory; the fake's save root lives under it.
+        body: The archive body.
+        patch: A limit to lower first, as `(name, value)`, or None.
+        link_states: Whether to make the `states` subtree a symlink out of the save root.
+        fragment: Text the 422 detail must contain.
+    """
+    from webstation_broker import emulators
+
+    calls = _record_activate_hooks(monkeypatch)
+    root = emulators.REGISTRY["fake"].save_root
+    seeded = root / "saves" / "keep.bin"
+    seeded.write_bytes(b"the player's own save")
+
+    def _wipe(self: FakeEmulator, excluded: tuple[str, ...] = ()) -> None:
+        """Record the clear and empty the save subtrees, as a real clear does.
+
+        Args:
+            self: The emulator being cleared.
+            excluded: Save subtrees the whole-card routes carry this session.
+        """
+        calls.append("clear_working_slot")
+        for sub in ("saves", "states"):
+            shutil.rmtree(root / sub, ignore_errors=True)
+
+    monkeypatch.setattr(emulators.REGISTRY["fake"], "clear_working_slot", _wipe)
+    if link_states:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (root / "states").rmdir()
+        (root / "states").symlink_to(outside)
+    if patch is not None:
+        name, value = patch
+        target = saves if name == "SAVE_FILE_MAX_BYTES" else settings
+        monkeypatch.setattr(target, name, value)
+    archive = broker_dirs["imports"] / "sess-1.zip"
+    archive.write_bytes(body)
+
+    response = _activate(client, broker_dirs, save={"archive": str(archive)})
+
+    assert response.status_code == 422
+    assert response.json()["detail"].startswith("save restore failed: ")
+    assert fragment in response.json()["detail"]
+    assert calls == []
+    assert seeded.read_bytes() == b"the player's own save"
+
+
+def test_a_corrupt_member_is_refused_even_where_a_newer_file_would_be_kept(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A corrupt v1 member refuses the restore though the newer-file guard would never have written it.
+
+    The seeded file is written now and the member is dated 2020, so the guard
+    keeps the file and the write would skip the member unread. The pre-clear
+    read does not ask the guard, so the damage still refuses the activate.
+
+    Args:
+        client: The app client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The instances the registry built.
+        monkeypatch: Pytest's attribute patcher.
+    """
+    from webstation_broker import emulators
+
+    calls = _record_activate_hooks(monkeypatch)
+    fake = emulators.REGISTRY["fake"]
+    seeded = fake.save_root / "saves" / "keep.bin"
+    seeded.write_bytes(b"the player's newer save")
+    kept_mtime = seeded.stat().st_mtime
+    member = zipfile.ZipInfo("saves/keep.bin", date_time=(2020, 1, 1, 0, 0, 0))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(member, bytes(range(256)) * 64)
+    intact = buf.getvalue()
+    plan = saves.ArchivePlan(("saves/keep.bin",), 0)
+    # The intact copy writes nothing here: the guard keeps the newer file on disk.
+    assert saves.write_save_archive(intact, fake.save_root, plan, fake.always_restore)["skipped"] == 1
+    archive = broker_dirs["imports"] / "sess-1.zip"
+    archive.write_bytes(corrupt_zip_member(intact, "saves/keep.bin"))
+
+    response = _activate(client, broker_dirs, save={"archive": str(archive)})
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "save restore failed: archive member is corrupt: saves/keep.bin"
+    assert calls == []
+    assert seeded.read_bytes() == b"the player's newer save"
+    assert seeded.stat().st_mtime == kept_mtime
 
 
 # ── the activate hooks run on every launch ─────────────────────────────
@@ -2510,3 +2733,422 @@ async def test_the_screenshot_body_is_read_before_the_session_lock_is_released(
     assert response.body == b"png bytes"
     assert api._SESSION_LOCK.acquire(blocking=False)
     api._SESSION_LOCK.release()
+
+
+def test_dump_saves_forces_the_session_import_paths_in(
+    broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """`_dump_saves` hands the session's placed paths to the dump."""
+    import anyio
+
+    from webstation_broker import emulators
+
+    emulator = emulators.get_emulator("fake")
+    assert emulator is not None
+    placed = emulator.save_root / "saves" / "placed.srm"
+    placed.write_bytes(b"p")
+    os.utime(placed, (1_600_000_000, 1_600_000_000))
+    sess = {
+        "id": "s",
+        "save_baseline": time.time(),
+        "save": {},
+        "import_paths": ["saves/placed.srm"],
+        "user": {"id": 1},
+        "rom": {},
+    }
+
+    report = anyio.run(api._dump_saves, emulator, sess)
+
+    assert [f["path"] for f in report["files"]] == ["saves/placed.srm"]
+
+
+def test_activate_takes_romm_identity_fields_and_never_refuses_a_layout(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The identity fields are accepted, and an unknown layout is logged, never refused."""
+    rom = {
+        "id": 5,
+        "name": "Game",
+        "platform": "ps2",
+        "path": str(_rom(broker_dirs)),
+        "title_id": "SLUS-20001",
+        "save_target": "BASLUS-20001",
+        "save_target_layout": "folder-sideways",
+    }
+    with caplog.at_level(logging.WARNING, logger="webstation_broker.api"):
+        response = _activate(client, broker_dirs, rom=rom)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "launching"
+    assert "folder-sideways" in caplog.text
+    assert session.SESSION is not None
+    assert session.SESSION["rom"]["title_id"] == "SLUS-20001"
+
+
+# ── declared imports on activate ───────────────────────────────────────
+
+
+def _import_zip(members: dict[str, bytes]) -> bytes:
+    """Build an archive declaring each `.import/` member by its path's kind.
+
+    Args:
+        members: Member names mapped to bytes.
+
+    Returns:
+        The zip.
+    """
+    files = [{"path": n, "kind": n.split("/")[1]} for n in members if n.startswith(".import/")]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, data in members.items():
+            zf.writestr(name, data)
+        zf.writestr(saves.MANIFEST_NAME, json.dumps({"version": 2, "created_at": 0, "files": files}))
+    return buf.getvalue()
+
+
+def _accept_save_imports(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Have the fake emulator accept `save` imports, placing each under `saves/`.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher, undone when the test ends.
+    """
+
+    def spec(self: FakeEmulator) -> imports.ImportSpec:
+        """Accept saves.
+
+        Args:
+            self: The emulator.
+
+        Returns:
+            The spec.
+        """
+        return imports.ImportSpec(kinds=(imports.KindSpec("save", ("<name>.srm",)),))
+
+    def place(
+        self: FakeEmulator, member: imports.ImportMember, spec: imports.ImportSpec, ctx: imports.ImportCtx
+    ) -> Union[imports.Placement, imports.ImportRefusal]:
+        """Place the member under `saves/`.
+
+        Args:
+            self: The emulator.
+            member: The member.
+            spec: The spec.
+            ctx: The launch context.
+
+        Returns:
+            The placement.
+        """
+        return imports.Placement(member, PurePosixPath("saves", *member.parts))
+
+    monkeypatch.setattr(FakeEmulator, "import_spec", spec)
+    monkeypatch.setattr(FakeEmulator, "place_import", place)
+
+
+def test_an_import_nobody_accepts_is_refused_with_the_slot_untouched(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Every emulator refuses imports in Wave 1, before anything is cleared, and says so at warning."""
+    calls = _record_activate_hooks(monkeypatch)
+    archive = broker_dirs["imports"] / "sess-1.zip"
+    archive.write_bytes(_import_zip({".import/save/a.srm": b"new", "saves/v1.srm": b"v1"}))
+
+    with caplog.at_level(logging.WARNING, logger="webstation_broker.api"):
+        response = _activate(client, broker_dirs, save={"archive": str(archive)})
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["error"] == "import_refused"
+    assert [(r["reason"], r["member"]) for r in detail["refusals"]] == [
+        ("kind_not_accepted", ".import/save/a.srm")
+    ]
+    assert calls == []
+    assert session.SESSION is None
+    assert [r.levelname for r in caplog.records if "refused" in r.getMessage()] == ["WARNING"]
+
+
+def test_a_corrupt_member_in_an_import_archive_is_refused_before_the_clear(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Corrupt data in a placed member or a v1 member refuses the import with the slot untouched.
+
+    Preflight reads only headers, and these headers are intact, so only the
+    pre-clear read can catch the damage.
+
+    Args:
+        client: The app client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The instances the registry built.
+        monkeypatch: Pytest's attribute patcher.
+    """
+    _accept_save_imports(monkeypatch)
+    calls = _record_activate_hooks(monkeypatch)
+    data = bytes(range(256)) * 64
+    body = _import_zip({".import/save/a.srm": data, "saves/v1.srm": data})
+    body = corrupt_zip_member(corrupt_zip_member(body, ".import/save/a.srm"), "saves/v1.srm")
+    archive = broker_dirs["imports"] / "sess-1.zip"
+    archive.write_bytes(body)
+
+    response = _activate(client, broker_dirs, save={"archive": str(archive)})
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["error"] == "import_refused"
+    assert [(r["reason"], r["member"]) for r in detail["refusals"]] == [
+        ("unreadable_member", ".import/save/a.srm"),
+        ("unreadable_member", "saves/v1.srm"),
+    ]
+    assert calls == []
+    assert session.SESSION is None
+
+
+def test_an_accepted_import_is_placed_recorded_and_reported(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A placed import is written, listed in the report, and remembered for the exit dump."""
+    _accept_save_imports(monkeypatch)
+    archive = broker_dirs["imports"] / "sess-1.zip"
+    archive.write_bytes(_import_zip({".import/save/a.srm": b"new"}))
+
+    response = _activate(client, broker_dirs, save={"archive": str(archive)})
+
+    assert response.status_code == 200
+    report = response.json()["save_restore"]
+    assert report["imported"] == [{"member": ".import/save/a.srm", "dest": "saves/a.srm", "sidecars": []}]
+    assert (fake_emulator[0].save_root / "saves" / "a.srm").read_bytes() == b"new"
+    assert session.SESSION is not None
+    assert session.SESSION["import_paths"] == ["saves/a.srm"]
+    assert session.SESSION["import_identity"] == {"value": None, "source": "none"}
+
+
+def test_a_placed_import_the_game_never_touches_still_ships_in_the_exit_dump(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A placed file older than the dump's baseline ships only because `import_paths` names it.
+
+    The file is back-dated past the baseline cutoff, so the mtime check alone
+    would leave it out. It ships only if `import_paths` is recorded in the
+    dump walk's own form.
+    """
+    monkeypatch.setattr(settings, "DEV_MODE", True)
+    _accept_save_imports(monkeypatch)
+    archive = broker_dirs["imports"] / "sess-1.zip"
+    archive.write_bytes(_import_zip({".import/save/a.srm": b"new"}))
+    assert _activate(client, broker_dirs, save={"archive": str(archive)}).status_code == 200
+    assert session.SESSION is not None
+    stale = session.SESSION["save_baseline"] - 3600
+    os.utime(fake_emulator[0].save_root / "saves" / "a.srm", (stale, stale))
+
+    body = client.post(f"{API}/session/exit").json()
+
+    assert [f["path"] for f in body["save_dump"]["files"]] == ["saves/a.srm"]
+    dumped = Path(body["upload"]["would_send"]["archive_path"])
+    with zipfile.ZipFile(dumped) as zf:
+        assert zf.read("saves/a.srm") == b"new"
+        assert json.loads(zf.read(saves.MANIFEST_NAME))["imported"] == ["saves/a.srm"]
+
+
+def test_imports_in_an_oversized_archive_get_the_structured_refusal(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A whole-archive limit on an archive with imports answers `too_large`, logged as a refusal."""
+    monkeypatch.setattr(settings, "SAVE_FILE_MAX_ENTRIES", 1)
+    archive = broker_dirs["imports"] / "sess-1.zip"
+    archive.write_bytes(_import_zip({".import/save/a.srm": b"x", "saves/b.srm": b"y"}))
+
+    with caplog.at_level(logging.WARNING, logger="webstation_broker.api"):
+        response = _activate(client, broker_dirs, save={"archive": str(archive)})
+
+    assert response.status_code == 422
+    assert [r["reason"] for r in response.json()["detail"]["refusals"]] == ["too_large"]
+    assert [r.levelname for r in caplog.records if "refused" in r.getMessage()] == ["WARNING"]
+
+
+def test_a_preflight_crash_is_a_500_with_the_slot_untouched(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bug in a hook fails the activate loudly, before the clear."""
+    calls = _record_activate_hooks(monkeypatch)
+
+    def boom(*args: object, **kwargs: object) -> imports.PreflightResult:
+        """Fail like a buggy hook.
+
+        Args:
+            *args: Ignored.
+            **kwargs: Ignored.
+
+        Raises:
+            RuntimeError: Always.
+        """
+        raise RuntimeError("hook bug")
+
+    monkeypatch.setattr(imports, "preflight", boom)
+    archive = broker_dirs["imports"] / "sess-1.zip"
+    archive.write_bytes(_import_zip({".import/save/a.srm": b"x"}))
+
+    response = _activate(client, broker_dirs, save={"archive": str(archive)})
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == {"error": "import_preflight_failed"}
+    assert calls == []
+
+
+def test_imports_in_an_archive_that_is_not_restored_are_refused(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With no subtree to restore into, imports are refused rather than silently dropped, and logged."""
+    from webstation_broker import emulators
+
+    monkeypatch.setattr(emulators.REGISTRY["fake"], "save_subtrees", ())
+    archive = broker_dirs["imports"] / "sess-1.zip"
+    archive.write_bytes(_import_zip({".import/save/a.srm": b"x"}))
+
+    with caplog.at_level(logging.WARNING, logger="webstation_broker.api"):
+        response = _activate(client, broker_dirs, save={"archive": str(archive)})
+
+    assert response.status_code == 422
+    assert [r["reason"] for r in response.json()["detail"]["refusals"]] == ["kind_not_accepted"]
+    refused = [r for r in caplog.records if "refused" in r.getMessage()]
+    assert [r.levelname for r in refused] == ["WARNING"]
+    assert "kind_not_accepted" in refused[0].getMessage()
+
+
+def test_imports_in_an_archive_held_back_by_the_card_sync_are_refused(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the only subtree on the card routes, imports are refused as synced separately."""
+    from webstation_broker import emulators
+
+    calls = _record_activate_hooks(monkeypatch)
+    monkeypatch.setattr(emulators.REGISTRY["fake"], "save_subtrees", ("saves",))
+    monkeypatch.setattr(emulators.REGISTRY["fake"], "memory_card_subtree", "saves")
+    archive = broker_dirs["imports"] / "sess-1.zip"
+    archive.write_bytes(_import_zip({".import/save/a.srm": b"x"}))
+
+    response = _activate(client, broker_dirs, save={"archive": str(archive), "memory_card_synced": True})
+
+    assert response.status_code == 422
+    refusals = response.json()["detail"]["refusals"]
+    assert [(r["reason"], r["member"]) for r in refusals] == [
+        ("memcard_synced_separately", ".import/save/a.srm")
+    ]
+    assert calls == []
+
+
+def test_a_plain_launch_records_no_imports(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """Without an archive the session still gets an identity and an empty import list."""
+    assert _activate(client, broker_dirs).status_code == 200
+
+    assert session.SESSION is not None
+    assert session.SESSION["import_paths"] == []
+    assert session.SESSION["import_identity"] == {"value": None, "source": "none"}
+
+
+def test_import_spec_describes_what_an_emulator_takes(
+    client: TestClient, fake_emulator: list[FakeEmulator]
+) -> None:
+    """The discovery route answers the spec, the state slot and every refusal code."""
+    response = client.get(f"{API}/session/import-spec", params={"emulator": "fake", "platform": "ps2"})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "import_api": 1,
+        "manifest_version": 2,
+        "emulator": "fake",
+        "platform": "ps2",
+        "kinds": [],
+        "state_channel": "none",
+        "card_subtree": None,
+        "state_slot": 3,
+        "reasons": sorted(imports.REASONS),
+    }
+    assert fake_emulator[0].platform == "ps2"
+
+
+@pytest.mark.parametrize(("channel", "slot"), [("archive", 3), ("none", None)])
+def test_import_spec_names_the_slot_for_an_archive_state_channel(
+    client: TestClient,
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+    channel: str,
+    slot: Optional[int],
+) -> None:
+    """An emulator with no mid-session states still names its slot when states ride the archive.
+
+    RomM sends that slot as `save.resume_slot`, and the state never loads without it.
+
+    Args:
+        client: The app, served without a secret.
+        fake_emulator: The registered fake.
+        monkeypatch: Pytest's attribute patcher.
+        channel: The spec's state channel.
+        slot: The `state_slot` discovery must answer.
+    """
+    monkeypatch.setattr(FakeEmulator, "supports_states", False)
+
+    def spec(self: FakeEmulator) -> imports.ImportSpec:
+        """Answer a spec with only the state channel set.
+
+        Args:
+            self: The emulator.
+
+        Returns:
+            The spec.
+        """
+        return imports.ImportSpec(state_channel=channel)
+
+    monkeypatch.setattr(FakeEmulator, "import_spec", spec)
+
+    response = client.get(f"{API}/session/import-spec", params={"emulator": "fake"})
+
+    assert response.status_code == 200
+    assert response.json()["state_slot"] == slot
+
+
+def test_import_spec_refuses_an_unknown_emulator(client: TestClient) -> None:
+    """An unknown emulator is a 422, as on the memory-card routes."""
+    response = client.get(f"{API}/session/import-spec", params={"emulator": "gameboy"})
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "unknown emulator: gameboy"
+
+
+def test_import_spec_requires_the_broker_secret(
+    secret_client: TestClient, fake_emulator: list[FakeEmulator]
+) -> None:
+    """The route is gated like every other RomM-facing route."""
+    assert secret_client.get(f"{API}/session/import-spec", params={"emulator": "fake"}).status_code == 403
+
+    secret_client.headers["X-Broker-Secret"] = "s3cret"
+    assert secret_client.get(f"{API}/session/import-spec", params={"emulator": "fake"}).status_code == 200

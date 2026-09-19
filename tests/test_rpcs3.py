@@ -1392,6 +1392,91 @@ def test_exit_passes_no_pid_when_the_broker_holds_no_handle(
     assert seen["pid"] is None
 
 
+# ── state_path: the exit state RomM files in its library ────────────────
+
+
+def _exit_confirming(monkeypatch: pytest.MonkeyPatch, state: Optional[Path]) -> rpcs3.Rpcs3:
+    """Build a running BLUS30443 session whose save-and-exit confirms `state` as written.
+
+    None stands for a hotkey whose write never settled.
+    """
+    emu = rpcs3.Rpcs3()
+    emu._session_serial = "BLUS30443"
+    monkeypatch.setattr(rpcs3.Rpcs3, "alive", lambda self: True)
+    emu._send_key = lambda key: True
+    monkeypatch.setattr(
+        rpcs3,
+        "_wait_for_state_write",
+        lambda serial, before, deadline, pid=None: None if state is None else _touch(state),
+    )
+    return emu
+
+
+def test_state_path_serves_the_state_a_saving_exit_confirmed(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without it the state-file GET 404s and RomM never files the exit state."""
+    _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT", mtime=1000)
+    written = rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_2.SAVESTAT"
+    emu = _exit_confirming(monkeypatch, written)
+
+    assert emu.save_and_exit(10)["state_saved"] is True
+    assert emu.state_path() == written
+
+
+def test_state_path_is_empty_before_any_exit(rpcs3_dirs: dict[str, Path]) -> None:
+    """A state on disk before the exit came in with the archive, so it is not this session's to file."""
+    _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT")
+    emu = rpcs3.Rpcs3()
+    emu._session_serial = "BLUS30443"
+
+    assert emu.state_path() is None
+
+
+def test_state_path_is_empty_after_an_exit_whose_write_never_settled(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The older state still on disk would otherwise be filed in RomM as this exit's save."""
+    _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT")
+    emu = _exit_confirming(monkeypatch, None)
+
+    assert emu.save_and_exit(10)["state_saved"] is False
+    assert emu.state_path() is None
+
+
+def test_state_path_is_empty_once_the_confirmed_state_is_gone(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing file is an empty slot, so the GET answers 404 rather than 500."""
+    written = rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT"
+    emu = _exit_confirming(monkeypatch, written)
+    emu.save_and_exit(10)
+
+    written.unlink()
+
+    assert emu.state_path() is None
+
+
+def test_a_launch_forgets_the_last_exits_state(
+    rpcs3_dirs: dict[str, Path],
+    no_boot_watchdog: list[tuple[str, tuple]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The next session has confirmed nothing yet, so a mid-session GET must not serve the old exit state."""
+    written = rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT"
+    emu = _exit_confirming(monkeypatch, written)
+    emu.save_and_exit(10)
+    monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
+    monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
+    monkeypatch.setattr(rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: None)
+    eboot = _touch(rpcs3_dirs["game_dir"] / "BLUS30443" / "USRDIR" / "EBOOT.BIN")
+
+    emu.launch(eboot, None)
+
+    assert written.exists()
+    assert emu.state_path() is None
+
+
 # ── PINE wire protocol ────────────────────────────────────────────────────
 
 
@@ -2750,3 +2835,10 @@ def test_session_save_dirs_is_empty_without_a_launch(
         assert emu._session_save_dirs() == []
 
     assert "no launch" in caplog.text
+
+
+def test_restore_subtrees_is_the_whole_restore_set_before_the_clear() -> None:
+    """Preflight runs before the clear flips `_restoring`, so it must not depend on it."""
+    emu = rpcs3.Rpcs3()
+
+    assert emu.restore_subtrees == ("home/00000001/savedata", "game", "savestates")

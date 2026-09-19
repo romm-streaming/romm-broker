@@ -7,6 +7,7 @@ SUBFOLDER prefix; the RomM-facing ones require `X-Broker-Secret` when
 `BROKER_SECRET` is set.
 """
 
+import functools
 import hmac
 import logging
 import os
@@ -22,10 +23,10 @@ from urllib.parse import urlsplit
 import anyio
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from starlette.websockets import WebSocketState
 
-from . import callback, memcard, saves, screenshot, selkies, session, settings
+from . import callback, imports, memcard, saves, screenshot, selkies, session, settings
 from .emulators import get_emulator
 from .emulators.base import Emulator, reap_orphan
 
@@ -98,6 +99,16 @@ class SaveIn(BaseModel):
     """
 
 
+KNOWN_SAVE_TARGET_LAYOUTS = frozenset(
+    {"folder-exact", "folder-prefix", "file-exact", "file-prefix", "folder-split"}
+)
+"""The `save_target_layout` values RomM is known to send.
+
+Any other value is logged and passed through: RomM may add layouts before
+the broker learns them, and a launch must never fail over a hint.
+"""
+
+
 class RomIn(BaseModel):
     """The rom RomM resolved for the launch.
 
@@ -106,6 +117,9 @@ class RomIn(BaseModel):
         name: The rom's display name, if known.
         platform: The platform slug, which general-purpose emulators use to pick a core.
         language: The rom's language, for emulators whose games ship several in one folder.
+        title_id: RomM's game id for the rom (a serial, title id or game code), if it has one.
+        save_target: RomM's name for where this game keeps its saves, if it has one.
+        save_target_layout: How `save_target` names that place; see `KNOWN_SAVE_TARGET_LAYOUTS`.
         path: Absolute container path to the rom, validated against ROM_ROOT on activate.
     """
 
@@ -120,7 +134,28 @@ class RomIn(BaseModel):
     language sorts first. Unknown or absent values leave the emulator on its
     own default rather than failing the launch.
     """
+    title_id: Optional[str] = None
+    """RomM's game id for the rom (a serial, title id or game code), if it has one."""
+    save_target: Optional[str] = None
+    """RomM's name for where this game keeps its saves, if it has one (a PS2 card dir, say)."""
+    save_target_layout: Optional[str] = None
+    """How `save_target` names that place; see `KNOWN_SAVE_TARGET_LAYOUTS`."""
     path: str
+
+    @field_validator("save_target_layout")
+    @classmethod
+    def _log_unknown_layout(cls, value: Optional[str]) -> Optional[str]:
+        """Log a layout this broker does not know, and keep it.
+
+        Args:
+            value: The layout RomM sent.
+
+        Returns:
+            The value, unchanged.
+        """
+        if value is not None and value not in KNOWN_SAVE_TARGET_LAYOUTS:
+            log.warning("activate: unknown save_target_layout %r, passing it through", value)
+        return value
 
 
 class CallbackIn(BaseModel):
@@ -332,7 +367,7 @@ def _resolve_callback(body_cb: Optional[CallbackIn], request: Request) -> dict[s
 
 
 def _archive_subtrees(
-    emulator: Emulator, memory_card_synced: bool
+    emulator: Emulator, memory_card_synced: bool, *, restore: bool = False
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Return the save subtrees this session ships, and the ones it leaves alone.
 
@@ -346,15 +381,18 @@ def _archive_subtrees(
     Args:
         emulator: The emulator whose save layout is being consulted.
         memory_card_synced: Whether the caller synced the whole memory card separately.
+        restore: Read `restore_subtrees` instead of `save_subtrees`: what an
+            archive may restore into, as it stands before the working slot is cleared.
 
     Returns:
         A pair of tuples: the subtrees to include in the archive, and the ones
         to pass over on a restore and skip on a dump.
     """
+    subtrees = emulator.restore_subtrees if restore else emulator.save_subtrees
     if not memory_card_synced or emulator.memory_card_subtree is None:
-        return emulator.save_subtrees, ()
+        return subtrees, ()
     card = emulator.memory_card_subtree
-    return tuple(s for s in emulator.save_subtrees if s != card), (card,)
+    return tuple(s for s in subtrees if s != card), (card,)
 
 
 def _archive_identity(sess: dict[str, Any], emulator: Emulator) -> dict[str, Any]:
@@ -490,12 +528,12 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     """Do the launch itself, with the session lock already held.
 
     Any emulator left behind by an earlier broker process is reaped first. The
-    save archive is located and read before the working slot is emptied, so a
-    request that turns out to name an archive that is not there leaves the slot
-    as it found it. The restore is then extracted into the emptied slot before
-    the emulator boots, so the restore rather than the previous session decides
-    what is in it, and the seat tokens are pushed to selkies once the emulator
-    is launching.
+    save archive is located, read and checked member by member before the
+    working slot is emptied, so a request naming an archive that is missing or
+    would be refused leaves the slot as it found it. The restore is then
+    written into the emptied slot before the emulator boots, so the restore
+    rather than the previous session decides what is in it, and the seat
+    tokens are pushed to selkies once the emulator is launching.
 
     Args:
         body: The launch request: emulator, rom, save data, callback and the multiplayer flag.
@@ -503,15 +541,19 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
 
     Returns:
         A dict with `status`, `session_id`, `rom_file`, `save_restore` (the
-        extraction report, or None when nothing was restored),
-        `selkies_tokens_pushed` and the controller's landing `url`.
+        restore report, its `imported` a list of `{member, dest, sidecars}`
+        for each placed import, or None when nothing was restored),
+        `save_restore_skipped`, `selkies_tokens_pushed` and the controller's
+        landing `url`.
 
     Raises:
         HTTPException: 409 when a session is already active; 422 for an unknown
             emulator, a missing rom on an emulator that needs one, no bootable
-            file, or a failed restore; 400 for a rom path that cannot be
-            resolved or lies outside ROM_ROOT; 404 for a rom path or save
-            archive that does not exist.
+            file, or a failed restore; 422 with an `import_refused` body when
+            an archive's declared imports cannot be placed; 500 with
+            `import_preflight_failed` when placing them crashed; 400 for a rom
+            path that cannot be resolved or lies outside ROM_ROOT; 404 for a
+            rom path or save archive that does not exist.
     """
     if session.SESSION is not None and session.SESSION.get("active"):
         log.warning(
@@ -577,15 +619,15 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
 
     save = body.save
     subtrees, excluded = _archive_subtrees(
-        emulator, bool(save and save.memory_card_synced)
+        emulator, bool(save and save.memory_card_synced), restore=True
     )
     # Read before the working slot is emptied: an archive that is not there
     # has to fail with the slot still holding whatever it held.
     content = None
     restore_skipped = None
     if save and save.archive:
+        archive_path = Path(save.archive)
         if subtrees:
-            archive_path = Path(save.archive)
             if not archive_path.is_file():
                 log.warning("activate: save archive not found: %s", save.archive)
                 raise HTTPException(
@@ -605,6 +647,124 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
                 save.archive,
                 restore_skipped,
             )
+            skipped: Optional[saves.ArchiveView] = None
+            try:
+                if archive_path.is_file():
+                    skipped = await anyio.to_thread.run_sync(
+                        saves.read_archive, await anyio.to_thread.run_sync(archive_path.read_bytes)
+                    )
+            except Exception:
+                # This read only looks for imports to refuse; failing it must
+                # not turn the skip every older archive gets into a crash.
+                log.warning(
+                    "activate: could not read skipped save archive %s for imports",
+                    save.archive,
+                    exc_info=True,
+                )
+            if skipped is not None and skipped.imports:
+                # Dropping a declared import is exactly the silent loss the
+                # refusal list exists to prevent.
+                reason = "memcard_synced_separately" if excluded else "kind_not_accepted"
+                log.warning(
+                    "activate: save archive %s refused: %d import member(s) are %s",
+                    save.archive,
+                    len(skipped.imports),
+                    reason,
+                )
+                raise HTTPException(
+                    status_code=422,
+                    detail=imports.refusal_body(
+                        imports.ImportRefusal(reason, i.filename, None, detail=restore_skipped)
+                        for i in skipped.imports
+                    ),
+                )
+
+    rom_ref = imports.RomRef.from_body(body.rom) if body.rom else None
+    v1_plan: Optional[saves.V1Plan] = None
+    preflight: Optional[imports.PreflightResult] = None
+    if content is not None:
+        view = await anyio.to_thread.run_sync(saves.read_archive, content)
+        if view.error is None:
+            v1_plan = await anyio.to_thread.run_sync(
+                functools.partial(saves.plan_v1, view, emulator.save_root, subtrees, excluded)
+            )
+        if not view.imports:
+            legacy_error = view.error or (v1_plan.error if v1_plan else None)
+            if legacy_error or v1_plan is None:
+                # Refused while the working slot still holds what it held: after
+                # the clear, a bad archive would leave the player with neither.
+                log.error(
+                    "activate: save archive %s refused before the clear: %s",
+                    save.archive,
+                    legacy_error,
+                )
+                raise HTTPException(status_code=422, detail=f"save restore failed: {legacy_error}")
+        else:
+            folded = imports.fold_v1_problems(view.error, v1_plan)
+            if view.error is not None:
+                log.warning("activate: import archive %s refused: %s", save.archive, view.error)
+                raise HTTPException(status_code=422, detail=imports.refusal_body(folded))
+            try:
+                preflight = await anyio.to_thread.run_sync(
+                    functools.partial(
+                        imports.preflight,
+                        emulator,
+                        view,
+                        content,
+                        rom_file=rom_file,
+                        rom=rom_ref,
+                        memory_card_synced=bool(save.memory_card_synced),
+                        excluded=excluded,
+                        resume_slot=save.resume_slot,
+                        v1_refusals=folded,
+                    )
+                )
+            except Exception:
+                log.error("activate: import preflight for %s crashed", save.archive, exc_info=True)
+                raise HTTPException(
+                    status_code=500, detail={"error": "import_preflight_failed"}
+                ) from None
+            if preflight.refusals:
+                log.warning(
+                    "activate: import archive %s refused: %s",
+                    save.archive,
+                    ", ".join(f"{r.member}: {r.reason}" for r in preflight.refusals),
+                )
+                raise HTTPException(status_code=422, detail=imports.refusal_body(preflight.refusals))
+    if content is not None and v1_plan is not None:
+        # Corrupt data shows only once a member is decompressed, and the write
+        # that would find it runs after the clear.
+        placed_names = [p.member.name for p in preflight.placements] if preflight else []
+        problems = await anyio.to_thread.run_sync(
+            saves.verify_members, content, [*v1_plan.names, *placed_names]
+        )
+        if problems:
+            if preflight is None:
+                log.error(
+                    "activate: save archive %s refused before the clear: %s", save.archive, problems[0][1]
+                )
+                raise HTTPException(status_code=422, detail=f"save restore failed: {problems[0][1]}")
+            log.warning(
+                "activate: import archive %s refused: %d member(s) failed the read check, first: %s",
+                save.archive,
+                len(problems),
+                problems[0][1],
+            )
+            raise HTTPException(
+                status_code=422, detail=imports.refusal_body(imports.fold_read_problems(problems))
+            )
+    if preflight is None:
+        try:
+            emulator.import_identity = await anyio.to_thread.run_sync(
+                imports.resolve_activate_identity,
+                emulator,
+                rom_file,
+                rom_ref,
+            )
+        except Exception:
+            # Identity only informs imports; a launch never fails over it.
+            log.warning("activate: could not resolve the session identity", exc_info=True)
+            emulator.import_identity = imports.SessionIdentity(None, "none")
 
     await anyio.to_thread.run_sync(emulator.clear_working_slot, excluded)
     # Unconditional: the hook is where a subclass drops a stale save that would
@@ -612,13 +772,18 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     # archive is exactly the one where nothing else would overwrite it.
     await anyio.to_thread.run_sync(emulator.prepare_restore)
     restore_report = None
-    if content is not None:
+    placements = preflight.placements if preflight else ()
+    if content is not None and v1_plan is not None:
         restore_report = await anyio.to_thread.run_sync(
-            saves.extract_save_archive,
+            saves.write_save_archive,
             content,
             emulator.save_root,
-            subtrees,
-            excluded,
+            saves.ArchivePlan(
+                v1_plan.names,
+                v1_plan.excluded_count,
+                tuple((p.member.name, p.dest) for p in placements),
+                tuple(sc for p in placements for sc in p.sidecars),
+            ),
             emulator.always_restore,
         )
         if restore_report["error"]:
@@ -644,6 +809,14 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
                 status_code=422,
                 detail=f"save restore failed: {restore_report['failed']} member(s) failed to write",
             )
+        restore_report["imported"] = [
+            {
+                "member": p.member.name,
+                "dest": p.dest.as_posix(),
+                "sidecars": [d.as_posix() for d, _ in p.sidecars],
+            }
+            for p in placements
+        ]
         log.info("save restore: %s", restore_report)
 
     payload = body.model_dump()
@@ -651,6 +824,14 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     sess = session.new_session(
         payload, emulator, str(rom_file) if rom_file else None
     )
+    # The exit dump ships these even if the game never touches them, so a
+    # placed import is never lost to the mtime baseline.
+    sess["import_paths"] = sorted(
+        {p.dest.as_posix() for p in placements}
+        | {d.as_posix() for p in placements for d, _ in p.sidecars}
+    )
+    identity = emulator.import_identity or imports.SessionIdentity(None, "none")
+    sess["import_identity"] = {"value": identity.value, "source": identity.source}
 
     log.info(
         "session %s started: emulator=%s multiplayer=%s",
@@ -959,12 +1140,15 @@ async def _dump_saves(emulator: Emulator, sess: dict[str, Any]) -> dict[str, Any
             emulator, bool((sess.get("save") or {}).get("memory_card_synced"))
         )
         return await anyio.to_thread.run_sync(
-            saves.build_save_archive,
-            emulator.save_root,
-            dump_subtrees,
-            sess["save_baseline"],
-            _archive_identity(sess, emulator),
-            emulator.save_file_kind,
+            functools.partial(
+                saves.build_save_archive,
+                emulator.save_root,
+                dump_subtrees,
+                sess["save_baseline"],
+                _archive_identity(sess, emulator),
+                emulator.save_file_kind,
+                always_include=frozenset(sess.get("import_paths") or ()),
+            )
         )
     except Exception as exc:
         log.error(
@@ -1686,6 +1870,47 @@ def _memory_card(name: str, platform: Optional[str]) -> tuple[Path, Optional[str
             detail=f"{emulator.display_name} has no memory card to sync",
         )
     return card, emulator.memory_card_marker
+
+
+@router.get("/api/session/import-spec")
+async def get_import_spec(
+    emulator: str = Query(...),
+    platform: Optional[str] = Query(default=None),
+    x_broker_secret: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    """Tell RomM what an emulator accepts as a declared import, before it builds an archive.
+
+    Args:
+        emulator: The emulator's name.
+        platform: The platform slug, for an emulator whose spec depends on it.
+        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
+
+    Returns:
+        The API and manifest versions, the emulator's spec, its state slot
+        (None when it takes no states, neither mid-session nor in the
+        archive) and every refusal code.
+
+    Raises:
+        HTTPException: 403 on a bad secret; 422 for an unknown emulator.
+    """
+    _check_secret(x_broker_secret)
+    inst = get_emulator(emulator)
+    if inst is None:
+        log.debug("import-spec: unknown emulator: %s", emulator)
+        raise HTTPException(status_code=422, detail=f"unknown emulator: {emulator}")
+    inst.platform = platform
+    spec = inst.import_spec()
+    return {
+        "import_api": 1,
+        "manifest_version": 2,
+        "emulator": inst.name,
+        "platform": platform,
+        **spec.as_dict(),
+        # An archive state resumes through save.resume_slot, so RomM needs the
+        # slot even from an emulator with no mid-session states.
+        "state_slot": inst.state_slot if (inst.supports_states or spec.state_channel == "archive") else None,
+        "reasons": sorted(imports.REASONS),
+    }
 
 
 @router.get("/api/session/memory-card")

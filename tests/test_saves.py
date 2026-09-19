@@ -10,12 +10,14 @@ import logging
 import os
 import time
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
 import pytest
 
 from webstation_broker import saves
+
+from .conftest import corrupt_zip_member, mangle_zip_member
 
 # Zip entries carry a DOS timestamp, which has no room for anything before
 # 1980, so the fixture clock sits in 2020 rather than at the epoch.
@@ -58,6 +60,31 @@ def _zip(
     with zipfile.ZipFile(buf, "w") as zf:
         for name, content in members.items():
             zf.writestr(zipfile.ZipInfo(name, date_time=when), content)
+    return buf.getvalue()
+
+
+_CORRUPTIBLE = bytes(range(256)) * 64
+"""Member data that compresses to enough bytes for `corrupt_zip_member` to damage under every method."""
+_METHODS = [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA]
+"""Every compression method `zipfile` can read."""
+_METHOD_IDS = ["stored", "deflate", "bzip2", "lzma"]
+"""Test ids for `_METHODS`, in the same order."""
+
+
+def _zip_with(name: str, data: bytes, method: int) -> bytes:
+    """Build a one-member archive compressed with `method`.
+
+    Args:
+        name: The member's name.
+        data: The member's bytes.
+        method: A `zipfile.ZIP_*` compression constant.
+
+    Returns:
+        The zip file contents.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0)), data, compress_type=method)
     return buf.getvalue()
 
 
@@ -331,7 +358,9 @@ def test_archive_round_trips_through_a_restore(tmp_path: Path) -> None:
     target.mkdir()
     result = saves.extract_save_archive(report["zip_bytes"], target, ("GC",))
 
-    assert result == {"written": 1, "skipped": 0, "excluded": 0, "failed": 0, "error": None}
+    assert result == {
+        "written": 1, "skipped": 0, "excluded": 0, "failed": 0, "imported": 0, "error": None
+    }
     assert (target / "GC" / "card.raw").read_bytes() == b"payload"
 
 
@@ -548,7 +577,9 @@ def test_restore_drops_the_manifest_instead_of_refusing_the_archive(tmp_path: Pa
 
     result = saves.extract_save_archive(body, target, ("GC",))
 
-    assert result == {"written": 1, "skipped": 0, "excluded": 0, "failed": 0, "error": None}
+    assert result == {
+        "written": 1, "skipped": 0, "excluded": 0, "failed": 0, "imported": 0, "error": None
+    }
     assert (target / "GC" / "card.raw").read_bytes() == b"payload"
     assert not (target / saves.MANIFEST_NAME).exists()
 
@@ -565,7 +596,9 @@ def test_manifest_archive_round_trips_through_a_restore(tmp_path: Path) -> None:
     target.mkdir()
     result = saves.extract_save_archive(report["zip_bytes"], target, ("GC",))
 
-    assert result == {"written": 1, "skipped": 0, "excluded": 0, "failed": 0, "error": None}
+    assert result == {
+        "written": 1, "skipped": 0, "excluded": 0, "failed": 0, "imported": 0, "error": None
+    }
     assert (target / "GC" / "card.raw").read_bytes() == b"payload"
 
 
@@ -616,3 +649,582 @@ def test_restore_leaves_no_staging_file_behind_when_a_member_fails(
     assert result["failed"] == 1
     assert result["written"] == 0
     assert list((tmp_path / "GC").iterdir()) == []
+
+
+# ── read_archive: the partition every restore starts from ──────────────
+
+
+def test_read_archive_partitions_v1_imports_and_the_manifest() -> None:
+    """Members split into v1 and `.import/`, and the manifest is neither."""
+    manifest = {"version": 2, "files": []}
+    body = _zip(
+        {
+            "saves/a.srm": b"a",
+            ".import/save/b.srm": b"b",
+            saves.MANIFEST_NAME: json.dumps(manifest).encode(),
+        }
+    )
+
+    view = saves.read_archive(body)
+
+    assert view.error is None
+    assert [i.filename for i in view.v1] == ["saves/a.srm"]
+    assert [i.filename for i in view.imports] == [".import/save/b.srm"]
+    assert view.manifest == manifest
+    assert view.manifest_error is None
+
+
+def test_read_archive_leaves_the_manifest_unparsed_without_imports() -> None:
+    """A v1 dump's manifest is never parsed, so a large one can never refuse a restore."""
+    body = _zip({"saves/a.srm": b"a", saves.MANIFEST_NAME: b"not json"})
+
+    view = saves.read_archive(body)
+
+    assert view.error is None
+    assert view.manifest is None
+    assert view.manifest_error is None
+
+
+def test_read_archive_rejects_a_body_that_is_not_a_zip() -> None:
+    """A non-zip body keeps today's error wording."""
+    view = saves.read_archive(b"nope")
+
+    assert view.error == "body is not a zip archive"
+    assert view.v1 == () and view.imports == ()
+
+
+def test_read_archive_reports_the_size_cap_but_still_partitions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tripped cap keeps the partition, so the caller can tell whether imports exist."""
+    monkeypatch.setattr(saves, "SAVE_FILE_MAX_BYTES", 3)
+    body = _zip({"saves/a.srm": b"aa", ".import/save/b.srm": b"bb"})
+
+    view = saves.read_archive(body)
+
+    assert view.error == "archive exceeds size limit when extracted"
+    assert len(view.imports) == 1
+    assert view.manifest is None
+
+
+def test_read_archive_counts_the_manifest_toward_the_entry_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The manifest is an entry like any other, as it is today."""
+    monkeypatch.setattr(saves.settings, "SAVE_FILE_MAX_ENTRIES", 1)
+    body = _zip({"saves/a.srm": b"a", saves.MANIFEST_NAME: b"{}"})
+
+    view = saves.read_archive(body)
+
+    assert view.error == "archive holds more than 1 entries"
+
+
+@pytest.mark.parametrize(
+    ("manifest", "fragment"),
+    [
+        (b"{not json", "not JSON"),
+        (b"x" * (1024 * 1024 + 1), "exceeds"),
+        (None, "no manifest"),
+    ],
+    ids=["not-json", "oversized", "missing"],
+)
+def test_read_archive_reports_an_unusable_manifest_beside_imports(
+    manifest: Optional[bytes], fragment: str
+) -> None:
+    """With imports present, a manifest that cannot be used is recorded rather than raised.
+
+    Args:
+        manifest: The manifest bytes, or None to leave it out.
+        fragment: Text the recorded manifest error must contain.
+    """
+    members = {".import/save/b.srm": b"b"}
+    if manifest is not None:
+        members[saves.MANIFEST_NAME] = manifest
+    view = saves.read_archive(_zip(members))
+
+    assert view.error is None
+    assert view.manifest is None
+    assert fragment in (view.manifest_error or "")
+
+
+def test_read_archive_rejects_a_name_flagged_utf8_that_is_not() -> None:
+    """A UTF-8-flagged name that does not decode is not a zip, not a crash."""
+    body = mangle_zip_member(_zip({"GC/X": b"x"}), "GC/X", flags=0x800, raw_name=b"GC/\xff")
+
+    view = saves.read_archive(body)
+
+    assert view.error == "body is not a zip archive"
+    assert view.v1 == () and view.imports == ()
+
+
+def test_read_archive_reports_a_manifest_nested_too_deep_to_parse() -> None:
+    """A manifest that blows the parser's recursion limit is unusable, not a crash."""
+    deep = b"[" * 100_000 + b"]" * 100_000
+    view = saves.read_archive(_zip({".import/save/b.srm": b"b", saves.MANIFEST_NAME: deep}))
+
+    assert view.manifest is None
+    assert "not JSON" in (view.manifest_error or "")
+
+
+def test_read_archive_reports_a_manifest_whose_data_is_corrupt() -> None:
+    """A deflated manifest whose data is damaged is unusable, not a crash."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(".import/save/b.srm", b"b")
+        zf.writestr(saves.MANIFEST_NAME, json.dumps({"version": 2, "pad": "x" * 4000}))
+    body = bytearray(buf.getvalue())
+    with zipfile.ZipFile(io.BytesIO(bytes(body))) as zf:
+        info = zf.getinfo(saves.MANIFEST_NAME)
+    start = info.header_offset + 30 + len(info.filename.encode())
+    body[start : start + info.compress_size] = b"\xff" * info.compress_size
+
+    view = saves.read_archive(bytes(body))
+
+    assert view.error is None
+    assert view.manifest is None
+    assert "manifest unreadable" in (view.manifest_error or "")
+
+
+# ── plan_v1: every v1 check, with nothing written ──────────────────────
+
+
+def _plan(tmp_path: Path, members: dict[str, bytes], **kwargs: Any) -> saves.V1Plan:
+    """Plan a v1 restore of `members` into `tmp_path / "root"`.
+
+    Args:
+        tmp_path: The per-test temporary directory.
+        members: Archive member names mapped to their bytes.
+        **kwargs: Passed through to `plan_v1`.
+
+    Returns:
+        The plan.
+    """
+    root = tmp_path / "root"
+    root.mkdir(exist_ok=True)
+    view = saves.read_archive(_zip(members))
+    return saves.plan_v1(view, root, ("GC", "states"), kwargs.pop("excluded", ()), **kwargs)
+
+
+def test_plan_v1_accepts_members_under_the_subtrees(tmp_path: Path) -> None:
+    """Members under a subtree are planned in zip order and nothing is written."""
+    plan = _plan(tmp_path, {"GC/a.raw": b"a", "states/b.s": b"b"})
+
+    assert plan.names == ("GC/a.raw", "states/b.s")
+    assert plan.problems == ()
+    assert plan.error is None
+    assert not (tmp_path / "root" / "GC").exists()
+
+
+@pytest.mark.parametrize(
+    ("name", "message", "kind"),
+    [
+        ("../x", "archive member escapes save dir: ../x", "escapes"),
+        ("/abs", "archive member escapes save dir: /abs", "escapes"),
+        ("GC", "archive member names a save subtree: GC", "names_subtree"),
+        ("other/x", "archive member outside save subtrees: other/x", "outside"),
+    ],
+)
+def test_plan_v1_keeps_the_legacy_messages(tmp_path: Path, name: str, message: str, kind: str) -> None:
+    """Each check keeps today's wording, and the problem carries its kind.
+
+    Args:
+        tmp_path: The per-test temporary directory.
+        name: The offending member name.
+        message: The legacy error text.
+        kind: The problem kind recorded beside it.
+    """
+    plan = _plan(tmp_path, {name: b"x"})
+
+    assert plan.problems == ((name, message, kind),)
+    assert plan.error == message
+
+
+@pytest.mark.parametrize(
+    ("mangle", "message"),
+    [
+        ({"flags": 0x1}, "archive member is encrypted: GC/a"),
+        ({"method": 99}, "archive member uses unsupported compression method 99: GC/a"),
+        ({"dos_date": 0}, "archive member has an invalid timestamp (1980, 0, 0, 0, 0, 0): GC/a"),
+    ],
+    ids=["encrypted", "compression", "date"],
+)
+def test_plan_v1_refuses_a_member_that_would_fail_to_write(
+    tmp_path: Path, mangle: dict[str, int], message: str
+) -> None:
+    """A member whose header says it cannot be read or stamped is refused before any write.
+
+    Each of these used to raise inside the write, after the slot was cleared.
+
+    Args:
+        tmp_path: The per-test temporary directory.
+        mangle: The header fields to break, passed to `mangle_zip_member`.
+        message: The legacy-style error text.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    body = mangle_zip_member(_zip({"GC/a": b"a", "GC/ok": b"k"}), "GC/a", **mangle)
+
+    plan = saves.plan_v1(saves.read_archive(body), root, ("GC",), ())
+
+    assert plan.problems == (("GC/a", message, "unreadable"),)
+    assert plan.names == ("GC/ok",)
+
+
+def test_plan_v1_never_reads_an_excluded_member_header(tmp_path: Path) -> None:
+    """A dropped member is never written, so a broken header on it is no problem."""
+    root = tmp_path / "root"
+    root.mkdir()
+    body = mangle_zip_member(_zip({"card/a": b"a"}), "card/a", flags=0x1)
+
+    plan = saves.plan_v1(saves.read_archive(body), root, ("GC",), ("card",))
+
+    assert plan.problems == ()
+    assert plan.excluded_count == 1
+
+
+def test_plan_v1_collects_every_problem(tmp_path: Path) -> None:
+    """All problems are collected, not just the first, and `error` is the first."""
+    plan = _plan(tmp_path, {"../x": b"x", "other/y": b"y", "GC/ok": b"z"})
+
+    assert [p[2] for p in plan.problems] == ["escapes", "outside"]
+    assert plan.names == ("GC/ok",)
+    assert plan.error == "archive member escapes save dir: ../x"
+
+
+def test_plan_v1_counts_excluded_members(tmp_path: Path) -> None:
+    """A member under an excluded subtree is counted and dropped."""
+    root = tmp_path / "root"
+    root.mkdir()
+    view = saves.read_archive(_zip({"card/a": b"a", "GC/b": b"b"}))
+
+    plan = saves.plan_v1(view, root, ("GC",), ("card",))
+
+    assert plan.excluded_count == 1
+    assert plan.names == ("GC/b",)
+
+
+def test_plan_v1_skips_imports_unless_asked(tmp_path: Path) -> None:
+    """`.import/` members are left out, unless the legacy path asks for them."""
+    members = {"GC/a": b"a", ".import/save/x": b"x"}
+
+    assert _plan(tmp_path, members).problems == ()
+    legacy = _plan(tmp_path, members, include_imports=True)
+    assert legacy.error == "archive member outside save subtrees: .import/save/x"
+
+
+def test_plan_v1_refuses_a_subtree_whose_link_leaves_the_root(tmp_path: Path) -> None:
+    """A subtree that is a symlink out of the root is refused before any clear."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "states").symlink_to(outside)
+
+    plan = _plan(tmp_path, {"states/a.s": b"a"})
+
+    assert plan.problems == (
+        ("states/a.s", "archive member resolves outside save dir: states/a.s", "symlink"),
+    )
+
+
+def test_surviving_chain_escapes_ignores_links_that_stay_inside(tmp_path: Path) -> None:
+    """A link that resolves inside the root is harmless, and a missing chain cannot escape."""
+    root = tmp_path / "root"
+    (root / "real").mkdir(parents=True)
+    (root / "GC").symlink_to(root / "real")
+
+    assert saves.surviving_chain_escapes(root, PurePosixPath("GC/a"), ("GC",)) is False
+    assert saves.surviving_chain_escapes(root, PurePosixPath("states/a"), ("states",)) is False
+
+
+def test_surviving_chain_escapes_checks_every_level_of_a_nested_subtree(tmp_path: Path) -> None:
+    """A link part-way down a multi-level subtree is caught, using the longest match."""
+    outside = tmp_path / "outside"
+    (outside / "b").mkdir(parents=True)
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a").symlink_to(outside)
+
+    assert saves.surviving_chain_escapes(root, PurePosixPath("a/b/f"), ("a", "a/b")) is True
+
+
+# ── write_save_archive: the write half of a restore ────────────────────
+
+
+def test_write_save_archive_writes_v1_members_under_the_guard(tmp_path: Path) -> None:
+    """v1 members keep the zip mtime and the newer-file guard."""
+    root = tmp_path / "root"
+    _write(root / "GC" / "kept.raw", b"newer", mtime=NEW)
+    body = _zip({"GC/kept.raw": b"older", "GC/new.raw": b"fresh"})
+
+    result = saves.write_save_archive(body, root, saves.ArchivePlan(("GC/kept.raw", "GC/new.raw"), 2))
+
+    assert result == {
+        "written": 1, "skipped": 1, "excluded": 2, "failed": 0, "imported": 0, "error": None
+    }
+    assert (root / "GC" / "kept.raw").read_bytes() == b"newer"
+    assert (root / "GC" / "new.raw").read_bytes() == b"fresh"
+
+
+def test_write_save_archive_places_imports_unguarded_and_stamped(tmp_path: Path) -> None:
+    """Placed members skip the guard and carry the write stamp, not the zip mtime."""
+    root = tmp_path / "root"
+    _write(root / "GC" / "slot.raw", b"newer", mtime=NEW)
+    body = _zip({".import/save/x.raw": b"imported"})
+    plan = saves.ArchivePlan(
+        (), 0, placed=((".import/save/x.raw", PurePosixPath("GC/slot.raw")),)
+    )
+
+    result = saves.write_save_archive(body, root, plan, stamp=NEW + 50)
+
+    assert result["imported"] == 1
+    assert result["written"] == 0
+    assert (root / "GC" / "slot.raw").read_bytes() == b"imported"
+    assert (root / "GC" / "slot.raw").stat().st_mtime == NEW + 50
+
+
+def test_write_save_archive_writes_sidecars(tmp_path: Path) -> None:
+    """Sidecars are written with the stamp and only their failures are counted."""
+    root = tmp_path / "root"
+    root.mkdir()
+    plan = saves.ArchivePlan((), 0, sidecars=((PurePosixPath("GC/a.rom"), b"id\n"),))
+
+    result = saves.write_save_archive(_zip({}), root, plan, stamp=NEW)
+
+    assert result["written"] == 0 and result["failed"] == 0
+    assert (root / "GC" / "a.rom").read_bytes() == b"id\n"
+
+
+def test_write_save_archive_counts_a_link_out_of_the_root_as_failed(tmp_path: Path) -> None:
+    """The resolve check still guards every write, placed members included."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "GC").symlink_to(outside)
+    body = _zip({".import/save/x": b"x"})
+    plan = saves.ArchivePlan((), 0, placed=((".import/save/x", PurePosixPath("GC/x")),))
+
+    result = saves.write_save_archive(body, root, plan)
+
+    assert result["failed"] == 1 and result["imported"] == 0
+    assert not (outside / "x").exists()
+
+
+def test_write_save_archive_stamps_an_unusable_zip_date_with_now(tmp_path: Path) -> None:
+    """A date the plan did not vet falls back to the write stamp instead of raising."""
+    root = tmp_path / "root"
+    root.mkdir()
+    body = mangle_zip_member(_zip({"GC/a": b"a"}), "GC/a", dos_date=0)
+
+    result = saves.write_save_archive(body, root, saves.ArchivePlan(("GC/a",), 0), stamp=NEW)
+
+    assert result["written"] == 1 and result["failed"] == 0
+    assert (root / "GC" / "a").stat().st_mtime == NEW
+
+
+@pytest.mark.parametrize(
+    "mangle",
+    [{"flags": 0x1}, {"method": 99}],
+    ids=["encrypted", "compression"],
+)
+def test_write_save_archive_counts_an_unreadable_member_as_failed(
+    tmp_path: Path, mangle: dict[str, int]
+) -> None:
+    """A member that raises on read is a failed write, never an exception out of the restore.
+
+    Args:
+        tmp_path: The per-test temporary directory.
+        mangle: The header fields to break, passed to `mangle_zip_member`.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    body = mangle_zip_member(_zip({"GC/a": b"a"}), "GC/a", **mangle)
+
+    result = saves.write_save_archive(body, root, saves.ArchivePlan(("GC/a",), 0))
+
+    assert result["failed"] == 1 and result["written"] == 0
+    assert list((root / "GC").iterdir()) == []
+
+
+def test_write_save_archive_counts_a_corrupt_lzma_member_as_failed(tmp_path: Path) -> None:
+    """Corrupt lzma data is a failed write, not an `LZMAError` out of the restore."""
+    root = tmp_path / "root"
+    root.mkdir()
+    body = corrupt_zip_member(_zip_with("GC/a", _CORRUPTIBLE, zipfile.ZIP_LZMA), "GC/a")
+
+    result = saves.write_save_archive(body, root, saves.ArchivePlan(("GC/a",), 0))
+
+    assert result["failed"] == 1 and result["written"] == 0
+    assert list((root / "GC").iterdir()) == []
+
+
+def test_read_archive_reports_a_corrupt_lzma_manifest() -> None:
+    """A corrupt lzma manifest is an unusable manifest, not an exception out of the read."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(".import/save/a.srm", b"a")
+        zf.writestr(
+            zipfile.ZipInfo(saves.MANIFEST_NAME, date_time=(2020, 1, 1, 0, 0, 0)),
+            json.dumps({"version": 2, "files": [], "pad": _CORRUPTIBLE.hex()}),
+            compress_type=zipfile.ZIP_LZMA,
+        )
+    body = corrupt_zip_member(buf.getvalue(), saves.MANIFEST_NAME)
+
+    view = saves.read_archive(body)
+
+    assert view.manifest is None
+    assert view.manifest_error is not None
+    assert view.manifest_error.startswith("manifest unreadable: ")
+
+
+# ── verify_members: the pre-clear read ─────────────────────────────────
+
+
+@pytest.mark.parametrize("method", _METHODS, ids=_METHOD_IDS)
+def test_verify_members_passes_an_intact_member(method: int) -> None:
+    """An intact member reads clean under every compression method.
+
+    Args:
+        method: The member's compression method.
+    """
+    body = _zip_with("saves/a.srm", _CORRUPTIBLE, method)
+
+    assert saves.verify_members(body, ["saves/a.srm"]) == ()
+
+
+@pytest.mark.parametrize("method", _METHODS, ids=_METHOD_IDS)
+def test_verify_members_reports_a_corrupt_member(method: int, caplog: pytest.LogCaptureFixture) -> None:
+    """Corrupt data fails its read under every method, however that method raises.
+
+    Stored and deflate raise `BadZipFile` on the CRC, bzip2 raises `OSError`,
+    and lzma raises `lzma.LZMAError`.
+
+    Args:
+        method: The member's compression method.
+        caplog: Pytest's log capture.
+    """
+    body = corrupt_zip_member(_zip_with("saves/a.srm", _CORRUPTIBLE, method), "saves/a.srm")
+
+    with caplog.at_level(logging.WARNING, logger="webstation_broker.saves"):
+        problems = saves.verify_members(body, ["saves/a.srm"])
+
+    assert problems == (("saves/a.srm", "archive member is corrupt: saves/a.srm"),)
+    assert "saves/a.srm failed its read check" in caplog.text
+
+
+def test_verify_members_reads_only_the_names_it_is_given() -> None:
+    """A corrupt member the plan leaves out is never read."""
+    body = corrupt_zip_member(_zip({"saves/a": _CORRUPTIBLE, "saves/b": b"b"}), "saves/a")
+
+    assert saves.verify_members(body, ["saves/b"]) == ()
+
+
+def test_verify_members_reads_a_repeated_name_once() -> None:
+    """A name listed twice is read, and reported, once."""
+    body = corrupt_zip_member(_zip({"saves/a": _CORRUPTIBLE}), "saves/a")
+
+    assert saves.verify_members(body, ["saves/a", "saves/a"]) == (
+        ("saves/a", "archive member is corrupt: saves/a"),
+    )
+
+
+def test_verify_members_reports_a_name_the_archive_lacks() -> None:
+    """A planned name missing from the archive is a problem, not a `KeyError`."""
+    assert saves.verify_members(_zip({"saves/a": b"a"}), ["saves/b"]) == (
+        ("saves/b", "archive member is corrupt: saves/b"),
+    )
+
+
+def test_verify_members_stops_at_the_size_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Decompressed bytes count against `SAVE_FILE_MAX_BYTES`, and the check ends once they pass it.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher.
+    """
+    monkeypatch.setattr(saves, "SAVE_FILE_MAX_BYTES", 10)
+    body = _zip({"saves/a": b"x" * 8, "saves/b": b"y" * 8, "saves/c": b"z"})
+
+    assert saves.verify_members(body, ["saves/a", "saves/b", "saves/c"]) == (
+        (None, "archive exceeds size limit when extracted"),
+    )
+
+
+def test_verify_members_reports_a_body_that_is_not_a_zip() -> None:
+    """A body that is not a zip is one archive-level problem."""
+    assert saves.verify_members(b"not a zip", ["saves/a"]) == ((None, "body is not a zip archive"),)
+
+
+def test_extract_save_archive_still_refuses_import_members(tmp_path: Path) -> None:
+    """The legacy path refuses `.import/` members exactly as it always has."""
+    root = tmp_path / "root"
+    root.mkdir()
+    body = _zip({"GC/a": b"a", ".import/save/x": b"x"})
+
+    result = saves.extract_save_archive(body, root, ("GC",))
+
+    assert result["error"] == "archive member outside save subtrees: .import/save/x"
+    assert not (root / "GC").exists()
+
+
+# ── always_include: placed imports ship even if untouched ──────────────
+
+
+def test_always_include_ships_an_untouched_placed_file(tmp_path: Path) -> None:
+    """A placed import older than the baseline still ships, and the manifest names it."""
+    root = tmp_path / "root"
+    _write(root / "GC" / "placed.raw", b"p", mtime=OLD)
+    _write(root / "GC" / "other.raw", b"o", mtime=OLD)
+
+    report = saves.build_save_archive(
+        root,
+        ("GC",),
+        BASELINE,
+        identity={"emulator": "fake"},
+        always_include=frozenset({"GC/placed.raw"}),
+    )
+
+    assert [f["path"] for f in report["files"]] == ["GC/placed.raw"]
+    with zipfile.ZipFile(io.BytesIO(report["zip_bytes"])) as zf:
+        manifest = json.loads(zf.read(saves.MANIFEST_NAME))
+    assert manifest["imported"] == ["GC/placed.raw"]
+    assert manifest["version"] == 1
+
+
+def test_always_include_never_resurrects_a_file_that_is_gone(tmp_path: Path) -> None:
+    """A placed path that was deleted or set aside is simply absent."""
+    root = tmp_path / "root"
+    _write(root / "GC" / "placed.raw.untrusted", b"p", mtime=OLD)
+
+    report = saves.build_save_archive(
+        root, ("GC",), BASELINE, always_include=frozenset({"GC/placed.raw", "GC/gone.raw"})
+    )
+
+    assert report["files"] == []
+    assert report["zip_bytes"] is None
+
+
+def test_always_include_still_respects_the_size_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Forcing a file in never lets a dump past the size cap."""
+    monkeypatch.setattr(saves, "SAVE_FILE_MAX_BYTES", 1)
+    root = tmp_path / "root"
+    _write(root / "GC" / "placed.raw", b"big", mtime=OLD)
+
+    report = saves.build_save_archive(
+        root, ("GC",), BASELINE, always_include=frozenset({"GC/placed.raw"})
+    )
+
+    assert report["error"] is not None and "size limit" in report["error"]
+
+
+def test_a_dump_without_imports_has_no_imported_key(tmp_path: Path) -> None:
+    """A plain dump's manifest is byte-for-byte the v1 shape it always was."""
+    root = tmp_path / "root"
+    _write(root / "GC" / "a.raw", b"a", mtime=NEW)
+
+    report = saves.build_save_archive(root, ("GC",), BASELINE, identity={"emulator": "fake"})
+
+    with zipfile.ZipFile(io.BytesIO(report["zip_bytes"])) as zf:
+        assert "imported" not in json.loads(zf.read(saves.MANIFEST_NAME))

@@ -7,12 +7,16 @@ why the redirect is a monkeypatch of those globals rather than of the env.
 """
 
 import contextlib
+import io
+import json
 import os
 import signal
+import struct
 import subprocess
 import sys
 import time
 import uuid
+import zipfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Optional
@@ -20,7 +24,7 @@ from typing import Any, Optional
 import pytest
 from fastapi.testclient import TestClient
 
-from webstation_broker import screenshot, selkies, session, settings
+from webstation_broker import imports, saves, screenshot, selkies, session, settings
 from webstation_broker.app import create_app
 from webstation_broker.emulators import base
 from webstation_broker.emulators.base import Emulator
@@ -32,6 +36,160 @@ SLEEPER_CMD = ["/usr/bin/sleep", "60"]
 
 DETACHED_CMD = ["/usr/bin/sleep", "61"]
 """Argv the stand-in detached app runs, distinct from `SLEEPER_CMD` so the two are told apart."""
+
+
+def mangle_zip_member(
+    body: bytes,
+    name: str,
+    *,
+    flags: int = 0,
+    method: Optional[int] = None,
+    dos_date: Optional[int] = None,
+    raw_name: Optional[bytes] = None,
+) -> bytes:
+    """Patch one member's local and central headers into a shape `zipfile` cannot write.
+
+    Args:
+        body: A zip built by `zipfile`, with `name` stored uncompressed.
+        name: The member to patch.
+        flags: General-purpose flag bits to set on it.
+        method: A compression method number to claim, or None to keep it.
+        dos_date: A raw DOS date to stamp, or None to keep it.
+        raw_name: Replacement name bytes of the same length, or None to keep it.
+
+    Returns:
+        The patched archive.
+    """
+    buf = bytearray(body)
+    with zipfile.ZipFile(io.BytesIO(body)) as zf:
+        local = zf.getinfo(name).header_offset
+    encoded = name.encode()
+    central = buf.find(b"PK\x01\x02")
+    while central != -1:
+        (length,) = struct.unpack_from("<H", buf, central + 28)
+        if bytes(buf[central + 46 : central + 46 + length]) == encoded:
+            break
+        central = buf.find(b"PK\x01\x02", central + 1)
+    assert central != -1, f"{name} has no central directory entry"
+    # (flags, method, date, name) offsets in the local header, then the central one.
+    for flags_at, method_at, date_at, name_at in (
+        (local + 6, local + 8, local + 12, local + 30),
+        (central + 8, central + 10, central + 14, central + 46),
+    ):
+        (old_flags,) = struct.unpack_from("<H", buf, flags_at)
+        struct.pack_into("<H", buf, flags_at, old_flags | flags)
+        if method is not None:
+            struct.pack_into("<H", buf, method_at, method)
+        if dos_date is not None:
+            struct.pack_into("<H", buf, date_at, dos_date)
+        if raw_name is not None:
+            assert len(raw_name) == len(encoded), "the replacement name must keep the length"
+            buf[name_at : name_at + len(raw_name)] = raw_name
+    return bytes(buf)
+
+
+def corrupt_zip_member(body: bytes, name: str) -> bytes:
+    """Flip one byte in the middle of a member's data, leaving every header intact.
+
+    The headers still read, so the damage shows only once the member is
+    decompressed or its CRC is checked.
+
+    Args:
+        body: A zip built by `zipfile`.
+        name: The member to damage. Its compressed data must be at least one byte long.
+
+    Returns:
+        The damaged archive.
+    """
+    with zipfile.ZipFile(io.BytesIO(body)) as zf:
+        info = zf.getinfo(name)
+    buf = bytearray(body)
+    name_len, extra_len = struct.unpack_from("<HH", buf, info.header_offset + 26)
+    start = info.header_offset + 30 + name_len + extra_len
+    buf[start + info.compress_size // 2] ^= 0xFF
+    return bytes(buf)
+
+
+def import_zip(members: dict[str, bytes], v1: Optional[dict[str, bytes]] = None) -> bytes:
+    """Build a version 2 archive declaring each import member by its path's kind.
+
+    Args:
+        members: `.import/<kind>/...` names mapped to bytes; the second path
+            component is the declared kind.
+        v1: Ordinary archive members to carry beside them, or None.
+
+    Returns:
+        The zip.
+    """
+    files = [{"path": name, "kind": name.split("/")[1]} for name in members]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, data in {**(v1 or {}), **members}.items():
+            zf.writestr(name, data)
+        zf.writestr(saves.MANIFEST_NAME, json.dumps({"version": 2, "created_at": 0, "files": files}))
+    return buf.getvalue()
+
+
+def preflight_import(
+    emulator: Emulator,
+    body: bytes,
+    *,
+    rom_file: Optional[Path],
+    resume_slot: Optional[int] = None,
+    rom: Optional[imports.RomRef] = None,
+    memory_card_synced: bool = False,
+) -> imports.PreflightResult:
+    """Run preflight on an archive the way activate does, with no subtree excluded.
+
+    Args:
+        emulator: The emulator, with its dirs already patched into tmp_path.
+        body: The archive.
+        rom_file: The resolved bootable file, or None.
+        resume_slot: The activate's `save.resume_slot`, or None.
+        rom: The activate body's rom, or None.
+        memory_card_synced: Whether the card travels on its own routes.
+
+    Returns:
+        What preflight decided.
+    """
+    return imports.preflight(
+        emulator,
+        saves.read_archive(body),
+        body,
+        rom_file=rom_file,
+        rom=rom,
+        memory_card_synced=memory_card_synced,
+        excluded=(),
+        resume_slot=resume_slot,
+    )
+
+
+def restore_import(emulator: Emulator, body: bytes, result: imports.PreflightResult) -> dict[str, Any]:
+    """Write a clean preflight's placements and sidecars the way activate does.
+
+    The archive's v1 members are left out, so the test sees only what the
+    import placed.
+
+    Args:
+        emulator: The emulator whose `save_root` the files land under.
+        body: The archive preflight read.
+        result: Preflight's answer; it must hold no refusals.
+
+    Returns:
+        `saves.write_save_archive`'s report.
+    """
+    assert result.refusals == (), result.refusals
+    placements = result.placements
+    return saves.write_save_archive(
+        body,
+        emulator.save_root,
+        saves.ArchivePlan(
+            (),
+            0,
+            tuple((p.member.name, p.dest) for p in placements),
+            tuple(sidecar for p in placements for sidecar in p.sidecars),
+        ),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -175,13 +333,13 @@ def broker_dirs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Pa
     """
     roms = tmp_path / "romm"
     exports = tmp_path / "exports"
-    imports = tmp_path / "imports"
-    for d in (roms, exports, imports):
+    import_dir = tmp_path / "imports"
+    for d in (roms, exports, import_dir):
         d.mkdir()
     monkeypatch.setattr(settings, "ROM_ROOT", roms)
     monkeypatch.setattr(settings, "EXPORT_DIR", exports)
-    monkeypatch.setattr(settings, "IMPORT_DIR", imports)
-    return {"roms": roms, "exports": exports, "imports": imports}
+    monkeypatch.setattr(settings, "IMPORT_DIR", import_dir)
+    return {"roms": roms, "exports": exports, "imports": import_dir}
 
 
 class FakeEmulator(Emulator):

@@ -1,30 +1,44 @@
 {
   "nes": {
     "core": "mesen",
+    "library_name": "Mesen",
+    "save_ram": true,
     "extensions": [".nes", ".unf", ".unif", ".fds"]
   },
   "famicom": {
     "core": "mesen",
+    "library_name": "Mesen",
+    "save_ram": true,
     "extensions": [".nes", ".unf", ".unif", ".fds"]
   },
   "fds": {
     "core": "mesen",
+    "library_name": "Mesen",
+    "save_ram": false,
     "extensions": [".fds"]
   },
   "snes": {
     "core": "snes9x",
+    "library_name": "Snes9x",
+    "save_ram": true,
     "extensions": [".sfc", ".smc", ".fig", ".swc", ".st", ".gd3", ".gd7", ".dx2", ".bs", ".bin"]
   },
   "sfam": {
     "core": "snes9x",
+    "library_name": "Snes9x",
+    "save_ram": true,
     "extensions": [".sfc", ".smc", ".fig", ".swc", ".st", ".gd3", ".gd7", ".dx2", ".bs", ".bin"]
   },
   "n64": {
     "core": "mupen64plus_next",
+    "library_name": "Mupen64Plus-Next",
+    "save_ram": true,
     "extensions": [".n64", ".z64", ".v64", ".rom", ".ndd"]
   },
   "ngc": {
     "core": "dolphin",
+    "library_name": "dolphin-emu",
+    "save_ram": false,
     "extensions": [".rvz", ".gcz", ".iso", ".gcm", ".wbfs", ".ciso", ".chd", ".wad", ".dol", ".elf"],
     "save_subtrees": [
       "states",
@@ -35,6 +49,8 @@
   },
   "wii": {
     "core": "dolphin",
+    "library_name": "dolphin-emu",
+    "save_ram": false,
     "extensions": [".rvz", ".gcz", ".iso", ".gcm", ".wbfs", ".ciso", ".chd", ".wad", ".dol", ".elf"],
     "save_subtrees": [
       "states",
@@ -45,26 +61,38 @@
   },
   "gb": {
     "core": "gambatte",
+    "library_name": "Gambatte",
+    "save_ram": true,
     "extensions": [".gb", ".dmg"]
   },
   "gbc": {
     "core": "gambatte",
+    "library_name": "Gambatte",
+    "save_ram": true,
     "extensions": [".gbc", ".gb", ".dmg"]
   },
   "gba": {
     "core": "mgba",
+    "library_name": "mGBA",
+    "save_ram": true,
     "extensions": [".gba", ".agb"]
   },
   "virtualboy": {
     "core": "mednafen_vb",
+    "library_name": "Beetle VB",
+    "save_ram": true,
     "extensions": [".vb", ".vboy", ".bin"]
   },
   "nds": {
     "core": "melonds",
+    "library_name": "melonDS",
+    "save_ram": false,
     "extensions": [".nds", ".srl"]
   },
   "3ds": {
     "core": "azahar",
+    "library_name": "Azahar",
+    "save_ram": false,
     "core_source": {
       "github_release": "azahar-emu/azahar",
       "asset": "azahar-libretro-linux-x86_64-.*\\.zip"
@@ -74,42 +102,62 @@
   },
   "genesis": {
     "core": "genesis_plus_gx",
+    "library_name": "Genesis Plus GX",
+    "save_ram": true,
     "extensions": [".md", ".gen", ".smd", ".bin", ".sg", ".sms", ".gg", ".cue"]
   },
   "sms": {
     "core": "genesis_plus_gx",
+    "library_name": "Genesis Plus GX",
+    "save_ram": true,
     "extensions": [".sms", ".bin"]
   },
   "gamegear": {
     "core": "genesis_plus_gx",
+    "library_name": "Genesis Plus GX",
+    "save_ram": true,
     "extensions": [".gg", ".bin"]
   },
   "sg1000": {
     "core": "genesis_plus_gx",
+    "library_name": "Genesis Plus GX",
+    "save_ram": true,
     "extensions": [".sg", ".bin"]
   },
   "segacd": {
     "core": "genesis_plus_gx",
+    "library_name": "Genesis Plus GX",
+    "save_ram": false,
     "extensions": [".m3u", ".cue", ".chd", ".iso"]
   },
   "sega32": {
     "core": "picodrive",
+    "library_name": "PicoDrive",
+    "save_ram": true,
     "extensions": [".32x", ".bin", ".md", ".smd"]
   },
   "dc": {
     "core": "flycast",
+    "library_name": "Flycast",
+    "save_ram": false,
     "extensions": [".m3u", ".gdi", ".cdi", ".chd", ".cue", ".iso", ".bin"]
   },
   "saturn": {
     "core": "yabasanshiro",
+    "library_name": "YabaSanshiro",
+    "save_ram": false,
     "extensions": [".m3u", ".cue", ".chd", ".iso", ".bin", ".ccd", ".toc"]
   },
   "psx": {
     "core": "swanstation",
+    "library_name": "SwanStation",
+    "save_ram": true,
     "extensions": [".m3u", ".chd", ".cue", ".pbp", ".ccd", ".mds", ".iso", ".img", ".ecm", ".bin", ".exe", ".psexe"]
   },
   "psp": {
     "core": "ppsspp",
+    "library_name": "PPSSPP",
+    "save_ram": false,
     "assets": {"PPSSPP": "/usr/share/ppsspp/assets"},
     "extensions": [".iso", ".cso", ".pbp", ".chd", ".elf", ".prx"],
     "resume_settle": 12.0,
@@ -117,127 +165,189 @@
   },
   "tg16": {
     "core": "mednafen_pce",
+    "library_name": "Beetle PCE",
+    "save_ram": true,
     "extensions": [".pce"]
   },
   "supergrafx": {
     "core": "mednafen_supergrafx",
+    "library_name": "Beetle SuperGrafx",
+    "save_ram": true,
     "extensions": [".sgx", ".pce", ".cue", ".chd", ".ccd"]
   },
   "turbografx-cd": {
     "core": "mednafen_pce",
+    "library_name": "Beetle PCE",
+    "save_ram": true,
     "extensions": [".m3u", ".cue", ".chd", ".ccd", ".toc"]
   },
   "neogeoaes": {
     "core": "fbneo",
+    "library_name": "FinalBurn Neo",
+    "save_ram": false,
     "extensions": [".zip", ".7z"]
   },
   "neogeomvs": {
     "core": "fbneo",
+    "library_name": "FinalBurn Neo",
+    "save_ram": false,
     "extensions": [".zip", ".7z"]
   },
   "neo-geo-cd": {
     "core": "neocd",
+    "library_name": "NeoCD",
+    "save_ram": true,
     "extensions": [".cue", ".chd"]
   },
   "neo-geo-pocket": {
     "core": "mednafen_ngp",
+    "library_name": "Beetle NeoPop",
+    "save_ram": false,
     "extensions": [".ngp", ".ngc", ".ngpc", ".npc"]
   },
   "neo-geo-pocket-color": {
     "core": "mednafen_ngp",
+    "library_name": "Beetle NeoPop",
+    "save_ram": false,
     "extensions": [".ngpc", ".npc", ".ngp", ".ngc"]
   },
   "wonderswan": {
     "core": "mednafen_wswan",
+    "library_name": "Beetle WonderSwan",
+    "save_ram": true,
     "extensions": [".ws", ".wsc", ".pc2"]
   },
   "wonderswan-color": {
     "core": "mednafen_wswan",
+    "library_name": "Beetle WonderSwan",
+    "save_ram": true,
     "extensions": [".wsc", ".ws", ".pc2"]
   },
   "atari2600": {
     "core": "stella",
+    "library_name": "Stella",
+    "save_ram": false,
     "extensions": [".a26", ".bin"]
   },
   "atari5200": {
     "core": "a5200",
+    "library_name": "a5200",
+    "save_ram": false,
     "extensions": [".a52", ".bin"]
   },
   "atari7800": {
     "core": "prosystem",
+    "library_name": "ProSystem",
+    "save_ram": false,
     "extensions": [".a78", ".bin"]
   },
   "lynx": {
     "core": "handy",
+    "library_name": "Handy",
+    "save_ram": false,
     "extensions": [".lnx", ".o"]
   },
   "jaguar": {
     "core": "virtualjaguar",
+    "library_name": "Virtual Jaguar",
+    "save_ram": true,
     "extensions": [".j64", ".jag", ".rom", ".abs", ".cof", ".bin"],
     "savestate": false
   },
   "3do": {
     "core": "opera",
+    "library_name": "Opera",
+    "save_ram": false,
     "extensions": [".iso", ".chd", ".cue", ".bin"]
   },
   "colecovision": {
     "core": "gearcoleco",
+    "library_name": "Gearcoleco",
+    "save_ram": true,
     "extensions": [".col", ".cv", ".rom", ".bin"]
   },
   "intellivision": {
     "core": "freeintv",
+    "library_name": "freeintv",
+    "save_ram": false,
     "extensions": [".int", ".rom", ".bin"]
   },
   "vectrex": {
     "core": "vecx",
+    "library_name": "VecX",
+    "save_ram": false,
     "extensions": [".vec", ".bin"]
   },
   "odyssey-2": {
     "core": "o2em",
+    "library_name": "O2EM",
+    "save_ram": false,
     "extensions": [".bin"]
   },
   "dos": {
     "core": "dosbox_pure",
+    "library_name": "DOSBox-pure",
+    "save_ram": false,
     "extensions": [".m3u", ".dosz", ".zip", ".iso", ".cue", ".exe", ".com", ".bat", ".conf"]
   },
   "amiga": {
     "core": "puae",
+    "library_name": "PUAE",
+    "save_ram": false,
     "extensions": [".adf", ".adz", ".dms", ".ipf", ".hdf", ".hdz", ".lha", ".m3u"]
   },
   "c64": {
     "core": "vice_x64",
+    "library_name": "VICE x64",
+    "save_ram": false,
     "extensions": [".d64", ".t64", ".tap", ".prg", ".crt", ".g64", ".m3u"]
   },
   "msx": {
     "core": "bluemsx",
+    "library_name": "blueMSX",
+    "save_ram": false,
     "extensions": [".rom", ".mx1", ".mx2", ".dsk", ".cas", ".m3u"]
   },
   "msx2": {
     "core": "bluemsx",
+    "library_name": "blueMSX",
+    "save_ram": false,
     "extensions": [".mx2", ".rom", ".dsk", ".cas", ".m3u"]
   },
   "zxs": {
     "core": "fuse",
+    "library_name": "Fuse",
+    "save_ram": false,
     "extensions": [".tzx", ".tap", ".z80", ".sna", ".szx", ".trd", ".scl", ".dsk"]
   },
   "atari-st": {
     "core": "hatari",
+    "library_name": "hatari",
+    "save_ram": false,
     "extensions": [".st", ".msa", ".stx", ".dim", ".ipf", ".m3u"]
   },
   "arcade": {
     "core": "fbneo",
+    "library_name": "FinalBurn Neo",
+    "save_ram": false,
     "extensions": [".zip", ".7z", ".chd"]
   },
   "cps1": {
     "core": "fbneo",
+    "library_name": "FinalBurn Neo",
+    "save_ram": false,
     "extensions": [".zip", ".7z"]
   },
   "cps2": {
     "core": "fbneo",
+    "library_name": "FinalBurn Neo",
+    "save_ram": false,
     "extensions": [".zip", ".7z"]
   },
   "cps3": {
     "core": "fbneo",
+    "library_name": "FinalBurn Neo",
+    "save_ram": false,
     "extensions": [".zip", ".7z"]
   }
 }

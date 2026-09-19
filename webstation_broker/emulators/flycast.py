@@ -62,9 +62,10 @@ import re
 import stat
 import subprocess
 import time
-from pathlib import Path
-from typing import Optional
+from pathlib import Path, PurePosixPath
+from typing import Optional, Union
 
+from .. import imports
 from .base import Emulator, base_launch_env, xdg_data_dir
 
 log = logging.getLogger(__name__)
@@ -175,6 +176,14 @@ write does not read as a finished one on a loaded host.
 
 
 def _state_path_for(rom_path: Path) -> Path:
+    """The resume state Flycast writes on exit and auto-loads on boot for one rom.
+
+    Args:
+        rom_path: The booted rom.
+
+    Returns:
+        `<rom stem>.state` in DATA_DIR.
+    """
     return DATA_DIR / f"{rom_path.stem}.state"
 
 
@@ -358,6 +367,210 @@ def _wait_for_state_write(
     return None
 
 
+VMU_IMAGE_BYTES = 131072
+"""The size of a raw VMU image, which is what Flycast mounts: 256 blocks of 512 bytes."""
+
+DEFAULT_VMU = "vmu_save_A1.bin"
+"""The VMU a memory-card import fills when its name picks none: controller A's first socket."""
+
+NVMEM_NAME = "dc_nvmem.bin"
+"""The Dreamcast's writable system flash (clock, language, and so on), as the Flycast binary names it."""
+
+_VMU_NAME = re.compile(r"vmu_save_([A-D])([12])\.bin", re.IGNORECASE | re.ASCII)
+"""A VMU image name: controller port A to D, socket 1 or 2."""
+
+_STATE_NAME = re.compile(r"[^/]+\.state", re.IGNORECASE | re.ASCII)
+"""A resume state's file name."""
+
+_CONVERTIBLE_SUFFIXES = frozenset({".vms", ".vmi", ".dci", ".dcm"})
+"""VMU export formats: each holds a save, but not as the raw image Flycast mounts."""
+
+_SAVE_EXPECTED = f"a raw {VMU_IMAGE_BYTES}-byte vmu_save_<A-D><1-2>.bin, or {NVMEM_NAME}, as a single file"
+"""The `expected` text on every refusal Flycast's own hook gives a `save` member."""
+_STATE_EXPECTED = "one non-empty .state file, as a single file"
+"""The `expected` text on every refusal Flycast's own hook gives a `state` member."""
+_CARD_EXPECTED = f"one raw {VMU_IMAGE_BYTES}-byte VMU image"
+"""The `expected` text on every refusal Flycast's own hook gives a `memcard` member."""
+
+
+def _vmu_name(leaf: str) -> Optional[str]:
+    """Spell a VMU image name the way Flycast writes it.
+
+    Args:
+        leaf: A file name.
+
+    Returns:
+        `vmu_save_<port><socket>.bin` with the port upper-cased, or None when
+        `leaf` names no VMU.
+    """
+    m = _VMU_NAME.fullmatch(leaf)
+    return f"vmu_save_{m.group(1).upper()}{m.group(2)}.bin" if m else None
+
+
+def _foreign_format(
+    member: imports.ImportMember, leaf: str, expected: str
+) -> Optional[imports.ImportRefusal]:
+    """Refuse a save in a format Flycast does not mount, naming the format.
+
+    Args:
+        member: The member.
+        leaf: Its file name.
+        expected: The accepted shape, in words.
+
+    Returns:
+        `source_incompatible` for a RetroArch file, `needs_conversion` for a
+        VMU export format, or None when the name is neither.
+    """
+    suffix = PurePosixPath(leaf).suffix.lower()
+    if suffix == ".srm":
+        return imports.ImportRefusal(
+            "source_incompatible", member.name, expected, detail="a RetroArch save file"
+        )
+    if suffix in _CONVERTIBLE_SUFFIXES:
+        return imports.ImportRefusal(
+            "needs_conversion",
+            member.name,
+            expected,
+            detail=f"{suffix} is a VMU export format; convert it to a raw {VMU_IMAGE_BYTES}-byte image",
+        )
+    return None
+
+
+def _place_vmu(
+    member: imports.ImportMember, name: str, expected: str
+) -> Union[imports.Placement, imports.ImportRefusal]:
+    """Place a raw VMU image in the data dir under a canonical name.
+
+    Args:
+        member: The member.
+        name: The canonical `vmu_save_<port><socket>.bin` it lands as.
+        expected: The accepted shape, in words.
+
+    Returns:
+        The placement, or `unrecognised_layout` when the member is not a raw image's size.
+    """
+    if member.size != VMU_IMAGE_BYTES:
+        return imports.ImportRefusal(
+            "unrecognised_layout",
+            member.name,
+            expected,
+            detail=f"a raw VMU image is {VMU_IMAGE_BYTES} bytes, this one is {member.size}",
+        )
+    return imports.Placement(member, PurePosixPath(DATA_DIR.name, name))
+
+
+def _place_save(member: imports.ImportMember) -> Union[imports.Placement, imports.ImportRefusal]:
+    """Place a `save` member: a VMU image or the system flash.
+
+    Args:
+        member: The member.
+
+    Returns:
+        The placement, or a refusal.
+    """
+    if len(member.parts) != 1:
+        return imports.ImportRefusal(
+            "unrecognised_layout", member.name, _SAVE_EXPECTED, detail="expected a single file"
+        )
+    leaf = member.parts[0]
+    foreign = _foreign_format(member, leaf, _SAVE_EXPECTED)
+    if foreign is not None:
+        return foreign
+    vmu = _vmu_name(leaf)
+    if vmu is not None:
+        return _place_vmu(member, vmu, _SAVE_EXPECTED)
+    if leaf.lower() == NVMEM_NAME:
+        if member.size == 0:
+            return imports.ImportRefusal(
+                "incomplete_unit", member.name, _SAVE_EXPECTED, detail="the file is empty"
+            )
+        return imports.Placement(member, PurePosixPath(DATA_DIR.name, NVMEM_NAME))
+    if leaf in CONTAINER_FILES or leaf.endswith(OWNER_SUFFIX) or _is_quarantined(leaf):
+        # Placed as named so the plan check refuses it as protected_destination,
+        # which tells the player more than "not recognised" would.
+        return imports.Placement(member, PurePosixPath(DATA_DIR.name, leaf))
+    if _STATE_NAME.fullmatch(leaf):
+        return imports.ImportRefusal(
+            "unrecognised_layout",
+            member.name,
+            _SAVE_EXPECTED,
+            detail="a Flycast resume state: declare it as kind state",
+        )
+    return imports.ImportRefusal("unrecognised_layout", member.name, _SAVE_EXPECTED)
+
+
+def _place_card(member: imports.ImportMember) -> Union[imports.Placement, imports.ImportRefusal]:
+    """Place a `memcard` member: one raw VMU image, in the socket its name picks or in A1.
+
+    Args:
+        member: The member.
+
+    Returns:
+        The placement, or a refusal.
+    """
+    if len(member.parts) != 1:
+        return imports.ImportRefusal(
+            "unrecognised_layout", member.name, _CARD_EXPECTED, detail="expected a single file"
+        )
+    leaf = member.parts[0]
+    foreign = _foreign_format(member, leaf, _CARD_EXPECTED)
+    if foreign is not None:
+        return foreign
+    return _place_vmu(member, _vmu_name(leaf) or DEFAULT_VMU, _CARD_EXPECTED)
+
+
+def _place_state(
+    member: imports.ImportMember, ctx: imports.ImportCtx
+) -> Union[imports.Placement, imports.ImportRefusal]:
+    """Place a `state` member as the booted rom's resume state, with its owner marker.
+
+    Flycast auto-loads only `<rom stem>.state`, and the broker only asks it to
+    when the marker beside the state names the rom, so the member is renamed
+    and the marker written as a sidecar.
+
+    Args:
+        member: The member.
+        ctx: The launch context; its `rom_file` names the state.
+
+    Returns:
+        The placement, or a refusal.
+    """
+    rom_file = ctx.rom_file
+    if rom_file is None:
+        return imports.ImportRefusal(
+            "destination_unresolvable",
+            member.name,
+            _STATE_EXPECTED,
+            detail="no rom file to name the state after",
+        )
+
+    def rename(leaf: str) -> str:
+        """Name the state after the rom, whatever the member was called.
+
+        Args:
+            leaf: The member's file name; unused.
+
+        Returns:
+            `<rom stem>.state`, the only name Flycast auto-loads.
+        """
+        return _state_path_for(rom_file).name
+
+    dest = imports.place_single_file(
+        member,
+        subtree=DATA_DIR.name,
+        pattern=_STATE_NAME,
+        rename=rename,
+        expected=_STATE_EXPECTED,
+        nonempty=True,
+        # The marker's name is the state's plus `.rom`, and it is written only
+        # after the working slot is cleared, so the state leaves room for it.
+        max_component_bytes=255 - len(imports.OWNER_MARKER_SUFFIX),
+    )
+    if isinstance(dest, imports.ImportRefusal):
+        return dest
+    return imports.Placement(member, dest, (imports.owner_marker_sidecar(dest, rom_file),))
+
+
 class Flycast(Emulator):
     """Exit-only Flycast (Sega Dreamcast) launcher.
 
@@ -398,6 +611,54 @@ class Flycast(Emulator):
             `state` for the savestate, `save` for everything else.
         """
         return "state" if rel.lower().endswith(".state") else "save"
+
+    def import_spec(self) -> imports.ImportSpec:
+        """Declare what Flycast takes: VMU and flash saves, raw VMU cards, and one resume state.
+
+        The state rides the archive and resumes through `save.resume_slot`,
+        like the one the broker saves on exit. There is still no mid-session
+        save or load, so `supports_states` stays False.
+
+        Returns:
+            The spec. Its paths follow DATA_DIR, so it is built on every call.
+        """
+        data = DATA_DIR.name
+        return imports.ImportSpec(
+            kinds=(
+                imports.KindSpec("save", ("vmu_save_<A-D><1-2>.bin", NVMEM_NAME)),
+                imports.KindSpec(
+                    "state", ("<name>.state",), requires_resume_slot=True, max_members=1, counts_v1=True
+                ),
+                imports.KindSpec("memcard", (f"raw {VMU_IMAGE_BYTES}-byte VMU image",)),
+            ),
+            state_channel="archive",
+            # The BIOS pair and emu.cfg are the container's. `*.rom` covers every
+            # owner marker, including a set-aside state's: only the broker writes one.
+            protected=(
+                *(f"{data}/{name}" for name in sorted(CONTAINER_FILES)),
+                f"*{OWNER_SUFFIX}",
+                f"*{UNTRUSTED_SUFFIX}",
+            ),
+        )
+
+    def place_import(
+        self, member: imports.ImportMember, spec: imports.ImportSpec, ctx: imports.ImportCtx
+    ) -> Union[imports.Placement, imports.ImportRefusal]:
+        """Place one declared member in the flat data dir.
+
+        Args:
+            member: The member, already past the kind gate.
+            spec: This emulator's spec.
+            ctx: The launch context.
+
+        Returns:
+            The placement, or a refusal.
+        """
+        if member.kind == "state":
+            return _place_state(member, ctx)
+        if member.kind == "memcard":
+            return _place_card(member)
+        return _place_save(member)
 
     def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """Resolve a ROM path to a single playable disc image or file.

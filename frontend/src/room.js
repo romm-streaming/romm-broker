@@ -1215,7 +1215,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Matches the tile size in room.css and the remote canvas below.
     const WEBCAM_WIDTH = 240;
     const WEBCAM_HEIGHT = 180;
-    let lastKnownVolume = parseFloat(localStorage.getItem('collab_iframe_volume')) || 1.0;
+    // Retro games mix far louder than a webcam mic, so a first visit starts the
+    // game below full. A saved level wins, including 0 from RomM's bar.
+    const DEFAULT_STREAM_VOLUME = 0.6;
+    const savedVolume = parseFloat(localStorage.getItem('collab_iframe_volume'));
+    let lastKnownVolume = Number.isFinite(savedVolume) ? savedVolume : DEFAULT_STREAM_VOLUME;
     let isIframeMuted = false;
 
     // RomM is normally same-origined under its SUBFOLDER, but it can also run

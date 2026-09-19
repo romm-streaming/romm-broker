@@ -37,11 +37,21 @@ code meaning the request is rejected). DuckStation, Flycast and RPCS3 are
 worth calling out here: `supports_states` is off for all three, but each one
 writes a state when it exits cleanly and can boot straight into that state on
 the next launch, so `resume_slot` still matters for them even though live
-saving and loading doesn't work. For every other "no" in the table,
+saving and loading doesn't work. DuckStation and RPCS3 also hand that exit
+state out through the
+[state-file GET](/docs/api/state#move-a-state-file-in-or-out) once the exit
+has confirmed it, so RomM can keep it in its state library; Flycast doesn't
+yet. For every other "no" in the table,
 `resume_slot` really is ignored and the game's own save data is all that's
 kept. Each emulator's exact save paths are listed as the `save_subtrees`
 attribute of its class in the
 [Python reference](/docs/developer/reference/emulators).
+
+RetroArch, Flycast and DuckStation also take
+[declared imports](/docs/api/imports): save files made outside the broker,
+such as another emulator's, placed into the session at activate.
+[What each emulator takes](/docs/api/imports#what-each-emulator-takes) lists
+the files each one accepts.
 
 ## RetroArch
 
@@ -121,7 +131,8 @@ DuckStation has no mid-session save states: it doesn't give the broker
 anything to hook into while a game is running, so the save-state routes
 return `400`. What it does have is a graceful shutdown: when it closes
 cleanly, it writes a resume state, and the broker reports that file as the
-exit save state. Getting that clean shutdown takes longer than for other
+exit save state and serves it through the state-file GET until the next
+activate. Getting that clean shutdown takes longer than for other
 emulators, which is why
 [`DUCKSTATION_STOP_WAIT`](/docs/configuration/emulators#duckstation), the
 time the broker waits after asking DuckStation to quit (a SIGTERM signal,
@@ -129,6 +140,19 @@ the standard request a program can ignore or handle gracefully) before
 forcing it closed, is the longest of any emulator here. Memory cards and
 that resume state both live
 under the data root that the save archive carries.
+
+Memory card 1 is one shared card, `memcards/shared_card_1.mcd`, that every
+game uses. DuckStation's own default names the card after each game, which
+the broker can't know before the disc boots, so the broker pins the shared
+card in DuckStation's settings on every launch. An archive saved before that
+pin holds a per-game card (`<title>_1.mcd`) instead. While the shared card
+doesn't exist, a launch copies the newest per-game card to it. It's a copy,
+never a move, so the per-game card stays on disk and in the archive. If the
+copy fails, the launch fails rather than boot the game on a blank card.
+
+A [declared import](/docs/api/imports#what-each-emulator-takes) can bring in
+a raw memory card, which becomes the shared card, or a resume state, which
+needs `resume_slot` and which the game boots straight into.
 
 ## Dolphin
 
@@ -237,7 +261,9 @@ keeping it open. A resume works by pointing the next launch straight at the
 newest saved state instead of the game itself: RPCS3 tells a save state
 apart from a normal boot target by its file contents, not its extension, so
 booting into one works the same way booting a ROM does. States are kept one
-per title, so `resume_slot` always finds the right one. The game's own save
+per title, so `resume_slot` always finds the right one. The state an exit
+confirms is served through the state-file GET until the next activate, the
+same way DuckStation's is. The game's own save
 data, under `dev_hdd0/home/`, persists separately from all of this.
 
 `rom.path` can be a PKG file, which the launcher installs first
@@ -319,6 +345,13 @@ nothing separates them from the save state, or from a leftover first-run
 setup file. A RetroArch core also covers the Dreamcast (`dc` uses it by
 default), for anyone who'd rather use RetroArch's shared save-state menu and
 hotkeys instead.
+
+A [declared import](/docs/api/imports#what-each-emulator-takes) can bring in
+VMU images, the console's system flash (`dc_nvmem.bin`), or a save state.
+An imported state needs `resume_slot`. It is renamed after the game being
+launched, and the game boots straight into it, as it does with the state
+Flycast writes on exit. A RetroArch `.srm` isn't a VMU image, so Flycast
+refuses one.
 
 ## ScummVM
 

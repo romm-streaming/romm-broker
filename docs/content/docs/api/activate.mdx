@@ -32,7 +32,7 @@ The payload fields:
 | Field | Required | Purpose |
 | --- | --- | --- |
 | `emulator` | yes | The emulator's name, from the [Supported emulators](/docs/emulators) list. |
-| `rom` | unless the emulator is `desktop` | `path` is the container path (the file's location inside the container, not on your host machine). `id`, `name` and `platform` come back in the exit upload, and for `retroarch`, `platform` picks the core (the plugin that lets RetroArch emulate that particular system). The optional `language` is the rom's own language, for an emulator whose games ship several of them in one folder: ScummVM sets up one entry, called a target, per language it detects, and that target is what actually boots. Without `language`, a multilingual game starts in whichever language happens to sort first. A code the broker doesn't recognise is ignored rather than failing the launch. |
+| `rom` | unless the emulator is `desktop` | `path` is the container path (the file's location inside the container, not on your host machine). `id`, `name` and `platform` come back in the exit upload, and for `retroarch`, `platform` picks the core (the plugin that lets RetroArch emulate that particular system). The optional `language` is the rom's own language, for an emulator whose games ship several of them in one folder: ScummVM sets up one entry, called a target, per language it detects, and that target is what actually boots. Without `language`, a multilingual game starts in whichever language happens to sort first. A code the broker doesn't recognise is ignored rather than failing the launch. The optional `title_id`, `save_target` and `save_target_layout` help an emulator place a [declared import](/docs/api/imports#what-romm-can-tell-the-broker). |
 | `gui_language` | no | The player's own interface language, not the rom's. If an emulator has a translated interface, it follows this setting (ScummVM writes it into `scummvm.ini`, which is also where the broker reads the keyboard shortcuts it uses to drive ScummVM's in-game menu automatically). A multilingual game folder falls back to `gui_language` when `rom.language` is missing: RomM rarely knows a game's language, so the player's own setting is the only clue left. This is sent for the `desktop` session too, even though it has no rom at all. An unrecognised code is ignored. |
 | `user` | no | `id`, `username` and `display_name` for the controller (the person launching the game, who gets full control by default). If they join or rejoin, the broker matches them by `id` first, then by `username`. |
 | `session_id` | no | An id you supply, cleaned up so it's safe to use in a filename. The broker generates one itself if you leave this out. |
@@ -86,6 +86,10 @@ A resume state can also show up after activate has already answered: the
 that's already live, so RomM sends its chosen state once the game has started
 booting, and the broker's deferred resume load waits for it.
 
+An archive can also carry saves the broker did not write, declared under
+`.import/`; see [Declared imports](/docs/api/imports). Each is checked before
+the working slot is cleared, and a refused import leaves the slot as it was.
+
 ## Launch the desktop
 
 Setting `emulator` to `"desktop"` streams the full webstation desktop, so you
@@ -136,9 +140,16 @@ state slot of anything left over from the previous session.
 <Step>
 Restores `save.archive`, if one was sent, into the emulator's save folders,
 but never rolls back a file that's newer on disk than what's in the archive.
-A file in the archive that falls outside those folders, or a synced memory
-card sitting in an older archive, gets skipped instead of failing the whole
-restore.
+A file in the archive that falls outside those folders refuses the whole
+restore, as do an encrypted file, one with a compression method the broker
+cannot read, one with an invalid timestamp, and one whose data is corrupt.
+The broker reads every file it is about to restore in full before step 2
+clears anything, so a refused activate leaves the slot as it was: an
+archive without imports answers 422 `save restore failed: <message>`, and
+one with imports lists the file as `unrecognised_layout`, `unsafe_path` or
+`unreadable_member`. A corrupt file refuses the restore even when a newer
+copy on disk means it would not have been written. Only a synced memory
+card sitting in an older archive gets skipped.
 </Step>
 <Step>
 Launches the emulator in its own process group, with its output captured to

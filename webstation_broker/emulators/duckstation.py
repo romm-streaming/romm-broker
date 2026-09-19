@@ -26,13 +26,17 @@ can be the only copy of the player's progress, and only the resume path
 needs to be kept away from it.
 """
 
+import contextlib
 import logging
 import os
 import re
+import shutil
+import stat
 from collections.abc import Iterable
-from pathlib import Path
-from typing import Any, Optional
+from pathlib import Path, PurePosixPath
+from typing import Any, Optional, Union
 
+from .. import imports
 from .base import Emulator, base_launch_env
 
 log = logging.getLogger(__name__)
@@ -79,6 +83,15 @@ INI_PATH = DATA_DIR / "settings.ini"
 """The settings.ini the broker patches before every launch."""
 SSTATE_DIR = DATA_DIR / "savestates"
 """Directory DuckStation writes `<serial>_resume.sav` into on shutdown."""
+MEMCARD_DIR = DATA_DIR / "memcards"
+"""Directory DuckStation keeps its memory cards in, as the pinned `[MemoryCards] Directory` names it."""
+PINNED_CARD = "shared_card_1.mcd"
+"""The one card the pinned settings mount in slot 1, under MEMCARD_DIR.
+
+DuckStation's default names card 1 after the game's title, which the broker
+never reads, so an imported card would have no name to land under before the
+disc boots. A Shared card has one fixed name.
+"""
 DUCKSTATION_LOG_PATH = Path(
     os.environ.get("DUCKSTATION_LOG_PATH", "/config/duckstation.log")
 )
@@ -164,6 +177,10 @@ def _patch_ini() -> None:
     are rewritten in place, missing ones are added under their section
     (created when absent), and the result is written through a temp file.
 
+    Card 1 is pinned to one shared card, `PINNED_CARD`, and the card and
+    state folders to DuckStation's relative defaults, so both stay inside the
+    subtrees the save archive carries.
+
     A failure is raised rather than logged and stepped over: without
     `SaveStateOnExit` the shutdown writes no state at all, so a launch that
     goes ahead anyway costs the player the whole session.
@@ -180,6 +197,16 @@ def _patch_ini() -> None:
         # .bak copies would leak into the save archive dump.
         ("Main", "CreateSaveStateBackups"): "CreateSaveStateBackups = false",
         ("AutoUpdater", "CheckAtStartup"): "CheckAtStartup = false",
+        # Card 1 is one fixed file, so an imported card has a name to land
+        # under before the disc boots. A relative path resolves against the
+        # memory card directory.
+        ("MemoryCards", "Card1Type"): "Card1Type = Shared",
+        ("MemoryCards", "Card1Path"): f"Card1Path = {PINNED_CARD}",
+        # DuckStation's own defaults, pinned so the cards and states stay in
+        # the subtrees the save archive carries. Both resolve against the
+        # data root.
+        ("MemoryCards", "Directory"): "Directory = memcards",
+        ("Folders", "SaveStates"): "SaveStates = savestates",
     }
     try:
         if not INI_PATH.exists():
@@ -235,6 +262,75 @@ def _patch_ini() -> None:
         raise RuntimeError(
             f"could not apply broker settings to {INI_PATH}: {exc}"
         ) from exc
+
+
+def _migrate_memory_card() -> None:
+    """Carry an older archive's per-game memory card over to the pinned card.
+
+    Archives written before card 1 was pinned hold DuckStation's per-game
+    `<title>_1.mcd`, which the pinned settings no longer mount. While the
+    pinned card is not a file, the newest `*_1.mcd` is copied to it. It is
+    copied, never moved, so the per-game card stays on disk and in the
+    archive. A path at the pinned card that is not a regular file counts as
+    absent. A real directory there is never removed, so a card that needs
+    carrying cannot land and the launch is refused. A symlink is replaced by
+    the copy, never written through, and the launch goes ahead.
+
+    The copy is written just before the dump baseline is taken, so its
+    mtime normally falls inside the baseline's slack and it ships with the
+    exit dump. If it does not, the unchanged copy is simply not shipped, and
+    the next launch makes it again from the per-game card the archive still
+    holds.
+
+    Raises:
+        RuntimeError: When the copy fails, a directory in its way included.
+            Booting on would mount a blank card, and the exit dump would
+            ship it as the player's.
+    """
+    pinned = MEMCARD_DIR / PINNED_CARD
+    try:
+        pinned_mode: Optional[int] = pinned.stat().st_mode
+    except OSError:
+        pinned_mode = None
+    if pinned_mode is not None:
+        if stat.S_ISREG(pinned_mode):
+            return
+        # Not a card DuckStation can mount, so it counts as absent. It is left
+        # in place: a copy below replaces a symlink but fails on a directory.
+        log.warning("duckstation: %s is not a memory card file, treating the pinned card as absent", pinned)
+    found: list[tuple[float, Path]] = []
+    for card in MEMCARD_DIR.glob("*_1.mcd"):
+        try:
+            st = card.stat()
+        except OSError as exc:
+            log.warning("duckstation: could not read memory card %s, skipping it: %s", card, exc)
+            continue
+        # An archive member below `X_1.mcd/` makes a directory by that name,
+        # and copying it would fail every launch of that archive.
+        if not stat.S_ISREG(st.st_mode):
+            log.warning("duckstation: %s is not a memory card file, skipping it", card)
+            continue
+        found.append((st.st_mtime, card))
+    if not found:
+        return
+    newest = max(found)[1]
+    tmp = pinned.with_name(pinned.name + ".tmp")
+    try:
+        shutil.copyfile(newest, tmp)
+        tmp.replace(pinned)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        log.error(
+            "duckstation: could not carry memory card %s over to %s: %s", newest.name, PINNED_CARD, exc
+        )
+        raise RuntimeError(f"could not carry memory card {newest.name} over to {PINNED_CARD}: {exc}") from exc
+    log.info(
+        "duckstation: carried memory card %s over to %s (%d per-game card(s) found)",
+        newest.name,
+        PINNED_CARD,
+        len(found),
+    )
 
 
 _RESUME_SUFFIX = "_resume.sav"
@@ -433,6 +529,150 @@ def _changed_resume_state(before: dict[Path, tuple[int, float]]) -> Optional[Pat
     return best[1] if best is not None else None
 
 
+MEMCARD_BYTES = 131072
+"""The size of a raw PlayStation memory card, which is what DuckStation mounts: 16 blocks of 8 KiB."""
+
+_RAW_CARD_SUFFIXES = frozenset({".mcd", ".mcr", ".mc", ".srm"})
+"""Raw memory card suffixes: each is the bare card image, as DuckStation mounts it.
+
+A RetroArch PlayStation core's `.srm` is the same raw card.
+"""
+
+_CONVERTIBLE_CARD_SUFFIXES = frozenset({".gme", ".psm", ".ps", ".ddf", ".mem", ".vgs", ".psx"})
+"""Headered memory card formats DuckStation's editor imports only by converting them to a raw card."""
+
+_STATE_NAME = re.compile(r"(?P<base>.+?)(?:_resume|_\d+)\.sav", re.IGNORECASE | re.ASCII)
+"""A DuckStation save state's file name: the resume state or a numbered one, after a base."""
+
+_CARD_EXPECTED = f"one raw {MEMCARD_BYTES}-byte .mcd, .mcr, .mc or .srm memory card, as a single file"
+"""The `expected` text on every refusal DuckStation's own hook gives a `save` or `memcard` member."""
+_STATE_EXPECTED = "one non-empty <serial>_resume.sav or <serial>_<n>.sav, as a single file"
+"""The `expected` text on every refusal DuckStation's own hook gives a `state` member."""
+
+
+def _place_card(member: imports.ImportMember) -> Union[imports.Placement, imports.ImportRefusal]:
+    """Place a `save` or `memcard` member: one raw memory card, as the pinned card.
+
+    Args:
+        member: The member.
+
+    Returns:
+        The placement, or a refusal.
+    """
+    if len(member.parts) != 1:
+        return imports.ImportRefusal(
+            "unrecognised_layout", member.name, _CARD_EXPECTED, detail="expected a single file"
+        )
+    leaf = member.parts[0]
+    if leaf.endswith((OWNER_SUFFIX, UNTRUSTED_SUFFIX)):
+        # Placed as named so the plan check refuses it as protected_destination,
+        # which tells the player more than "not recognised" would.
+        return imports.Placement(member, PurePosixPath(SSTATE_DIR.name, leaf))
+    suffix = PurePosixPath(leaf).suffix.lower()
+    if suffix in _RAW_CARD_SUFFIXES:
+        if member.size != MEMCARD_BYTES:
+            return imports.ImportRefusal(
+                "unrecognised_layout",
+                member.name,
+                _CARD_EXPECTED,
+                detail=f"a raw memory card is {MEMCARD_BYTES} bytes, this one is {member.size}",
+            )
+        return imports.Placement(member, PurePosixPath(MEMCARD_DIR.name, PINNED_CARD))
+    if suffix in _CONVERTIBLE_CARD_SUFFIXES:
+        return imports.ImportRefusal(
+            "needs_conversion",
+            member.name,
+            _CARD_EXPECTED,
+            detail=f"{suffix} is not a raw memory card; convert it to a raw {MEMCARD_BYTES}-byte .mcd",
+        )
+    if _STATE_NAME.fullmatch(leaf):
+        return imports.ImportRefusal(
+            "unrecognised_layout",
+            member.name,
+            _CARD_EXPECTED,
+            detail="a DuckStation save state: declare it as kind state",
+        )
+    return imports.ImportRefusal("unrecognised_layout", member.name, _CARD_EXPECTED)
+
+
+def _place_state(
+    member: imports.ImportMember, ctx: imports.ImportCtx, session: imports.SessionIdentity
+) -> Union[imports.Placement, imports.ImportRefusal]:
+    """Place a `state` member as the session's resume state, with its owner marker.
+
+    DuckStation names a resume state after the disc's serial, and the broker
+    resumes only the state whose marker names the booted disc, so the member
+    is renamed to `<serial>_resume.sav` and the marker written as a sidecar.
+    The serial is the session's when RomM knows it, else the one in the
+    member's name, else the name's own base.
+
+    Args:
+        member: The member.
+        ctx: The launch context; its `rom_file` is the disc the marker names.
+        session: The session's identity.
+
+    Returns:
+        The placement, or a refusal.
+    """
+    rom_file = ctx.rom_file
+    if rom_file is None:
+        return imports.ImportRefusal(
+            "destination_unresolvable",
+            member.name,
+            _STATE_EXPECTED,
+            detail="no rom file to mark the state for",
+        )
+    single = len(member.parts) == 1
+    if single and PurePosixPath(member.parts[0]).suffix.lower() == ".srm":
+        return imports.ImportRefusal(
+            "source_incompatible", member.name, _STATE_EXPECTED, detail="a RetroArch save file"
+        )
+    m = _STATE_NAME.fullmatch(member.parts[0]) if single else None
+    member_id = imports.NORMALISERS["ps_serial_dashed"](m["base"]) if m else None
+    refusal = imports.check_member_identity(
+        member,
+        member_id,
+        session,
+        family="ps_serial_dashed",
+        policy="strict",
+        expected=_STATE_EXPECTED,
+        keyed=False,
+    )
+    if refusal is not None:
+        return refusal
+
+    def rename(name: str) -> Optional[str]:
+        """Name the state for the session's serial, or failing that the member's.
+
+        Args:
+            name: The member's file name.
+
+        Returns:
+            `<serial>_resume.sav`, or None when `name` is not a state's.
+        """
+        found = _STATE_NAME.fullmatch(name)
+        if found is None:
+            return None
+        return f"{session.value or member_id or found['base']}{_RESUME_SUFFIX}"
+
+    dest = imports.place_single_file(
+        member,
+        subtree=SSTATE_DIR.name,
+        pattern=_STATE_NAME,
+        rename=rename,
+        expected=_STATE_EXPECTED,
+        nonempty=True,
+        # With no serial to rename to, the state keeps its own base, so a long
+        # name reaches the marker. The marker's name is the state's plus
+        # `.rom`, and it is written only after the working slot is cleared, so
+        # the state leaves room for it.
+        max_component_bytes=255 - len(imports.OWNER_MARKER_SUFFIX),
+    )
+    if isinstance(dest, imports.ImportRefusal):
+        return dest
+    return imports.Placement(member, dest, (imports.owner_marker_sidecar(dest, rom_file),))
+
+
 class Duckstation(Emulator):
     """PlayStation 1 sessions on duckstation-qt.
 
@@ -454,7 +694,15 @@ class Duckstation(Emulator):
     data (`memcards`) and states (`savestates`) both ride the save archive.
     DuckStation writes the resume state whether or not one was asked for, so
     an exit without a slot simply leaves it unreported, and the emulator
-    resumes from it locally as usual.
+    resumes from it locally as usual. The state a saving exit does report is
+    also what `state_path` serves, so RomM can file it in its state library.
+
+    Memory card 1 is pinned to one shared card, `memcards/shared_card_1.mcd`,
+    so an imported card has a fixed name to land under. Launch copies an
+    older archive's per-game card over to it once, while it does not exist
+    yet. Declared imports take a raw card, as kind `save` or `memcard`, and
+    one resume state, renamed to the session's serial and marked as this
+    disc's; the state resumes through `save.resume_slot`.
 
     Attributes:
         name: RomM platform key, `duckstation`.
@@ -486,6 +734,7 @@ class Duckstation(Emulator):
         """Initialize the emulator with no disc booted yet."""
         super().__init__()
         self._rom_path: Optional[Path] = None
+        self._exit_state: Optional[Path] = None
 
     def save_file_kind(self, rel: str) -> str:
         """Classify an archive member for the manifest.
@@ -504,6 +753,112 @@ class Duckstation(Emulator):
         if rel.lower().endswith((OWNER_SUFFIX, UNTRUSTED_SUFFIX)):
             return "save"
         return super().save_file_kind(rel)
+
+    def import_spec(self) -> imports.ImportSpec:
+        """Declare what DuckStation takes: a raw memory card, and one resume state.
+
+        A card is accepted under either kind and lands as the pinned card.
+        The state rides the archive and resumes through `save.resume_slot`,
+        like the one the broker saves on exit. There is still no mid-session
+        save or load, so `supports_states` stays False.
+
+        Returns:
+            The spec.
+        """
+        card = (f"raw {MEMCARD_BYTES}-byte .mcd/.mcr/.mc/.srm card",)
+        return imports.ImportSpec(
+            kinds=(
+                imports.KindSpec("save", card),
+                imports.KindSpec(
+                    "state",
+                    ("<serial>_resume.sav", "<serial>_<n>.sav"),
+                    requires_resume_slot=True,
+                    max_members=1,
+                    counts_v1=True,
+                ),
+                imports.KindSpec("memcard", card),
+            ),
+            state_channel="archive",
+            # `*.rom` covers every owner marker, including a set-aside state's:
+            # only the broker writes one.
+            protected=(f"*{OWNER_SUFFIX}", f"*{UNTRUSTED_SUFFIX}"),
+        )
+
+    def place_import(
+        self, member: imports.ImportMember, spec: imports.ImportSpec, ctx: imports.ImportCtx
+    ) -> Union[imports.Placement, imports.ImportRefusal]:
+        """Place one declared member: a card as the pinned card, a state as the session's resume state.
+
+        Args:
+            member: The member, already past the kind gate.
+            spec: This emulator's spec.
+            ctx: The launch context.
+
+        Returns:
+            The placement, or a refusal.
+        """
+        if member.kind == "state":
+            return _place_state(member, ctx, imports.identity_for(self, ctx))
+        return _place_card(member)
+
+    def validate_import_plan(
+        self, plan: list[imports.Placement], ctx: imports.ImportCtx
+    ) -> list[imports.ImportRefusal]:
+        """Refuse an imported card when the archive already carries another one.
+
+        Launch carries an older archive's per-game card over to the pinned
+        card only while the pinned card does not exist. Once an import has
+        put one there, the per-game card is never mounted again, and the
+        progress on it drops out of play without a word.
+
+        A card that clashes with another member is left to the shared
+        one-member-per-destination check, which has already refused it, so
+        it is not refused twice. That covers a second imported card, and an
+        archive member at the pinned card's path, below it, or at a path the
+        pinned card needs as a directory.
+
+        Args:
+            plan: The placements that passed every per-member check.
+            ctx: The launch context; its `archive_paths` are the archive's ordinary members.
+
+        Returns:
+            One `destination_conflict` for the imported card, or none.
+        """
+        cards = MEMCARD_DIR.name
+        pinned = f"{cards}/{PINNED_CARD}"
+        imported = [p for p in plan if p.dest.as_posix() == pinned]
+        # Keyed the way the shared check keys them: PurePosixPath drops `.` and
+        # empty components, so `./memcards/X_1.mcd` is the file it extracts to.
+        archived = {PurePosixPath(rel).as_posix() for rel in ctx.archive_paths}
+        carried = sorted(rel for rel in archived if rel.startswith(f"{cards}/"))
+        # The shared check's own clash rule: the same file, or one path a
+        # strict prefix of the other.
+        clashes = len(imported) > 1 or any(
+            rel == pinned or rel.startswith(f"{pinned}/") or pinned.startswith(f"{rel}/") for rel in archived
+        )
+        if not carried or clashes:
+            return []
+        return [
+            imports.ImportRefusal(
+                "destination_conflict",
+                p.member.name,
+                "one memory card per archive",
+                detail=f"the archive already carries {', '.join(carried)}",
+            )
+            for p in imported
+        ]
+
+    def identity_source(self) -> Optional[imports.IdentitySource]:
+        """Take the session's serial from RomM.
+
+        The broker never reads a serial off the disc, so RomM's `title_id` is
+        the only source. An imported state is renamed to it, and one named for
+        another serial is refused.
+
+        Returns:
+            A PlayStation serial source with no rom reader.
+        """
+        return imports.IdentitySource("ps_serial_dashed")
 
     def clear_working_slot(self, excluded: tuple[str, ...] = ()) -> None:
         """Empty the save subtrees this session owns before the archive restore.
@@ -589,9 +944,11 @@ class Duckstation(Emulator):
         return resolved
 
     def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
-        """Stop any running instance, patch settings.ini, and start duckstation-qt.
+        """Stop any running instance, prepare the data dir, and start duckstation-qt.
 
-        The binary comes from env `DUCKSTATION_BIN` (default
+        Preparing the data dir means patching settings.ini, then carrying an
+        older archive's per-game memory card over to the pinned card. The
+        binary comes from env `DUCKSTATION_BIN` (default
         `/opt/duckstation/AppRun`). With `resume_slot` set, the resume state
         `_resume_state_for` claims for this disc is passed with `-statefile`;
         a resume with no state on disk is logged and boots clean. The disc is
@@ -605,10 +962,14 @@ class Duckstation(Emulator):
 
         Raises:
             RuntimeError: When the broker's settings.ini values cannot be
-                applied, which would cost the session its exit save state.
+                applied, which would cost the session its exit save state,
+                or when an older archive's memory card cannot be carried
+                over, which would boot the session on a blank card.
         """
         self.stop()
+        self._exit_state = None
         _patch_ini()
+        _migrate_memory_card()
 
         cmd = [os.environ.get("DUCKSTATION_BIN", "/opt/duckstation/AppRun"), "-batch", "-fullscreen"]
         state = _resume_state_for(rom_path) if resume_slot is not None else None
@@ -702,4 +1063,21 @@ class Duckstation(Emulator):
                     else:
                         saved = True
                         state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
+                        self._exit_state = p
         return {"state_saved": saved, "state_slot": slot, "state_file": state_file}
+
+    def state_path(self) -> Optional[Path]:
+        """Return the resume state the last saving exit confirmed, or None.
+
+        Only a confirmed exit state is served, never whatever sits in the
+        savestates directory: a state already there came in with the archive
+        and can belong to another disc, and one a force-killed exit set aside
+        may be torn. A launch clears it, since the new session has confirmed
+        nothing yet.
+
+        Returns:
+            The state file's path, or None when no saving exit has confirmed one
+            since the last launch or the file has since gone.
+        """
+        p = self._exit_state
+        return p if p is not None and p.is_file() else None

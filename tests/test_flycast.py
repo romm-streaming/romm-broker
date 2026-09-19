@@ -3,12 +3,15 @@
 import itertools
 import subprocess
 from collections.abc import Iterator
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import NoReturn, Optional
 
 import pytest
+from fastapi.testclient import TestClient
 
 from webstation_broker.emulators import base, flycast
+
+from .conftest import PREFIX, import_zip, preflight_import, restore_import
 
 
 @pytest.fixture(autouse=True)
@@ -1444,3 +1447,457 @@ def test_the_savestate_is_labelled_apart_from_the_vmu_saves() -> None:
 
     assert emulator.save_file_kind(f"{data}/Game.state") == "state"
     assert emulator.save_file_kind(f"{data}/vmu_save_A1.bin") == "save"
+
+
+# ── declared imports ─────────────────────────────────────────────────────
+
+
+_VMU_BYTES = 131072
+"""A raw VMU image's size, spelled out so the tests do not lean on the module's constant."""
+
+
+def _rom(rom_root: Path, name: str = "Game (USA).cdi") -> Path:
+    """Write a stand-in disc image under the rom root.
+
+    Args:
+        rom_root: The patched rom root.
+        name: The image's file name.
+
+    Returns:
+        The image's path.
+    """
+    rom = rom_root / name
+    rom.write_bytes(b"disc")
+    return rom
+
+
+def _wrong_size(size: int) -> str:
+    """The detail a VMU image of the wrong size is refused with.
+
+    Args:
+        size: The member's size.
+
+    Returns:
+        The detail.
+    """
+    return f"a raw VMU image is {_VMU_BYTES} bytes, this one is {size}"
+
+
+def _export_format(suffix: str) -> str:
+    """The detail a VMU export format is refused with.
+
+    Args:
+        suffix: The member's suffix, lower-cased.
+
+    Returns:
+        The detail.
+    """
+    return f"{suffix} is a VMU export format; convert it to a raw {_VMU_BYTES}-byte image"
+
+
+def test_the_import_spec_declares_saves_cards_and_one_archive_state(data_dir: Path) -> None:
+    """Flycast takes saves and cards, and one state that rides the archive.
+
+    Args:
+        data_dir: The patched data dir.
+    """
+    spec = flycast.Flycast().import_spec()
+
+    assert spec.as_dict() == {
+        "kinds": [
+            {
+                "kind": "save",
+                "shapes": ["vmu_save_<A-D><1-2>.bin", "dc_nvmem.bin"],
+                "requires_resume_slot": False,
+                "max_members": None,
+            },
+            {"kind": "state", "shapes": ["<name>.state"], "requires_resume_slot": True, "max_members": 1},
+            {
+                "kind": "memcard",
+                "shapes": [f"raw {_VMU_BYTES}-byte VMU image"],
+                "requires_resume_slot": False,
+                "max_members": None,
+            },
+        ],
+        "state_channel": "archive",
+        "card_subtree": None,
+    }
+    assert spec.protected == (
+        "flycast/dc_boot.bin",
+        "flycast/dc_flash.bin",
+        "flycast/emu.cfg",
+        "*.rom",
+        "*.untrusted",
+    )
+    state = spec.kind("state")
+    assert state is not None and state.counts_v1 is True
+
+
+@pytest.mark.parametrize(
+    ("name", "size", "dest"),
+    [
+        ("vmu_save_A1.bin", _VMU_BYTES, "flycast/vmu_save_A1.bin"),
+        ("vmu_save_a1.bin", _VMU_BYTES, "flycast/vmu_save_A1.bin"),
+        ("VMU_SAVE_D2.BIN", _VMU_BYTES, "flycast/vmu_save_D2.bin"),
+        ("dc_nvmem.bin", 16, "flycast/dc_nvmem.bin"),
+        ("DC_NVMEM.BIN", 16, "flycast/dc_nvmem.bin"),
+    ],
+)
+def test_a_save_lands_under_the_name_flycast_reads(data_dir: Path, name: str, size: int, dest: str) -> None:
+    """A VMU image or the system flash lands under Flycast's own spelling of its name.
+
+    Args:
+        data_dir: The patched data dir.
+        name: The member's file name.
+        size: The member's size.
+        dest: Where it must land, relative to `save_root`.
+    """
+    body = import_zip({f".import/save/{name}": b"\0" * size})
+
+    result = preflight_import(flycast.Flycast(), body, rom_file=None)
+
+    assert result.refusals == ()
+    assert [(p.dest, p.sidecars) for p in result.placements] == [(PurePosixPath(dest), ())]
+
+
+@pytest.mark.parametrize(
+    ("name", "size", "reason", "detail"),
+    [
+        ("sub/vmu_save_A1.bin", _VMU_BYTES, "unrecognised_layout", "expected a single file"),
+        ("Game.srm", 8192, "source_incompatible", "a RetroArch save file"),
+        ("vmu_save_A1.bin", 4096, "unrecognised_layout", _wrong_size(4096)),
+        ("vmu_save_E1.bin", _VMU_BYTES, "unrecognised_layout", None),
+        ("vmu_save_A3.bin", _VMU_BYTES, "unrecognised_layout", None),
+        ("dc_nvmem.bin", 0, "incomplete_unit", "the file is empty"),
+        ("Game.vms", 512, "needs_conversion", _export_format(".vms")),
+        ("Game.DCI", 512, "needs_conversion", _export_format(".dci")),
+        ("nvmem.bin", 16, "unrecognised_layout", None),
+        ("eeprom.bin", 16, "unrecognised_layout", None),
+        ("Game.state", 16, "unrecognised_layout", "a Flycast resume state: declare it as kind state"),
+    ],
+)
+def test_a_save_flycast_cannot_read_is_refused(
+    data_dir: Path, name: str, size: int, reason: str, detail: Optional[str]
+) -> None:
+    """A save in the wrong place, size or format is refused with the reason, before anything is written.
+
+    `nvmem.bin` and `eeprom.bin` are the arcade names; the broker boots no
+    arcade content, and the Dreamcast flash is `dc_nvmem.bin`.
+
+    Args:
+        data_dir: The patched data dir.
+        name: The member's path below `.import/save/`.
+        size: The member's size.
+        reason: The refusal code.
+        detail: The refusal's detail.
+    """
+    body = import_zip({f".import/save/{name}": b"\0" * size})
+
+    result = preflight_import(flycast.Flycast(), body, rom_file=None)
+
+    assert [(r.reason, r.member, r.detail) for r in result.refusals] == [
+        (reason, f".import/save/{name}", detail)
+    ]
+    assert result.placements == ()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "dc_boot.bin",
+        "dc_flash.bin",
+        "emu.cfg",
+        "Game.state.rom",
+        "Game.state.untrusted",
+        "Game.state.untrusted.rom",
+    ],
+)
+def test_a_save_may_not_overwrite_the_bios_the_config_or_a_marker(data_dir: Path, name: str) -> None:
+    """The BIOS pair, emu.cfg, owner markers and set-aside states are the broker's, not the player's.
+
+    Args:
+        data_dir: The patched data dir.
+        name: The protected file name.
+    """
+    body = import_zip({f".import/save/{name}": b"x"})
+
+    result = preflight_import(flycast.Flycast(), body, rom_file=None)
+
+    assert [(r.reason, r.detail) for r in result.refusals] == [
+        ("protected_destination", f"flycast/{name} is emulator configuration")
+    ]
+
+
+def test_a_state_lands_as_the_rom_s_resume_state_with_its_owner_marker(
+    data_dir: Path, rom_root: Path
+) -> None:
+    """Whatever the member is called, it becomes `<rom stem>.state`, marked as this rom's.
+
+    Args:
+        data_dir: The patched data dir.
+        rom_root: The patched rom root.
+    """
+    rom = _rom(rom_root)
+    body = import_zip({".import/state/Other Name.STATE": b"progress"})
+
+    result = preflight_import(flycast.Flycast(), body, rom_file=rom, resume_slot=0)
+
+    assert result.refusals == ()
+    (placement,) = result.placements
+    assert placement.dest == PurePosixPath("flycast/Game (USA).state")
+    assert placement.sidecars == (
+        (PurePosixPath("flycast/Game (USA).state.rom"), f"{rom.resolve()}\n".encode()),
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "data", "reason", "detail"),
+    [
+        ("Game.state1", b"x", "source_incompatible", "a RetroArch (libretro) state"),
+        ("Game.state.auto", b"x", "source_incompatible", "a RetroArch (libretro) state"),
+        ("Game.state", b"", "incomplete_unit", "the file is empty"),
+        ("Game.sav", b"x", "unrecognised_layout", None),
+        ("sub/Game.state", b"x", "unrecognised_layout", "expected a single file"),
+    ],
+)
+def test_a_state_flycast_cannot_resume_is_refused(
+    data_dir: Path, rom_root: Path, name: str, data: bytes, reason: str, detail: Optional[str]
+) -> None:
+    """A RetroArch state, an empty file, another name or a nested file is refused.
+
+    Args:
+        data_dir: The patched data dir.
+        rom_root: The patched rom root.
+        name: The member's path below `.import/state/`.
+        data: The member's bytes.
+        reason: The refusal code.
+        detail: The refusal's detail.
+    """
+    body = import_zip({f".import/state/{name}": data})
+
+    result = preflight_import(flycast.Flycast(), body, rom_file=_rom(rom_root), resume_slot=0)
+
+    assert [(r.reason, r.member, r.detail) for r in result.refusals] == [
+        (reason, f".import/state/{name}", detail)
+    ]
+
+
+def test_a_state_with_no_rom_to_name_it_after_is_refused(data_dir: Path) -> None:
+    """Without a rom file there is no name Flycast would auto-load the state under.
+
+    Args:
+        data_dir: The patched data dir.
+    """
+    body = import_zip({".import/state/Game.state": b"x"})
+
+    result = preflight_import(flycast.Flycast(), body, rom_file=None, resume_slot=0)
+
+    assert [(r.reason, r.detail) for r in result.refusals] == [
+        ("destination_unresolvable", "no rom file to name the state after")
+    ]
+
+
+def test_a_state_whose_owner_marker_name_is_too_long_is_refused(data_dir: Path, rom_root: Path) -> None:
+    """A state that fits the name limit but whose `.rom` marker does not is refused in preflight.
+
+    The marker is written after the working slot is cleared, so a name only
+    the marker overflows has to be caught before anything is touched.
+
+    Args:
+        data_dir: The patched data dir.
+        rom_root: The patched rom root.
+    """
+    stem = "A" * 247
+    state = f"{stem}.state"
+    assert len(state.encode()) == 253
+    body = import_zip({".import/state/Game.state": b"x"})
+
+    result = preflight_import(flycast.Flycast(), body, rom_file=_rom(rom_root, f"{stem}.cdi"), resume_slot=0)
+
+    assert result.placements == ()
+    assert [(r.reason, r.member, r.detail) for r in result.refusals] == [
+        (
+            "unsafe_path",
+            ".import/state/Game.state",
+            f"renamed to {state!r}: component longer than 251 bytes",
+        )
+    ]
+
+
+def test_a_state_without_a_resume_slot_is_refused(data_dir: Path, rom_root: Path) -> None:
+    """Without `resume_slot` the state is never loaded, and the exit dump would overwrite it.
+
+    Args:
+        data_dir: The patched data dir.
+        rom_root: The patched rom root.
+    """
+    body = import_zip({".import/state/Game.state": b"x"})
+
+    result = preflight_import(flycast.Flycast(), body, rom_file=_rom(rom_root), resume_slot=None)
+
+    assert [(r.reason, r.expected) for r in result.refusals] == [
+        ("resume_slot_required", "save.resume_slot set on the activate")
+    ]
+
+
+def test_an_imported_state_beside_an_archived_one_is_refused(data_dir: Path, rom_root: Path) -> None:
+    """Flycast resumes one state; one in the archive already counts toward that one.
+
+    The archived state's marker never counts as a second state: `Other.state.rom`
+    does not end in `.state`, so Flycast's `save_file_kind` labels it a `save`.
+    (Its `*.rom` glob also makes it protected, which the count skips as well.)
+
+    Args:
+        data_dir: The patched data dir.
+        rom_root: The patched rom root.
+    """
+    body = import_zip(
+        {".import/state/Game.state": b"x"},
+        v1={"flycast/Other.state": b"old", "flycast/Other.state.rom": b"/romm/Other.cdi\n"},
+    )
+
+    result = preflight_import(flycast.Flycast(), body, rom_file=_rom(rom_root), resume_slot=0)
+
+    assert [(r.reason, r.expected, r.detail) for r in result.refusals] == [
+        ("destination_conflict", "at most 1 state member(s)", "2 state members in the archive")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("name", "dest"),
+    [("card.bin", "flycast/vmu_save_A1.bin"), ("vmu_save_c2.bin", "flycast/vmu_save_C2.bin")],
+)
+def test_a_card_fills_the_socket_its_name_picks_or_a1(data_dir: Path, name: str, dest: str) -> None:
+    """A raw VMU image goes into the socket its name picks, or controller A's first.
+
+    Args:
+        data_dir: The patched data dir.
+        name: The member's file name.
+        dest: Where it must land.
+    """
+    body = import_zip({f".import/memcard/{name}": b"\0" * _VMU_BYTES})
+
+    result = preflight_import(flycast.Flycast(), body, rom_file=None)
+
+    assert result.refusals == ()
+    assert [p.dest for p in result.placements] == [PurePosixPath(dest)]
+
+
+@pytest.mark.parametrize(
+    ("name", "size", "reason", "detail"),
+    [
+        ("card.vmi", 512, "needs_conversion", _export_format(".vmi")),
+        ("card.dcm", _VMU_BYTES, "needs_conversion", _export_format(".dcm")),
+        ("card.srm", _VMU_BYTES, "source_incompatible", "a RetroArch save file"),
+        ("card.bin", 1024, "unrecognised_layout", _wrong_size(1024)),
+        ("sub/card.bin", _VMU_BYTES, "unrecognised_layout", "expected a single file"),
+    ],
+)
+def test_a_card_that_is_not_a_raw_vmu_image_is_refused(
+    data_dir: Path, name: str, size: int, reason: str, detail: str
+) -> None:
+    """A VMU export format, a RetroArch file, a wrong size or a nested file is refused.
+
+    Args:
+        data_dir: The patched data dir.
+        name: The member's path below `.import/memcard/`.
+        size: The member's size.
+        reason: The refusal code.
+        detail: The refusal's detail.
+    """
+    body = import_zip({f".import/memcard/{name}": b"\0" * size})
+
+    result = preflight_import(flycast.Flycast(), body, rom_file=None)
+
+    assert [(r.reason, r.member, r.detail) for r in result.refusals] == [
+        (reason, f".import/memcard/{name}", detail)
+    ]
+
+
+def test_a_card_and_a_save_for_the_same_socket_are_both_refused(data_dir: Path) -> None:
+    """Two members landing on vmu_save_A1.bin are a conflict, not a silent overwrite.
+
+    Args:
+        data_dir: The patched data dir.
+    """
+    vmu = b"\0" * _VMU_BYTES
+    body = import_zip({".import/memcard/card.bin": vmu, ".import/save/vmu_save_A1.bin": vmu})
+
+    result = preflight_import(flycast.Flycast(), body, rom_file=None)
+
+    assert sorted((r.reason, r.member) for r in result.refusals) == [
+        ("destination_conflict", ".import/memcard/card.bin"),
+        ("destination_conflict", ".import/save/vmu_save_A1.bin"),
+    ]
+
+
+def test_discovery_names_the_slot_an_archive_state_resumes_through(client: TestClient) -> None:
+    """Flycast has no mid-session states, but RomM still needs the slot to send as resume_slot.
+
+    Args:
+        client: The app, served without a secret.
+    """
+    params = {"emulator": "flycast", "platform": "dc"}
+    response = client.get(f"{PREFIX}/api/session/import-spec", params=params)
+
+    assert response.status_code == 200
+    assert (response.json()["state_channel"], response.json()["state_slot"]) == ("archive", 0)
+
+
+def test_an_imported_vmu_is_written_where_flycast_mounts_it(data_dir: Path) -> None:
+    """The restore writes the image under its canonical name, byte for byte.
+
+    Args:
+        data_dir: The patched data dir.
+    """
+    emu = flycast.Flycast()
+    image = bytes(range(256)) * (_VMU_BYTES // 256)
+    body = import_zip({".import/save/VMU_SAVE_b1.bin": image})
+
+    report = restore_import(emu, body, preflight_import(emu, body, rom_file=None))
+
+    assert (report["imported"], report["failed"]) == (1, 0)
+    assert (data_dir / "vmu_save_B1.bin").read_bytes() == image
+
+
+def test_an_imported_state_is_resumed_by_the_next_launch(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Import, restore and launch: the state and its marker land, and Flycast auto-loads it.
+
+    Args:
+        data_dir: The patched data dir.
+        rom_root: The patched rom root.
+        monkeypatch: Pytest's attribute patcher.
+    """
+    emu = flycast.Flycast()
+    rom = _rom(rom_root)
+    body = import_zip({".import/state/Game.state": b"progress"})
+
+    report = restore_import(emu, body, preflight_import(emu, body, rom_file=rom, resume_slot=0))
+
+    assert (report["imported"], report["failed"]) == (1, 0)
+    assert (data_dir / "Game (USA).state").read_bytes() == b"progress"
+    assert (data_dir / "Game (USA).state.rom").read_bytes() == f"{rom.resolve()}\n".encode()
+
+    monkeypatch.setattr(flycast.Flycast, "stop", lambda self: None)
+    spawned: dict[str, list[str]] = {}
+
+    def fake_spawn(
+        self: flycast.Flycast, cmd: list[str], env: dict[str, str], stdin_pipe: bool = False
+    ) -> None:
+        """Record the command instead of starting Flycast.
+
+        Args:
+            self: The emulator.
+            cmd: The argv.
+            env: The environment; unused.
+            stdin_pipe: Unused; matches `_spawn`.
+        """
+        spawned["cmd"] = cmd
+
+    monkeypatch.setattr(flycast.Flycast, "_spawn", fake_spawn)
+
+    emu.launch(rom, resume_slot=0)
+
+    assert "config:Dreamcast.AutoLoadState=yes" in spawned["cmd"][2]

@@ -34,17 +34,22 @@ it is the one part the stale-save clear cannot take out; see
 
 A profile has to exist before the broker launches anything. Xenia Edge
 checks its account list as soon as the emulator is initialised and, finding
-none, raises a native "No Profiles Found" dialog that is not gated on
---headless and that nobody in the stream can dismiss; without a profile a
-game cannot save either. Creating one on the desktop signs it in and persists
-the XUID into xenia-edge.config.toml under the storage root
-(logged_profile_slot_0_xuid), so every later launch against the same
---storage_root signs in silently. docs/standalone_emulators.md carries the
-user-facing version of this.
+none, raises a native "No Profiles Found" dialog that nobody in the stream
+can dismiss; without a profile a game cannot save either. Creating one on the
+desktop signs it in and persists the XUID into xenia-edge.config.toml under
+the storage root (logged_profile_slot_0_xuid), so every later launch against
+the same --storage_root signs in silently.
+docs/content/docs/emulators/setup.mdx carries the user-facing version of this.
 
-`--headless` does not mean windowless: the game still renders in the normal
-window selkies captures. It auto-answers guest system dialogs (storage
-select, sign-in, message boxes) that nobody in the stream could dismiss.
+Guest system dialogs (sign-in, message boxes, the on-screen keyboard) are
+drawn inside the game window selkies captures. The controller answers sign-in
+and message boxes. The on-screen keyboard is a text field with OK and Cancel:
+the controller can accept the text the game suggests or cancel, but typing
+anything else takes a keyboard in the browser. Since Xenia Edge commit
+19b223d (2026-09-15) removed --headless, nothing answers these dialogs on the
+player's behalf. Storage device selection is the exception: Xenia picks the
+HDD itself unless storage_selection_dialog is turned on in its config.
+
 One title per process: loading a second game requires a process restart.
 
 Bootable forms: an XISO (.iso), a bare executable (.xex), an extracted dump
@@ -513,16 +518,21 @@ class Xenia(Emulator):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self._session_start = time.time()
         log.info("launching xenia (rom=%s)", rom_path)
+        # The image tracks the latest Xenia Edge release, and Xenia refuses
+        # the whole command line over one option the build lacks. With a
+        # terminal on stdin it prints that refusal (and any fatal error) to
+        # XENIA_LOG_PATH and exits; without one it says so only in a modal
+        # dialog on the stream and stays running, so the session looks alive.
         self._spawn(
             [
                 XENIA_BIN,
                 "--fullscreen",
-                "--headless",
                 f"--storage_root={DATA_DIR}",
                 "--discord=false",
                 str(rom_path),
             ],
             base_launch_env(),
+            stdin_tty=True,
         )
 
     def _session_title_dirs(self) -> list[Path]:

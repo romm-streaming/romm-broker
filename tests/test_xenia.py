@@ -226,28 +226,51 @@ def test_resolve_prefers_an_executable_or_disc_over_a_container(rom_root: Path) 
 
 def _spawned(monkeypatch: pytest.MonkeyPatch, rom: Path, resume_slot: Optional[int] = None) -> list[str]:
     calls = []
-    monkeypatch.setattr(xenia.Xenia, "_spawn", lambda self, cmd, env: calls.append(cmd))
+    monkeypatch.setattr(xenia.Xenia, "_spawn", lambda self, cmd, env, **kwargs: calls.append(cmd))
     xenia.Xenia().launch(rom, resume_slot)
     assert len(calls) == 1
     return calls[0]
 
 
-def test_launch_runs_headless_fullscreen_against_the_broker_storage_root(
+def test_launch_runs_fullscreen_against_the_broker_storage_root(
     monkeypatch: pytest.MonkeyPatch, rom_root: Path, data_dir: Path
 ) -> None:
-    """The launch command line is headless, fullscreen, and storage-rooted."""
+    """The launch command line is exactly the flags Xenia Edge is known to accept.
+
+    Pinned whole so a flag cannot be added without someone checking it against
+    a current build: Xenia refuses an unknown option outright. Xenia Edge
+    commit 19b223d (2026-09-15) removed `--headless`, which is why it is absent.
+    """
     rom = _touch(rom_root / "Game.iso")
 
     cmd = _spawned(monkeypatch, rom)
 
-    assert cmd[0] == xenia.XENIA_BIN
-    assert "--fullscreen" in cmd
-    # Guest dialogs (storage select, sign-in) are auto-answered; nobody in
-    # the stream could dismiss them otherwise.
-    assert "--headless" in cmd
-    assert f"--storage_root={data_dir}" in cmd
-    assert "--discord=false" in cmd
-    assert cmd[-1] == str(rom)
+    assert cmd == [
+        xenia.XENIA_BIN,
+        "--fullscreen",
+        f"--storage_root={data_dir}",
+        "--discord=false",
+        str(rom),
+    ]
+
+
+def test_launch_gives_xenia_a_terminal_for_stdin(
+    monkeypatch: pytest.MonkeyPatch, rom_root: Path, data_dir: Path
+) -> None:
+    """Xenia is spawned with a terminal on stdin.
+
+    Xenia reports a rejected option or a fatal error to stdout and exits only
+    when stdin is a terminal. Otherwise it raises a modal dialog in the stream,
+    writes nothing to the log, and stays up until someone dismisses it.
+    """
+    kwargs: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        xenia.Xenia, "_spawn", lambda self, cmd, env, **kw: kwargs.append(kw)
+    )
+
+    xenia.Xenia().launch(_touch(rom_root / "Game.iso"), None)
+
+    assert kwargs == [{"stdin_tty": True}]
 
 
 def test_launch_creates_the_storage_root(
@@ -290,7 +313,7 @@ def test_launch_records_the_session_baseline(
     """Launching stamps the baseline the exit restamp scopes itself by."""
     rom = _touch(rom_root / "Game.iso")
     emu = xenia.Xenia()
-    monkeypatch.setattr(xenia.Xenia, "_spawn", lambda self, cmd, env: None)
+    monkeypatch.setattr(xenia.Xenia, "_spawn", lambda self, cmd, env, **kwargs: None)
     assert emu._session_start == float("inf")
 
     before = time.time()

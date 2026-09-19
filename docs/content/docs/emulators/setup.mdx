@@ -126,12 +126,15 @@ in automatically, and Xenia remembers it in its own settings. So every later
 launch signs into that profile by itself, and games see a logged-in Xbox Live
 profile to save against.
 
-Single game launches run with `--headless`, which automatically answers the
-guest dialogs (storage device selection, sign-in, message boxes) that nobody
-watching the stream could otherwise click through. The profile prompt is
-different: it's Xenia's own window, it still appears even in headless mode,
-and a game launched without a profile would get stuck behind it with no way
-to dismiss it.
+During a single game launch, the game's own dialogs (sign-in, message boxes,
+the on-screen keyboard) show up inside the game's window. The player answers
+sign-in and message boxes with the controller, the same as on a console. The
+on-screen keyboard is the exception: the controller can accept the text the
+game suggests or cancel, but typing anything else needs a keyboard in the
+browser. Xenia picks the storage device (the hard drive) by itself unless you
+turn on `storage_selection_dialog` in its settings. The profile prompt is
+different: it's Xenia's own window, and a game launched without a profile
+would get stuck behind it with no way to dismiss it.
 
 Set your graphics options and test a real game from the desktop before
 launching it through RomM.

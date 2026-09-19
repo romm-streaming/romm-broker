@@ -42,18 +42,20 @@ presses back up parks the slot absolutely. That runs once per launch, and
 again only if a save lands somewhere else, which is the one thing that can
 happen: the player cycling slots with their own hotkeys.
 
-State file naming:
+State file naming, under `states/<library_name>/`, the dir RetroArch sorts
+each core's states into (`library_name` is the name the core reports):
 
 * `<content_basename>.state` for slot 0.
 * `<content_basename>.state<n>` for slot n.
 * `<content_basename>.state.auto` for slot -1.
-* SRAM: `<content_basename>.srm` under the savefile dir.
+* SRAM: `<content_basename>.srm` under `saves/<library_name>/`.
 
 Because stdout carries only command replies here, the child is spawned with
 a real stdout pipe drained by a reader thread, unlike the shared `_spawn`
 which merges stderr into stdout (that would corrupt the reply stream).
 """
 
+import dataclasses
 import glob
 import io
 import json
@@ -67,11 +69,12 @@ import threading
 import time
 import zipfile
 from collections.abc import Iterable
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Optional, Union
 
 import httpx
 
+from .. import imports
 from .base import Emulator, _record_pid, base_launch_env, xdg_config_dir
 
 log = logging.getLogger(__name__)
@@ -389,9 +392,16 @@ def _load_platforms() -> dict[str, dict[str, Any]]:
     Returns:
         Platform slug to its entry, with `extensions` and any `save_subtrees`
         as tuples.
+
+    Raises:
+        ValueError: When an entry has no boolean `save_ram`. It decides whether
+            an import may place a `.srm`, so a missing one is never read as
+            either answer.
     """
     platforms = json.loads(_PLATFORMS_FILE.read_text())
-    for info in platforms.values():
+    for slug, info in platforms.items():
+        if not isinstance(info.get("save_ram"), bool):
+            raise ValueError(f"{_PLATFORMS_FILE.name}: {slug} needs a true or false save_ram")
         info["extensions"] = tuple(info["extensions"])
         if "save_subtrees" in info:
             info["save_subtrees"] = tuple(info["save_subtrees"])
@@ -403,6 +413,15 @@ PLATFORMS: dict[str, dict[str, Any]] = _load_platforms()
 
 Each entry names the `core` and its `extensions`; the extensions order doubles
 as the preference order when a folder holds several candidates.
+
+`library_name` is the name the core reports in `retro_get_system_info`.
+RetroArch names the sorted save and state dirs after it, and it is not
+always the core's file name: dolphin reports `dolphin-emu`.
+
+`save_ram` is required, and says whether the core exposes
+`RETRO_MEMORY_SAVE_RAM` on this platform, so that RetroArch loads its battery
+save from `<stem>.srm`. Where it is false the core keeps its save in a file of
+its own, or has none, so an imported `.srm` would never reach the game.
 
 `savestate` is assumed true; only specialized cores opt out.
 
@@ -444,6 +463,19 @@ def _platform_info(platform: Optional[str]) -> Optional[dict[str, Any]]:
     if not platform:
         return None
     return PLATFORMS.get(platform.lower())
+
+
+def _library_name(platform: Optional[str]) -> Optional[str]:
+    """The name the platform's core reports, which RetroArch names its sorted dirs after.
+
+    Args:
+        platform: The slug from the activate payload, or None.
+
+    Returns:
+        The core's `library_name`, or None when the platform is unset or unmapped.
+    """
+    info = _platform_info(platform)
+    return info["library_name"] if info else None
 
 
 def _github_release_asset(repo: str, asset_pattern: str) -> str:
@@ -646,8 +678,9 @@ def _ensure_core_assets(assets: dict[str, str]) -> None:
 def _write_broker_cfg() -> Path:
     """Write the minimal per-launch config, applied *on top of* the user's config.
 
-    The stdin interface, the system dir, the broker save dirs, and the joypad
-    driver the streamed pads need; nothing else. Save thumbnails are off: the frame RomM
+    The stdin interface, the system dir, the broker save dirs and how saves
+    are sorted inside them, and the joypad driver the streamed pads need;
+    nothing else. Save thumbnails are off: the frame RomM
     files beside a state comes from the broker's own capture, and the
     framebuffer grab RetroArch would do instead deadlocks GPU-rendered cores.
     The broker data directories are created first, and the file is written
@@ -667,6 +700,16 @@ def _write_broker_cfg() -> Path:
         f'system_directory = "{SYSTEM_DIR}"\n'
         f'savestate_directory = "{STATE_DIR}"\n'
         f'savefile_directory = "{SAVE_DIR}"\n'
+        # RetroArch's shipped defaults, stated so a user config cannot move
+        # them: SRAM loads from saves/<library_name>/<content>.srm and states
+        # from states/<library_name>/, where every archive already holds them
+        # and where an imported .srm is placed.
+        'sort_savefiles_enable = "true"\n'
+        'sort_savestates_enable = "true"\n'
+        'sort_savefiles_by_content_enable = "false"\n'
+        'sort_savestates_by_content_enable = "false"\n'
+        'savefiles_in_content_dir = "false"\n'
+        'savestates_in_content_dir = "false"\n'
         'savestate_auto_save = "false"\n'
         'savestate_auto_load = "false"\n'
         'savestate_auto_index = "false"\n'
@@ -713,8 +756,12 @@ def _state_name(base: str, slot: int) -> str:
     return base + _state_suffix(slot)
 
 
-_STATE_SUFFIX_RE = re.compile(r"\.state(?:\d{1,2}|\.auto)?$")
-"""Matches the state suffix RetroArch writes: `.state`, `.state<n>` (up to two digits) or `.state.auto`."""
+_STATE_SUFFIX_RE = re.compile(r"\.state(?:\d{1,2}|\.auto)?", re.ASCII)
+"""The state suffix RetroArch writes: `.state`, `.state<n>` (up to two digits) or `.state.auto`.
+
+`_is_state_name` matches it with `fullmatch` from the end of the base, so
+nothing may follow it, not even a newline.
+"""
 
 
 def _is_state_name(filename: str, base: str) -> bool:
@@ -730,22 +777,22 @@ def _is_state_name(filename: str, base: str) -> bool:
         base: The content basename of the loaded game.
 
     Returns:
-        True when the name is a plain filename with `base`'s state prefix and
-        a valid state suffix.
+        True when the name is a plain filename made of `base` and one whole
+        state suffix.
     """
     return (
         "/" not in filename
-        and filename.startswith(f"{base}.state")
-        and _STATE_SUFFIX_RE.search(filename) is not None
+        and filename.startswith(base)
+        and _STATE_SUFFIX_RE.fullmatch(filename, len(base)) is not None
     )
 
 
 def _state_snapshot(dir_path: Path, base: str) -> dict[Path, tuple[int, float]]:
     """Snapshot the state files of one content basename.
 
-    Recursive because cores like dolphin redirect state paths into their own
-    subdir (e.g. states/dolphin-emu/), where a flat lookup would never see
-    the write.
+    Recursive because RetroArch sorts every core's states into its own
+    subdir, `states/<library_name>/` (`states/dolphin-emu/` for dolphin),
+    where a flat lookup would never see the write.
 
     Args:
         dir_path: The savestate directory to walk.
@@ -871,8 +918,9 @@ def _wait_for_state_file(
 def _newest_state(dir_path: Path, base: str, slot: int) -> Optional[Path]:
     """Find the most recently written file named for `base` and `slot`.
 
-    Searched recursively, since a core may redirect states into its own
-    subdir; where several copies exist the newest by mtime wins.
+    Searched recursively, since RetroArch sorts every core's states into
+    `states/<library_name>/`; where several copies exist the newest by
+    mtime wins.
 
     Args:
         dir_path: The savestate directory to walk.
@@ -1220,6 +1268,142 @@ def _find_reply(buf: bytes, prefixes: tuple[str, ...]) -> Optional[tuple[str, in
         start = newline + 1
 
 
+_SRM_NAME_RE = re.compile(r"[^/]+\.srm", re.IGNORECASE | re.ASCII)
+"""An imported save's name: any `<name>.srm`, in any case. The name itself is replaced."""
+_STATE_LEAF_RE = re.compile(f".+{_STATE_SUFFIX_RE.pattern}", re.IGNORECASE | re.ASCII)
+"""A RetroArch state's name in any slot; a state is pushed after activate, not imported as a save.
+
+Built from `_STATE_SUFFIX_RE` so the two never disagree on the slot grammar.
+Unlike that one, it ignores case.
+"""
+_UNCONVERTED_SAVE_SUFFIXES: frozenset[str] = frozenset({".sav", ".rtc", ".nv", ".eep", ".mpk"})
+"""Other save-file suffixes cores write, not placed until each core's name for them is verified."""
+_SRM_EXPECTED = "one non-empty <name>.srm, the core's SRAM"
+"""The save shape RetroArch takes, in words, for a refusal's `expected`."""
+
+
+def _srm_dir(platform: Optional[str]) -> Union[str, imports.ImportRefusal]:
+    """Where an imported `.srm` lands on this platform, or why it lands nowhere.
+
+    The one answer both `Retroarch.import_spec` and `Retroarch.place_import`
+    read, so discovery never offers a `.srm` that placement then refuses.
+    Only a core with `save_ram` set in the platform table loads a `.srm`.
+    The PPSSPP core keeps SAVEDATA folders, and a scoped platform's core
+    (dolphin, azahar) keeps its saves in its own folders; each of those, and
+    an unmapped platform, gets a reason of its own.
+
+    Args:
+        platform: The slug from the activate payload, or None.
+
+    Returns:
+        The core's `library_name`, which names the sorted save dir, or the
+        refusal a save member gets here, with its `member` left unset.
+    """
+    info = _platform_info(platform)
+    if info is None:
+        return imports.ImportRefusal(
+            "destination_unresolvable", None, None, detail=f"RetroArch has no core for platform {platform!r}"
+        )
+    if info["core"] == "ppsspp":
+        return imports.ImportRefusal(
+            "destination_unresolvable",
+            None,
+            "a PSP SAVEDATA folder, launched on ppsspp",
+            detail="the PPSSPP core keeps saves as SAVEDATA folders, not a .srm",
+            suggest_emulator="ppsspp",
+        )
+    if "save_subtrees" in info:
+        return imports.ImportRefusal(
+            "shape_unverified",
+            None,
+            None,
+            detail=(
+                f"the {info['core']} core keeps its saves in its own folders, "
+                "which imports do not place yet"
+            ),
+        )
+    if not info["save_ram"]:
+        return imports.ImportRefusal(
+            "destination_unresolvable",
+            None,
+            None,
+            detail=(
+                f"the {info['core']} core does not load a .srm on {platform}; "
+                "it keeps its save in a file of its own, or has none"
+            ),
+        )
+    return info["library_name"]
+
+
+def _place_srm(
+    member: imports.ImportMember, lib: str, rom_file: Path
+) -> Union[imports.Placement, imports.ImportRefusal]:
+    """Place one `.srm` where the core loads SRAM for the booted content.
+
+    RetroArch names SRAM after the content it loaded, so the member's own
+    stem is replaced with the booted file's; for a playlist boot that is the
+    playlist's stem.
+
+    Args:
+        member: The save member, already past the kind gate.
+        lib: The core's `library_name`, which names the sorted save dir.
+        rom_file: The booted file.
+
+    Returns:
+        The placement at `saves/<lib>/<rom_file.stem>.srm`, or a refusal.
+    """
+    if len(member.parts) != 1:
+        return imports.ImportRefusal(
+            "unrecognised_layout", member.name, _SRM_EXPECTED, detail="expected a single file"
+        )
+    leaf = member.parts[0]
+    if _STATE_LEAF_RE.fullmatch(leaf):
+        return imports.ImportRefusal(
+            "unrecognised_layout",
+            member.name,
+            _SRM_EXPECTED,
+            detail="a RetroArch state, which is PUT to /api/session/state-file after activate",
+        )
+    suffix = PurePosixPath(leaf).suffix.lower()
+    if suffix in _UNCONVERTED_SAVE_SUFFIXES:
+        return imports.ImportRefusal(
+            "needs_conversion",
+            member.name,
+            _SRM_EXPECTED,
+            detail=(
+                f"{suffix} files are not placed until each core's name for them is verified; "
+                "send the core's .srm"
+            ),
+        )
+
+    def rename(name: str) -> str:
+        """Name the save for the booted content.
+
+        Args:
+            name: The member's file name, which is discarded.
+
+        Returns:
+            `<rom_file.stem>.srm`.
+        """
+        return f"{rom_file.stem}.srm"
+
+    dest = imports.place_single_file(
+        member,
+        subtree=f"{SAVE_DIR.name}/{lib}",
+        pattern=_SRM_NAME_RE,
+        rename=rename,
+        expected=_SRM_EXPECTED,
+        nonempty=True,
+        # A state name is refused above, with the route it belongs on.
+        refuse_libretro_states=False,
+    )
+    if isinstance(dest, imports.ImportRefusal):
+        return dest
+    if PurePosixPath(leaf).stem != rom_file.stem:
+        log.info("retroarch: import %s placed as %s, named for the loaded content", member.name, dest)
+    return imports.Placement(member, dest)
+
+
 class Retroarch(Emulator):
     """RetroArch driven over its stdin command interface.
 
@@ -1227,6 +1411,13 @@ class Retroarch(Emulator):
     activate payload before `launch`, and picks the core, the ROM extensions and
     the save scope. Saves, loads and quit go over stdin; replies come back on a
     stdout pipe drained by a reader thread, and saves are confirmed on disk.
+
+    Declared imports take one `.srm` save per archive, renamed to the booted
+    content's stem and placed in `saves/<library_name>/`, where the core
+    loads SRAM. Only a platform whose core loads a `.srm` (`save_ram` in
+    `PLATFORMS`) takes one; the rest, psp, dolphin and azahar among them,
+    keep their saves in other files. States are never imported; they are
+    pushed after activate.
 
     Attributes:
         name: Registry key, `retroarch`.
@@ -2295,18 +2486,75 @@ class Retroarch(Emulator):
             filename: The name the pushed state was stored under.
 
         Returns:
-            The existing slot file when there is one, else the slot's path at
-            the top of `STATE_DIR`; None when nothing is loaded or the name is
-            not a state RetroArch would write for the loaded content.
+            The existing slot file when there is one, else the slot's path in
+            the core's sorted dir, `STATE_DIR/<library_name>/` (the top of
+            `STATE_DIR` when no platform is mapped); None when nothing is
+            loaded or the name is not a state RetroArch would write for the
+            loaded content.
         """
         if not self._rom_base or not _is_state_name(filename, self._rom_base):
             return None
         existing = self.state_path()
-        # Cores that redirect states into their own subdir keep writing there,
-        # so a push has to land where the last save did, not at the top.
+        # A push has to land where the last save did, which is where the core
+        # looks for it.
         if existing is not None:
             return existing
-        return STATE_DIR / _state_name(self._rom_base, STATE_SLOT)
+        # With no state yet, the core reads one from its sorted dir. The PUT
+        # route creates the dir.
+        name = _state_name(self._rom_base, STATE_SLOT)
+        lib = _library_name(self.platform)
+        return STATE_DIR / lib / name if lib else STATE_DIR / name
+
+    def import_spec(self) -> imports.ImportSpec:
+        """Take one `.srm` where the core loads SRAM from one; take states through the push routes.
+
+        A platform whose core loads no `.srm` (see `_srm_dir`), and an
+        unmapped platform, declare the save kind with no shapes: discovery
+        tells RomM the save is refused there, and `place_import` says why. A
+        state placed in the archive would race the resume's fingerprint
+        check, so a mapped platform whose core has states takes them through
+        PUT /api/session/state-file after activate.
+
+        Returns:
+            The spec for the loaded platform.
+        """
+        # counts_v1 stays False: the archive's other save files belong to other
+        # content, and a .srm at this destination is already a conflict.
+        if isinstance(_srm_dir(self.platform), str):
+            save = imports.KindSpec("save", ("<name>.srm",), max_members=1)
+        else:
+            save = imports.KindSpec("save", ())
+        mapped = _platform_info(self.platform) is not None
+        channel: imports.StateChannel = "push" if mapped and self.supports_states else "none"
+        return imports.ImportSpec(kinds=(save,), state_channel=channel)
+
+    def place_import(
+        self, member: imports.ImportMember, spec: imports.ImportSpec, ctx: imports.ImportCtx
+    ) -> Union[imports.Placement, imports.ImportRefusal]:
+        """Place one `.srm` in the core's sorted save dir, named for the booted content.
+
+        Only saves reach here: the kind gate refuses a state, which is pushed,
+        and a memory card, which is resent as the core's `.srm` save.
+
+        Args:
+            member: The save member, already past the kind gate.
+            spec: This emulator's spec.
+            ctx: The launch context.
+
+        Returns:
+            The placement, or a refusal saying why this platform takes no `.srm`.
+        """
+        lib = _srm_dir(self.platform)
+        if isinstance(lib, imports.ImportRefusal):
+            return dataclasses.replace(lib, member=member.name)
+        if ctx.rom_file is None:
+            return imports.ImportRefusal(
+                "destination_unresolvable",
+                member.name,
+                _SRM_EXPECTED,
+                detail="no rom file to name the save after",
+            )
+        return _place_srm(member, lib, ctx.rom_file)
 
     def _flush_sram(self) -> bool:
         """Ask RetroArch to write the game's SRAM out before the archive is dumped.

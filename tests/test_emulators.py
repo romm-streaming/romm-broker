@@ -18,10 +18,10 @@ from typing import Optional
 
 import pytest
 
-from webstation_broker import emulators
-from webstation_broker.emulators import base
+from webstation_broker import emulators, imports, saves
+from webstation_broker.emulators import base, retroarch
 
-from .conftest import DETACHED_CMD, SLEEPER_CMD, await_cmdline, await_gone
+from .conftest import DETACHED_CMD, SLEEPER_CMD, await_cmdline, await_gone, import_zip, preflight_import
 
 
 def test_an_unknown_name_resolves_to_nothing() -> None:
@@ -314,6 +314,50 @@ def test_an_untagged_spawn_records_no_tag(pid_record: Path, tmp_path: Path) -> N
         base.Emulator.stop(emu)
 
 
+def test_a_tty_spawn_gives_the_child_a_terminal_for_stdin(pid_record: Path, tmp_path: Path) -> None:
+    """The child still sees a terminal on stdin after the broker has let go of its end.
+
+    The child checks only after a delay, by which point `_spawn` has closed both of its pty fds.
+    Were the child not holding the master itself, that close would hang the terminal up and
+    `isatty` would come back false.
+    """
+
+    class _Tty(base.Emulator):
+        """A stand-in emulator whose stdin should be a terminal."""
+
+        name = "tty"
+        """Registry key this stand-in would be registered under."""
+        log_path = tmp_path / "tty.log"
+        """Kept inside the test's own directory rather than /config."""
+
+    emu = _Tty()
+    cmd = [sys.executable, "-c", "import os, time; time.sleep(0.5); print('isatty', os.isatty(0))"]
+    try:
+        emu._spawn(cmd, dict(os.environ), stdin_tty=True)
+        assert emu._proc is not None
+        emu._proc.wait(timeout=10)
+        assert "isatty True" in emu.log_path.read_text()
+    finally:
+        base.Emulator.stop(emu)
+
+
+def test_a_spawn_cannot_ask_for_both_a_pipe_and_a_terminal(tmp_path: Path) -> None:
+    """Asking for both stdin kinds is refused before anything starts."""
+
+    class _Both(base.Emulator):
+        """A stand-in emulator asked for two stdins at once."""
+
+        name = "both"
+        """Registry key this stand-in would be registered under."""
+        log_path = tmp_path / "both.log"
+        """Kept inside the test's own directory rather than /config."""
+
+    emu = _Both()
+    with pytest.raises(ValueError):
+        emu._spawn(SLEEPER_CMD, dict(os.environ), stdin_pipe=True, stdin_tty=True)
+    assert emu._proc is None
+
+
 def test_reaping_closes_apps_a_shell_that_already_exited_left_open(
     pid_record: Path, desktop_tree: tuple[subprocess.Popen[bytes], int, str]
 ) -> None:
@@ -601,3 +645,331 @@ def test_the_launch_env_points_at_the_labwc_session(monkeypatch: pytest.MonkeyPa
 
     assert env["WAYLAND_DISPLAY"] == "wayland-0"
     assert env["DISPLAY"] == ":0"
+
+
+_IMPORTING: frozenset[str] = frozenset({"duckstation", "flycast", "retroarch"})
+"""The emulators that accept declared imports; every other one inherits the refusing base hooks."""
+
+
+@pytest.mark.parametrize("name", sorted(set(emulators.REGISTRY) - _IMPORTING))
+def test_an_emulator_without_import_support_accepts_nothing(name: str) -> None:
+    """An emulator that has not opted in declares an empty spec.
+
+    Args:
+        name: The registry name.
+    """
+    emu = emulators.get_emulator(name)
+    assert emu is not None
+
+    assert emu.import_spec().kinds == ()
+
+
+@pytest.mark.parametrize("name", sorted(set(emulators.REGISTRY) - _IMPORTING))
+def test_an_emulator_without_import_support_keeps_the_base_hooks(name: str) -> None:
+    """An emulator that has not opted in inherits the base import hooks, which refuse everything.
+
+    The behavioural test below only reaches the kind gate, so an override past
+    it, or a platform-dependent spec, would slip by it. An emulator that gains
+    real hooks moves into `_IMPORTING`.
+
+    Args:
+        name: The registry name.
+    """
+    emu = emulators.get_emulator(name)
+    assert emu is not None
+
+    for hook in ("import_spec", "place_import", "validate_import_plan", "identity_source"):
+        assert getattr(type(emu), hook) is getattr(base.Emulator, hook), f"{name} overrides {hook}"
+
+
+@pytest.mark.parametrize("name", sorted(set(emulators.REGISTRY) - _IMPORTING))
+def test_an_emulator_without_import_support_refuses_a_declared_import(name: str) -> None:
+    """Preflight refuses each member with `kind_not_accepted`.
+
+    Args:
+        name: The registry name.
+    """
+    emu = emulators.get_emulator(name)
+    assert emu is not None
+    body = import_zip({".import/save/a.sav": b"x"})
+
+    result = preflight_import(emu, body, rom_file=None)
+
+    assert [(r.reason, r.member) for r in result.refusals] == [("kind_not_accepted", ".import/save/a.sav")]
+    assert result.placements == ()
+
+
+@pytest.mark.parametrize("name", sorted(_IMPORTING))
+def test_an_importing_emulator_places_members_itself(name: str) -> None:
+    """An emulator listed as importing overrides the spec and placement hooks.
+
+    Guards the list itself: a name left in it after its hooks were removed
+    would otherwise escape every test above.
+
+    Args:
+        name: The registry name.
+    """
+    emu = emulators.get_emulator(name)
+    assert emu is not None
+
+    for hook in ("import_spec", "place_import"):
+        assert getattr(type(emu), hook) is not getattr(base.Emulator, hook), f"{name} inherits {hook}"
+
+
+@pytest.mark.parametrize("name", sorted(emulators.REGISTRY))
+def test_restore_subtrees_covers_every_save_subtree(name: str) -> None:
+    """Whatever a restore may write into includes every subtree a dump ships.
+
+    Args:
+        name: The registry name.
+    """
+    emu = emulators.get_emulator(name)
+    assert emu is not None
+
+    assert set(emu.save_subtrees) <= set(emu.restore_subtrees) | {
+        s for s in emu.save_subtrees if any(s.startswith(r + "/") for r in emu.restore_subtrees)
+    }
+
+
+def _spec_cases() -> list[tuple[str, Optional[str]]]:
+    """List every registry emulator once, and RetroArch once more per platform.
+
+    RetroArch's spec depends on the loaded platform, so each mapped slug is
+    checked on its own, and so is one no table maps.
+
+    Returns:
+        `(name, platform)` pairs; the platform is None except in RetroArch's extra cases.
+    """
+    cases: list[tuple[str, Optional[str]]] = [(name, None) for name in sorted(emulators.REGISTRY)]
+    cases += [("retroarch", slug) for slug in sorted(retroarch.PLATFORMS)]
+    cases.append(("retroarch", "not-a-platform"))
+    return cases
+
+
+def _on(name: str, platform: Optional[str]) -> base.Emulator:
+    """Build a registry emulator with a platform loaded, as discovery does.
+
+    Args:
+        name: The registry name.
+        platform: The RomM platform slug, or None.
+
+    Returns:
+        A fresh instance.
+    """
+    emu = emulators.get_emulator(name)
+    assert emu is not None
+    emu.platform = platform
+    return emu
+
+
+@pytest.mark.parametrize(("name", "platform"), _spec_cases())
+def test_a_state_kind_rides_the_archive_and_waits_for_a_resume_slot(
+    name: str, platform: Optional[str]
+) -> None:
+    """A declared state rides the archive, at most one per archive, and needs `save.resume_slot`.
+
+    An archive state resumes through the slot the broker saves into on exit,
+    so it needs no mid-session states: Flycast and DuckStation take one with
+    `supports_states` off. Counting the archive's own state keeps two states
+    from competing for that one slot.
+
+    Args:
+        name: The registry name.
+        platform: The loaded platform.
+    """
+    spec = _on(name, platform).import_spec()
+    state = spec.kind("state")
+
+    assert (state is not None) == (spec.state_channel == "archive")
+    if state is not None:
+        assert (state.requires_resume_slot, state.max_members, state.counts_v1) == (True, 1, True)
+
+
+@pytest.mark.parametrize(("name", "platform"), _spec_cases())
+def test_a_push_state_channel_needs_mid_session_states(name: str, platform: Optional[str]) -> None:
+    """An emulator only sends states to the push route when that route can take them.
+
+    `state_uses_push` tells RomM to send the state to
+    PUT /api/session/state-file after activate, and that route answers 400
+    when `supports_states` is off.
+
+    Args:
+        name: The registry name.
+        platform: The loaded platform.
+    """
+    emu = _on(name, platform)
+
+    assert emu.import_spec().state_channel != "push" or emu.supports_states
+
+
+@pytest.mark.parametrize(("name", "platform"), _spec_cases())
+def test_each_kind_is_declared_once_and_only_a_state_needs_a_resume_slot(
+    name: str, platform: Optional[str]
+) -> None:
+    """A spec declares each kind at most once, and only its state waits for a resume slot.
+
+    `ImportSpec.kind` answers the first declaration, so a second one would be
+    listed by discovery and never used.
+
+    Args:
+        name: The registry name.
+        platform: The loaded platform.
+    """
+    kinds = _on(name, platform).import_spec().kinds
+
+    assert len({k.kind for k in kinds}) == len(kinds)
+    assert all(k.requires_resume_slot == (k.kind == "state") for k in kinds)
+
+
+@pytest.mark.parametrize(("name", "platform"), _spec_cases())
+def test_a_spec_names_no_card_subtree_but_the_emulators_own(name: str, platform: Optional[str]) -> None:
+    """Discovery's `card_subtree` is either absent or the subtree the restore leaves out.
+
+    The restore leaves out `memory_card_subtree` when the card is synced on
+    its own routes. A spec naming any other subtree would tell RomM the card
+    lives somewhere the broker does not treat as one.
+
+    Args:
+        name: The registry name.
+        platform: The loaded platform.
+    """
+    emu = _on(name, platform)
+
+    assert emu.import_spec().card_subtree in (None, emu.memory_card_subtree)
+
+
+@pytest.mark.parametrize(("name", "platform"), _spec_cases())
+def test_only_a_declared_kind_reaches_place_import(
+    monkeypatch: pytest.MonkeyPatch, name: str, platform: Optional[str]
+) -> None:
+    """The kind gate stops every undeclared kind before the emulator's own hook sees it.
+
+    A hook is written for the kinds its spec declares, so a member of any
+    other kind must never reach it. A state on a push channel is pointed at
+    the push route; every other undeclared member answers
+    `kind_not_accepted`.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher.
+        name: The registry name.
+        platform: The loaded platform.
+    """
+    emu = _on(name, platform)
+    declared = emu.import_spec()
+    seen: list[str] = []
+
+    def spy(
+        member: imports.ImportMember, spec: imports.ImportSpec, ctx: imports.ImportCtx
+    ) -> imports.ImportRefusal:
+        """Record the member's kind and refuse it.
+
+        Args:
+            member: The member that got past the kind gate.
+            spec: The emulator's spec.
+            ctx: The launch context.
+
+        Returns:
+            An `unrecognised_layout` refusal, so nothing is placed.
+        """
+        seen.append(member.kind)
+        return imports.ImportRefusal("unrecognised_layout", member.name, None)
+
+    monkeypatch.setattr(emu, "place_import", spy)
+    members = [".import/save/Game.srm", ".import/state/Game.state", ".import/memcard/Game.mcd"]
+    body = import_zip({m: b"x" for m in members})
+
+    result = preflight_import(emu, body, rom_file=None, resume_slot=emu.state_slot)
+
+    expected = []
+    for m in members:
+        kind = m.split("/")[1]
+        if declared.kind(kind) is not None:
+            expected.append((m, "unrecognised_layout"))
+        elif kind == "state" and declared.state_channel == "push":
+            expected.append((m, "state_uses_push"))
+        else:
+            expected.append((m, "kind_not_accepted"))
+    assert sorted(seen) == sorted(k.kind for k in declared.kinds)
+    assert sorted((r.member, r.reason) for r in result.refusals) == sorted(expected)
+
+
+@pytest.mark.parametrize("name", ["duckstation", "flycast"])
+def test_a_flat_card_is_an_ordinary_save(name: str) -> None:
+    """Flycast and DuckStation keep their cards among the saves, not on the memory card routes.
+
+    Each card is a file in a save subtree, so an imported card is restored
+    with the rest of the archive, and syncing the card separately never
+    turns it away as `memcard_synced_separately`.
+
+    Args:
+        name: The registry name.
+    """
+    emu = _on(name, None)
+
+    assert (emu.memory_card_subtree, emu.import_spec().card_subtree) == (None, None)
+
+
+_EXAMPLE_PLATFORM: dict[str, str] = {"duckstation": "psx", "flycast": "dc", "retroarch": "gb"}
+"""The platform each importing emulator's examples below are placed on."""
+
+_EXAMPLES: list[tuple[str, str, bytes]] = [
+    ("duckstation", ".import/save/card.mcd", bytes(131072)),
+    ("duckstation", ".import/memcard/card.mcr", bytes(131072)),
+    ("duckstation", ".import/state/SLUS-00594_resume.sav", b"progress"),
+    ("flycast", ".import/save/vmu_save_B2.bin", bytes(131072)),
+    ("flycast", ".import/save/dc_nvmem.bin", b"flash"),
+    ("flycast", ".import/memcard/card.bin", bytes(131072)),
+    ("flycast", ".import/state/Game.state", b"progress"),
+    ("retroarch", ".import/save/Game.srm", b"sram"),
+]
+"""One member each importing emulator accepts, for every kind it accepts on its example platform."""
+
+
+def test_every_accepted_kind_has_an_example() -> None:
+    """Each kind an importing emulator can place has an example in `_EXAMPLES`.
+
+    A kind with shapes on the example platform is one the emulator places,
+    so a newly accepted kind fails here until it has an example.
+    """
+    assert set(_EXAMPLE_PLATFORM) == _IMPORTING
+    accepted = {
+        (name, k.kind)
+        for name, platform in _EXAMPLE_PLATFORM.items()
+        for k in _on(name, platform).import_spec().kinds
+        if k.shapes
+    }
+
+    assert accepted == {(name, member.split("/")[1]) for name, member, _ in _EXAMPLES}
+
+
+@pytest.mark.parametrize(("name", "member", "data"), _EXAMPLES)
+def test_an_accepted_member_lands_inside_the_save_tree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str, member: str, data: bytes
+) -> None:
+    """An accepted member, and every sidecar it brings, lands strictly inside a restored subtree.
+
+    `check_plan` holds a member's own destination to the save tree, but not
+    its sidecars. A sidecar written outside the tree is never shipped by the
+    exit dump, so it is lost with the session, and never cleared, so it
+    outlives it.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher.
+        tmp_path: Per-test scratch directory.
+        name: The registry name.
+        member: The import member.
+        data: Its bytes.
+    """
+    emu = _on(name, _EXAMPLE_PLATFORM[name])
+    monkeypatch.setattr(emu, "save_root", tmp_path / "data")
+    rom = tmp_path / "Game.bin"
+    rom.write_bytes(b"rom")
+
+    result = preflight_import(emu, import_zip({member: data}), rom_file=rom, resume_slot=emu.state_slot)
+
+    assert result.refusals == ()
+    assert [p.member.name for p in result.placements] == [member]
+    subtrees = tuple(emu.restore_subtrees)
+    for placement in result.placements:
+        for dest in (placement.dest, *(d for d, _ in placement.sidecars)):
+            assert saves.under_subtrees(dest, subtrees), dest

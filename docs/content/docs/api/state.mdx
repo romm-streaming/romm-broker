@@ -111,3 +111,7 @@ it fires, so it never tries to load a state that isn't there yet. Because of
 this, RomM follows this order: call activate with `resume_slot` set, PUT
 the chosen state, and let the broker's watchdog load it once the emulator
 reports the game is running.
+
+A state from outside the broker goes the same way on emulators whose
+`state_channel` is `push`. Inside the archive it is refused with
+[`state_uses_push`](/docs/api/imports#state-uses-push).

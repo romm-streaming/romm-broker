@@ -1,4 +1,4 @@
 {
   "title": "REST API",
-  "pages": ["index", "activate", "join", "state", "exit", "archives", "status"]
+  "pages": ["index", "activate", "join", "state", "exit", "archives", "status", "imports"]
 }

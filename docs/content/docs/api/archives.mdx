@@ -45,14 +45,22 @@ curl -k -X DELETE https://localhost:3001/streaming/api/session/exports/abc123-17
   -H 'X-Broker-Secret: <shared secret>'
 ```
 
+Members under `.import/` are not restored path for path; they are placed by
+the emulator's own rules. See [Declared imports](/docs/api/imports).
+
 ## What an archive holds
 
 An archive is a zip file of the emulator's save subtrees (the specific
 folders inside its save data that actually hold saves and states). The
 paths inside the zip are relative to the emulator's save root folder: for
 PCSX2, that means paths like `memcards/...` and `sstates/...`. When an
-archive is restored, any file outside those folders is skipped, and a file
-already on disk is never overwritten by an older copy from the archive.
+archive is restored, a file already on disk is never overwritten by an
+older copy from the archive. A file outside those folders refuses the whole
+restore before anything is cleared (it is listed as `unrecognised_layout` in
+an archive with imports), and so does an encrypted file, one with a
+compression method the broker cannot read, or one whose data is corrupt. The
+broker reads every file in full to check before it clears anything. Only a
+synced memory card in an older archive is skipped.
 That's what keeps an old archive from rolling a session backward. When an
 archive is built at exit, only the files that changed since launch go into
 it, so an archive holds just the changes, not a full copy of the save data.
@@ -70,26 +78,28 @@ at its root, naming the session and labelling each file:
   "created_at": 1787880008.5,
   "session": {
     "emulator": "retroarch",
-    "core": "ppsspp",
-    "platform": "psp",
+    "core": "mgba",
+    "platform": "gba",
     "rom_id": 5,
-    "rom": "Patapon",
-    "rom_file": "/romm/roms/psp/Patapon (USA).chd",
+    "rom": "Advance Wars",
+    "rom_file": "/romm/roms/gba/Advance Wars (USA).gba",
     "state_slot": 0
   },
   "files": [
-    { "path": "states/Patapon (USA).state", "kind": "state" },
-    { "path": "states/Patapon (USA).state.png", "kind": "state_screenshot" },
-    { "path": "saves/Patapon (USA).srm", "kind": "save" }
+    { "path": "states/mGBA/Advance Wars (USA).state", "kind": "state" },
+    { "path": "states/mGBA/Advance Wars (USA).state.png", "kind": "state_screenshot" },
+    { "path": "saves/mGBA/Advance Wars (USA).srm", "kind": "save" }
   ]
 }
 ```
 
 `kind` is one of `state`, `state_screenshot`, `memcard` or `save`. `core` is
 only set for a launcher that can run several different emulator cores, like
-RetroArch, so a RetroArch PSP archive can be told apart from a standalone
-PPSSPP one. `state_slot` is `null` when the emulator has no save states at
-all.
+RetroArch (`mgba` above), so a RetroArch PSP archive (`core: "ppsspp"`) can
+be told apart from a standalone PPSSPP one. `state_slot` is `null` when the emulator has no save states at
+all. When the session placed [declared imports](/docs/api/imports), an
+`imported` list names the placed files, which ship whether or not the game
+changed them.
 
 The manifest describes what's in the archive, it isn't save data itself: it
 doesn't appear in the `save_dump.files` list, and when an archive is
