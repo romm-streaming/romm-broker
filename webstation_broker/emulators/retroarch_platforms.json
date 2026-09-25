@@ -363,5 +363,99 @@
     "library_name": "FinalBurn Neo",
     "save_ram": false,
     "extensions": [".zip", ".7z"]
+  },
+  "pc-fx": {
+    "core": "mednafen_pcfx",
+    "save_ram": false,
+    "library_name": "Beetle PC-FX",
+    "extensions": [".m3u", ".cue", ".chd", ".ccd", ".toc"]
+  },
+  "appleii": {
+    "core": "applewin",
+    "save_ram": false,
+    "library_name": "applewin",
+    "core_source": {
+      "github_release": "audetto/AppleWin",
+      "asset": "applewin-libretro-linux-x86_64-.*\\.zip"
+    },
+    "extensions": [".dsk", ".po", ".do", ".nib", ".woz", ".2mg"]
+  },
+  "fairchild-channel-f": {
+    "core": "freechaf",
+    "save_ram": false,
+    "library_name": "FreeChaF",
+    "extensions": [".bin", ".chf", ".zip"]
+  },
+  "pc-9800-series": {
+    "core": "np2kai",
+    "save_ram": false,
+    "library_name": "Neko Project II Kai",
+    "extensions": [".d98", ".98d", ".fdi", ".fdd", ".2hd", ".tfd", ".d88", ".88d", ".hdm", ".xdf", ".dup", ".cmd", ".hdi", ".thd", ".nhd", ".hdd", ".hdn", ".zip"]
+  },
+  "pc-8800-series": {
+    "core": "quasi88",
+    "save_ram": false,
+    "library_name": "QUASI88",
+    "extensions": [".d88", ".u88", ".m3u"]
+  },
+  "sharp-x68000": {
+    "core": "px68k",
+    "save_ram": false,
+    "library_name": "PX68k",
+    "extensions": [".dim", ".img", ".d88", ".88d", ".hdm", ".dup", ".2hd", ".xdf", ".hdf", ".cmd", ".m3u", ".zip"]
+  },
+  "arcadia-2001": {
+    "core": "amiarcadia",
+    "save_ram": false,
+    "library_name": "AmiArcadia",
+    "extensions": [".bin", ".tvc", ".zip"]
+  },
+  "supervision": {
+    "core": "potator",
+    "save_ram": false,
+    "library_name": "Potator",
+    "extensions": [".sv", ".bin", ".zip", ".7z"]
+  },
+  "model3": {
+    "core": "supermodel",
+    "save_ram": false,
+    "library_name": "Supermodel",
+    "extensions": [".zip"]
+  },
+  "benesse-pocket-challenge-v2": {
+    "core": "mednafen_wswan",
+    "save_ram": false,
+    "library_name": "Beetle WonderSwan",
+    "extensions": [".pc2", ".zip"]
+  },
+  "epoch-super-cassette-vision": {
+    "core": "emuscv",
+    "save_ram": false,
+    "library_name": "EmuSCV",
+    "extensions": [".cart", ".bin", ".rom"]
+  },
+  "videopac-g7000": {
+    "core": "o2em",
+    "save_ram": false,
+    "library_name": "O2EM",
+    "extensions": [".bin"]
+  },
+  "pokemon-mini": {
+    "core": "pokemini",
+    "save_ram": false,
+    "library_name": "PokeMini",
+    "extensions": [".min"]
+  },
+  "amiga-cd32": {
+    "core": "puae",
+    "save_ram": false,
+    "library_name": "PUAE",
+    "extensions": [".cue", ".ccd", ".chd", ".nrg", ".mds", ".iso", ".zip", ".7z"]
+  },
+  "atari8bit": {
+    "core": "atari800",
+    "save_ram": false,
+    "library_name": "Atari800",
+    "extensions": [".xfd", ".atr", ".atx", ".cdm", ".cas", ".bin", ".a52", ".xex", ".zip"]
   }
 }
