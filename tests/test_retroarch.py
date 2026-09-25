@@ -609,17 +609,18 @@ def test_a_scoped_platform_s_saves_sit_in_its_core_s_sorted_dir() -> None:
 
 _SRM_PLATFORMS = frozenset(
     {
-        "nes", "famicom", "snes", "sfam", "n64", "gb", "gbc", "gba", "virtualboy", "nds", "genesis", "sms",
+        "nes", "famicom", "snes", "sfam", "n64", "gb", "gbc", "gba", "virtualboy", "nds", "nintendo-dsi", "genesis", "sms",
         "gamegear", "sg1000", "sega32", "tg16", "turbografx-cd", "supergrafx", "neo-geo-cd",
         "wonderswan", "wonderswan-color", "jaguar", "colecovision", "psx",
     }
 )  # fmt: skip
-"""The 24 platforms whose core exposes `RETRO_MEMORY_SAVE_RAM`, per the 2026-09-18 source check
-(updated 2026-09-23: nds moved from `melonds` to `melondsds`, which does expose it)."""
+"""The 25 platforms whose core exposes `RETRO_MEMORY_SAVE_RAM`, per the 2026-09-18 source check
+(updated 2026-09-23: nds moved from `melonds` to `melondsds`, which does expose it;
+2026-09-25: nintendo-dsi added on the same `melondsds` core)."""
 
 
 def test_a_srm_is_taken_on_exactly_the_platforms_whose_core_loads_one() -> None:
-    """The `.srm` predicate answers yes on the 24 checked platforms, and the table's flags agree.
+    """The `.srm` predicate answers yes on the 25 checked platforms, and the table's flags agree.
 
     The second check keeps `save_ram` false on psp, dolphin and azahar too,
     though the predicate refuses those for reasons of their own.

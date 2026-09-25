@@ -89,6 +89,12 @@
     "save_ram": true,
     "extensions": [".nds", ".srl"]
   },
+  "nintendo-dsi": {
+    "core": "melondsds",
+    "library_name": "melonDS DS",
+    "save_ram": true,
+    "extensions": [".nds", ".ids", ".dsi"]
+  },
   "3ds": {
     "core": "azahar",
     "library_name": "Azahar",
