@@ -17,8 +17,8 @@ You get no permission prompt at all, and the invite buttons fall back to a
 manual copy box instead of copying the link automatically. This is a
 cross-origin problem: browsers only fully trust a page when it's served
 from the same website address ("origin") as the page around it. Here,
-`host` in `config.yml` is a full URL on its own domain instead of a path
-under RomM's own origin, so the browser treats the room as a different
+`host` in `config.yml` points at a different origin than RomM's (its own
+domain, or RomM's host on another port or scheme), so the browser treats the room as a different
 website and blocks it from ever asking for camera, microphone, or clipboard
 access. No reverse-proxy setting can fix this. See the callout at the top
 of [Reverse proxy](/docs/deployment/reverse-proxy) for why, and the
@@ -79,6 +79,21 @@ Two separate things can cause this. It's worth ruling out both:
    settings (or wait for it to expire), instead of expecting the new config
    to fix a session that's already in progress.
 
+## Traefik sends `/streaming/` to RomM, or answers with an intermittent 502
+
+Both symptoms come from the Traefik labels rather than the container.
+
+- **RomM's page loads at `/streaming/` instead of the room.** RomM's router
+  matches every path on the domain, and it is winning over the container's.
+  Give the container's router a higher `priority` than RomM's.
+- **Some requests work and others return `502 Bad Gateway`.** The service is
+  attached to more than one Docker network and Traefik is sometimes using
+  an address on a network it isn't part of. Set `traefik.docker.network` to
+  the network Traefik shares with the service.
+
+The [Traefik tab](/docs/deployment/reverse-proxy#proxy-recipes) has a full
+example with both settings.
+
 ## Activate/join/exit calls fail with 403, and the broker log shows `rejected request: bad or missing broker secret`
 
 `BROKER_SECRET` on the container and `broker_secret` in RomM's `config.yml`
@@ -88,7 +103,9 @@ different values, produces this exact log line. If `BROKER_SECRET` isn't
 set on the container at all, this check doesn't run at all, so seeing this
 warning tells you it *is* set, and the two sides just disagree. See
 [`BROKER_SECRET`](/docs/configuration) and the `config.yml` example in
-[Wiring it into RomM](/docs/container#wiring-it-into-romm).
+[Wiring it into RomM](/docs/container#wiring-it-into-romm). If RomM has
+`STREAMING_BROKER_SECRET` set in its environment, that value is used instead
+of `broker_secret` for every container, so check it too.
 
 ## Where to look next
 

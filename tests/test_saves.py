@@ -112,10 +112,52 @@ def test_build_ignores_subtrees_it_was_not_given(tmp_path: Path) -> None:
     assert [f["path"] for f in report["files"]] == ["memcards/card.bin"]
 
 
-def test_build_skips_dot_prefixed_entries(tmp_path: Path) -> None:
-    """Build skips dot-prefixed entries."""
-    _write(tmp_path / "sstates" / ".staging.tmp", mtime=NEW)
+def test_build_ships_a_dot_prefixed_save(tmp_path: Path) -> None:
+    """A save an emulator wrote under a dot-prefixed name is still save data."""
     _write(tmp_path / "sstates" / ".hidden" / "inside.bin", mtime=NEW)
+    _write(tmp_path / "sstates" / ".config.tmp", mtime=NEW)
+    _write(tmp_path / "sstates" / "state.p2s", mtime=NEW)
+
+    report = saves.build_save_archive(tmp_path, ("sstates",), baseline=0)
+
+    assert [f["path"] for f in report["files"]] == [
+        "sstates/.config.tmp", "sstates/.hidden/inside.bin", "sstates/state.p2s"
+    ]
+
+
+@pytest.mark.parametrize(
+    "scratch",
+    [
+        pytest.param(".state.p2s.0123456789abcdef.tmp", id="staging"),
+        pytest.param("sub/.card.raw.0123456789abcdef.tmp", id="nested-staging"),
+        pytest.param(".atime-probe.1234", id="atime-probe"),
+        pytest.param(".atime-probe.1234.89abcdef", id="atime-probe-tagged"),
+        pytest.param(".Mcd001.ps2.new/_pcsx2_superblock", id="memcard-staging"),
+        pytest.param(".Mcd001.ps2.old/_pcsx2_superblock", id="memcard-backup"),
+    ],
+)
+def test_build_skips_broker_scratch_a_crash_left_behind(tmp_path: Path, scratch: str) -> None:
+    """Scratch the broker writes inside a save tree never ships, wherever it was left."""
+    _write(tmp_path / "sstates" / scratch, mtime=NEW)
+    _write(tmp_path / "sstates" / "state.p2s", mtime=NEW)
+
+    report = saves.build_save_archive(tmp_path, ("sstates",), baseline=0)
+
+    assert [f["path"] for f in report["files"]] == ["sstates/state.p2s"]
+
+
+def test_build_skips_a_fresh_staging_name(tmp_path: Path) -> None:
+    """The skip matches what `_staging_name` actually produces."""
+    _write(tmp_path / "sstates" / saves._staging_name("state.p2s"), mtime=NEW)
+
+    report = saves.build_save_archive(tmp_path, ("sstates",), baseline=0)
+
+    assert report["files"] == []
+
+
+def test_build_skips_a_manifest_left_in_a_save_tree(tmp_path: Path) -> None:
+    """The broker's own archive index is never mistaken for save data."""
+    _write(tmp_path / "sstates" / saves.MANIFEST_NAME, b"{}", mtime=NEW)
     _write(tmp_path / "sstates" / "state.p2s", mtime=NEW)
 
     report = saves.build_save_archive(tmp_path, ("sstates",), baseline=0)
@@ -363,6 +405,20 @@ def test_archive_round_trips_through_a_restore(tmp_path: Path) -> None:
         "written": 1, "skipped": 0, "excluded": 0, "failed": 0, "imported": 0, "error": None
     }
     assert (target / "GC" / "card.raw").read_bytes() == b"payload"
+
+
+def test_a_dot_prefixed_save_round_trips_through_a_restore(tmp_path: Path) -> None:
+    """A dotfile save dumped at exit lands back where it came from."""
+    source = tmp_path / "source"
+    _write(source / "GC" / ".hidden" / "card.raw", b"payload", mtime=NEW)
+    report = saves.build_save_archive(source, ("GC",), baseline=0)
+
+    target = tmp_path / "target"
+    target.mkdir()
+    result = saves.extract_save_archive(report["zip_bytes"], target, ("GC",))
+
+    assert result["written"] == 1
+    assert (target / "GC" / ".hidden" / "card.raw").read_bytes() == b"payload"
 
 
 def test_restore_counts_a_corrupt_member_as_failed_not_a_crash(
@@ -936,6 +992,229 @@ def test_plan_v1_refuses_a_subtree_whose_link_leaves_the_root(tmp_path: Path) ->
     )
 
 
+@pytest.mark.parametrize(
+    "members",
+    [{"GC/a": b"file", "GC/a/b": b"child"}, {"GC/a/b": b"child", "GC/a": b"file"}],
+    ids=["file-first", "dir-first"],
+)
+def test_plan_v1_refuses_a_member_that_is_another_members_directory(
+    tmp_path: Path, members: dict[str, bytes]
+) -> None:
+    """A path cannot be both a file and a directory, so one of the two would fail after the clear.
+
+    Args:
+        tmp_path: The per-test temporary directory.
+        members: The two colliding members, in either zip order.
+    """
+    plan = _plan(tmp_path, members)
+
+    assert plan.problems == (
+        ("GC/a", "archive member is also the directory of another member: GC/a", "collides"),
+    )
+    assert plan.names == ("GC/a/b",)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        pytest.param("GC/.a.raw.0123456789abcdef.tmp", id="staging"),
+        pytest.param("GC/.atime-probe.1234", id="atime-probe"),
+        pytest.param("GC/.Mcd001.ps2.old/_pcsx2_superblock", id="memcard-backup"),
+        pytest.param(f"GC/{saves.MANIFEST_NAME}", id="manifest"),
+    ],
+)
+def test_plan_v1_refuses_a_member_no_dump_would_carry_back(tmp_path: Path, name: str) -> None:
+    """A member named like broker scratch would land on disk and never be saved again."""
+    plan = _plan(tmp_path, {name: b"x", "GC/b.raw": b"b"})
+
+    assert plan.problems == (
+        (name, f"archive member is named like broker scratch, which is never saved back: {name}", "scratch"),
+    )
+    assert plan.names == ("GC/b.raw",)
+
+
+def _zip_entries(entries: list[tuple[str, bytes]]) -> bytes:
+    """Build an in-memory zip archive that may hold one name more than once.
+
+    Args:
+        entries: `(name, bytes)` pairs, written in order.
+
+    Returns:
+        The zip file contents.
+    """
+    buf = io.BytesIO()
+    with pytest.warns(UserWarning, match="Duplicate name"), zipfile.ZipFile(buf, "w") as zf:
+        for name, content in entries:
+            zf.writestr(zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0)), content)
+    return buf.getvalue()
+
+
+def test_plan_v1_refuses_a_name_the_archive_holds_twice(tmp_path: Path) -> None:
+    """Two copies of one member leave which one lands up to write order, so neither is written."""
+    root = tmp_path / "root"
+    root.mkdir()
+    body = _zip_entries([("GC/a", b"first"), ("GC/b", b"b"), ("GC/a", b"second")])
+
+    plan = saves.plan_v1(saves.read_archive(body), root, ("GC",), ())
+
+    assert plan.problems == (("GC/a", "archive holds 2 members for GC/a: GC/a", "duplicate"),)
+    assert plan.names == ("GC/b",)
+
+
+def test_plan_v1_refuses_a_dot_segment_alias_of_another_member(tmp_path: Path) -> None:
+    """`GC/./a` and `GC//a` are the file `GC/a` under another spelling."""
+    plan = _plan(tmp_path, {"GC/./a": b"one", "GC/b": b"b", "GC/a": b"two", "GC//a": b"three"})
+
+    assert plan.problems == (("GC/./a", "archive holds 3 members for GC/a: GC/./a", "duplicate"),)
+    assert plan.names == ("GC/b",)
+
+
+def _name_max(path: Path) -> int:
+    """The longest single name the filesystem under `path` takes.
+
+    Args:
+        path: Any existing directory on the filesystem.
+
+    Returns:
+        Its `PC_NAME_MAX`, in bytes.
+    """
+    return os.pathconf(path, "PC_NAME_MAX")
+
+
+def test_plan_v1_refuses_a_component_longer_than_the_filesystem_takes(tmp_path: Path) -> None:
+    """A name the filesystem cannot hold is refused before the clear, not failed after it."""
+    long_dir = "d" * (_name_max(tmp_path) + 1)
+
+    plan = _plan(tmp_path, {f"GC/{long_dir}/a.raw": b"a"})
+
+    assert [(p[0], p[2]) for p in plan.problems] == [(f"GC/{long_dir}/a.raw", "too_long")]
+    assert plan.names == ()
+
+
+def test_plan_v1_counts_the_staging_suffix_against_the_name_limit(tmp_path: Path) -> None:
+    """The write stages through `.<name>.<16 hex>.tmp`, so that name has to fit too.
+
+    A final component that fits on its own but not once staged would pass a
+    bare NAME_MAX check and still fail after the clear.
+    """
+    staging_overhead = len(".") + len(".") + 16 + len(".tmp")
+    fits = "f" * (_name_max(tmp_path) - staging_overhead)
+    too_long = fits + "g"
+
+    plan = _plan(tmp_path, {f"GC/{fits}": b"a", f"GC/{too_long}": b"b"})
+
+    assert [(p[0], p[2]) for p in plan.problems] == [(f"GC/{too_long}", "too_long")]
+    assert plan.names == (f"GC/{fits}",)
+    written = saves.write_save_archive(
+        _zip({f"GC/{fits}": b"a"}), tmp_path / "root", saves.ArchivePlan(plan.names, 0)
+    )
+    assert written["failed"] == 0
+
+
+def test_plan_v1_reads_the_name_limit_from_the_filesystem(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A name limit is read from the filesystem: eCryptfs takes 143 bytes, so 255 is not safe.
+
+    Args:
+        tmp_path: The per-test temporary directory.
+        monkeypatch: Stands in a filesystem with a 143-byte name limit.
+    """
+    real_pathconf = os.pathconf
+
+    def ecryptfs(path: Any, name: Any) -> int:
+        """Answer like an eCryptfs mount.
+
+        Args:
+            path: The queried path.
+            name: The queried limit.
+
+        Returns:
+            143 for the name limit, the real answer otherwise.
+        """
+        return 143 if name == "PC_NAME_MAX" else real_pathconf(path, name)
+
+    monkeypatch.setattr(os, "pathconf", ecryptfs)
+    member = f"GC/{'d' * 150}/a.raw"
+
+    plan = _plan(tmp_path, {member: b"a", "GC/ok.raw": b"k"})
+
+    assert [(p[0], p[2]) for p in plan.problems] == [(member, "too_long")]
+    assert "143" in plan.problems[0][1]
+    assert plan.names == ("GC/ok.raw",)
+
+
+def test_plan_v1_refuses_a_path_longer_than_the_filesystem_takes(tmp_path: Path) -> None:
+    """Every component can fit and the whole path still be too long to open."""
+    deep = "/".join(["d" * 200] * 21)
+    member = f"GC/{deep}/g.raw"
+
+    plan = _plan(tmp_path, {member: b"x"})
+
+    assert [(p[0], p[2]) for p in plan.problems] == [(member, "too_long")]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes through a read-only mode")
+def test_plan_v1_refuses_a_subtree_it_cannot_write(tmp_path: Path) -> None:
+    """Permission drift on a save directory is found before the clear, once per directory."""
+    root = tmp_path / "root"
+    locked = root / "GC"
+    locked.mkdir(parents=True)
+    locked.chmod(0o500)
+    try:
+        plan = _plan(tmp_path, {"GC/a.raw": b"a", "GC/b.raw": b"b", "states/c.s": b"c"})
+    finally:
+        locked.chmod(0o700)
+
+    assert plan.problems == (
+        ("GC/a.raw", "archive member cannot be written, GC is not writable: GC/a.raw", "unwritable"),
+    )
+    assert plan.names == ("states/c.s",)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes through a read-only mode")
+def test_plan_v1_probes_the_subtree_a_clear_leaves_behind(tmp_path: Path) -> None:
+    """The clear removes a writable subdirectory, and the write then recreates it in the subtree."""
+    root = tmp_path / "root"
+    locked = root / "GC"
+    (locked / "sub").mkdir(parents=True)
+    locked.chmod(0o500)
+    try:
+        plan = _plan(tmp_path, {"GC/sub/a.raw": b"a"})
+    finally:
+        locked.chmod(0o700)
+
+    assert plan.problems == (
+        ("GC/sub/a.raw", "archive member cannot be written, GC is not writable: GC/sub/a.raw", "unwritable"),
+    )
+    assert plan.names == ()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes through a read-only mode")
+def test_plan_v1_probes_the_nearest_directory_that_exists(tmp_path: Path) -> None:
+    """A subtree the write would create is judged by the directory it would be created in."""
+    root = tmp_path / "root"
+    root.mkdir()
+    root.chmod(0o500)
+    try:
+        plan = _plan(tmp_path, {"GC/sub/a.raw": b"a"})
+    finally:
+        root.chmod(0o700)
+
+    assert [p[2] for p in plan.problems] == ["unwritable"]
+
+
+def test_plan_v1_leaves_nothing_behind_from_its_write_probe(tmp_path: Path) -> None:
+    """The writability probe cleans up after itself and creates no directories."""
+    root = tmp_path / "root"
+    (root / "GC").mkdir(parents=True)
+
+    plan = _plan(tmp_path, {"GC/deep/a.raw": b"a", "states/b.s": b"b"})
+
+    assert plan.problems == ()
+    assert sorted(p.relative_to(root).as_posix() for p in root.rglob("*")) == ["GC"]
+
+
 def test_surviving_chain_escapes_ignores_links_that_stay_inside(tmp_path: Path) -> None:
     """A link that resolves inside the root is harmless, and a missing chain cannot escape."""
     root = tmp_path / "root"
@@ -1135,6 +1414,38 @@ def test_write_save_archive_stamps_an_unusable_zip_date_with_now(tmp_path: Path)
 
     assert result["written"] == 1 and result["failed"] == 0
     assert (root / "GC" / "a").stat().st_mtime == NEW
+
+
+def test_a_future_member_is_stamped_before_the_restore_and_never_ships_back(tmp_path: Path) -> None:
+    """A member from a device with a bad clock must not look like this session's own save.
+
+    The dump ships anything stamped at or after the launch baseline, so a
+    2107 mtime left on disk would ride along on every exit, still stamped
+    2107. Stamping it at the restore itself is not enough either: the
+    baseline is taken right after, and its slack reaches back past it.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    body = _zip({"GC/a.raw": b"old"}, when=(2107, 12, 31, 0, 0, 0))
+
+    result = saves.write_save_archive(body, root, saves.ArchivePlan(("GC/a.raw",), 0))
+    launch = time.time()
+
+    assert result["written"] == 1
+    assert (root / "GC" / "a.raw").stat().st_mtime < launch
+    dump = saves.build_save_archive(root, ("GC",), launch)
+    assert dump["files"] == []
+
+
+def test_a_past_member_keeps_its_own_mtime(tmp_path: Path) -> None:
+    """Only a future stamp is replaced; an ordinary one still round-trips unchanged."""
+    root = tmp_path / "root"
+    root.mkdir()
+    body = _zip({"GC/a.raw": b"old"}, when=(2020, 1, 1, 0, 0, 0))
+
+    saves.write_save_archive(body, root, saves.ArchivePlan(("GC/a.raw",), 0), stamp=NEW)
+
+    assert (root / "GC" / "a.raw").stat().st_mtime == 1_577_836_800
 
 
 @pytest.mark.parametrize(

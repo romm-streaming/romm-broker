@@ -89,6 +89,12 @@
     "save_ram": true,
     "extensions": [".nds", ".srl"]
   },
+  "nintendo-dsi": {
+    "core": "melondsds",
+    "library_name": "melonDS DS",
+    "save_ram": true,
+    "extensions": [".nds", ".ids", ".dsi"]
+  },
   "3ds": {
     "core": "azahar",
     "library_name": "Azahar",
@@ -98,7 +104,13 @@
       "asset": "azahar-libretro-linux-x86_64-.*\\.zip"
     },
     "extensions": [".3ds", ".cci", ".zcci", ".cxi", ".zcxi", ".app", ".3dsx", ".z3dsx", ".elf", ".axf"],
-    "save_subtrees": ["states", "saves/Azahar/sdmc/Nintendo 3DS", "saves/Azahar/nand/data"]
+    "save_subtrees": [
+      "states",
+      "saves/Azahar/Azahar/sdmc/Nintendo 3DS/00000000000000000000000000000000/00000000000000000000000000000000/title",
+      "saves/Azahar/Azahar/sdmc/Nintendo 3DS/00000000000000000000000000000000/00000000000000000000000000000000/extdata",
+      "saves/Azahar/Azahar/nand/data/00000000000000000000000000000000/extdata",
+      "saves/Azahar/Azahar/nand/data/00000000000000000000000000000000/sysdata"
+    ]
   },
   "genesis": {
     "core": "genesis_plus_gx",

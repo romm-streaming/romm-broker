@@ -609,17 +609,18 @@ def test_a_scoped_platform_s_saves_sit_in_its_core_s_sorted_dir() -> None:
 
 _SRM_PLATFORMS = frozenset(
     {
-        "nes", "famicom", "snes", "sfam", "n64", "gb", "gbc", "gba", "virtualboy", "nds", "genesis", "sms",
-        "gamegear", "sg1000", "sega32", "tg16", "turbografx-cd", "supergrafx", "neo-geo-cd",
+        "nes", "famicom", "snes", "sfam", "n64", "gb", "gbc", "gba", "virtualboy", "nds", "nintendo-dsi",
+        "genesis", "sms", "gamegear", "sg1000", "sega32", "tg16", "turbografx-cd", "supergrafx", "neo-geo-cd",
         "wonderswan", "wonderswan-color", "jaguar", "colecovision", "psx",
     }
 )  # fmt: skip
-"""The 24 platforms whose core exposes `RETRO_MEMORY_SAVE_RAM`, per the 2026-09-18 source check
-(updated 2026-09-23: nds moved from `melonds` to `melondsds`, which does expose it)."""
+"""The 25 platforms whose core exposes `RETRO_MEMORY_SAVE_RAM`, per the 2026-09-18 source check
+(updated 2026-09-23: nds moved from `melonds` to `melondsds`, which does expose it;
+2026-09-25: nintendo-dsi added on the same `melondsds` core)."""
 
 
 def test_a_srm_is_taken_on_exactly_the_platforms_whose_core_loads_one() -> None:
-    """The `.srm` predicate answers yes on the 24 checked platforms, and the table's flags agree.
+    """The `.srm` predicate answers yes on the 25 checked platforms, and the table's flags agree.
 
     The second check keeps `save_ram` false on psp, dolphin and azahar too,
     though the predicate refuses those for reasons of their own.
@@ -1450,6 +1451,64 @@ class TestClearWorkingSlot:
 
         assert not (user / "GC" / "MemoryCardA.raw").exists()
         assert (user / "Config" / "Dolphin.ini").exists()
+
+    def test_a_3ds_save_at_the_cores_real_nested_path_is_cleared(
+        self, emulator: retroarch.Retroarch, tmp_path: Path
+    ) -> None:
+        """The clear reaches where Azahar actually writes, not one level short of it.
+
+        `sort_savefiles_enable` redirects RetroArch's save dir to
+        `saves/Azahar/`, and the Azahar core then creates its own `Azahar/`
+        folder under whatever directory it is handed, so the SD card and NAND
+        sit at `saves/Azahar/Azahar/sdmc` and `saves/Azahar/Azahar/nand`, one
+        level deeper than a bare `saves/Azahar/`.
+        """
+        emulator.platform = "3ds"
+        card = tmp_path / "saves" / "Azahar" / "Azahar" / "sdmc" / "Nintendo 3DS" / _ID32 / _ID32
+        data = card / "extdata" / "00040000" / "0009abcd" / "00000001"
+        data.mkdir(parents=True)
+        (data / "save.bin").write_bytes(b"player-a save data")
+
+        emulator.clear_working_slot()
+
+        assert not (data / "save.bin").exists()
+
+    def test_a_3ds_clear_does_not_reach_the_whole_sd_card_or_nand(
+        self, emulator: retroarch.Retroarch, tmp_path: Path
+    ) -> None:
+        """The clear is scoped to the declared save leaves, not the whole card.
+
+        `_clear_subtree` empties every top-level entry under the path it is
+        given, so declaring the clear at `sdmc/Nintendo 3DS` or `nand/data`
+        directly (rather than at the save-category leaves under the fixed
+        console and SD card id Azahar always uses) would `rmtree` the entire
+        SD card and NAND on every activate, taking out anything else either
+        one holds alongside those leaves. A different id here stands in for
+        "whatever else the card/NAND holds beyond the four declared leaves,"
+        since a real card only ever has the one id this session's Azahar uses.
+        """
+        emulator.platform = "3ds"
+        root = tmp_path / "saves" / "Azahar" / "Azahar"
+        other_sd_id = root / "sdmc" / "Nintendo 3DS" / ("1" * 32) / ("1" * 32) / "title"
+        other_sd_id.mkdir(parents=True)
+        (other_sd_id / "canary").write_bytes(b"a different sd card id")
+        sd_id = root / "sdmc" / "Nintendo 3DS" / _ID32 / _ID32
+        extdata = sd_id / "extdata" / "00040000" / "0009abcd" / "00000001"
+        extdata.mkdir(parents=True)
+        (extdata / "save.bin").write_bytes(b"player-a save data")
+        other_nand_id = root / "nand" / "data" / ("1" * 32) / "sysdata"
+        other_nand_id.mkdir(parents=True)
+        (other_nand_id / "canary").write_bytes(b"a different nand id")
+        sysdata = root / "nand" / "data" / _ID32 / "sysdata" / "00010017" / "00000000"
+        sysdata.mkdir(parents=True)
+        (sysdata / "config").write_bytes(b"console config")
+
+        emulator.clear_working_slot()
+
+        assert (other_sd_id / "canary").exists()
+        assert (other_nand_id / "canary").exists()
+        assert not (extdata / "save.bin").exists()
+        assert not (sysdata / "config").exists()
 
     def test_a_missing_save_dir_is_not_an_error(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2865,19 +2924,19 @@ _WII_PROTECTED = (f"{_WII_NAND}/title/00000001/*", f"{_WII_NAND}/title/????????/
 """The globs no Wii import may write: system titles, and every title's installed content."""
 _ID32 = "0" * 32
 """An Azahar id0 or id1: a 128-bit hash, as 32 hex digits."""
-_N3DS_SD = f"saves/Azahar/sdmc/Nintendo 3DS/{_ID32}/{_ID32}"
+_N3DS_SD = f"saves/Azahar/Azahar/sdmc/Nintendo 3DS/{_ID32}/{_ID32}"
 """The emulated SD card's title tree, as Azahar lays it out."""
 _N3DS_SHAPES = (
-    "saves/Azahar/sdmc/Nintendo 3DS/<id0>/<id1>/title/<high>/<low>/...",
-    "saves/Azahar/sdmc/Nintendo 3DS/<id0>/<id1>/extdata/<high>/<low>/...",
-    "saves/Azahar/nand/data/<id0>/...",
+    "saves/Azahar/Azahar/sdmc/Nintendo 3DS/<id0>/<id1>/title/<high>/<low>/...",
+    "saves/Azahar/Azahar/sdmc/Nintendo 3DS/<id0>/<id1>/extdata/<high>/<low>/...",
+    "saves/Azahar/Azahar/nand/data/<id0>/...",
 )
 """The save shapes a 3DS session advertises."""
 _N3DS_EXPECTED = "a 3DS save, " + " or ".join(_N3DS_SHAPES)
 """What a refused 3DS save is told to look like."""
 _N3DS_PROTECTED = (
-    f"saves/Azahar/nand/data/{'?' * 32}/sysdata/*",
-    f"saves/Azahar/sdmc/Nintendo 3DS/{'?' * 32}/{'?' * 32}/title/????????/????????/content/*",
+    f"saves/Azahar/Azahar/nand/data/{'?' * 32}/sysdata/*",
+    f"saves/Azahar/Azahar/sdmc/Nintendo 3DS/{'?' * 32}/{'?' * 32}/title/????????/????????/content/*",
 )
 """The globs no 3DS import may write: the NAND's system save data, and every title's installed content."""
 
@@ -3531,7 +3590,7 @@ def test_an_imported_wii_save_is_written_into_the_nand(ra_dirs: Path) -> None:
     [
         f"{_N3DS_TITLE}/data/00000001/game.sav",
         f"{_N3DS_SD}/extdata/00000000/00001234/00000001",
-        f"saves/Azahar/nand/data/{_ID32}/extdata/00048000/f000000b/Quota.dat",
+        f"saves/Azahar/Azahar/nand/data/{_ID32}/extdata/00048000/f000000b/Quota.dat",
     ],
 )
 def test_a_3ds_save_is_placed_exactly_as_named(ra_dirs: Path, tail: str) -> None:
@@ -3588,7 +3647,7 @@ def test_a_3ds_extdata_and_a_title_without_a_session_id_are_not_held_to_an_id(
 @pytest.mark.parametrize(
     "tail",
     [
-        f"saves/Azahar/nand/data/{_ID32}/sysdata/00010011/00000000",
+        f"saves/Azahar/Azahar/nand/data/{_ID32}/sysdata/00010011/00000000",
         f"{_N3DS_TITLE}/content/00000000.app",
     ],
 )
@@ -3612,15 +3671,15 @@ def test_3ds_system_save_data_and_install_data_are_protected(ra_dirs: Path, tail
         "game.sav",
         "title/00040000/00030100/data/00000001/game.sav",
         "Azahar/sdmc/Nintendo 3DS/" + _ID32 + "/" + _ID32 + "/title/00040000/00030100/data/x",
-        "saves/Azahar/config/qt-config.ini",
-        f"saves/Azahar/sdmc/Nintendo 3DS/{_ID32}/{_ID32}/dbs/title.db",
-        f"saves/Azahar/sdmc/Nintendo 3DS/{_ID32}/{_ID32}/title/00040000/00030100",
-        f"saves/Azahar/sdmc/Nintendo 3DS/{_ID32}/title/00040000/00030100/data/x",
-        f"saves/Azahar/sdmc/Nintendo 3DS/{'0' * 31}/{_ID32}/title/00040000/00030100/data/x",
-        f"saves/Azahar/sdmc/Nintendo 3DS/{_ID32}/{_ID32}/title/0004/00030100/data/x",
-        "saves/Azahar/nand/data/short/extdata/x",
-        f"saves/Azahar/nand/{_ID32}/x",
-        f"saves/Azahar/sdmc/Nintendo 3DS/{_ID32}/{_ID32}/Nintendo DSiWare/x",
+        "saves/Azahar/Azahar/config/qt-config.ini",
+        f"saves/Azahar/Azahar/sdmc/Nintendo 3DS/{_ID32}/{_ID32}/dbs/title.db",
+        f"saves/Azahar/Azahar/sdmc/Nintendo 3DS/{_ID32}/{_ID32}/title/00040000/00030100",
+        f"saves/Azahar/Azahar/sdmc/Nintendo 3DS/{_ID32}/title/00040000/00030100/data/x",
+        f"saves/Azahar/Azahar/sdmc/Nintendo 3DS/{'0' * 31}/{_ID32}/title/00040000/00030100/data/x",
+        f"saves/Azahar/Azahar/sdmc/Nintendo 3DS/{_ID32}/{_ID32}/title/0004/00030100/data/x",
+        "saves/Azahar/Azahar/nand/data/short/extdata/x",
+        f"saves/Azahar/Azahar/nand/{_ID32}/x",
+        f"saves/Azahar/Azahar/sdmc/Nintendo 3DS/{_ID32}/{_ID32}/Nintendo DSiWare/x",
     ],
 )
 def test_a_3ds_member_outside_azahars_layout_is_left_unplaced(ra_dirs: Path, tail: str) -> None:

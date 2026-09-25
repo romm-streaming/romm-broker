@@ -31,6 +31,19 @@ from .conftest import PREFIX, SLEEPER_CMD, FakeEmulator, corrupt_zip_member, man
 API = f"{PREFIX}/api"
 
 
+@pytest.fixture(autouse=True)
+def no_token_clear_grace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Skip the exit route's real 1.5s token-clear sleep.
+
+    Only the test that measures the grace period needs it, and it sets its
+    own shorter value.
+
+    Args:
+        monkeypatch: Used to zero `api.TOKEN_CLEAR_GRACE_SECONDS`.
+    """
+    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
+
+
 def _zip(members: dict[str, bytes]) -> bytes:
     """Build an in-memory zip archive from a name-to-content mapping.
 
@@ -1627,14 +1640,12 @@ def test_a_failed_save_dump_is_not_reported_as_a_successful_no_op(
     client: TestClient,
     broker_dirs: dict[str, Path],
     fake_emulator: list[FakeEmulator],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A dump that failed is reported as a failure, not as a session with nothing to save.
 
     Both produce no archive, and calling that a success is what has RomM file
     the session as saved and drop save data it never received.
     """
-    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
     _activate(client, broker_dirs)
     shutil.rmtree(fake_emulator[0].save_root)
 
@@ -1657,10 +1668,8 @@ def test_a_session_that_saved_nothing_still_reports_a_clean_exit(
     client: TestClient,
     broker_dirs: dict[str, Path],
     fake_emulator: list[FakeEmulator],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A session that wrote no saves is a skipped upload, which is still a success."""
-    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
     _activate(client, broker_dirs)
 
     body = client.post(f"{API}/session/exit").json()
@@ -1750,7 +1759,6 @@ def test_exit_reports_stream_tokens_it_could_not_clear(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Exit reports a token set selkies would not empty, so a live credential is not left unnoticed."""
-    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
     _activate(client, broker_dirs)
 
     async def _refuse() -> bool:
@@ -1808,7 +1816,6 @@ def test_the_exit_summary_keeps_paths_urls_and_errors_off_the_invite_seats(
     An invite link seats anonymous guests, and the container layout and the
     parent's endpoints are not theirs to read.
     """
-    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
 
     async def _refuse(
         _cb: Optional[dict[str, Any]],
@@ -1864,7 +1871,6 @@ def test_a_refused_sram_flush_is_flagged_to_the_controller(
     flush means the room's "saves uploaded" message would otherwise read as
     success while shipping save data from before this session.
     """
-    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
     monkeypatch.setattr(settings, "DEV_MODE", True)
     _activate(client, broker_dirs)
     real_save_and_exit = fake_emulator[0].save_and_exit
@@ -2130,7 +2136,6 @@ def test_an_archive_that_cannot_be_kept_still_finishes_the_teardown(
     Raising here would leave the session active forever, with its stream tokens
     live and every later activate refused.
     """
-    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
     _activate(client, broker_dirs)
     _write_save_after_launch(fake_emulator[0].save_root / "saves" / "card.bin", b"played")
 
@@ -2189,7 +2194,6 @@ def test_a_save_dump_that_raises_still_retires_the_session(
     exception would leave the session marked active with its stream tokens
     live, nothing able to exit it and every later activate refused.
     """
-    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
     _activate(client, broker_dirs)
     _write_save_after_launch(fake_emulator[0].save_root / "saves" / "card.bin", b"played")
 
@@ -2221,7 +2225,6 @@ def test_a_session_whose_dump_raised_can_be_activated_again(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A dump failure does not wedge the container on 409 forever."""
-    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
     _activate(client, broker_dirs)
 
     def _explode(*args: object, **kwargs: object) -> dict[str, Any]:
@@ -2249,7 +2252,6 @@ def test_an_emulator_still_up_after_its_exit_is_stopped_before_the_dump(
     `Emulator.stop` can return with the process still up, so a teardown that
     took its return as proof would zip the save tree mid-write.
     """
-    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
     monkeypatch.setattr(settings, "DEV_MODE", True)
     _activate(client, broker_dirs)
     _write_save_after_launch(fake_emulator[0].save_root / "saves" / "card.bin", b"played")
@@ -2287,7 +2289,6 @@ def test_an_emulator_that_outlives_its_stop_has_its_save_tree_left_alone(
     Zipping a live emulator's save tree files a half-written file in RomM over
     the save the player actually has, which is worse than reporting no archive.
     """
-    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
     _activate(client, broker_dirs)
     _write_save_after_launch(fake_emulator[0].save_root / "saves" / "card.bin", b"played")
 
@@ -2549,6 +2550,30 @@ def test_a_restored_archive_reports_no_skip(
             False,
             "archive member is corrupt: saves/a",
         ),
+        (
+            _zip({"saves/a": b"file", "saves/a/b": b"child"}),
+            None,
+            False,
+            "archive member is also the directory of another member: saves/a",
+        ),
+        (
+            _zip({f"saves/{'x' * 300}": b"x"}),
+            None,
+            False,
+            "archive member has a name component too long for the save filesystem",
+        ),
+        (
+            _zip({"saves/./a": b"one", "saves/a": b"two"}),
+            None,
+            False,
+            "archive holds 2 members for saves/a: saves/./a",
+        ),
+        (
+            _zip({"saves/.a.0123456789abcdef.tmp": b"x"}),
+            None,
+            False,
+            "archive member is named like broker scratch, which is never saved back",
+        ),
     ],
     ids=[
         "not-a-zip",
@@ -2563,6 +2588,10 @@ def test_a_restored_archive_reports_no_skip(
         "bad-date",
         "bad-utf8-name",
         "corrupt",
+        "file-and-dir",
+        "name-too-long",
+        "dot-segment-alias",
+        "broker-scratch",
     ],
 )
 def test_a_bad_archive_is_refused_before_the_slot_is_cleared(

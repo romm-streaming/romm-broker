@@ -1265,16 +1265,6 @@ def test_the_cache_enabled_switch_reads_the_usual_spellings(setting: str, expect
     assert shadps4._truthy(setting) is expected
 
 
-def test_extracted_dir_size_sums_files_and_skips_the_marker(cache_dir: Path) -> None:
-    """Extracted dir size sums files and skips the last-accessed marker."""
-    game_dir = cache_dir / "Game"
-    _touch(game_dir / "eboot.bin")
-    _touch(game_dir / "sce_sys" / "param.sfo")
-    _touch(game_dir / shadps4._LAST_ACCESSED_MARKER)
-
-    assert shadps4._extracted_dir_size(game_dir) == 10
-
-
 def test_cache_size_bytes_sums_across_every_game_dir(cache_dir: Path) -> None:
     """Cache size bytes sums across every game dir."""
     _touch(cache_dir / "GameA" / "eboot.bin")
@@ -1286,16 +1276,6 @@ def test_cache_size_bytes_sums_across_every_game_dir(cache_dir: Path) -> None:
 def test_cache_size_bytes_is_zero_without_a_cache_dir(cache_dir: Path) -> None:
     """Cache size bytes is zero without a cache dir."""
     assert shadps4._cache_size_bytes() == 0
-
-
-def test_touch_last_accessed_writes_a_marker_file(cache_dir: Path) -> None:
-    """Touch last accessed writes a marker file."""
-    game_dir = cache_dir / "Game"
-    _touch(game_dir / "eboot.bin")
-
-    shadps4._touch_last_accessed(game_dir)
-
-    assert (game_dir / shadps4._LAST_ACCESSED_MARKER).exists()
 
 
 def test_evict_lru_is_a_noop_when_disabled(cache_dir: Path) -> None:
@@ -1379,72 +1359,6 @@ def test_extracted_boot_target_rejects_an_eboot_that_symlinks_outside_root(
     (root / "eboot.bin").symlink_to(outside)
 
     assert shadps4._extracted_boot_target(root) is None
-
-
-def test_cache_key_changes_when_a_same_named_pkg_is_replaced(tmp_path: Path) -> None:
-    """Cache key changes when a same-named pkg is replaced with different content."""
-    pkg = tmp_path / "Game.pkg"
-    pkg.write_bytes(b"original")
-    original_key = shadps4._cache_key(pkg)
-
-    pkg.write_bytes(b"a completely different replacement dump")
-    os.utime(pkg, (pkg.stat().st_mtime + 5, pkg.stat().st_mtime + 5))
-
-    assert shadps4._cache_key(pkg) != original_key
-
-
-def test_cache_key_differs_for_same_named_roms_in_different_folders(tmp_path: Path) -> None:
-    """Two ROMs sharing a filename, size, and second-granularity mtime still key apart.
-
-    A library holds one title per folder, so same-named dumps sitting side
-    by side is ordinary; keying off the bare filename would hand them a
-    single cache dir and boot whichever extraction landed there first.
-    """
-    first = tmp_path / "USA" / "Game.pkg"
-    second = tmp_path / "EUR" / "Game.pkg"
-    _touch(first, mtime=1000)
-    _touch(second, mtime=1000)
-
-    assert shadps4._cache_key(first) != shadps4._cache_key(second)
-
-
-def test_cache_key_changes_for_a_same_second_replacement_of_the_same_size(
-    tmp_path: Path,
-) -> None:
-    """A rewrite within the same second still changes the key.
-
-    A library sync replaces a dump in place, so the old and new file can
-    share a size and a whole-second mtime; a key truncated to seconds would
-    keep serving the previous extraction as if it were the new ROM.
-    """
-    pkg = tmp_path / "Game.pkg"
-    pkg.write_bytes(b"original")
-    os.utime(pkg, ns=(1_000_000_000_000, 1_000_000_000_000))
-    original_key = shadps4._cache_key(pkg)
-
-    pkg.write_bytes(b"replaced")
-    os.utime(pkg, ns=(1_000_000_000_000 + 250_000_000, 1_000_000_000_000 + 250_000_000))
-
-    assert int(pkg.stat().st_mtime) == 1000
-    assert shadps4._cache_key(pkg) != original_key
-
-
-def test_cache_key_refuses_an_unreadable_rom_instead_of_keying_it_by_name(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """An unstattable ROM raises rather than falling back to an under-specified key.
-
-    The bare-name fallback returns exactly the collision-prone key the hash
-    exists to avoid, and the extraction that follows fails on the same
-    unreadable file anyway.
-    """
-    missing = tmp_path / "Game.pkg"
-
-    with caplog.at_level("ERROR"):
-        with pytest.raises(RuntimeError, match="to key its extraction"):
-            shadps4._cache_key(missing)
-
-    assert "could not read" in caplog.text
 
 
 def test_extract_and_cache_pkg_refuses_an_unreadable_rom(

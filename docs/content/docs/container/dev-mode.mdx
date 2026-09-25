@@ -42,7 +42,7 @@ emulator on startup rather than stacking a second one on top.
 The broker is a plain FastAPI app and runs anywhere for tests and API work:
 
 ```bash
-uv venv && uv pip install -e . pytest
+uv venv && uv pip install -e . pytest pytest-asyncio "ruff==0.16.1"
 .venv/bin/pytest -q
 .venv/bin/ruff check webstation_broker tests
 .venv/bin/uvicorn --factory webstation_broker.app:create_app --reload

@@ -10,11 +10,13 @@ import json
 import logging
 import lzma
 import os
+import re
 import secrets
 import stat
 import time
 import zipfile
 import zlib
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -29,16 +31,17 @@ SAVE_FILE_MAX_BYTES = int(os.environ.get("SAVE_FILE_MAX_BYTES", str(256 * 1024 *
 MANIFEST_NAME = ".broker-manifest.json"
 """Index the broker adds to a dump archive, labelling each member for the parent.
 
-Dot-prefixed so `_iter_save_files` skips it if it ever lands in a save tree,
-and so a restore can tell the broker's own index from real save data.
+`_iter_save_files` skips it by name if it ever lands in a save tree, and a
+restore tells the broker's own index from real save data by it.
 """
 MANIFEST_VERSION = 1
 """Schema version of the archive manifest, for a parent reading old archives."""
 IMPORT_PREFIX = ".import/"
 """Archive prefix that marks a member as a declared import rather than a restored dump.
 
-The broker never dumps a dot-prefixed path, so no v1 archive can carry one. A
-member under it is placed by the emulator's own import rules, not by path.
+Every v1 member starts with a save subtree name, and none is `.import`, so no
+dump can carry one. A member under it is placed by the emulator's own import
+rules, not by path.
 """
 MANIFEST_MAX_BYTES = 1024 * 1024
 """Largest manifest a restore will parse, and only when the archive holds imports.
@@ -75,18 +78,66 @@ The slack costs at worst an unchanged file riding along, since the restore
 that runs before the baseline is taken stamps its files with the archive's own
 (older) mtimes.
 """
+_FUTURE_MEMBER_BACKDATE = 2 * _BASELINE_MTIME_SLACK
+"""Seconds before the restore that a member stamped in the future is stamped instead.
+
+The launch baseline is taken just after the restore, and the dump reaches
+`_BASELINE_MTIME_SLACK` back past it, so a file stamped at the restore
+itself would still ship on the next exit as if the session had written it.
+"""
 _ZIP_MIN_DATE = (1980, 1, 1, 0, 0, 0)
 """Earliest timestamp a zip entry can carry: DOS dates start in 1980."""
 _ZIP_MAX_DATE = (2107, 12, 31, 23, 59, 58)
 """Latest timestamp a zip entry can carry: the DOS year field stops in 2107."""
+_NAME_MAX_FALLBACK = 255
+"""Longest name assumed when the filesystem will not say: the Linux VFS ceiling."""
+_PATH_MAX_FALLBACK = 4096
+"""Longest path assumed when the filesystem will not say: the Linux kernel's `PATH_MAX`."""
+
+
+def _staging_name(name: str) -> str:
+    """Pick the name a file is staged under before it is renamed into place as `name`.
+
+    Unique per call: two writers sharing one staging name interleave their
+    writes, and the rename then publishes the mixture. Dot-prefixed, so a dump
+    never ships one that a crash left behind.
+
+    Args:
+        name: The final file name.
+
+    Returns:
+        `.<name>.<16 hex>.tmp`, in the same directory as `name`.
+    """
+    return f".{name}.{secrets.token_hex(8)}.tmp"
+
+
+_BROKER_SCRATCH = re.compile(r"\.(?:.+\.[0-9a-f]{16}\.tmp|atime-probe\..+|.+\.(?:new|old))")
+"""Names of the scratch the broker itself leaves inside a save tree, matched whole.
+
+A staging file from `_staging_name` or a state-file push, an emulator's
+access-time probe, and the staging and backup directories `memcard` swaps a
+folder card through. Any of them can be stranded by a kill; none is save data.
+"""
+
+
+def _is_broker_scratch(parts: tuple[str, ...]) -> bool:
+    """Whether a path, as its components, is the broker's own and never save data.
+
+    Args:
+        parts: The path's components, relative to a save subtree or the root.
+
+    Returns:
+        True for broker scratch anywhere in the path, or a `MANIFEST_NAME` leaf.
+    """
+    return parts[-1:] == (MANIFEST_NAME,) or any(_BROKER_SCRATCH.fullmatch(part) for part in parts)
 
 
 def _iter_save_files(root: Path, subtrees: tuple[str, ...]) -> list[Path]:
     """List every regular file under the allowed subtrees.
 
-    Sorted so identical content zips to identical bytes. Dot-prefixed
-    components are staging or tmp entries and never ship, and symlinks are
-    skipped.
+    Sorted so identical content zips to identical bytes. Broker scratch a
+    crash left behind, a stray `MANIFEST_NAME`, and symlinks are skipped. Any
+    other dot-prefixed name is an emulator's own save data and ships.
 
     Args:
         root: The emulator's save data root.
@@ -104,7 +155,7 @@ def _iter_save_files(root: Path, subtrees: tuple[str, ...]) -> list[Path]:
             if not p.is_file() or p.is_symlink():
                 continue
             rel = p.relative_to(base)
-            if any(part.startswith(".") for part in rel.parts):
+            if _is_broker_scratch(rel.parts):
                 continue
             # shadPS4 writes sce_sys/corrupted while a save is mounted
             # read-write and removes it on unmount; shipping it would make
@@ -486,7 +537,18 @@ def under_subtrees(member: PurePosixPath, subtrees: tuple[str, ...]) -> bool:
     return any(rel.startswith(sub + "/") for sub in subtrees)
 
 
-V1Problem = Literal["escapes", "names_subtree", "outside", "symlink", "unreadable"]
+V1Problem = Literal[
+    "escapes",
+    "names_subtree",
+    "outside",
+    "symlink",
+    "unreadable",
+    "scratch",
+    "duplicate",
+    "collides",
+    "too_long",
+    "unwritable",
+]
 """Why a v1 member was refused, so a v2 caller can fold it into a refusal code."""
 
 
@@ -497,7 +559,10 @@ class V1Plan:
     Attributes:
         names: Member names to write, in zip order.
         excluded_count: Members dropped because they sit under an excluded subtree.
-        problems: Every refused member as `(name, legacy message, kind)`, in zip order.
+        problems: Every refused member as `(name, legacy message, kind)`, in zip
+            order. A path the archive holds more than once, and an unwritable
+            directory, are each reported once, on the first member for it; the
+            rest are dropped from `names` without an entry.
     """
 
     names: tuple[str, ...]
@@ -710,6 +775,101 @@ def surviving_chain_escapes(
     return False
 
 
+def _nearest_dir(path: Path) -> Path:
+    """The deepest directory at or above `path` that already exists.
+
+    Args:
+        path: A directory a write would create if it had to.
+
+    Returns:
+        `path` itself when it is a directory, else its closest existing ancestor.
+    """
+    while path != path.parent:
+        try:
+            if path.is_dir():
+                break
+        except OSError:
+            # `is_dir` raises rather than answering False for a path too long
+            # to look up, which is exactly the path the length check refuses.
+            pass
+        path = path.parent
+    return path
+
+
+def _fs_limit(directory: Path, key: str, fallback: int) -> int:
+    """Ask the filesystem holding `directory` for one of its `pathconf` limits.
+
+    Args:
+        directory: An existing directory.
+        key: `PC_NAME_MAX` or `PC_PATH_MAX`.
+        fallback: What to assume when the filesystem does not say.
+
+    Returns:
+        The limit, in bytes.
+    """
+    try:
+        value = os.pathconf(directory, key)
+    except (OSError, ValueError) as exc:
+        log.debug("saves: pathconf %s on %s failed, assuming %d: %s", key, directory, fallback, exc)
+        return fallback
+    return value if value > 0 else fallback
+
+
+def _probe_writable(directory: Path) -> Optional[str]:
+    """Create and remove a file in `directory`, the way a restore would write one.
+
+    `os.access` answers from the mode bits alone, so it misses a read-only
+    mount, an ACL, or a FUSE or network filesystem that refuses at create.
+
+    Args:
+        directory: An existing directory.
+
+    Returns:
+        Why the create failed, or None when it succeeded.
+    """
+    probe = directory / _staging_name("broker-probe")
+    try:
+        fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError as exc:
+        return str(exc)
+    os.close(fd)
+    try:
+        probe.unlink()
+    except OSError as exc:
+        log.warning("saves: could not remove the write probe %s: %s", probe, exc)
+    return None
+
+
+def _length_problem(
+    root: Path, rel: PurePosixPath, name: str, limits: tuple[int, int]
+) -> Optional[str]:
+    """Find a name in `rel` too long for the filesystem the write lands on.
+
+    Every name is measured through the staging file `_write_member` actually
+    creates, which is longer than the member's own name.
+
+    Args:
+        root: The emulator's save data root.
+        rel: The member path, relative to `root`.
+        name: The member's zip name, for the message.
+        limits: `(PC_NAME_MAX, PC_PATH_MAX)` of the filesystem the write lands on.
+
+    Returns:
+        The refusal message, or None.
+    """
+    name_max, path_max = limits
+    staged = _staging_name(rel.name)
+    if any(len(os.fsencode(part)) > name_max for part in (*rel.parent.parts, staged)):
+        return (
+            "archive member has a name component too long for the save filesystem "
+            f"({name_max} bytes): {name}"
+        )
+    # PATH_MAX counts the terminating NUL.
+    if len(os.fsencode(str(root / rel.parent / staged))) >= path_max:
+        return f"archive member path is too long for the save filesystem ({path_max} bytes): {name}"
+    return None
+
+
 def plan_v1(
     view: ArchiveView,
     root: Path,
@@ -719,13 +879,19 @@ def plan_v1(
     include_imports: bool = False,
     link_roots: tuple[Path, ...] = (),
 ) -> V1Plan:
-    """Run every per-member restore check on the v1 members, writing nothing.
+    """Run every per-member restore check on the v1 members before anything is cleared.
 
     The checks and their messages are the ones restores have always used,
-    in the same order, followed by two new ones: a member whose surviving
-    parent chain links out of `root`, and a member `member_problem` says
-    cannot be read or stamped, are refused here rather than failing to
-    write after the slot has already been cleared.
+    in the same order, followed by the ones that catch a member which would
+    otherwise fail to write after the slot has already been cleared: a
+    surviving parent chain that links out of `root`, a header `member_problem`
+    says cannot be read or stamped, a name `_iter_save_files` would never
+    dump again, a path the archive holds more than once
+    (`./` and `//` spellings included), a member that is also another member's
+    directory, a name too long for the filesystem, and a destination directory
+    the broker cannot create files in, checked both where it stands now and at
+    its subtree, which is what survives a clear. The last is found by creating
+    and removing a probe file, the only thing a plan ever writes.
 
     Args:
         view: The archive, from `read_archive`.
@@ -743,15 +909,15 @@ def plan_v1(
     infos = list(view.v1)
     if include_imports and view.imports:
         infos = sorted(infos + list(view.imports), key=lambda i: i.header_offset)
-    names: list[str] = []
-    problems: list[tuple[str, str, V1Problem]] = []
+    problems: list[tuple[int, tuple[str, str, V1Problem]]] = []
+    candidates: list[tuple[int, str, PurePosixPath]] = []
     excluded_count = 0
     escapes_by_subtree: dict[Optional[str], bool] = {}
-    for info in infos:
+    for index, info in enumerate(infos):
         name = info.filename
         member = PurePosixPath(name)
         if member.is_absolute() or ".." in member.parts:
-            problems.append((name, f"archive member escapes save dir: {name}", "escapes"))
+            problems.append((index, (name, f"archive member escapes save dir: {name}", "escapes")))
             continue
         rel = member.as_posix()
         if rel in subtrees or rel in excluded:
@@ -759,26 +925,100 @@ def plan_v1(
             # only ever walks below `root / sub`. Writing such a member would
             # leave a plain file where the emulator expects its save
             # directory, and the mkdir on its next launch would fail.
-            problems.append((name, f"archive member names a save subtree: {name}", "names_subtree"))
+            problems.append((index, (name, f"archive member names a save subtree: {name}", "names_subtree")))
             continue
         if under_subtrees(member, excluded):
             excluded_count += 1
             continue
         if not under_subtrees(member, subtrees):
-            problems.append((name, f"archive member outside save subtrees: {name}", "outside"))
+            problems.append((index, (name, f"archive member outside save subtrees: {name}", "outside")))
+            continue
+        if _is_broker_scratch(member.parts):
+            # `_iter_save_files` skips these names, so the file would sit on
+            # disk from now on and never reach another dump.
+            message = f"archive member is named like broker scratch, which is never saved back: {name}"
+            problems.append((index, (name, message, "scratch")))
             continue
         sub = _longest_subtree(rel, subtrees)
         if sub not in escapes_by_subtree:
             escapes_by_subtree[sub] = surviving_chain_escapes(root, member, subtrees, link_roots)
         if escapes_by_subtree[sub]:
-            problems.append((name, f"archive member resolves outside save dir: {name}", "symlink"))
+            problems.append((index, (name, f"archive member resolves outside save dir: {name}", "symlink")))
             continue
         problem = member_problem(info)
         if problem is not None:
-            problems.append((name, f"archive member {problem}: {name}", "unreadable"))
+            problems.append((index, (name, f"archive member {problem}: {name}", "unreadable")))
+            continue
+        candidates.append((index, name, member))
+
+    names: list[str] = []
+    copies = Counter(member for _, _, member in candidates)
+    reported: set[PurePosixPath] = set()
+    dirs = {parent for _, _, member in candidates for parent in member.parents}
+    nearest: dict[PurePosixPath, Path] = {}
+    limits: dict[Path, tuple[int, int]] = {}
+    probed: dict[Path, Optional[str]] = {}
+    refused: set[Path] = set()
+    root_real = root.resolve() if candidates else root
+
+    def nearest_dir(rel: PurePosixPath) -> Path:
+        if rel not in nearest:
+            nearest[rel] = _nearest_dir(root / rel)
+        return nearest[rel]
+
+    for index, name, member in candidates:
+        if copies[member] > 1:
+            # Every copy would be written in turn and the last one would
+            # silently win, so none is.
+            if member not in reported:
+                reported.add(member)
+                message = f"archive holds {copies[member]} members for {member}: {name}"
+                problems.append((index, (name, message, "duplicate")))
+            continue
+        if member in dirs:
+            # Whichever of the two is written second finds the path already
+            # taken by the other kind of entry.
+            message = f"archive member is also the directory of another member: {name}"
+            problems.append((index, (name, message, "collides")))
+            continue
+        existing = nearest_dir(member.parent)
+        if existing not in limits:
+            limits[existing] = (
+                _fs_limit(existing, "PC_NAME_MAX", _NAME_MAX_FALLBACK),
+                _fs_limit(existing, "PC_PATH_MAX", _PATH_MAX_FALLBACK),
+            )
+        message = _length_problem(root, member, name, limits[existing])
+        if message is not None:
+            problems.append((index, (name, message, "too_long")))
+            continue
+        # A clear can remove everything below the subtree, and the write then
+        # recreates the parent inside it, so both must take a new file.
+        sub = PurePosixPath(_longest_subtree(member.as_posix(), subtrees) or ".")
+        locked: Optional[Path] = None
+        for directory in dict.fromkeys((nearest_dir(sub), existing)):
+            if directory not in probed:
+                # Never create a file somewhere the write itself would refuse
+                # to go; `_write_member` catches that case on its own.
+                probed[directory] = (
+                    _probe_writable(directory) if _within(directory, root_real, link_roots) else None
+                )
+            if probed[directory] is not None:
+                locked = directory
+                break
+        if locked is not None:
+            if locked not in refused:
+                refused.add(locked)
+                try:
+                    shown = locked.relative_to(root).as_posix()
+                except ValueError:
+                    shown = str(locked)
+                log.warning("saves: %s is not writable, refusing the restore: %s", locked, probed[locked])
+                message = f"archive member cannot be written, {shown} is not writable: {name}"
+                problems.append((index, (name, message, "unwritable")))
             continue
         names.append(name)
-    return V1Plan(tuple(names), excluded_count, tuple(problems))
+    problems.sort(key=lambda p: p[0])
+    return V1Plan(tuple(names), excluded_count, tuple(p for _, p in problems))
 
 
 def _guard_exempt(always_restore: Optional[Callable[[str], bool]], rel: str) -> bool:
@@ -864,10 +1104,7 @@ def _write_member(
         if guard and target.exists() and target.stat().st_mtime > mtime + _SAVE_MTIME_SLACK:
             return "skipped"
         target.parent.mkdir(parents=True, exist_ok=True)
-        # Unique per member: two restores sharing one staging name interleave
-        # their writes, and the os.replace below then publishes the mixture
-        # as the player's save.
-        tmp = target.parent / f".{target.name}.{secrets.token_hex(8)}.tmp"
+        tmp = target.parent / _staging_name(target.name)
         tmp.write_bytes(read())
         os.replace(tmp, target)
         os.utime(target, (mtime, mtime))
@@ -876,8 +1113,8 @@ def _write_member(
         # shows once it is read.
         # This also catches filesystem errors from the write itself, so never narrow it to read errors.
         log.warning("saves: could not restore %s: %s", label, exc)
-        # The staging file is dot-prefixed, so `_iter_save_files` never sees
-        # it and no later dump would ever carry it off the disk.
+        # `_iter_save_files` skips a staging name, so no later dump would
+        # ever carry this one off the disk.
         if tmp is not None:
             try:
                 tmp.unlink(missing_ok=True)
@@ -900,9 +1137,11 @@ def write_save_archive(
     v1 members are restored as they always have been: existing files newer
     than their member are skipped, so a restore can never roll back saves
     made since the archive was taken, unless `always_restore` exempts the
-    member. Placed imports and sidecars skip that guard, because preflight
-    refused any collision, and are stamped with the write time rather than a
-    zip mtime.
+    member. A v1 member stamped later than the restore is stamped
+    `_FUTURE_MEMBER_BACKDATE` before it instead, so the next dump does not
+    mistake it for a file the session wrote. Placed imports and sidecars skip
+    the guard, because preflight refused any collision, and are stamped with
+    the write time rather than a zip mtime.
 
     Args:
         content: The zip archive body, the same bytes the plan was made from.
@@ -946,6 +1185,15 @@ def write_save_archive(
             except (ValueError, OverflowError) as exc:
                 log.warning("saves: %s has an unusable timestamp, stamping it now: %s", name, exc)
                 mtime = when
+            if mtime > when:
+                # A device with a bad clock. Left as is, the dump's baseline
+                # check would ship the untouched file back on every exit.
+                log.warning(
+                    "saves: %s is stamped in the future (%s), backdating it to the restore",
+                    name,
+                    info.date_time,
+                )
+                mtime = when - _FUTURE_MEMBER_BACKDATE
             outcome = _write_member(
                 root,
                 root_real,
@@ -1059,7 +1307,7 @@ def write_export(zip_bytes: bytes, name: str) -> str:
     """
     settings.EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     path = settings.EXPORT_DIR / name
-    tmp = settings.EXPORT_DIR / f".{name}.{secrets.token_hex(8)}.tmp"
+    tmp = settings.EXPORT_DIR / _staging_name(name)
     try:
         tmp.write_bytes(zip_bytes)
         os.replace(tmp, path)

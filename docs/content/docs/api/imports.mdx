@@ -199,19 +199,21 @@ and a save is a game's title folder, under `save`:
 On `3ds`, the Azahar core's SD card and NAND are placed exactly as named, and
 nothing is renamed:
 
-- A member must already sit under `saves/Azahar/`, and then inside
+- A member must already sit under `saves/Azahar/Azahar/`, and then inside
   `sdmc/Nintendo 3DS/<id0>/<id1>/title/<high>/<low>/...`,
   `sdmc/Nintendo 3DS/<id0>/<id1>/extdata/<high>/<low>/...` or
-  `nand/data/<id0>/...`. Every id0 and id1 is 32 hexadecimal digits.
+  `nand/data/<id0>/...`. Every id0 and id1 is 32 hexadecimal digits. (The
+  Azahar core nests its own `Azahar/` folder under the `saves/Azahar/` dir
+  RetroArch already sorted it into.)
 - A title's id, its high and low halves together, must be RomM's `title_id`, or
   it is `identity_mismatch`. Extdata and NAND data carry no title id and are
   not held to one, and with no `title_id` a title is taken on trust.
 - `nand/data/<id0>/sysdata/` and a title's `content/` folder are
   `protected_destination`.
 - Anything else, including a member that does not already sit under
-  `saves/Azahar/`, is `shape_unverified`. Azahar's layout has not been checked
-  against a running core beyond these paths, so the broker refuses rather than
-  guess.
+  `saves/Azahar/Azahar/`, is `shape_unverified`. Azahar's layout has not been
+  checked against a running core beyond these paths, so the broker refuses
+  rather than guess.
 
 **Flycast** places every file loose in its data folder, `flycast/`, under the
 name Flycast reads:
@@ -466,9 +468,13 @@ encrypted, and rewrites the console and card ids to the ones it uses:
 - Saves are `title/<high>/<low>/...` and `extdata/<high>/<low>/...` under
   `sdmc/Nintendo 3DS/<id0>/<id1>/`, and `extdata/<high>/<low>/...` under
   `nand/data/<id0>/`. The ids are 32 hex digits. The SD card's folders can
-  sit under `saves/Azahar/` or `Nintendo 3DS/`, or be the two ids alone. The
-  NAND's can sit under `saves/Azahar/`. The `<high>` and `<low>` folders are
-  lower-cased.
+  sit under `saves/Azahar/Azahar/` or `Nintendo 3DS/`, or be the two ids
+  alone. The NAND's can sit under `saves/Azahar/Azahar/` or be bare. (The
+  doubled form is where the RetroArch build of this same core actually
+  writes, and is what an archive dumped through RetroArch now carries. A
+  single `saves/Azahar/` with no second `Azahar/` is never what the core
+  itself produces, so it is left unrecognised rather than guessed at.) The
+  `<high>` and `<low>` folders are lower-cased.
 - A `title/` save is held to the game being launched whenever RomM names it,
   and another game's is `identity_mismatch`. The game is named by
   `save_target`, the title's `<high>/<low>` pair, or, when there is none, by

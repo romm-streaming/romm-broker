@@ -109,7 +109,7 @@ docs/                    the documentation site (Fumadocs, deployed to GitHub Pa
 ## Development
 
 ```bash
-uv venv && uv pip install -e . pytest "ruff==0.16.1"
+uv venv && uv pip install -e . pytest pytest-asyncio "ruff==0.16.1"
 .venv/bin/pytest -q
 .venv/bin/ruff check webstation_broker tests
 ```

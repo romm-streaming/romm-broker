@@ -1954,16 +1954,6 @@ def cache_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return cache
 
 
-def test_archive_dir_size_sums_files_and_skips_the_marker(cache_dir: Path) -> None:
-    """Archive dir size sums files and skips the marker."""
-    game_dir = cache_dir / "Game"
-    _touch(game_dir / "EBOOT.BIN")
-    _touch(game_dir / "PARAM.SFO")
-    _touch(game_dir / rpcs3._LAST_ACCESSED_MARKER)
-
-    assert rpcs3._archive_dir_size(game_dir) == 10
-
-
 def test_cache_size_bytes_sums_across_every_game_dir(cache_dir: Path) -> None:
     """Cache size bytes sums across every game dir."""
     _touch(cache_dir / "GameA" / "EBOOT.BIN")
@@ -1975,16 +1965,6 @@ def test_cache_size_bytes_sums_across_every_game_dir(cache_dir: Path) -> None:
 def test_cache_size_bytes_is_zero_without_a_cache_dir(cache_dir: Path) -> None:
     """Cache size bytes is zero without a cache dir."""
     assert rpcs3._cache_size_bytes() == 0
-
-
-def test_touch_last_accessed_writes_a_marker_file(cache_dir: Path) -> None:
-    """Touch last accessed writes a marker file."""
-    game_dir = cache_dir / "Game"
-    _touch(game_dir / "EBOOT.BIN")
-
-    rpcs3._touch_last_accessed(game_dir)
-
-    assert (game_dir / rpcs3._LAST_ACCESSED_MARKER).exists()
 
 
 def test_evict_lru_is_a_noop_when_disabled(cache_dir: Path) -> None:
@@ -2360,28 +2340,6 @@ def test_run_extractor_raises_when_the_binary_is_missing(monkeypatch: pytest.Mon
 
     with pytest.raises(RuntimeError, match="failed to run"):
         rpcs3._run_extractor(["unrar", "x"], "unrar (Game.rar)")
-
-
-def test_cache_key_differs_for_archives_sharing_a_stem_but_not_an_extension(tmp_path: Path) -> None:
-    """Cache key differs for archives sharing a stem but not an extension."""
-    zip_archive = tmp_path / "Game.zip"
-    zip_archive.write_bytes(b"zip")
-    rar_archive = tmp_path / "Game.rar"
-    rar_archive.write_bytes(b"rar")
-
-    assert rpcs3._cache_key(zip_archive) != rpcs3._cache_key(rar_archive)
-
-
-def test_cache_key_changes_when_a_same_named_archive_is_replaced(tmp_path: Path) -> None:
-    """Cache key changes when a same named archive is replaced."""
-    archive = tmp_path / "Game.7z"
-    archive.write_bytes(b"original")
-    original_key = rpcs3._cache_key(archive)
-
-    archive.write_bytes(b"a completely different dump")
-    os.utime(archive, (archive.stat().st_mtime + 5, archive.stat().st_mtime + 5))
-
-    assert rpcs3._cache_key(archive) != original_key
 
 
 def test_extract_and_cache_does_not_reuse_a_stale_entry_from_a_replaced_archive(

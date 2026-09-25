@@ -1436,12 +1436,24 @@ _WII_PROTECTED = (
 `sys` and `ticket` need no glob, as the platform's save subtrees leave them
 out. `check_plan` matches these with `fnmatch`, whose `*` also crosses `/`.
 """
-_N3DS_ROOT = "saves/Azahar"
-"""Where the Azahar core keeps its data, relative to `RA_DATA_DIR`."""
+_N3DS_ROOT = "saves/Azahar/Azahar"
+"""Where the Azahar core keeps its data, relative to `RA_DATA_DIR`.
+
+`sort_savefiles_enable` (pinned in `_write_broker_cfg`) redirects RetroArch's
+GET_SAVE_DIRECTORY answer to `saves/Azahar/`, the dir sorted by the core's
+`library_name`; Azahar then creates and uses its own `Azahar/` folder under
+whatever directory it is handed, landing one level deeper still.
+"""
+_N3DS_ROOT_PARTS = tuple(_N3DS_ROOT.split("/"))
+"""`_N3DS_ROOT` split on `/`.
+
+Lets `_place_n3ds` strip exactly as many leading components as the root
+has, however many that is.
+"""
 _N3DS_SHAPES = (
-    "saves/Azahar/sdmc/Nintendo 3DS/<id0>/<id1>/title/<high>/<low>/...",
-    "saves/Azahar/sdmc/Nintendo 3DS/<id0>/<id1>/extdata/<high>/<low>/...",
-    "saves/Azahar/nand/data/<id0>/...",
+    "saves/Azahar/Azahar/sdmc/Nintendo 3DS/<id0>/<id1>/title/<high>/<low>/...",
+    "saves/Azahar/Azahar/sdmc/Nintendo 3DS/<id0>/<id1>/extdata/<high>/<low>/...",
+    "saves/Azahar/Azahar/nand/data/<id0>/...",
 )
 """The save shapes a 3DS session advertises: a member is placed exactly as it is named."""
 _N3DS_EXPECTED = "a 3DS save, " + " or ".join(_N3DS_SHAPES)
@@ -1554,14 +1566,14 @@ def _srm_dir(platform: Optional[str]) -> Union[str, imports.ImportRefusal]:
 
 
 def _n3ds_kind(rest: tuple[str, ...]) -> Optional[str]:
-    """Classify a path below `saves/Azahar/` as one of the places a 3DS save lives.
+    """Classify a path below `saves/Azahar/Azahar/` as one of the places a 3DS save lives.
 
     Both id levels have to be a 32-digit hex hash and a title id's halves
     eight digits each. `_N3DS_PROTECTED`'s globs cover every path this
     accepts, and more, because an `fnmatch` `?` or `*` also matches a `/`.
 
     Args:
-        rest: The member's components below `saves/Azahar`.
+        rest: The member's components below `saves/Azahar/Azahar`.
 
     Returns:
         `title` or `extdata` for a file under `sdmc/Nintendo 3DS/<id0>/<id1>/`,
@@ -1586,7 +1598,7 @@ def _place_n3ds(
 ) -> Union[imports.Placement, imports.ImportRefusal]:
     """Place one file of a 3DS save exactly where the Azahar core keeps it.
 
-    A member has to arrive under `saves/Azahar/` and then under the SD card's
+    A member has to arrive under `saves/Azahar/Azahar/` and then under the SD card's
     `title` or `extdata` folders or the NAND's `data`; the ids are copied,
     never rewritten, so a copy from real hardware whose id0 and id1 differ
     from this Azahar's is placed under names the core never reads. A title
@@ -1603,7 +1615,8 @@ def _place_n3ds(
         or an identity refusal for another title.
     """
     parts = member.parts
-    rest = parts[2:] if parts[:2] == tuple(_N3DS_ROOT.split("/")) else ()
+    root = _N3DS_ROOT_PARTS
+    rest = parts[len(root):] if parts[:len(root)] == root else ()
     kind = _n3ds_kind(rest)
     if kind is None:
         return imports.ImportRefusal(

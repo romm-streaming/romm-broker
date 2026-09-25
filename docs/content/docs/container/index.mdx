@@ -227,6 +227,8 @@ streaming:
 
 `host` is the address your browser connects to. `broker_host` is the address
 RomM's backend server uses to reach the broker directly, server to server,
-not through your browser. `subfolder` should match the container's
+not through your browser. If RomM and the container share a Docker network,
+it can be the service name and port `3000` (`http://romm_webstation:3000`)
+instead of an IP. `subfolder` should match the container's
 `SUBFOLDER`. The full story, including why `host` is written as a path, is in
 [Reverse proxy](/docs/deployment/reverse-proxy).
