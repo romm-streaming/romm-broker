@@ -1,6 +1,7 @@
 """Tests for the shared, opt-in archive/pkg extraction cache."""
 from __future__ import annotations
 
+import os
 import shutil
 import zipfile
 from pathlib import Path
@@ -24,7 +25,6 @@ def _touch(path: Path, mtime: Optional[float] = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"x" * 5)
     if mtime is not None:
-        import os
         os.utime(path, (mtime, mtime))
 
 
@@ -103,11 +103,52 @@ def test_cache_key_changes_when_a_same_named_file_is_replaced(tmp_path: Path) ->
     assert first != second
 
 
-def test_cache_key_raises_when_the_file_cannot_be_read(tmp_path: Path) -> None:
-    """An unreadable file raises rather than falling back to the collision-prone bare stem."""
+def test_cache_key_differs_for_same_named_files_in_different_folders(tmp_path: Path) -> None:
+    """Two files sharing a filename, size, and second-granularity mtime still key apart.
+
+    A library holds one title per folder, so same-named dumps sitting side
+    by side is ordinary; keying off the bare filename would hand them a
+    single cache dir and boot whichever extraction landed there first.
+    """
+    first = tmp_path / "USA" / "Game.pkg"
+    second = tmp_path / "EUR" / "Game.pkg"
+    _touch(first, mtime=1000)
+    _touch(second, mtime=1000)
+
+    assert extraction_cache._cache_key(first) != extraction_cache._cache_key(second)
+
+
+def test_cache_key_changes_for_a_same_second_replacement_of_the_same_size(
+    tmp_path: Path,
+) -> None:
+    """A rewrite within the same second still changes the key.
+
+    A library sync replaces a dump in place, so the old and new file can
+    share a size and a whole-second mtime; a key truncated to seconds would
+    keep serving the previous extraction as if it were the new ROM.
+    """
+    rom = tmp_path / "Game.pkg"
+    rom.write_bytes(b"original")
+    os.utime(rom, ns=(1_000_000_000_000, 1_000_000_000_000))
+    original_key = extraction_cache._cache_key(rom)
+
+    rom.write_bytes(b"replaced")
+    os.utime(rom, ns=(1_000_000_000_000 + 250_000_000, 1_000_000_000_000 + 250_000_000))
+
+    assert int(rom.stat().st_mtime) == 1000
+    assert extraction_cache._cache_key(rom) != original_key
+
+
+def test_cache_key_raises_when_the_file_cannot_be_read(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unreadable file raises and logs rather than falling back to the collision-prone bare stem."""
     missing = tmp_path / "Missing.zip"
-    with pytest.raises(RuntimeError, match="could not read"):
-        extraction_cache._cache_key(missing)
+    with caplog.at_level("ERROR"):
+        with pytest.raises(RuntimeError, match="could not read Missing.zip to key its extraction"):
+            extraction_cache._cache_key(missing)
+
+    assert "could not read" in caplog.text
 
 
 def test_dir_size_sums_files_and_skips_the_marker(tmp_path: Path) -> None:
