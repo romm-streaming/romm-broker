@@ -60,13 +60,13 @@ def xiso(
         The path the image was written to.
     """
     root_sector, xbe_sector, xbe_size = 33, 34, 0x200
-    image = bytearray((partition_at + (xbe_sector + 1) * SECTOR))
+    image = bytearray((xbe_sector + 1) * SECTOR)
 
     vd = bytearray(SECTOR)
     vd[: len(xemu._XISO_MAGIC)] = xemu._XISO_MAGIC
     vd[20:24] = struct.pack("<I", root_sector)
     vd[24:28] = struct.pack("<I", SECTOR)
-    image[partition_at + 32 * SECTOR : partition_at + 33 * SECTOR] = vd
+    image[32 * SECTOR : 33 * SECTOR] = vd
 
     entry = bytearray(SECTOR)
     entry[0:2] = struct.pack("<H", 0)  # left
@@ -75,17 +75,21 @@ def xiso(
     entry[8:12] = struct.pack("<I", xbe_size)
     entry[13] = len(xbe_name)
     entry[14 : 14 + len(xbe_name)] = xbe_name
-    image[partition_at + root_sector * SECTOR : partition_at + (root_sector + 1) * SECTOR] = entry
+    image[root_sector * SECTOR : (root_sector + 1) * SECTOR] = entry
 
     xbe = bytearray(xbe_size)
     xbe[0:4] = b"XBEH"
     xbe[0x104:0x108] = struct.pack("<I", 0x10000)
     xbe[0x118:0x11C] = struct.pack("<I", 0x10100)
     xbe[0x108:0x10C] = struct.pack("<I", title_id)  # certificate title id
-    off = partition_at + xbe_sector * SECTOR
+    off = xbe_sector * SECTOR
     image[off : off + xbe_size] = xbe
 
-    path.write_bytes(bytes(image))
+    # Seeking past the video partition leaves it a sparse hole that reads
+    # back as zeros, rather than writing hundreds of MB of them to disk.
+    with open(path, "wb") as f:
+        f.seek(partition_at)
+        f.write(image)
     return path
 
 
