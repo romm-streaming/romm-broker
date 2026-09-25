@@ -10,7 +10,7 @@ import time
 import zipfile
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
-from typing import Any, Optional
+from typing import Any, NoReturn, Optional
 
 import pytest
 
@@ -58,6 +58,28 @@ def rom_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return root
 
 
+@pytest.fixture(autouse=True)
+def _no_real_patches_fetch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep every test in this module off the network, sudo and `/usr/share`.
+
+    A launch fetches patches.zip when the installed one is missing, and the
+    real path is missing on any dev machine, so an unstubbed launch test would
+    otherwise shell out to curl and sudo for real.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        tmp_path: The per-test temporary directory.
+    """
+    resources = tmp_path / "usr-share-PCSX2-resources"
+    resources.mkdir()
+    monkeypatch.setattr(pcsx2, "PATCHES_ZIP", resources / "patches.zip")
+
+    def refuse(cmd: list[str], **kwargs: object) -> NoReturn:
+        raise AssertionError(f"unstubbed subprocess.run in a pcsx2 test: {cmd}")
+
+    monkeypatch.setattr(pcsx2.subprocess, "run", refuse)
+
+
 def _touch(path: Path, mtime: Optional[float] = None) -> Path:
     """Write a placeholder state file, optionally with a fixed mtime.
 
@@ -71,6 +93,24 @@ def _touch(path: Path, mtime: Optional[float] = None) -> Path:
     path.write_bytes(b"state")
     if mtime is not None:
         os.utime(path, (mtime, mtime))
+    return path
+
+
+def _write_patches_zip(path: Path, members: Optional[dict[str, str]] = None) -> Path:
+    """Write a small zip shaped like PCSX2's patch bundle.
+
+    Args:
+        path: Where to write it.
+        members: Archive name to text content; one `.pnach` entry by default.
+
+    Returns:
+        The path that was written.
+    """
+    if members is None:
+        members = {"SLUS-20946_7D3A8B4E.pnach": "patch=1,EE,00000000,extended,00000000"}
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, text in members.items():
+            zf.writestr(name, text)
     return path
 
 
@@ -501,7 +541,6 @@ def test_launch_always_spawns_the_watchdog_even_with_no_resume_slot(
     """
     started = []
     monkeypatch.setattr(pcsx2, "_patch_ini", lambda: None)
-    monkeypatch.setattr(pcsx2, "_validate_patches_cache", lambda: None)
     monkeypatch.setattr(pcsx2.Pcsx2, "_ensure_folder_card", lambda self: None)
     monkeypatch.setattr(pcsx2.Pcsx2, "_spawn", lambda self, cmd, env: None)
 
@@ -534,55 +573,54 @@ def test_an_unpatchable_ini_is_raised_rather_than_logged(
         pcsx2._patch_ini()
 
 
-def test_validate_patches_cache_leaves_a_missing_file_alone(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """No cached zip yet is not an error; nothing is created."""
-    monkeypatch.setattr(pcsx2, "PATCHES_ZIP", tmp_path / "cache" / "patches.zip")
+def test_patches_zip_points_at_the_only_path_pcsx2_reads() -> None:
+    """PCSX2 opens the bundle from its install resources, never from the user tree.
 
-    pcsx2._validate_patches_cache()
-
-    assert not (tmp_path / "cache" / "patches.zip").exists()
+    Probed live on 2.6.3: a copy under `$XDG_CONFIG_HOME/PCSX2/resources` was
+    ignored and the warning stayed until the system copy existed.
+    """
+    assert Path("/usr/share/PCSX2/resources/patches.zip") == pcsx2._PATCHES_ZIP_SYSTEM_PATH
 
 
-def test_validate_patches_cache_leaves_a_good_zip_alone(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A cache that opens cleanly and passes its CRC check survives, so most launches skip the fetch."""
-    zip_path = tmp_path / "patches.zip"
-    with zipfile.ZipFile(zip_path, "w") as zf:
-        zf.writestr("SLUS-20946.pnach", "patch=1,EE,00000000,extended,00000000")
-    monkeypatch.setattr(pcsx2, "PATCHES_ZIP", zip_path)
-
-    pcsx2._validate_patches_cache()
-
-    assert zip_path.exists()
+def test_patches_zip_problem_reports_a_missing_file(tmp_path: Path) -> None:
+    """No file is a problem, so the launch hook knows to fetch one."""
+    assert pcsx2._patches_zip_problem(tmp_path / "patches.zip") == "missing"
 
 
-def test_validate_patches_cache_removes_an_empty_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A zero-byte cache, the shape a download cut off mid-transfer leaves, is deleted."""
-    zip_path = tmp_path / "patches.zip"
-    zip_path.write_bytes(b"")
-    monkeypatch.setattr(pcsx2, "PATCHES_ZIP", zip_path)
-
-    pcsx2._validate_patches_cache()
-
-    assert not zip_path.exists()
+def test_patches_zip_problem_accepts_a_good_bundle(tmp_path: Path) -> None:
+    """A zip that opens, passes its CRC check and holds a `.pnach` is usable."""
+    assert pcsx2._patches_zip_problem(_write_patches_zip(tmp_path / "patches.zip")) is None
 
 
-def test_validate_patches_cache_removes_a_corrupt_zip(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A file that exists but is not a valid zip is deleted rather than left for PCSX2 to fail on."""
-    zip_path = tmp_path / "patches.zip"
-    zip_path.write_bytes(b"not actually a zip file")
-    monkeypatch.setattr(pcsx2, "PATCHES_ZIP", zip_path)
+def test_patches_zip_problem_rejects_an_empty_file(tmp_path: Path) -> None:
+    """A zero-byte file, the shape a cut-off transfer leaves, is not usable."""
+    path = tmp_path / "patches.zip"
+    path.write_bytes(b"")
+    assert pcsx2._patches_zip_problem(path) == "empty"
 
-    pcsx2._validate_patches_cache()
 
-    assert not zip_path.exists()
+def test_patches_zip_problem_rejects_something_that_is_not_a_zip(tmp_path: Path) -> None:
+    """An HTML error page served with a 200 is refused rather than installed."""
+    path = tmp_path / "patches.zip"
+    path.write_bytes(b"<html>rate limited</html>")
+    assert pcsx2._patches_zip_problem(path) is not None
+
+
+def test_patches_zip_problem_rejects_a_zip_with_no_pnach_entries(tmp_path: Path) -> None:
+    """A valid zip that holds no patches is not the bundle PCSX2 wants."""
+    path = _write_patches_zip(tmp_path / "patches.zip", {"README.md": "moved"})
+    assert pcsx2._patches_zip_problem(path) == "holds no .pnach patches"
+
+
+def test_patches_zip_problem_rejects_a_zip_that_fails_its_crc(tmp_path: Path) -> None:
+    """A member whose bytes no longer match its CRC is refused."""
+    path = tmp_path / "patches.zip"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("SLUS-20946_7D3A8B4E.pnach", "patch=1,EE,00000000,extended,00000000")
+    raw = bytearray(path.read_bytes())
+    raw[raw.index(b"patch=1")] ^= 0xFF
+    path.write_bytes(bytes(raw))
+    assert pcsx2._patches_zip_problem(path) is not None
 
 
 def test_a_launch_stops_at_an_unpatchable_ini(

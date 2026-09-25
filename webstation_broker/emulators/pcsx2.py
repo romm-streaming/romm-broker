@@ -13,6 +13,7 @@ import os
 import re
 import socket as _socket
 import struct
+import subprocess  # noqa: F401 (patched by tests/test_pcsx2.py's network-safety fixture)
 import time
 import zipfile
 from collections.abc import Iterable
@@ -64,14 +65,15 @@ INI_PATH = DATA_DIR / "inis" / "PCSX2.ini"
 """The PCSX2.ini the broker patches before every launch, `inis/PCSX2.ini` under `DATA_DIR`."""
 SSTATE_DIR = DATA_DIR / "sstates"
 """Directory PCSX2 writes its `.p2s` save states into, `sstates` under `DATA_DIR`."""
-PATCHES_ZIP = DATA_DIR / "cache" / "patches.zip"
-"""The GameDB/cheat/widescreen patch bundle PCSX2 fetches from GitHub and re-opens on every launch.
+_PATCHES_ZIP_SYSTEM_PATH = Path("/usr/share/PCSX2/resources/patches.zip")
+PATCHES_ZIP = _PATCHES_ZIP_SYSTEM_PATH
+"""The GameDB/widescreen/fix patch bundle PCSX2 opens at boot, from its install resources.
 
-PCSX2 downloads this once and never re-validates it afterwards: a fetch cut
-short by a network drop or a full disk leaves a zero-byte or truncated zip
-behind, and every later launch just repeats "Failed to open patches.zip"
-instead of trying the download again. `_validate_patches_cache` clears a bad
-one before PCSX2 ever gets to open it.
+Not configurable, and not under `DATA_DIR`: pcsx2-qt reads this one path and
+no other (a copy under the user tree is ignored), and it never downloads the
+file itself. The Ubuntu `+dfsg` package ships without it, so a missing file
+means a permanent "Failed to open patches.zip" warning and no game fixes.
+`_ensure_patches_zip` fetches it before a launch.
 """
 PCSX2_LOG_PATH = Path(os.environ.get("PCSX2_LOG_PATH", "/config/pcsx2-qt.log"))
 """Log file the broker tails for this emulator (env `PCSX2_LOG_PATH`, default `/config/pcsx2-qt.log`)."""
@@ -406,40 +408,35 @@ def _patch_ini() -> None:
         ) from exc
 
 
-def _validate_patches_cache() -> None:
-    """Delete a corrupt cached patches.zip so PCSX2 re-downloads it instead of failing forever.
+def _patches_zip_problem(path: Path) -> Optional[str]:
+    """Say what, if anything, makes a patches.zip unusable to PCSX2.
 
-    Checked, not wiped, on every launch: PCSX2's own fetch is a multi-megabyte
-    GitHub download, so a good cache should survive as many launches as it can
-    rather than being forced through a fresh one every session. Only a file
-    that is empty or fails its own CRC check is removed; everything else is
-    left for PCSX2 to open. A failure to remove a bad file is logged, not
-    raised, the same as `_ensure_folder_card`: the game still boots, just
-    without official patches until a later launch's fetch succeeds.
+    Used on both the installed file and a fresh download, so a bad download
+    is never moved over a good install. Beyond opening and passing its CRC
+    check, the archive must hold at least one `.pnach`: an HTML error page or
+    a restructured release can arrive with a 200 and still be a valid zip.
+
+    Args:
+        path: The zip to check.
+
+    Returns:
+        None when the file is usable, otherwise a short reason: `"missing"`,
+        `"empty"`, `"failed its CRC check"`, `"holds no .pnach patches"`, or
+        the error the zip reader raised.
     """
-    if not PATCHES_ZIP.exists():
-        return
-    reason: Optional[str] = None
     try:
-        if PATCHES_ZIP.stat().st_size == 0:
-            reason = "empty"
-        else:
-            with zipfile.ZipFile(PATCHES_ZIP) as zf:
-                if zf.testzip() is not None:
-                    reason = "failed its CRC check"
+        if not path.exists():
+            return "missing"
+        if path.stat().st_size == 0:
+            return "empty"
+        with zipfile.ZipFile(path) as zf:
+            if zf.testzip() is not None:
+                return "failed its CRC check"
+            if not any(name.endswith(".pnach") for name in zf.namelist()):
+                return "holds no .pnach patches"
     except (OSError, zipfile.BadZipFile) as exc:
-        reason = str(exc)
-    if reason is None:
-        return
-    log.warning(
-        "pcsx2: cached patches.zip at %s is %s, removing it so PCSX2 re-downloads it",
-        PATCHES_ZIP,
-        reason,
-    )
-    try:
-        PATCHES_ZIP.unlink()
-    except OSError as exc:
-        log.warning("pcsx2: could not remove the bad patches.zip at %s: %s", PATCHES_ZIP, exc)
+        return str(exc) or type(exc).__name__
+    return None
 
 
 def _sstate_snapshot() -> dict[Path, tuple[int, float]]:
@@ -987,7 +984,6 @@ class Pcsx2(Emulator):
         """
         self.stop()
         _patch_ini()
-        _validate_patches_cache()
         self._ensure_folder_card()
         self.boot_failed = False  # every launch starts clean
         self._launch_seq += 1
