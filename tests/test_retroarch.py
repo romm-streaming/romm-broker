@@ -609,8 +609,8 @@ def test_a_scoped_platform_s_saves_sit_in_its_core_s_sorted_dir() -> None:
 
 _SRM_PLATFORMS = frozenset(
     {
-        "nes", "famicom", "snes", "sfam", "n64", "gb", "gbc", "gba", "virtualboy", "nds", "nintendo-dsi", "genesis", "sms",
-        "gamegear", "sg1000", "sega32", "tg16", "turbografx-cd", "supergrafx", "neo-geo-cd",
+        "nes", "famicom", "snes", "sfam", "n64", "gb", "gbc", "gba", "virtualboy", "nds", "nintendo-dsi",
+        "genesis", "sms", "gamegear", "sg1000", "sega32", "tg16", "turbografx-cd", "supergrafx", "neo-geo-cd",
         "wonderswan", "wonderswan-color", "jaguar", "colecovision", "psx",
     }
 )  # fmt: skip
