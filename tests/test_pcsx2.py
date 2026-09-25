@@ -150,6 +150,22 @@ def _fake_fetch_run(
     return run
 
 
+def _swallow_thread(
+    target: Callable[..., object], args: tuple[object, ...] = (), daemon: bool = False
+) -> object:
+    """Stand in for `Thread` when a test only needs the background work never to run.
+
+    Args:
+        target: The callable the real `Thread` would run.
+        args: Positional args the real `Thread` would pass to `target`.
+        daemon: Whether the real `Thread` would be a daemon thread.
+
+    Returns:
+        An object whose `start` does nothing.
+    """
+    return type("MockThread", (), {"start": lambda s: None})()
+
+
 @pytest.mark.parametrize(
     ("filename", "expected"),
     [
@@ -577,6 +593,7 @@ def test_launch_always_spawns_the_watchdog_even_with_no_resume_slot(
     """
     started = []
     monkeypatch.setattr(pcsx2, "_patch_ini", lambda: None)
+    monkeypatch.setattr(pcsx2, "_ensure_patches_zip", lambda: None)
     monkeypatch.setattr(pcsx2.Pcsx2, "_ensure_folder_card", lambda self: None)
     monkeypatch.setattr(pcsx2.Pcsx2, "_spawn", lambda self, cmd, env: None)
 
@@ -658,6 +675,44 @@ def test_patches_zip_problem_rejects_a_zip_that_fails_its_crc(tmp_path: Path) ->
     path.write_bytes(bytes(raw))
     assert pcsx2._patches_zip_problem(path) is not None
 
+
+
+
+def test_patches_zip_problem_reports_a_corrupt_deflate_stream_instead_of_raising(tmp_path: Path) -> None:
+    """Damaged compressed bytes make zlib raise its own error, which becomes a reason."""
+    path = tmp_path / "patches.zip"
+    body = "".join(f"patch=1,EE,{n:08X},extended,{n * 7:08X}\n" for n in range(2000))
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("SLUS-20946_7D3A8B4E.pnach", body)
+    raw = bytearray(path.read_bytes())
+    for offset in range(60, 400):
+        raw[offset] ^= 0x55
+    path.write_bytes(bytes(raw))
+    assert pcsx2._patches_zip_problem(path) is not None
+
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("File is encrypted, password required"), NotImplementedError("compression type 99")],
+)
+def test_patches_zip_problem_reports_an_unreadable_member_instead_of_raising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    """An encrypted or exotically compressed member becomes a reason, never an exception."""
+    path = _write_patches_zip(tmp_path / "patches.zip")
+
+    def _raise(self: zipfile.ZipFile) -> None:
+        """Raise what ZipFile.open raises for a member it cannot read.
+
+        Args:
+            self: The zip under test.
+
+        Raises:
+            Exception: The parametrized error.
+        """
+        raise error
+
+    monkeypatch.setattr(zipfile.ZipFile, "testzip", _raise)
+    assert pcsx2._patches_zip_problem(path) == str(error)
 
 def test_refresh_downloads_validates_and_moves_the_bundle_into_place(
     monkeypatch: pytest.MonkeyPatch,
@@ -799,6 +854,125 @@ def test_refresh_survives_a_filesystem_error_and_frees_the_lock(
     pcsx2._PATCHES_LOCK.release()
 
 
+def test_ensure_fetches_synchronously_when_the_bundle_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing bundle is fetched before PCSX2 starts, since PCSX2 opens it at boot."""
+    ran: list[str] = []
+    monkeypatch.setattr(pcsx2, "_refresh_patches_zip", lambda: ran.append("sync") or True)
+    monkeypatch.setattr(pcsx2, "Thread", lambda **kw: pytest.fail("fetched in the background"))
+
+    pcsx2._ensure_patches_zip()
+
+    assert ran == ["sync"]
+
+
+def test_ensure_refetches_synchronously_when_the_bundle_is_corrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A corrupt install is treated like a missing one and replaced before boot."""
+    pcsx2.PATCHES_ZIP.write_bytes(b"")
+    ran: list[str] = []
+    monkeypatch.setattr(pcsx2, "_refresh_patches_zip", lambda: ran.append("sync") or True)
+
+    pcsx2._ensure_patches_zip()
+
+    assert ran == ["sync"]
+
+
+def test_ensure_leaves_a_fresh_bundle_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A valid bundle younger than the max age costs the launch nothing."""
+    _write_patches_zip(pcsx2.PATCHES_ZIP)
+    monkeypatch.setattr(pcsx2, "_refresh_patches_zip", lambda: pytest.fail("fetched"))
+    monkeypatch.setattr(pcsx2, "Thread", lambda **kw: pytest.fail("fetched in the background"))
+
+    pcsx2._ensure_patches_zip()
+
+
+def test_ensure_refreshes_a_stale_bundle_in_the_background(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid but old bundle boots as-is while a newer one is fetched behind it."""
+    _write_patches_zip(pcsx2.PATCHES_ZIP)
+    old = time.time() - pcsx2.PATCHES_MAX_AGE - 60
+    os.utime(pcsx2.PATCHES_ZIP, (old, old))
+    started: list[object] = []
+    monkeypatch.setattr(pcsx2, "_refresh_patches_zip", lambda: pytest.fail("fetched inline"))
+
+    def mock_thread(target: Callable[..., object], daemon: bool) -> object:
+        """Record the background target instead of running it."""
+        started.append(target)
+        return type("MockThread", (), {"start": lambda s: None})()
+
+    monkeypatch.setattr(pcsx2, "Thread", mock_thread)
+
+    pcsx2._ensure_patches_zip()
+
+    assert started == [pcsx2._refresh_patches_zip]
+
+
+def test_ensure_does_nothing_when_the_fetch_is_switched_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`PCSX2_PATCHES_FETCH=false` means no network and no sudo, even with no bundle."""
+    monkeypatch.setattr(pcsx2, "PATCHES_FETCH", False)
+    monkeypatch.setattr(pcsx2, "_refresh_patches_zip", lambda: pytest.fail("fetched"))
+
+    pcsx2._ensure_patches_zip()
+
+
+def test_a_failed_patches_fetch_still_launches_pcsx2(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No network and no sudo still boots the game, just without patches."""
+    spawned: list[list[str]] = []
+    calls: list[list[str]] = []
+    monkeypatch.setattr(pcsx2, "_patch_ini", lambda: None)
+    monkeypatch.setattr(pcsx2.Pcsx2, "_ensure_folder_card", lambda self: None)
+    monkeypatch.setattr(pcsx2.Pcsx2, "_spawn", lambda self, cmd, env: spawned.append(cmd))
+    monkeypatch.setattr(pcsx2.subprocess, "run", _fake_fetch_run(calls, fail="curl"))
+    monkeypatch.setattr(pcsx2, "Thread", _swallow_thread)
+
+    pcsx2.Pcsx2().launch(tmp_path / "g.iso", None)
+
+    assert [c[0] for c in calls] == [pcsx2._CURL]
+    assert len(spawned) == 1
+    assert not pcsx2.PATCHES_ZIP.exists()
+
+
+def test_launch_ensures_patches_before_spawning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The bundle check runs before pcsx2-qt starts, and before the old game is stopped.
+
+    PCSX2 opens the file at boot, so a fetch after the spawn is too late; a
+    fetch after the stop leaves the player on a dead stream while it runs.
+    """
+    order: list[str] = []
+    monkeypatch.setattr(pcsx2, "_patch_ini", lambda: None)
+    monkeypatch.setattr(pcsx2, "_ensure_patches_zip", lambda: order.append("patches"))
+    monkeypatch.setattr(pcsx2.Pcsx2, "stop", lambda self: order.append("stop"))
+    monkeypatch.setattr(pcsx2.Pcsx2, "_ensure_folder_card", lambda self: None)
+    monkeypatch.setattr(pcsx2.Pcsx2, "_spawn", lambda self, cmd, env: order.append("spawn"))
+    monkeypatch.setattr(pcsx2, "Thread", _swallow_thread)
+
+    pcsx2.Pcsx2().launch(tmp_path / "g.iso", None)
+
+    assert order == ["patches", "stop", "spawn"]
+
+
+@pytest.mark.parametrize("value", ["false", "FALSE", "0", "no", "off", " Off "])
+def test_the_fetch_switch_turns_off_for_every_off_spelling(value: str) -> None:
+    """`0`, `no` and `off` disable the fetch too, not only the literal `false`."""
+    assert pcsx2._fetch_enabled(value) is False
+
+
+@pytest.mark.parametrize("value", ["true", "1", "yes", "on", ""])
+def test_the_fetch_switch_stays_on_otherwise(value: str) -> None:
+    """Anything that is not an off spelling leaves the fetch on, its default."""
+    assert pcsx2._fetch_enabled(value) is True
+
+
 def test_a_launch_stops_at_an_unpatchable_ini(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -809,6 +983,7 @@ def test_a_launch_stops_at_an_unpatchable_ini(
         raise RuntimeError("no ini")
 
     monkeypatch.setattr(pcsx2, "_patch_ini", refuse)
+    monkeypatch.setattr(pcsx2, "_ensure_patches_zip", lambda: None)
     monkeypatch.setattr(pcsx2.Pcsx2, "_ensure_folder_card", lambda self: None)
     monkeypatch.setattr(pcsx2.Pcsx2, "_spawn", lambda self, cmd, env: spawned.append(cmd))
 
@@ -865,18 +1040,12 @@ def test_a_launch_sends_pcsx2_to_the_data_root_the_broker_uses(
     spawned: dict[str, dict[str, str]] = {}
     monkeypatch.setattr(pcsx2, "DATA_DIR", data_dir)
     monkeypatch.setattr(pcsx2, "_patch_ini", lambda: None)
+    monkeypatch.setattr(pcsx2, "_ensure_patches_zip", lambda: None)
     monkeypatch.setattr(pcsx2.Pcsx2, "_ensure_folder_card", lambda self: None)
     monkeypatch.setattr(
         pcsx2.Pcsx2, "_spawn", lambda self, cmd, env: spawned.update(env=env)
     )
-
-    def mock_thread(
-        target: Callable[..., object], args: tuple[object, ...], daemon: bool
-    ) -> object:
-        """Swallow the boot watchdog thread this launch would start."""
-        return type("MockThread", (), {"start": lambda s: None})()
-
-    monkeypatch.setattr(pcsx2, "Thread", mock_thread)
+    monkeypatch.setattr(pcsx2, "Thread", _swallow_thread)
 
     pcsx2.Pcsx2().launch(tmp_path / "g.iso", None)
 

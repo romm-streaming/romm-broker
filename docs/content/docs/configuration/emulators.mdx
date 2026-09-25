@@ -29,12 +29,23 @@ are in seconds.
 | `PCSX2_STATE_SLOT` | `10` | The slot PCSX2 works in; 10 is its own autosave slot, which the per-emulator broker also used. |
 | `PCSX2_SLOT1_CARD` | `romm-slot1` | Name of the Slot 1 folder memory card the broker owns (a directory, no `.ps2` extension). |
 | `PCSX2_LOG_PATH` | `/config/pcsx2-qt.log` | Where PCSX2's stdout/stderr is captured. |
+| `PCSX2_PATCHES_FETCH` | `true` | Fetch PCSX2's game-patch bundle (`patches.zip`) from `PCSX2/pcsx2_patches` before a launch. Set `false` with no route to GitHub. |
 | `PINE_WAIT` | `20.0` | How long a save state has to land on disk after the PINE save command. |
 | `RESUME_LOAD_WAIT` | `90.0` | How long a resume load waits for PCSX2 to report a running game. |
 | `RESUME_LOAD_SETTLE` | `3.0` | How long the game has to be running before the resume load fires. |
 
 PCSX2's data folder isn't configurable here. Everything (`inis/PCSX2.ini`,
 `sstates/`, `memcards/`) lives under `/config/.config/PCSX2`.
+
+The Ubuntu PCSX2 package ships without `patches.zip`, the bundle of
+widescreen and compatibility patches PCSX2 applies per game, and PCSX2 only
+reads it from `/usr/share/PCSX2/resources/`. Before each launch the broker
+downloads it from the `latest` release of `PCSX2/pcsx2_patches` when it is
+missing, invalid, or older than a week, checks the download is a valid zip of
+`.pnach` patches, and moves it into place with `sudo`. A missing or invalid
+bundle is fetched before the game starts, which can hold a launch for up to
+about a minute; a week-old one is refreshed in the background. A failed
+fetch is logged and the game boots with whatever bundle is there, or none.
 
 ## DuckStation
 

@@ -67,6 +67,7 @@ INI_PATH = DATA_DIR / "inis" / "PCSX2.ini"
 SSTATE_DIR = DATA_DIR / "sstates"
 """Directory PCSX2 writes its `.p2s` save states into, `sstates` under `DATA_DIR`."""
 _PATCHES_ZIP_SYSTEM_PATH = Path("/usr/share/PCSX2/resources/patches.zip")
+"""The one path pcsx2-qt opens the patch bundle from, kept apart so tests can redirect `PATCHES_ZIP`."""
 PATCHES_ZIP = _PATCHES_ZIP_SYSTEM_PATH
 """The GameDB/widescreen/fix patch bundle PCSX2 opens at boot, from its install resources.
 
@@ -96,6 +97,36 @@ _MV = "/usr/bin/mv"
 """Renames the staged copy over `PATCHES_ZIP`, atomic because both sit in one directory."""
 _PATCHES_LOCK = Lock()
 """Held for a whole fetch, so overlapping launches never run two at once."""
+
+
+def _fetch_enabled(value: str) -> bool:
+    """Read the `PCSX2_PATCHES_FETCH` switch, which is on unless it says off.
+
+    Accepts the spellings the other emulators' switches accept, so `0`, `no`
+    or `off` turn off sudo and network use just as `false` does.
+
+    Args:
+        value: The raw environment value.
+
+    Returns:
+        False for `0`, `false`, `no` or `off` in any case, True otherwise.
+    """
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+
+PATCHES_FETCH = _fetch_enabled(os.environ.get("PCSX2_PATCHES_FETCH", "true"))
+"""Whether launches fetch patches.zip (env `PCSX2_PATCHES_FETCH`, default `true`).
+
+Set it to `false` (or `0`, `no`, `off`) on a deploy with no route to GitHub, or one that should not
+use sudo at all: PCSX2 then runs without game patches, as it did before.
+"""
+PATCHES_MAX_AGE = 7 * 24 * 3600.0
+"""Age in seconds past which an installed bundle is refreshed in the background.
+
+Upstream rebuilds on every merge, but patches change slowly; a week keeps
+launches to one fetch between container recreations without letting fixes
+lag far behind.
+"""
 PCSX2_LOG_PATH = Path(os.environ.get("PCSX2_LOG_PATH", "/config/pcsx2-qt.log"))
 """Log file the broker tails for this emulator (env `PCSX2_LOG_PATH`, default `/config/pcsx2-qt.log`)."""
 STATE_SLOT = int(os.environ.get("PCSX2_STATE_SLOT", "10"))
@@ -455,7 +486,11 @@ def _patches_zip_problem(path: Path) -> Optional[str]:
                 return "failed its CRC check"
             if not any(name.endswith(".pnach") for name in zf.namelist()):
                 return "holds no .pnach patches"
-    except (OSError, zipfile.BadZipFile) as exc:
+    # testzip() decompresses every member, and each decompressor raises its own
+    # types (zlib.error, EOFError, lzma.LZMAError, RuntimeError for an
+    # encrypted member, NotImplementedError for an unknown method). A broken
+    # download must become a reason here, never an exception out of launch().
+    except Exception as exc:
         return str(exc) or type(exc).__name__
     return None
 
@@ -472,7 +507,9 @@ def _run_step(verb: str, cmd: list[str], timeout: float) -> bool:
         True when the step exited 0.
     """
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, errors="replace", timeout=timeout
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.warning("patches fetch: %s failed: %s", verb, exc)
         return False
@@ -505,7 +542,9 @@ def _refresh_patches_zip() -> bool:
         True when a new bundle was put in place.
     """
     if not _PATCHES_LOCK.acquire(blocking=False):
-        log.debug("patches fetch: already running, skipping")
+        # Only a background refresh can hold it (launches are serialized), so
+        # the bundle it is replacing is still there for this launch to use.
+        log.info("patches fetch: a refresh is already running, skipping")
         return False
     try:
         if not PATCHES_ZIP.parent.is_dir():
@@ -569,10 +608,10 @@ def _refresh_patches_zip() -> bool:
                     str(download),
                     str(staged),
                 ],
-                timeout=15,
+                timeout=10,
             )
             if not installed or not _run_step(
-                "rename", [_SUDO, "-n", _MV, "-f", "--", str(staged), str(PATCHES_ZIP)], timeout=15
+                "rename", [_SUDO, "-n", _MV, "-f", "--", str(staged), str(PATCHES_ZIP)], timeout=10
             ):
                 return False
             log.info(
@@ -584,6 +623,35 @@ def _refresh_patches_zip() -> bool:
         return False
     finally:
         _PATCHES_LOCK.release()
+
+
+def _ensure_patches_zip() -> None:
+    """Make sure PCSX2 has a patch bundle to open, without ever failing the launch.
+
+    A missing or unusable bundle is fetched inline, since PCSX2 opens it at
+    boot and a later fetch would come too late for this session. A usable but
+    stale one is refreshed on a background thread and this launch boots with
+    what is there. A fresh one costs nothing.
+    """
+    if not PATCHES_FETCH:
+        return
+    problem = _patches_zip_problem(PATCHES_ZIP)
+    if problem is not None:
+        log.info("patches fetch: %s is %s, fetching it before launch", PATCHES_ZIP, problem)
+        _refresh_patches_zip()
+        return
+    try:
+        age = time.time() - PATCHES_ZIP.stat().st_mtime
+    except OSError as exc:
+        log.warning("patches fetch: could not stat %s: %s", PATCHES_ZIP, exc)
+        return
+    if age >= PATCHES_MAX_AGE:
+        log.info(
+            "patches fetch: %s is %.0f days old, refreshing in the background",
+            PATCHES_ZIP,
+            age / 86400,
+        )
+        Thread(target=_refresh_patches_zip, daemon=True).start()
 
 
 def _sstate_snapshot() -> dict[Path, tuple[int, float]]:
@@ -1115,7 +1183,7 @@ class Pcsx2(Emulator):
             log.warning("could not create the slot 1 folder card at %s: %s", card, exc)
 
     def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
-        """Stop any running instance, prepare the config, patches cache and card, and start pcsx2-qt.
+        """Fetch the patch bundle if needed, stop the running instance, prepare config and card, then start.
 
         The binary comes from env `PCSX2_BIN` (default `pcsx2-qt`). A boot
         watchdog thread is always started; it verifies boot and only delivers
@@ -1129,6 +1197,9 @@ class Pcsx2(Emulator):
             RuntimeError: When PCSX2.ini could not be patched, which leaves PINE off and
                 the session with no save states and no boot signal.
         """
+        # Before stop(): a slow fetch then keeps the old game on screen instead
+        # of a dead stream while the player waits.
+        _ensure_patches_zip()
         self.stop()
         _patch_ini()
         self._ensure_folder_card()
