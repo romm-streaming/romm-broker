@@ -125,6 +125,10 @@ core reports `Azahar`.
 - In-game saves (SRAM) go in `saves/<core name>/<game>.srm`.
 - Save states go in `states/<core name>/`.
 
+The `azahar` core is the one exception: it nests its own `Azahar/` folder
+under the one RetroArch already sorted it into, landing its SD card and NAND
+one level deeper, at `saves/Azahar/Azahar/`. See the 3DS bullet below.
+
 The broker states these settings on every launch, so a setting in your own
 `retroarch.cfg` can't move saves away from where every save archive already
 keeps them. The platform table records each core's reported name as
@@ -157,7 +161,9 @@ The other platforms refuse a `.srm`:
 - **Wii and 3DS**: these cores keep saves in folders, not a `.srm`, and a
   `.srm` is refused as `unrecognised_layout`. Imports place folders here
   instead: Wii title folders in `saves/dolphin-emu/User/Wii/title/`, and
-  Azahar's SD card and NAND folders as they already sit in `saves/Azahar/`.
+  Azahar's SD card and NAND folders as they already sit in
+  `saves/Azahar/Azahar/` (the core nests its own `Azahar/` folder under the
+  one RetroArch already sorted it into).
   [What each emulator takes](/docs/api/imports#what-each-emulator-takes)
   lists the shapes.
 - **GameCube**: the core keeps saves as GCI files in its own folders, which

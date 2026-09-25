@@ -124,19 +124,28 @@ _EXPECTED = (
 )
 """The shapes an import member is asked to take, for refusals."""
 _SD_WRAPPERS = (
-    ("saves", "Azahar", "sdmc", "Nintendo 3DS"),
-    ("saves", "Azahar", "Nintendo 3DS"),
-    ("saves", "Azahar"),
+    ("saves", "Azahar", "Azahar", "sdmc", "Nintendo 3DS"),
+    ("saves", "Azahar", "Azahar", "Nintendo 3DS"),
+    ("saves", "Azahar", "Azahar"),
     ("sdmc", "Nintendo 3DS"),
     ("Nintendo 3DS",),
     (),
 )
-"""Folders an archive may wrap an SD card's ids in, longest first with `()` last.
+"""Folders an archive may wrap an SD card's ids in, most specific first with `()` last.
 
-`saves/Azahar/`, `sdmc/` and `Nintendo 3DS/` nest in the order Azahar's own
-layout does, and `sdmc` only ever leads to `Nintendo 3DS`.
+`sdmc/` and `Nintendo 3DS/` nest in the order Azahar's own layout does, and
+`sdmc` only ever leads to `Nintendo 3DS`. The `saves/Azahar/Azahar/` forms are
+where the RetroArch/libretro build of this same core actually writes:
+`sort_savefiles_enable` redirects RetroArch's save dir to `saves/Azahar/`
+(sorted by the core's `library_name`), and the core then nests its own
+`Azahar/` folder under whatever directory it is handed, so a bare
+`saves/Azahar/` with no second `Azahar/` is never what the core itself
+produces and is left unrecognised rather than guessed at.
 """
-_NAND_WRAPPERS = (("saves", "Azahar", "nand", "data"), ("nand", "data"))
+_NAND_WRAPPERS = (
+    ("saves", "Azahar", "Azahar", "nand", "data"),
+    ("nand", "data"),
+)
 """Folders an archive may wrap the NAND data ids in. There is no bare form: the NAND path is kept."""
 _ID_LEVEL = re.compile(r"[0-9A-Fa-f]{32}", re.ASCII)
 """A console or SD card id, as a folder name."""
