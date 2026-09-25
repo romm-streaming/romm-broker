@@ -86,6 +86,11 @@ def test_fold_v1_problems_maps_each_kind() -> None:
             ("saves", "archive member names a save subtree: saves", "names_subtree"),
             ("x/c", "archive member outside save subtrees: x/c", "outside"),
             ("s/d", "archive member is encrypted: s/d", "unreadable"),
+            ("s/e", "archive member is also the directory of another member: s/e", "collides"),
+            ("s/f", "archive member has a name component too long for the save filesystem: s/f", "too_long"),
+            ("s/g", "archive member cannot be written, s is not writable: s/g", "unwritable"),
+            ("s/h", "archive holds 2 members for s/h: s/h", "duplicate"),
+            ("s/.i.old/x", "archive member is named like broker scratch: s/.i.old/x", "scratch"),
         ),
     )
 
@@ -98,6 +103,11 @@ def test_fold_v1_problems_maps_each_kind() -> None:
         ("unrecognised_layout", "saves"),
         ("unrecognised_layout", "x/c"),
         ("unreadable_member", "s/d"),
+        ("destination_conflict", "s/e"),
+        ("unsafe_path", "s/f"),
+        ("destination_unresolvable", "s/g"),
+        ("unsafe_path", "s/h"),
+        ("unrecognised_layout", "s/.i.old/x"),
     ]
     assert folded[1].detail == "archive member escapes save dir: ../a"
     assert folded[5].expected == imports.READABLE_EXPECTED

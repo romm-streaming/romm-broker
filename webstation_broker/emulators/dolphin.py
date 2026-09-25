@@ -89,10 +89,10 @@ _ATIME_PROBE_PREFIX = ".atime-probe."
 """Name prefix of the scratch file the access-time probe measures on.
 
 The probe has to sit on the same mount as the states to measure anything, and
-that mount is inside the tree the exit archive is built from. The dot prefix
-is what keeps it out of a dump: `saves._iter_save_files` skips every
-dot-prefixed name. `_clear_atime_probes` sweeps the rest, for a probe whose
-own cleanup never ran because the broker was killed mid-measurement.
+that mount is inside the tree the exit archive is built from. The prefix is
+what keeps it out of a dump: `saves._iter_save_files` skips it as broker
+scratch. `_clear_atime_probes` sweeps the rest, for a probe whose own cleanup
+never ran because the broker was killed mid-measurement.
 """
 _UNDO_BUFFER_NAME = "lastState.sav"
 """The undo-load buffer Dolphin rewrites in the state directory on every state load."""

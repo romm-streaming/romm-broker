@@ -404,6 +404,11 @@ _V1_REASONS: dict[str, str] = {
     "names_subtree": "unrecognised_layout",
     "outside": "unrecognised_layout",
     "unreadable": "unreadable_member",
+    "scratch": "unrecognised_layout",
+    "duplicate": "unsafe_path",
+    "collides": "destination_conflict",
+    "too_long": "unsafe_path",
+    "unwritable": "destination_unresolvable",
 }
 """Refusal code for each `saves.V1Problem` in an archive that also holds imports."""
 

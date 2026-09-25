@@ -2550,6 +2550,30 @@ def test_a_restored_archive_reports_no_skip(
             False,
             "archive member is corrupt: saves/a",
         ),
+        (
+            _zip({"saves/a": b"file", "saves/a/b": b"child"}),
+            None,
+            False,
+            "archive member is also the directory of another member: saves/a",
+        ),
+        (
+            _zip({f"saves/{'x' * 300}": b"x"}),
+            None,
+            False,
+            "archive member has a name component too long for the save filesystem",
+        ),
+        (
+            _zip({"saves/./a": b"one", "saves/a": b"two"}),
+            None,
+            False,
+            "archive holds 2 members for saves/a: saves/./a",
+        ),
+        (
+            _zip({"saves/.a.0123456789abcdef.tmp": b"x"}),
+            None,
+            False,
+            "archive member is named like broker scratch, which is never saved back",
+        ),
     ],
     ids=[
         "not-a-zip",
@@ -2564,6 +2588,10 @@ def test_a_restored_archive_reports_no_skip(
         "bad-date",
         "bad-utf8-name",
         "corrupt",
+        "file-and-dir",
+        "name-too-long",
+        "dot-segment-alias",
+        "broker-scratch",
     ],
 )
 def test_a_bad_archive_is_refused_before_the_slot_is_cleared(
