@@ -30,7 +30,7 @@ environments but plain `pip` works the same:
 
 ```bash
 uv venv
-uv pip install -e . pytest "ruff==0.16.1"
+uv pip install -e . pytest pytest-asyncio "ruff==0.16.1"
 .venv/bin/pytest -q
 .venv/bin/ruff check webstation_broker tests
 ```
