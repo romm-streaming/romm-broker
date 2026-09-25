@@ -14,7 +14,7 @@ container somewhere other than `/streaming/`.
 | `BROKER_SECRET` | unset | A shared password for the session lifecycle endpoints (the URLs RomM uses to run a session, start to finish), sent as the `X-Broker-Secret` header. Leave it unset outside dev mode and the broker refuses to start; leave it unset in dev mode and it starts anyway with those endpoints unauthenticated, so dev mode should never be exposed beyond local development. |
 | `BROKER_HOST` | `127.0.0.1` | The network interface uvicorn (the server process that runs the broker) listens on. Only nginx is meant to talk to it directly. |
 | `BROKER_PORT` | `8000` | The port uvicorn listens on. The image's nginx setup already expects 8000. |
-| `ROM_ROOT` | `/romm` | The folder your ROMs live in. Activate (the call that launches a game) refuses any ROM path outside this folder. |
+| `ROM_ROOT` | `/romm` | The folder your ROMs live in. Activate (the call that launches a game) refuses any ROM path outside this folder. The default already covers the recommended `/romm/library` mount, so you only need this if the library is mounted outside `/romm`. |
 | `BROKER_EXPORT_DIR` | `/config/broker-exports` | Where exit writes save archives to disk. In dev mode it always writes here; otherwise only if uploading the save fails. |
 | `BROKER_IMPORT_DIR` | `/config/broker-imports` | Where uploaded save archives land, ready for activate to load them via `save.archive`. |
 | `BROKER_FRONTEND_DIST` | `/usr/share/webstation-broker/www` | Where the built room UI is served from outside dev mode. |

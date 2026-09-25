@@ -251,14 +251,14 @@ def test_activate_refuses_a_rom_outside_the_library(
 def test_activate_reports_a_rom_that_is_not_there(
     client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
 ) -> None:
-    """Activate reports a ROM that is not there as 404."""
-    response = _activate(
-        client,
-        broker_dirs,
-        rom={"path": str(broker_dirs["roms"] / "gone.iso"), "platform": "ps2"},
-    )
+    """Activate reports a ROM that is not there as 404, naming the path and the mount fix."""
+    missing = str(broker_dirs["roms"] / "gone.iso")
+    response = _activate(client, broker_dirs, rom={"path": missing, "platform": "ps2"})
 
     assert response.status_code == 404
+    detail = response.json()["detail"]
+    assert missing in detail
+    assert "same path as in RomM" in detail
 
 
 def test_activate_reports_a_folder_holding_nothing_bootable(

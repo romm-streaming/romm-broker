@@ -13,7 +13,7 @@ docker run --rm -it \
   -e BROKER_DEV_MODE=true \
   -e PUID=1000 -e PGID=1000 \
   -v $(pwd):/broker \
-  -v /path/to/roms:/romm \
+  -v /path/to/library:/romm/library \
   -v /path/to/config:/config \
   -p 3001:3001 \
   lscr.io/linuxserver/webstation:romm bash

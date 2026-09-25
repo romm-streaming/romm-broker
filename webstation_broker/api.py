@@ -602,8 +602,19 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
                 status_code=400, detail=f"rom path must live under {rom_root}"
             )
         if not rom_path.exists():
-            log.debug("activate: rom path does not exist: %s", rom_path)
-            raise HTTPException(status_code=404, detail="rom path does not exist")
+            # Almost always a mount mismatch rather than a deleted file: RomM
+            # found the rom in its own container, so the path it sent only
+            # misses here when this container mounts the library elsewhere.
+            log.warning("activate: rom path does not exist: %s", rom_path)
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"rom not found at {body.rom.path}. Mount the ROM library in"
+                    " this container at the same path as in RomM (normally"
+                    " /romm/library), or set library_path for this container in"
+                    " RomM's config.yml"
+                ),
+            )
         rom_file = emulator.resolve_rom_file(rom_path)
         if rom_file is None:
             log.debug(

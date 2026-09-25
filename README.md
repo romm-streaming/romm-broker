@@ -34,7 +34,7 @@ services:
       - /dev/dri:/dev/dri
     volumes:
       - /path/to/config:/config
-      - /path/to/roms:/romm
+      - /path/to/library:/romm/library
     ports:
       - 3000:3000
       - 3001:3001

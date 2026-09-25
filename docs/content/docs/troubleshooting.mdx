@@ -46,11 +46,17 @@ confirmed to work anyway.
 
 ## Activate fails, or a specific game won't launch
 
-A 400 response with detail `rom path must live under <root>` means RomM's
-`library_path` for this container doesn't point at the same path the broker
-sees as `ROM_ROOT` (default `/romm`). Fix `library_path` in `config.yml` to
-match. See [Wiring it into RomM](/docs/container#wiring-it-into-romm) and
-[Broker settings](/docs/configuration).
+A 404 response with detail `rom not found at <path>` means this container
+doesn't have the library at the path RomM uses. Mount the same host folder at
+the same path as on the RomM container (normally `/romm/library`). Check with
+`docker exec webstation ls <path>` using the path from the error.
+
+A 400 response with detail `rom path must live under <root>` means the path
+RomM sent is outside the broker's `ROM_ROOT` (default `/romm`). This only
+comes up when the library is mounted somewhere other than under `/romm` and
+RomM's `library_path` points there: set `ROM_ROOT` to match. See [Mounting the
+library somewhere else](/docs/container#mounting-the-library-somewhere-else)
+and [Broker settings](/docs/configuration).
 
 The emulator may just need its one-time setup first. Run it through
 [Emulator setup](/docs/emulators/setup) from a desktop session before the
