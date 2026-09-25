@@ -13,12 +13,13 @@ import os
 import re
 import socket as _socket
 import struct
-import subprocess  # noqa: F401 (patched by tests/test_pcsx2.py's network-safety fixture)
+import subprocess
+import tempfile
 import time
 import zipfile
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Optional, Union
 
 from .. import imports, memcard
@@ -75,6 +76,26 @@ file itself. The Ubuntu `+dfsg` package ships without it, so a missing file
 means a permanent "Failed to open patches.zip" warning and no game fixes.
 `_ensure_patches_zip` fetches it before a launch.
 """
+PATCHES_URL = "https://github.com/PCSX2/pcsx2_patches/releases/download/latest/patches.zip"
+"""Upstream's rolling release of the patch bundle, rebuilt by CI on every push to its main branch.
+
+Hardcoded, like the destination: this download ends in a root-owned file, so
+neither end of it may come from a request, the environment or config.
+Upstream publishes no checksum, so trust rests on TLS to GitHub plus
+`_patches_zip_problem`.
+"""
+_PATCHES_MAX_BYTES = 64 * 1024 * 1024
+"""Download ceiling handed to curl; the real bundle is about 2 MB."""
+_CURL = "/usr/bin/curl"
+"""Absolute, so a `PATH` entry ahead of `/usr/bin` cannot stand in for it."""
+_SUDO = "/usr/bin/sudo"
+"""Absolute for the same reason as `_CURL`; only the install and the rename run under it."""
+_INSTALL = "/usr/bin/install"
+"""Copies the validated download to a root-owned staging name beside `PATCHES_ZIP`."""
+_MV = "/usr/bin/mv"
+"""Renames the staged copy over `PATCHES_ZIP`, atomic because both sit in one directory."""
+_PATCHES_LOCK = Lock()
+"""Held for a whole fetch, so overlapping launches never run two at once."""
 PCSX2_LOG_PATH = Path(os.environ.get("PCSX2_LOG_PATH", "/config/pcsx2-qt.log"))
 """Log file the broker tails for this emulator (env `PCSX2_LOG_PATH`, default `/config/pcsx2-qt.log`)."""
 STATE_SLOT = int(os.environ.get("PCSX2_STATE_SLOT", "10"))
@@ -437,6 +458,132 @@ def _patches_zip_problem(path: Path) -> Optional[str]:
     except (OSError, zipfile.BadZipFile) as exc:
         return str(exc) or type(exc).__name__
     return None
+
+
+def _run_step(verb: str, cmd: list[str], timeout: float) -> bool:
+    """Run one step of the patches fetch, logging rather than raising on failure.
+
+    Args:
+        verb: What the step does, for the log line (`"download"`, `"install"`, `"rename"`).
+        cmd: The argv, list-form.
+        timeout: Seconds before the step is abandoned.
+
+    Returns:
+        True when the step exited 0.
+    """
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("patches fetch: %s failed: %s", verb, exc)
+        return False
+    if result.returncode != 0:
+        log.warning(
+            "patches fetch: %s exited %s: %s", verb, result.returncode, result.stderr.strip()
+        )
+        return False
+    return True
+
+
+def _refresh_patches_zip() -> bool:
+    """Download the patch bundle and move it into the path PCSX2 reads.
+
+    The download and the validation run as the broker's own user in a private
+    temp directory. Only the copy into `/usr/share` and the rename over the
+    live file go through `sudo -n`, so neither curl nor anything it fetched
+    ever runs with root's rights. The live file only ever changes by rename,
+    so a PCSX2 booting mid-refresh sees the old bundle or the new one, never a
+    partial copy.
+
+    Every failure is logged and swallowed: patches are nice to have, and a
+    launch without them still plays. This includes an `OSError` raised by the
+    filesystem work around the subprocess steps (a full or read-only
+    `TMPDIR`, a permission error `Path.is_dir` does not swallow, a `stat` on a
+    file removed out from under it), not just a failed step: the caller in
+    `launch` relies on this never raising.
+
+    Returns:
+        True when a new bundle was put in place.
+    """
+    if not _PATCHES_LOCK.acquire(blocking=False):
+        log.debug("patches fetch: already running, skipping")
+        return False
+    try:
+        if not PATCHES_ZIP.parent.is_dir():
+            log.warning(
+                "patches fetch: %s does not exist, is PCSX2 installed? skipping",
+                PATCHES_ZIP.parent,
+            )
+            return False
+        with tempfile.TemporaryDirectory(prefix="pcsx2-patches-") as tmp:
+            download = Path(tmp) / "patches.zip"
+            fetched = _run_step(
+                "download",
+                [
+                    _CURL,
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--location",
+                    "--proto",
+                    "=https",
+                    "--proto-redir",
+                    "=https",
+                    "--connect-timeout",
+                    "10",
+                    "--max-time",
+                    "30",
+                    "--max-filesize",
+                    str(_PATCHES_MAX_BYTES),
+                    "--output",
+                    str(download),
+                    "--",
+                    PATCHES_URL,
+                ],
+                timeout=40,
+            )
+            if not fetched:
+                return False
+            problem = _patches_zip_problem(download)
+            if problem is not None:
+                log.warning(
+                    "patches fetch: download from %s is %s, not installing it",
+                    PATCHES_URL,
+                    problem,
+                )
+                return False
+            size = download.stat().st_size
+            staged = PATCHES_ZIP.with_name(".patches.zip.new")
+            installed = _run_step(
+                "install",
+                [
+                    _SUDO,
+                    "-n",
+                    _INSTALL,
+                    "-m",
+                    "0644",
+                    "-o",
+                    "root",
+                    "-g",
+                    "root",
+                    "--",
+                    str(download),
+                    str(staged),
+                ],
+                timeout=15,
+            )
+            if not installed or not _run_step(
+                "rename", [_SUDO, "-n", _MV, "-f", "--", str(staged), str(PATCHES_ZIP)], timeout=15
+            ):
+                return False
+            log.info(
+                "patches fetch: installed %s (%d bytes) from %s", PATCHES_ZIP, size, PATCHES_URL
+            )
+            return True
+    except OSError as exc:
+        log.warning("patches fetch: failed: %s", exc)
+        return False
+    finally:
+        _PATCHES_LOCK.release()
 
 
 def _sstate_snapshot() -> dict[Path, tuple[int, float]]:

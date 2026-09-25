@@ -114,6 +114,42 @@ def _write_patches_zip(path: Path, members: Optional[dict[str, str]] = None) -> 
     return path
 
 
+def _fake_fetch_run(
+    calls: list[list[str]],
+    download: Optional[bytes] = None,
+    fail: Optional[str] = None,
+) -> Callable[..., object]:
+    """Build a `subprocess.run` stand-in that plays curl, install and mv.
+
+    Args:
+        calls: List each argv is appended to, in order.
+        download: Bytes curl "downloads"; a valid patch bundle when None.
+        fail: Basename of the binary to fail (`"curl"`, `"install"`, `"mv"`), if any.
+
+    Returns:
+        The fake.
+    """
+
+    def run(cmd: list[str], **kwargs: object) -> object:
+        calls.append(cmd)
+        tool = Path(cmd[2] if cmd[0] == pcsx2._SUDO else cmd[0]).name
+        if tool == fail:
+            return type("R", (), {"returncode": 1, "stdout": "", "stderr": f"{tool} said no"})()
+        if tool == "curl":
+            out = Path(cmd[cmd.index("--output") + 1])
+            if download is None:
+                _write_patches_zip(out)
+            else:
+                out.write_bytes(download)
+        elif tool == "install":
+            Path(cmd[-1]).write_bytes(Path(cmd[-2]).read_bytes())
+        elif tool == "mv":
+            Path(cmd[-2]).replace(cmd[-1])
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    return run
+
+
 @pytest.mark.parametrize(
     ("filename", "expected"),
     [
@@ -621,6 +657,146 @@ def test_patches_zip_problem_rejects_a_zip_that_fails_its_crc(tmp_path: Path) ->
     raw[raw.index(b"patch=1")] ^= 0xFF
     path.write_bytes(bytes(raw))
     assert pcsx2._patches_zip_problem(path) is not None
+
+
+def test_refresh_downloads_validates_and_moves_the_bundle_into_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A good download ends up at the path PCSX2 reads, and nothing is left staged."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(pcsx2.subprocess, "run", _fake_fetch_run(calls))
+
+    assert pcsx2._refresh_patches_zip() is True
+
+    assert pcsx2._patches_zip_problem(pcsx2.PATCHES_ZIP) is None
+    assert [p.name for p in pcsx2.PATCHES_ZIP.parent.iterdir()] == ["patches.zip"]
+
+
+def test_refresh_runs_curl_unprivileged_with_hardcoded_https_only_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Curl never runs under sudo, never skips TLS checks, and only speaks HTTPS."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(pcsx2.subprocess, "run", _fake_fetch_run(calls))
+
+    pcsx2._refresh_patches_zip()
+
+    curl = calls[0]
+    assert curl[0] == "/usr/bin/curl"
+    assert curl[-2:] == [
+        "--",
+        "https://github.com/PCSX2/pcsx2_patches/releases/download/latest/patches.zip",
+    ]
+    assert curl[curl.index("--proto") + 1] == "=https"
+    assert curl[curl.index("--proto-redir") + 1] == "=https"
+    assert "--fail" in curl
+    assert not {"-k", "--insecure"} & set(curl)
+
+
+def test_refresh_stages_then_renames_never_installs_over_the_live_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live path only ever changes by rename, so a booting PCSX2 never reads a half-copied zip."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(pcsx2.subprocess, "run", _fake_fetch_run(calls))
+
+    pcsx2._refresh_patches_zip()
+
+    install, mv = calls[1], calls[2]
+    staged = str(pcsx2.PATCHES_ZIP.with_name(".patches.zip.new"))
+    source = Path(install[-2])
+    assert install[:3] == ["/usr/bin/sudo", "-n", "/usr/bin/install"]
+    assert install[3:9] == ["-m", "0644", "-o", "root", "-g", "root"]
+    assert install[-3:] == ["--", install[-2], staged]
+    # The source is the unprivileged temp download, never a path already
+    # sitting beside the live file.
+    assert source.name == "patches.zip"
+    assert source.parent != pcsx2.PATCHES_ZIP.parent
+    assert mv == ["/usr/bin/sudo", "-n", "/usr/bin/mv", "-f", "--", staged, str(pcsx2.PATCHES_ZIP)]
+
+
+def test_refresh_does_not_install_a_download_that_fails_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An error page served with a 200 never reaches sudo, and a working install survives."""
+    _write_patches_zip(pcsx2.PATCHES_ZIP)
+    before = pcsx2.PATCHES_ZIP.read_bytes()
+    calls: list[list[str]] = []
+    monkeypatch.setattr(pcsx2.subprocess, "run", _fake_fetch_run(calls, download=b"<html>"))
+
+    assert pcsx2._refresh_patches_zip() is False
+
+    assert len(calls) == 1
+    assert pcsx2.PATCHES_ZIP.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("fail", "verb"), [("curl", "download"), ("install", "install"), ("mv", "rename")]
+)
+def test_refresh_failure_at_any_step_is_logged_not_raised(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, fail: str, verb: str
+) -> None:
+    """A network, sudo or rename failure returns False and says which step broke, at warning level."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(pcsx2.subprocess, "run", _fake_fetch_run(calls, fail=fail))
+
+    with caplog.at_level("WARNING", logger=pcsx2.log.name):
+        assert pcsx2._refresh_patches_zip() is False
+
+    assert f"{fail} said no" in caplog.text
+    assert f"patches fetch: {verb}" in caplog.text
+    matching = [r for r in caplog.records if f"patches fetch: {verb}" in r.message]
+    assert matching and all(r.levelname == "WARNING" for r in matching)
+
+
+def test_refresh_survives_a_timeout_or_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hung curl or an image without curl is a logged skip, not an exception."""
+
+    def hang(cmd: list[str], **kwargs: object) -> NoReturn:
+        raise pcsx2.subprocess.TimeoutExpired(cmd, 1)
+
+    monkeypatch.setattr(pcsx2.subprocess, "run", hang)
+    assert pcsx2._refresh_patches_zip() is False
+
+    def missing(cmd: list[str], **kwargs: object) -> NoReturn:
+        raise FileNotFoundError(cmd[0])
+
+    monkeypatch.setattr(pcsx2.subprocess, "run", missing)
+    assert pcsx2._refresh_patches_zip() is False
+
+
+def test_refresh_skips_when_the_resources_dir_is_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No PCSX2 resources directory means no PCSX2 to patch: no fetch, no sudo."""
+    monkeypatch.setattr(pcsx2, "PATCHES_ZIP", tmp_path / "absent" / "patches.zip")
+
+    assert pcsx2._refresh_patches_zip() is False  # the autouse stub raises if anything runs
+
+
+def test_refresh_is_skipped_while_another_is_running() -> None:
+    """A second launch does not queue behind, or double up on, a fetch already in flight."""
+    assert pcsx2._PATCHES_LOCK.acquire(blocking=False)
+    try:
+        assert pcsx2._refresh_patches_zip() is False  # the autouse stub raises if anything runs
+    finally:
+        pcsx2._PATCHES_LOCK.release()
+
+
+def test_refresh_survives_a_filesystem_error_and_frees_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A full or read-only TMPDIR is a logged skip, not an exception that escapes launch()."""
+
+    def broken_tempdir(*args: object, **kwargs: object) -> NoReturn:
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(pcsx2.tempfile, "TemporaryDirectory", broken_tempdir)
+
+    assert pcsx2._refresh_patches_zip() is False
+
+    assert pcsx2._PATCHES_LOCK.acquire(blocking=False)
+    pcsx2._PATCHES_LOCK.release()
 
 
 def test_a_launch_stops_at_an_unpatchable_ini(
