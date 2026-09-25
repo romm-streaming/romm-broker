@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.10.0](https://github.com/romm-streaming/romm-broker/compare/v0.9.0...v0.10.0) (2026-09-24)
+
+
+### Features
+
+* add shared cache-key fingerprinting ([4b0075b](https://github.com/romm-streaming/romm-broker/commit/4b0075b83addd696b3228d692836acf93538d5ac))
+* add shared dir-sizing and last-accessed marker helpers ([9632f3d](https://github.com/romm-streaming/romm-broker/commit/9632f3dd4ed07b774c753970a22baa1df37b118e))
+* add shared LRU eviction with an on_evict hook ([f6f35ff](https://github.com/romm-streaming/romm-broker/commit/f6f35ff716666828433cb053eb538f93d7d01bd0))
+* add shared per-instance locking and scratch cleanup ([27ee55a](https://github.com/romm-streaming/romm-broker/commit/27ee55acadacf80f01eaba29526effe4bd7d237a))
+* add shared two-figure disk-space guard ([429ac3c](https://github.com/romm-streaming/romm-broker/commit/429ac3c7a4f9ff20b1729106d7a7359da3826062))
+* add the shared default listing-based budget ([56be69f](https://github.com/romm-streaming/romm-broker/commit/56be69f3b169b225ff75d19998289dc7701d5675))
+* add the shared default safe-extract stage ([124471d](https://github.com/romm-streaming/romm-broker/commit/124471d2a94e74c71eaf0add2b45122db9b0e730))
+* add the shared extract() orchestration method ([5597c3c](https://github.com/romm-streaming/romm-broker/commit/5597c3c38af7d2400af29ada645f8516289ea338))
+* scaffold the shared ExtractionCache class ([7982dfe](https://github.com/romm-streaming/romm-broker/commit/7982dfe818246c79de78b0f2dfb01561d67b59ff))
+
+
+### Bug Fixes
+
+* correct the eviction test's cap so it actually forces eviction ([3c92c8f](https://github.com/romm-streaming/romm-broker/commit/3c92c8fa17d6344f59ce1887997ce27bfc8b1da0))
+* **extraction-cache:** fix log drift and doubled sweep name, dedupe shared constants, document extract() as unsupported for rpcs3/shadps4 ([4cb03ea](https://github.com/romm-streaming/romm-broker/commit/4cb03ea582cc49a39d06214ffd26620258313ea3))
+* **pcsx2:** validate cached patches.zip before every launch ([32518c7](https://github.com/romm-streaming/romm-broker/commit/32518c781e74dcc1731c755d1245aef0b2a959c3))
+* restore forward-looking imports for later ExtractionCache tasks ([67061e3](https://github.com/romm-streaming/romm-broker/commit/67061e325a27b4068e0cd20495277f33617a22dc))
+* **retroarch:** enable .srm save import/export for nds ([fd338f8](https://github.com/romm-streaming/romm-broker/commit/fd338f8cbf7c7ac00b3dbd77acc54b9315bf0405))
+* **retroarch:** isolate core-owned saves that live outside SAVE_DIR ([e1d3bf5](https://github.com/romm-streaming/romm-broker/commit/e1d3bf50033ad4953d9dd1616a4fa1157b5dc7a0))
+* **retroarch:** isolate core-owned saves that live outside SAVE_DIR ([d769c6a](https://github.com/romm-streaming/romm-broker/commit/d769c6a9b72f8797c7bfa81bd2e62bf027c4ef23))
+* **retroarch:** switch nds to the maintained melondsds core ([81bb50c](https://github.com/romm-streaming/romm-broker/commit/81bb50c9a3658109bf9c91d30b4864839f70baf6))
+* **rpcs3:** drop dead missing_target_error config and stale docstring reference ([b9f6a09](https://github.com/romm-streaming/romm-broker/commit/b9f6a098c0943209d1797787a172ca0fd06d75f2))
+* **saves:** refuse bzip2 and lzma members instead of unbounded-decompressing them ([cb714b7](https://github.com/romm-streaming/romm-broker/commit/cb714b754f0e217b2f47efebc841f6a4b2ee21e5))
+
 ## [0.9.0](https://github.com/romm-streaming/romm-broker/compare/v0.8.5...v0.9.0) (2026-09-21)
 
 
