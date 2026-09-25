@@ -108,11 +108,42 @@ streaming:
       label: WEBSTATION
 ```
 
-`host` can also be a full URL (`https://webstation.example.com`) instead of a
-path. That is the cross-origin deployment: RomM's player falls back to its
-edge-strip overlay automatically to make up for the lost pointer tracking, but
-camera, microphone, and automatic invite-link copying stay broken there for
-the reason above. There is no proxy-side fix for those.
+`host` can also be a full URL. What matters is the origin it names, not
+whether it is written as a path:
+
+- **A full URL on RomM's own origin** (`https://romm.example.com/streaming`,
+  where RomM itself is served from `https://romm.example.com`) is the same
+  deployment as the path form. The browser ends up at the same address
+  either way, so everything on this page applies unchanged. The path in it
+  still has to match `subfolder`.
+- **A full URL on any other origin** (`https://webstation.example.com`, or
+  the same host on a different port or scheme) is the cross-origin
+  deployment. RomM's player falls back to its edge-strip overlay
+  automatically to make up for the lost pointer tracking, but camera,
+  microphone, and automatic invite-link copying stay broken there for the
+  reason above. There is no proxy-side fix for those.
+
+`broker_secret` has to match the container's `BROKER_SECRET`. If you would
+rather keep it out of `config.yml`, set `STREAMING_BROKER_SECRET` in RomM's
+own environment instead. When that is set, RomM uses it for every streaming
+container and ignores each entry's `broker_secret`, so it only suits
+deployments where all containers share one secret.
+
+### When RomM and the container share a Docker network
+
+If both run from the same Compose file, or are otherwise attached to a
+common Docker network, RomM's backend can reach the container by its service
+name. Point `broker_host` at that name and the container's own port `3000`,
+not a port you published on the host:
+
+```yaml
+broker_host: http://romm_webstation:3000
+```
+
+A published host port (`3009:3000`) is only reachable through the host's
+address, which a container on a bridge network often can't see. Once a
+reverse proxy and `broker_host` both reach the container over the Docker
+network, it needs no published ports at all.
 
 Session identity is derived from `broker_host`, not `host`, so moving a
 container behind a proxy does not disturb a session it is already holding.
@@ -198,13 +229,92 @@ its own, so there is nothing to add for those.
 </Tab>
 <Tab value="Traefik">
 
-```yaml
-labels:
-  - "traefik.http.routers.streaming.rule=Host(`romm.example.com`) && PathPrefix(`/streaming`)"
-  - "traefik.http.services.streaming.loadbalancer.server.port=3000"
+With Traefik's Docker provider, both routers are labels on the services
+themselves. This example assumes RomM and the container sit in one Compose
+file, sharing a private `romm-internal` network and joined to an external
+`traefik-ingress` network that Traefik also lives on.
+
+```yaml title="docker-compose.yml"
+services:
+  romm:
+    # ...image, volumes and the rest of RomM's own settings
+    environment:
+      - STREAMING_BROKER_SECRET=change-me
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: traefik-ingress
+      traefik.http.routers.romm.rule: Host(`romm.example.com`)
+      traefik.http.routers.romm.entrypoints: websecure
+      traefik.http.routers.romm.priority: "1"
+      traefik.http.services.romm.loadbalancer.server.port: "8080"
+    networks:
+      - romm-internal
+      - traefik-ingress
+
+  romm_webstation:
+    # ...image, volumes and the rest of the container's settings
+    environment:
+      - SUBFOLDER=/streaming/
+      - BROKER_SECRET=change-me
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: traefik-ingress
+      traefik.http.routers.romm_webstation.rule: Host(`romm.example.com`) && PathPrefix(`/streaming/`)
+      traefik.http.routers.romm_webstation.entrypoints: websecure
+      traefik.http.routers.romm_webstation.priority: "10"
+      traefik.http.services.romm_webstation.loadbalancer.server.port: "3000"
+    networks:
+      - romm-internal
+      - traefik-ingress
+
+networks:
+  romm-internal:
+  traefik-ingress:
+    external: true
 ```
 
-Do not attach a `stripPrefix` middleware.
+```yaml title="config.yml"
+streaming:
+  enabled: true
+  containers:
+    - platform: ps2
+      # Either form works, since both name RomM's own origin:
+      host: /streaming
+      # host: https://romm.example.com/streaming
+      broker_host: http://romm_webstation:3000
+      subfolder: /streaming
+      protocol: webstation
+      emulator: pcsx2
+      library_path: /romm
+```
+
+What each piece is for:
+
+- **Priorities.** Both routers match ``Host(`romm.example.com`)``, and
+  RomM's matches every path on it. The explicit `priority` values make sure
+  `/streaming/` always goes to the container instead of RomM, rather than
+  relying on Traefik's default of ranking rules by their length.
+- **`traefik.docker.network`.** Each service is on two networks, so Traefik
+  has two addresses to choose from. Naming the network it shares with them
+  stops it from picking the `romm-internal` address, which it can't reach,
+  and answering with an intermittent `502`.
+- **``PathPrefix(`/streaming/`)`` with the trailing slash.** Without it the
+  rule also matches `/streaming-2/` and anything else that starts with the
+  same letters, which matters as soon as you run [more than one
+  container](#running-more-than-one-container).
+- **No `stripPrefix` middleware.** The container expects the prefix intact.
+- **`broker_host` uses the service name**, as described
+  [above](#when-romm-and-the-container-share-a-docker-network). RomM's
+  backend talks to the container directly over `romm-internal` and never goes
+  through Traefik. The browser is the only thing that uses `host`.
+- **`STREAMING_BROKER_SECRET` on RomM** takes the place of `broker_secret` in
+  `config.yml`, and must equal the container's `BROKER_SECRET`.
+
+Neither service needs a `ports:` mapping for any of this. Keep one only if
+you also want to reach a service directly, bypassing Traefik.
+
+Thanks to [@hylandpad](https://github.com/hylandpad) for the working setup
+this recipe is based on ([#66](https://github.com/romm-streaming/romm-broker/issues/66)).
 
 </Tab>
 </Tabs>
