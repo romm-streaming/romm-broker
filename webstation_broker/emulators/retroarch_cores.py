@@ -16,12 +16,18 @@ import hashlib
 import io
 import json
 import logging
+import os
 import re
+import secrets
+import time
 import zipfile
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, Optional
+from typing import Any, Callable, Optional
+
+import anyio.to_thread
+import httpx
 
 log = logging.getLogger(__name__)
 
@@ -161,26 +167,42 @@ class Catalog:
     Attributes:
         cores: Core name to its info, read-only.
         info_zip: The zip the catalog was built from, for installing `.info` files.
+        cache_zip: The zip a background refresh wrote, or None before any refresh has
+            landed (§7).
+        protected: Cores a refresh may never change: every default, every alternate
+            and every core in `TIERS`. `info_file` never serves one of these from
+            `cache_zip`, even when the merged catalog holds one.
     """
 
     cores: Mapping[str, CoreInfo]
     info_zip: bytes
+    cache_zip: Optional[bytes] = None
+    protected: frozenset[str] = frozenset()
 
     def info_file(self, core: str) -> Optional[bytes]:
-        """The core's `.info` file from `info_zip`, or None when the catalog lacks it.
+        """The core's `.info` file, preferring the refreshed zip for an unprotected core.
 
         Args:
             core: The core name.
 
         Returns:
-            The file's bytes, or None.
+            The file's bytes, or None when the catalog lacks it. A protected core
+            is always read from `info_zip`; an unprotected one is looked up in
+            `cache_zip` first and falls back to `info_zip`, so a core the cache no
+            longer lists still resolves to the bundled entry.
         """
         if core not in self.cores:
             return None
-        with zipfile.ZipFile(io.BytesIO(self.info_zip)) as zf:
-            for member in zf.infolist():
-                if PurePosixPath(member.filename).name == f"{core}{_INFO_SUFFIX}":
-                    return zf.read(member)
+        zips = (
+            (self.info_zip,)
+            if self.cache_zip is None or core in self.protected
+            else (self.cache_zip, self.info_zip)
+        )
+        for zip_bytes in zips:
+            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                for member in zf.infolist():
+                    if PurePosixPath(member.filename).name == f"{core}{_INFO_SUFFIX}":
+                        return zf.read(member)
         return None
 
 
@@ -554,3 +576,248 @@ def set_catalog(new: Catalog) -> None:
     """
     global _catalog
     _catalog = new
+
+
+ZIP_CAP = 5 * 1024 * 1024
+"""Largest core-info zip a refresh accepts, 5 MiB (§7)."""
+INDEX_CAP = 256 * 1024
+"""Largest buildbot index a refresh accepts, 256 KiB (§7)."""
+REFRESH_EVERY = 7 * 24 * 3600
+"""Seconds between background refreshes, 7 days (§7)."""
+CACHE_ZIP = "core_info_cache.zip"
+"""File name the refreshed core-info zip is cached under, in `RA_DATA_DIR`."""
+CACHE_INDEX = "core_info_cache.index"
+"""File name the refreshed buildbot index is cached under, in `RA_DATA_DIR`."""
+FETCH_DEADLINE = 120
+"""Total seconds a single fetch may take (§7). `timeout=60` below is a per-read
+timeout, so without this a server that trickles a byte every 59 seconds would
+otherwise never finish."""
+
+
+def protected_cores(platforms: Mapping[str, Mapping[str, Any]]) -> frozenset[str]:
+    """Cores a refresh may never change: every default, every alternate, every tiered core.
+
+    Args:
+        platforms: The platform table.
+
+    Returns:
+        Their names.
+    """
+    names = {info["core"] for info in platforms.values()}
+    names |= {core for info in platforms.values() for core in info.get("alternates", {})}
+    return frozenset(names | set(TIERS))
+
+
+def merge_catalogs(bundled: Catalog, cache: Catalog, protected: frozenset[str]) -> Catalog:
+    """Bundled first, then the cache, never overriding a protected core (§7).
+
+    Args:
+        bundled: The catalog from the package.
+        cache: The catalog from a refresh.
+        protected: Cores the cache may not change.
+
+    Returns:
+        The merged catalog.
+    """
+    cores = dict(bundled.cores)
+    for name, info in cache.cores.items():
+        if name not in protected:
+            cores[name] = info
+    return Catalog(MappingProxyType(cores), bundled.info_zip, cache.info_zip, protected)
+
+
+def installed_cores(cores_dir: Path) -> frozenset[str]:
+    """Cores whose `.so` is already in `cores_dir`.
+
+    Args:
+        cores_dir: RetroArch's core dir.
+
+    Returns:
+        Their names, or an empty set when `cores_dir` cannot be listed.
+    """
+    try:
+        return frozenset(p.name[: -len("_libretro.so")] for p in cores_dir.glob("*_libretro.so"))
+    except OSError:
+        return frozenset()
+
+
+def _http_fetch(url: str, cap: int) -> bytes:
+    """GET `url`, refusing a body over `cap` bytes or a fetch over `FETCH_DEADLINE`.
+
+    Args:
+        url: What to fetch.
+        cap: The largest body accepted.
+
+    Returns:
+        The body.
+
+    Raises:
+        ValueError: When the body is over `cap`, or the fetch runs past `FETCH_DEADLINE`.
+        httpx.HTTPError: When the request fails.
+    """
+    buf = bytearray()
+    deadline = time.monotonic() + FETCH_DEADLINE
+    with httpx.stream("GET", url, follow_redirects=True, timeout=60) as resp:
+        resp.raise_for_status()
+        for chunk in resp.iter_bytes():
+            buf += chunk
+            if len(buf) > cap:
+                raise ValueError(f"{url} is over {cap} bytes")
+            if time.monotonic() > deadline:
+                raise ValueError(f"{url} took over {FETCH_DEADLINE}s")
+    return bytes(buf)
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
+    """Write `data` to `path` through a temp file and a rename.
+
+    Args:
+        path: The destination.
+        data: The bytes.
+    """
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def refresh_once(
+    cache_dir: Path,
+    cores_dir: Path,
+    *,
+    fetch: Callable[[str, int], bytes],
+    platforms: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    """Fetch, validate, cache and swap in a fresh catalog; keep the current one on any failure.
+
+    Args:
+        cache_dir: Where the cache files go (`RA_DATA_DIR`).
+        cores_dir: RetroArch's core dir, for sticky removal.
+        fetch: `(url, cap) -> bytes`; `_http_fetch` outside tests.
+        platforms: The platform table.
+
+    Returns:
+        Whether a new catalog was swapped in.
+    """
+    zip_url = (
+        os.environ.get("RETROARCH_CORE_INFO_URL", "").strip()
+        or "https://buildbot.libretro.com/assets/frontend/info.zip"
+    )
+    index_url = (
+        os.environ.get("RETROARCH_CORE_INDEX_URL", "").strip()
+        or "https://buildbot.libretro.com/nightly/linux/x86_64/latest/.index"
+    )
+    try:
+        zip_bytes = fetch(zip_url, ZIP_CAP)
+        index_text = fetch(index_url, INDEX_CAP).decode("utf-8", "replace")
+        if not parse_info_zip(zip_bytes):
+            raise ValueError("the zip holds no .info members")
+    except Exception as exc:  # noqa: BLE001 - a hostile or corrupt zip can raise
+        # far more than httpx.HTTPError/OSError/ValueError/zipfile.BadZipFile
+        # (zlib.error, RuntimeError for an encrypted member, NotImplementedError,
+        # EOFError, ...); §7 says any failure here keeps the current catalog.
+        log.warning("retroarch: core info refresh failed, keeping the current catalog: %s", exc)
+        return False
+    lines = [line for line in index_text.splitlines() if line.strip()]
+    dropped = len(lines) - len(parse_index(index_text))
+    if dropped:
+        log.info(
+            "retroarch: core info refresh dropped %d index line(s) that are not valid core names",
+            dropped,
+        )
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        # Index first: refresh_forever schedules off the zip's mtime, so a
+        # failed index write must never leave a fresh zip behind on its own.
+        _write_atomic(cache_dir / CACHE_INDEX, index_text.encode())
+        _write_atomic(cache_dir / CACHE_ZIP, zip_bytes)
+    except OSError as exc:
+        log.warning("retroarch: core info refresh could not write its cache: %s", exc)
+        return False
+    try:
+        installed = installed_cores(cores_dir)
+        cache = build_catalog(zip_bytes, index_text, installed)
+        set_catalog(merge_catalogs(load_bundled_catalog(installed), cache, protected_cores(platforms)))
+    except Exception as exc:  # noqa: BLE001 - building the catalog re-parses the
+        # same fetched bytes, so the same open-ended set of errors applies; keep
+        # the current catalog rather than let one escape.
+        log.warning(
+            "retroarch: core info refresh could not build the catalog, keeping the current one: %s", exc
+        )
+        return False
+    log.info("retroarch: core info refreshed, %d cores", len(catalog().cores))
+    return True
+
+
+def load_startup_catalog(
+    cache_dir: Path, cores_dir: Path, platforms: Mapping[str, Mapping[str, Any]]
+) -> None:
+    """Load the bundled catalog, merged with a cache from a previous refresh when one is valid.
+
+    Runs once at lifespan start, whether or not `RETROARCH_CORE_INFO_REFRESH` is
+    set, so a cache a previous broker process wrote is used immediately instead
+    of waiting out a full refresh interval.
+
+    Args:
+        cache_dir: Where the cache files are (`RA_DATA_DIR`).
+        cores_dir: RetroArch's core dir, for sticky removal.
+        platforms: The platform table.
+    """
+    installed = installed_cores(cores_dir)
+    bundled = load_bundled_catalog(installed)
+    try:
+        zip_bytes = (cache_dir / CACHE_ZIP).read_bytes()
+        index_text = (cache_dir / CACHE_INDEX).read_text()
+    except FileNotFoundError:
+        # No cache yet is the default configuration (a fresh install, or a
+        # refresh that has never run): not a failure, so no WARNING.
+        log.debug("retroarch: no cached core catalog yet, using the bundled one")
+        set_catalog(bundled)
+        return
+    try:
+        if not parse_info_zip(zip_bytes):
+            raise ValueError("the cached zip holds no .info members")
+        cache = build_catalog(zip_bytes, index_text, installed)
+        set_catalog(merge_catalogs(bundled, cache, protected_cores(platforms)))
+    except Exception as exc:  # noqa: BLE001 - a corrupt on-disk cache can raise
+        # far more than OSError/ValueError/zipfile.BadZipFile (zlib.error,
+        # RuntimeError for an encrypted member, NotImplementedError, EOFError,
+        # ...); a bad cache must never stop the broker from booting.
+        log.warning(
+            "retroarch: could not load the cached core catalog, using the bundled one: %s", exc
+        )
+        set_catalog(bundled)
+
+
+async def refresh_forever(
+    cache_dir: Path, cores_dir: Path, platforms: Mapping[str, Mapping[str, Any]]
+) -> None:
+    """Refresh at startup when the cache is stale, then every 7 days (§7).
+
+    Args:
+        cache_dir: Where the cache files go.
+        cores_dir: RetroArch's core dir.
+        platforms: The platform table.
+    """
+    while True:
+        try:
+            age = time.time() - (cache_dir / CACHE_ZIP).stat().st_mtime
+        except OSError:
+            age = REFRESH_EVERY
+        if age >= REFRESH_EVERY:
+            try:
+                await anyio.to_thread.run_sync(
+                    functools.partial(
+                        refresh_once, cache_dir, cores_dir, fetch=_http_fetch, platforms=platforms
+                    ),
+                    abandon_on_cancel=True,
+                )
+            except Exception:  # noqa: BLE001 - refresh_once already turns its own
+                # known failures into a returned bool; this only guards against
+                # something unexpected escaping it, and a refresh must never end
+                # the loop for the life of the process (§7).
+                log.exception("retroarch: core info refresh crashed, keeping the current catalog")
+            age = 0
+        await anyio.sleep(REFRESH_EVERY - age)

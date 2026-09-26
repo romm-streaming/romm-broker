@@ -1,14 +1,37 @@
 """Tests for the RetroArch core catalog, tiers and profile resolution."""
 
 import io
+import logging
+import threading
 import zipfile
+import zlib
+from collections.abc import Iterator, Mapping
+from pathlib import Path
+from typing import Any, Callable
 
 import pytest
 from fastapi.testclient import TestClient
 
+from webstation_broker import settings
+from webstation_broker.app import create_app
+from webstation_broker.emulators import retroarch
 from webstation_broker.emulators import retroarch_cores as rc
 
 from .conftest import PREFIX
+
+
+@pytest.fixture(autouse=True)
+def clean_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reset the module-global catalog before and after every test in this module.
+
+    `rc._catalog` is module-global state, so a test's `set_catalog` would
+    otherwise leak into the next one.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher, undone (restoring the pre-test
+            value, which this same fixture already reset to None) when the test ends.
+    """
+    monkeypatch.setattr(rc, "_catalog", None)
 
 
 def info_zip(infos: dict[str, dict[str, str]]) -> bytes:
@@ -337,3 +360,411 @@ def test_cores_route_lists_every_platform_without_one(client: TestClient) -> Non
 def test_cores_route_404s_an_unknown_platform(client: TestClient) -> None:
     """Not a RetroArch platform."""
     assert client.get(f"{PREFIX}/api/retroarch/cores", params={"platform": "ps2"}).status_code == 404
+
+
+def _fetcher(zip_bytes: bytes, index: str) -> Callable[[str, int], bytes]:
+    """A fetch stub serving one zip and one index by URL suffix.
+
+    Args:
+        zip_bytes: The body served for a URL ending in `.zip`.
+        index: The body served for any other URL, encoded as UTF-8.
+
+    Returns:
+        A `fetch(url, cap)` callable matching `refresh_once`'s `fetch` parameter.
+    """
+
+    def fetch(url: str, cap: int) -> bytes:
+        """Serve `zip_bytes` or `index`, refusing a body over `cap`.
+
+        Args:
+            url: The URL being fetched.
+            cap: The largest body accepted.
+
+        Returns:
+            The body.
+
+        Raises:
+            ValueError: When the body is over `cap`.
+        """
+        body = zip_bytes if url.endswith(".zip") else index.encode()
+        if len(body) > cap:
+            raise ValueError("over cap")
+        return body
+
+    return fetch
+
+
+class TestRefresh:
+    """§7, all offline."""
+
+    def test_refresh_adds_an_untested_core_and_writes_the_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A new core becomes launchable; files land atomically."""
+        rc.set_catalog(rc.load_bundled_catalog())
+        new = info_zip({"brand_new": {"corename": "BN", "supported_extensions": "sfc"}})
+        assert rc.refresh_once(
+            tmp_path, tmp_path, fetch=_fetcher(new, "brand_new_libretro.so.zip"), platforms=PLATFORMS
+        )
+        assert "brand_new" in rc.catalog().cores
+        assert (tmp_path / "core_info_cache.zip").read_bytes() == new
+        assert not list(tmp_path.glob("*.tmp"))
+
+    def test_refresh_never_changes_a_protected_core(self, tmp_path: Path) -> None:
+        """default, vetted and tiered cores keep the bundled entry."""
+        rc.set_catalog(rc.load_bundled_catalog())
+        evil = info_zip({"snes9x": {"corename": "EVIL", "supported_extensions": "exe"}})
+        rc.refresh_once(
+            tmp_path,
+            tmp_path,
+            fetch=_fetcher(evil, "snes9x_libretro.so.zip"),
+            platforms={"snes": {"core": "snes9x", "extensions": (".sfc",)}},
+        )
+        assert rc.catalog().cores["snes9x"].corename == "Snes9x"
+        assert b"EVIL" not in (rc.catalog().info_file("snes9x") or b"")
+
+    @pytest.mark.parametrize("bad", ["cap", "notzip", "noinfo"])
+    def test_a_bad_fetch_keeps_the_current_catalog(
+        self, tmp_path: Path, bad: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Over cap, not a zip, or no .info members: warn and keep."""
+        rc.set_catalog(rc.load_bundled_catalog())
+        before = rc.catalog()
+        body = {"cap": b"x" * (rc.ZIP_CAP + 1), "notzip": b"nope", "noinfo": info_zip({})}[bad]
+        with caplog.at_level(logging.WARNING):
+            assert not rc.refresh_once(tmp_path, tmp_path, fetch=_fetcher(body, ""), platforms=PLATFORMS)
+        assert rc.catalog() is before and "core info refresh" in caplog.text
+
+    def test_bad_core_names_are_dropped_and_counted(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Names are filtered by ^[a-z0-9_]+$."""
+        rc.set_catalog(rc.load_bundled_catalog())
+        z = info_zip({"good_one": {"supported_extensions": "sfc"}})
+        with caplog.at_level(logging.INFO):
+            rc.refresh_once(
+                tmp_path,
+                tmp_path,
+                fetch=_fetcher(z, "good_one_libretro.so.zip\nBad-One_libretro.so.zip"),
+                platforms=PLATFORMS,
+            )
+        assert "dropped 1" in caplog.text
+
+    def test_removal_is_sticky_for_an_installed_core(self, tmp_path: Path) -> None:
+        """A core gone from the index stays if its .so is installed."""
+        rc.set_catalog(rc.load_bundled_catalog())
+        (tmp_path / "gone_libretro.so").write_bytes(b"so")
+        z = info_zip({"gone": {"supported_extensions": "sfc"}})
+        rc.refresh_once(tmp_path, tmp_path, fetch=_fetcher(z, ""), platforms=PLATFORMS)
+        assert "gone" in rc.catalog().cores
+
+    def test_load_startup_catalog_merges_a_valid_cache(self, tmp_path: Path) -> None:
+        """A cache-only core, not in the bundled catalog, is present after startup."""
+        z = info_zip({"cache_only": {"corename": "Cache Only", "supported_extensions": "sfc"}})
+        (tmp_path / rc.CACHE_INDEX).write_text("cache_only_libretro.so.zip\n")
+        (tmp_path / rc.CACHE_ZIP).write_bytes(z)
+
+        rc.load_startup_catalog(tmp_path, tmp_path, PLATFORMS)
+
+        assert "cache_only" in rc.catalog().cores
+
+    @pytest.mark.parametrize("kind", ["truncated", "zlib_error"])
+    def test_load_startup_catalog_falls_back_on_a_corrupt_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+    ) -> None:
+        """Ruling R8: a corrupt on-disk cache must not stop the broker from booting.
+
+        A truncated zip raises `zipfile.BadZipFile` on its own. The second case
+        stands in for a member that fails to decompress (`zlib.error`), which
+        needs a real deflate-stream corruption to trigger naturally; monkeypatch
+        `parse_info_zip` instead, but only for the cached bytes, so the bundled
+        catalog's own (unrelated) parse is untouched.
+        """
+        (tmp_path / rc.CACHE_INDEX).write_text("x_libretro.so.zip\n")
+        if kind == "truncated":
+            (tmp_path / rc.CACHE_ZIP).write_bytes(b"PK\x03\x04not a real zip")
+        else:
+            bad_zip = info_zip({"x": {"supported_extensions": "sfc"}})
+            (tmp_path / rc.CACHE_ZIP).write_bytes(bad_zip)
+            real_parse_info_zip = rc.parse_info_zip
+
+            def flaky(data: bytes) -> dict[str, rc.CoreInfo]:
+                """Raise for the cached bytes only; defer to the real parser otherwise.
+
+                Args:
+                    data: The zip bytes being parsed.
+
+                Returns:
+                    The real parser's result, for any input other than `bad_zip`.
+
+                Raises:
+                    zlib.error: When `data` is the cached zip under test.
+                """
+                if data == bad_zip:
+                    raise zlib.error("bad deflate stream")
+                return real_parse_info_zip(data)
+
+            monkeypatch.setattr(rc, "parse_info_zip", flaky)
+
+        rc.load_startup_catalog(tmp_path, tmp_path, PLATFORMS)  # must not raise
+
+        assert rc.catalog() is rc.load_bundled_catalog(frozenset())
+
+    def test_load_startup_catalog_is_quiet_about_no_cache(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No cache files yet is the default configuration, not a failure."""
+        with caplog.at_level(logging.WARNING):
+            rc.load_startup_catalog(tmp_path, tmp_path, PLATFORMS)
+        assert not caplog.records
+        assert rc.catalog() is rc.load_bundled_catalog(frozenset())
+
+    async def test_refresh_forever_skips_a_fresh_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cache written moments ago is not stale; refresh_once must not run yet."""
+        (tmp_path / rc.CACHE_ZIP).write_bytes(b"x")
+        calls: list[object] = []
+
+        class Sentinel(Exception):
+            """Stops the infinite loop once the first sleep is reached."""
+
+        def fake_refresh_once(*args: object, **kwargs: object) -> bool:
+            """Record that it ran; it must never be called in this test.
+
+            Args:
+                args: Unused.
+                kwargs: Unused.
+
+            Returns:
+                False.
+            """
+            calls.append((args, kwargs))
+            return False
+
+        async def fake_sleep(seconds: float) -> None:
+            """Stand in for `anyio.sleep`, ending the loop instead of waiting.
+
+            Args:
+                seconds: Unused.
+
+            Raises:
+                Sentinel: Always, once control reaches the loop's sleep.
+            """
+            raise Sentinel
+
+        monkeypatch.setattr(rc, "refresh_once", fake_refresh_once)
+        monkeypatch.setattr(rc.anyio, "sleep", fake_sleep)
+
+        with pytest.raises(Sentinel):
+            await rc.refresh_forever(tmp_path, tmp_path, PLATFORMS)
+
+        assert calls == []
+
+    async def test_refresh_forever_survives_a_crash_and_keeps_looping(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ruling R8: an exception escaping refresh_once must not end the loop."""
+        calls: list[float] = []
+
+        class Sentinel(Exception):
+            """Stops the infinite loop once the second sleep is reached."""
+
+        def fake_refresh_once(*args: object, **kwargs: object) -> bool:
+            """Simulate a bug that escapes refresh_once's own error handling.
+
+            Args:
+                args: Unused.
+                kwargs: Unused.
+
+            Raises:
+                RuntimeError: Always.
+            """
+            raise RuntimeError("boom")
+
+        async def fake_sleep(seconds: float) -> None:
+            """Record each call, ending the loop on the second one.
+
+            Args:
+                seconds: The seconds `refresh_forever` asked to sleep.
+
+            Raises:
+                Sentinel: Once this is the second call.
+            """
+            calls.append(seconds)
+            if len(calls) >= 2:
+                raise Sentinel
+
+        monkeypatch.setattr(rc, "refresh_once", fake_refresh_once)
+        monkeypatch.setattr(rc.anyio, "sleep", fake_sleep)
+
+        with pytest.raises(Sentinel):
+            await rc.refresh_forever(tmp_path, tmp_path, PLATFORMS)
+
+        assert len(calls) == 2
+
+    def test_http_fetch_enforces_the_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A response over `cap` bytes is cut off before it is fully buffered."""
+
+        class FakeResponse:
+            """Stands in for `httpx.Response`."""
+
+            def raise_for_status(self) -> None:
+                """Do nothing; the fake response is never an error."""
+
+            def iter_bytes(self) -> Iterator[bytes]:
+                """Yield a single chunk over the cap under test.
+
+                Yields:
+                    One 10-byte chunk.
+                """
+                yield b"x" * 10
+
+        class FakeStream:
+            """Stands in for the context manager `httpx.stream` returns."""
+
+            def __enter__(self) -> "FakeResponse":
+                """Return the fake response.
+
+                Returns:
+                    The fake response.
+                """
+                return FakeResponse()
+
+            def __exit__(self, *exc: object) -> None:
+                """Do nothing; the fake stream needs no cleanup.
+
+                Args:
+                    exc: Unused.
+                """
+
+        monkeypatch.setattr(rc.httpx, "stream", lambda *a, **k: FakeStream())
+
+        with pytest.raises(ValueError, match="over"):
+            rc._http_fetch("https://example.invalid/x", 5)
+
+    def test_http_fetch_enforces_the_deadline(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Ruling R8: `timeout=60` is per read, so a trickling server needs a total deadline too."""
+        times = iter([0.0, 0.0, rc.FETCH_DEADLINE + 1])
+        monkeypatch.setattr(rc.time, "monotonic", lambda: next(times))
+
+        class FakeResponse:
+            """Stands in for `httpx.Response`, trickling one byte at a time."""
+
+            def raise_for_status(self) -> None:
+                """Do nothing; the fake response is never an error."""
+
+            def iter_bytes(self) -> Iterator[bytes]:
+                """Yield chunks well under the cap, so only the deadline can stop this.
+
+                Yields:
+                    Two 1-byte chunks.
+                """
+                yield b"a"
+                yield b"b"
+
+        class FakeStream:
+            """Stands in for the context manager `httpx.stream` returns."""
+
+            def __enter__(self) -> "FakeResponse":
+                """Return the fake response.
+
+                Returns:
+                    The fake response.
+                """
+                return FakeResponse()
+
+            def __exit__(self, *exc: object) -> None:
+                """Do nothing; the fake stream needs no cleanup.
+
+                Args:
+                    exc: Unused.
+                """
+
+        monkeypatch.setattr(rc.httpx, "stream", lambda *a, **k: FakeStream())
+
+        with pytest.raises(ValueError, match="took over"):
+            rc._http_fetch("https://example.invalid/x", 1_000_000)
+
+    def test_refresh_does_not_change_a_running_profile(self) -> None:
+        """Review Focus 5: a resolved profile is a snapshot.
+
+        Ruling R3: this cannot fail as written, because `resolve` builds its
+        profile from the module-level `CATALOG` fixture it is passed
+        explicitly, not from `rc.catalog()`. Kept anyway, alongside the test
+        below that drives the same scenario through a real `Retroarch`
+        session, which does read `rc.catalog()`.
+        """
+        rc.set_catalog(CATALOG)
+        profile = resolve("snes", "beetle_snes", experimental=True)
+        rc.set_catalog(rc.build_catalog(info_zip({}), ""))
+        assert profile["core"] == "beetle_snes" and profile["extensions"] == (".sfc", ".smc")
+
+    def test_refresh_does_not_change_a_running_retroarch_session(self) -> None:
+        """Review Focus 5, through a real session: a catalog swap never touches a resolved profile.
+
+        `Retroarch._profile` resolves once per (platform, core) pair and
+        caches the result on the instance, so a refresh swapping `rc.catalog()`
+        out from under a session already playing must not move it.
+        """
+        rc.set_catalog(CATALOG)
+        emu = retroarch.Retroarch()
+        emu.platform = "snes"
+        emu.core = "beetle_snes"
+        emu.experimental_cores = True
+        emu.select_core()
+        profile = emu._profile()
+        core = emu.archive_core()
+
+        rc.set_catalog(rc.build_catalog(info_zip({}), ""))
+
+        assert emu._profile() is profile
+        assert emu.archive_core() == core == "beetle_snes"
+
+
+def test_lifespan_starts_the_refresh_task_when_opted_in(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """§7: RETROARCH_CORE_INFO_REFRESH starts the background loop, which runs once at once.
+
+    The app still shuts down cleanly: the lifespan's task group cancels the
+    loop rather than waiting out its 7 day sleep.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher, undone when the test ends.
+        tmp_path: The per-test temporary directory.
+    """
+    monkeypatch.setenv("RETROARCH_CORE_INFO_REFRESH", "true")
+    monkeypatch.setattr(retroarch, "RA_DATA_DIR", tmp_path / "data")
+    monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path / "cores")
+
+    ran = threading.Event()
+    calls: list[Path] = []
+
+    def fake_refresh_once(
+        cache_dir: Path, cores_dir: Path, *, fetch: Callable[[str, int], bytes], platforms: Mapping[str, Any]
+    ) -> bool:
+        """Record the call instead of touching the network.
+
+        Args:
+            cache_dir: The cache dir `refresh_forever` was given.
+            cores_dir: The cores dir `refresh_forever` was given.
+            fetch: Unused; `refresh_forever` always passes `_http_fetch`.
+            platforms: Unused; `refresh_forever` always passes the real platform table.
+
+        Returns:
+            False, so no catalog swap is attempted.
+        """
+        del fetch, platforms
+        calls.append(cache_dir)
+        ran.set()
+        return False
+
+    monkeypatch.setattr(rc, "refresh_once", fake_refresh_once)
+    monkeypatch.setattr(settings, "BROKER_SECRET", "")
+    monkeypatch.setattr(settings, "DEV_MODE", True)
+    app = create_app()
+    monkeypatch.setattr(settings, "DEV_MODE", False)
+    with TestClient(app):
+        assert ran.wait(5), "refresh_forever never called refresh_once"
+    assert calls == [tmp_path / "data"]
