@@ -11,12 +11,14 @@ launcher can import this module without a cycle.
 """
 
 import dataclasses
+import hashlib
 import io
+import json
 import logging
 import re
 import zipfile
 from collections.abc import Mapping
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Optional
 
@@ -28,6 +30,12 @@ CORE_NAME_RE = re.compile(r"^[a-z0-9_]+$")
 _INFO_SUFFIX = "_libretro.info"
 _INDEX_SUFFIX = "_libretro.so.zip"
 _INFO_LINE_RE = re.compile(r'^\s*([A-Za-z0-9_]+)\s*=\s*"(.*)"\s*$')
+
+_HERE = Path(__file__).parent
+BUNDLED_ZIP = _HERE / "retroarch_core_info.zip"
+"""libretro's info.zip, byte for byte, bundled so the catalog works offline."""
+BUNDLED_SOURCE = _HERE / "retroarch_core_info.source.json"
+"""Where `BUNDLED_ZIP` came from, its sha256 and the x86_64 build list at that time."""
 
 
 def truthy(value: Optional[str]) -> bool:
@@ -190,3 +198,24 @@ def build_catalog(zip_bytes: bytes, index_text: str, installed: frozenset[str] =
     built = parse_index(index_text) | installed
     cores = {name: info for name, info in parse_info_zip(zip_bytes).items() if name in built}
     return Catalog(MappingProxyType(cores), zip_bytes)
+
+
+def load_bundled_catalog(installed: frozenset[str] = frozenset()) -> Catalog:
+    """Build the catalog from the bundled zip and the build list in its source file.
+
+    Args:
+        installed: Cores already in `CORES_DIR`.
+
+    Returns:
+        The catalog.
+
+    Raises:
+        ValueError: When the zip does not match the recorded sha256; a
+            half-updated bundle must stop the broker, not boot a wrong catalog.
+    """
+    data = BUNDLED_ZIP.read_bytes()
+    source = json.loads(BUNDLED_SOURCE.read_text())
+    if hashlib.sha256(data).hexdigest() != source["sha256"]:
+        raise ValueError(f"{BUNDLED_ZIP.name} does not match the sha256 in {BUNDLED_SOURCE.name}")
+    index = "\n".join(f"{core}_libretro.so.zip" for core in source["x86_64_cores"])
+    return build_catalog(data, index, installed)
