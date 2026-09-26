@@ -296,3 +296,216 @@ def load_tiers(raw: Mapping[str, Any]) -> dict[str, TierEntry]:
 
 TIERS: Mapping[str, TierEntry] = MappingProxyType(load_tiers(json.loads(TIERS_FILE.read_text())))
 """The loaded tiers file."""
+
+Profile = Mapping[str, Any]
+"""A resolved, read-only platform profile: the platform entry's keys plus `tier` and `display_name`."""
+
+REPORT_URL = "https://github.com/romm-streaming/romm-broker/issues/new?template=core-report.yml"
+"""Where players report how a core works (§9)."""
+
+
+class CoreRejectedError(ValueError):
+    """A `core:` the broker will not launch on this platform; `detail` is shown to the player."""
+
+    def __init__(self, detail: str) -> None:
+        """Keep the detail for the 422.
+
+        Args:
+            detail: The message, naming the options.
+        """
+        super().__init__(detail)
+        self.detail = detail
+
+
+def _blocking_entry(tiers: Mapping[str, TierEntry], core: str, platform: str) -> Optional[TierEntry]:
+    """The tiers entry blocking `core` on `platform`, or None.
+
+    Args:
+        tiers: The tiers table.
+        core: The core name.
+        platform: The platform slug.
+
+    Returns:
+        The entry when it is a block that covers the platform.
+    """
+    entry = tiers.get(core)
+    if entry is None or entry.tier != "blocked":
+        return None
+    if entry.platforms is not None and platform not in entry.platforms:
+        return None
+    return entry
+
+
+def _untested_extensions(platform_exts: tuple[str, ...], info: CoreInfo) -> tuple[str, ...]:
+    """The platform's extensions the core also supports, in platform order (§5.4).
+
+    Args:
+        platform_exts: The platform entry's extensions.
+        info: The core's catalog entry.
+
+    Returns:
+        The intersection.
+    """
+    supported = set(info.extensions)
+    return tuple(ext for ext in platform_exts if ext in supported)
+
+
+def tier_of(
+    platforms: Mapping[str, Mapping[str, Any]],
+    platform: str,
+    core: str,
+    catalog: Catalog,
+    tiers: Mapping[str, TierEntry],
+) -> Optional[str]:
+    """The tier `core` has on `platform`, or None when it is not offered there.
+
+    Args:
+        platforms: The platform table.
+        platform: The platform slug.
+        core: The core name.
+        catalog: The current catalog.
+        tiers: The tiers table.
+
+    Returns:
+        `default`, `vetted`, `blocked`, `untested`, or None.
+    """
+    entry = platforms.get(platform)
+    if entry is None:
+        return None
+    if core == entry["core"]:
+        return "default"
+    if core in entry.get("alternates", {}):
+        return "vetted"
+    info = catalog.cores.get(core)
+    if info is None or not _untested_extensions(entry["extensions"], info):
+        return None
+    return "blocked" if _blocking_entry(tiers, core, platform) else "untested"
+
+
+def _options_detail(
+    platforms: Mapping[str, Mapping[str, Any]],
+    platform: str,
+    catalog: Catalog,
+    tiers: Mapping[str, TierEntry],
+) -> str:
+    """Name what a platform does offer, for a rejected core.
+
+    Args:
+        platforms: The platform table.
+        platform: The platform slug.
+        catalog: The current catalog.
+        tiers: The tiers table.
+
+    Returns:
+        One sentence listing the default, the vetted cores and a count of the rest.
+    """
+    entry = platforms[platform]
+    vetted = sorted(entry.get("alternates", {}))
+    untested = sum(
+        1
+        for core in catalog.cores
+        if core != entry["core"]
+        and core not in vetted
+        and tier_of(platforms, platform, core, catalog, tiers) == "untested"
+    )
+    listed = ", ".join(vetted) if vetted else "none"
+    return (
+        f"default {entry['core']}; vetted: {listed}; {untested} untested; "
+        f"see GET /api/retroarch/cores?platform={platform}"
+    )
+
+
+def resolve_profile(
+    platforms: Mapping[str, Mapping[str, Any]],
+    platform: str,
+    core: Optional[str],
+    *,
+    experimental: bool,
+    catalog: Catalog,
+    tiers: Mapping[str, TierEntry],
+) -> Profile:
+    """Resolve the profile a launch uses (§6.1).
+
+    Args:
+        platforms: The platform table.
+        platform: The platform slug, lowercase.
+        core: The requested core, or None for the platform's default.
+        experimental: Whether a known-broken core may run (§6.4).
+        catalog: The current catalog.
+        tiers: The tiers table.
+
+    Returns:
+        The read-only profile.
+
+    Raises:
+        CoreRejectedError: For an unmapped platform with a core, a blocked
+            core without the opt-in, or a core not offered on the platform.
+    """
+    entry = platforms.get(platform)
+    if entry is None:
+        raise CoreRejectedError(
+            f"RetroArch has no core for platform {platform!r}; see GET /api/retroarch/cores"
+        )
+    default_info = catalog.cores.get(entry["core"])
+    if core is None or core == entry["core"]:
+        base = {k: v for k, v in entry.items() if k != "alternates"}
+        name = default_info.display_name if default_info else entry["core"]
+        return MappingProxyType({**base, "tier": "default", "display_name": name})
+    alternate = entry.get("alternates", {}).get(core)
+    if alternate is not None:
+        info = catalog.cores.get(core)
+        return MappingProxyType({
+            **alternate,
+            "core": core,
+            "extensions": entry["extensions"],
+            "tier": "vetted",
+            "display_name": info.display_name if info else core,
+        })
+    info = catalog.cores.get(core)
+    extensions = _untested_extensions(entry["extensions"], info) if info else ()
+    if not extensions:
+        raise CoreRejectedError(
+            f"core {core} is not offered on {platform}: "
+            f"{_options_detail(platforms, platform, catalog, tiers)}"
+        )
+    block = _blocking_entry(tiers, core, platform)
+    if block is not None and not experimental:
+        raise CoreRejectedError(
+            f"core {core} is known broken on {platform}: {block.reason}; set "
+            f"experimental_cores: true in RomM's config.yml or "
+            f"RETROARCH_EXPERIMENTAL_CORES=true on the container to run it "
+            f"anyway, or remove core: to use {entry['core']}"
+        )
+    return MappingProxyType({
+        "core": core,
+        "library_name": LIBRARY_NAME_FIXES.get(core, info.corename),
+        "save_ram": None,
+        "extensions": extensions,
+        "tier": "blocked" if block is not None else "untested",
+        "display_name": info.display_name,
+    })
+
+
+_catalog: Optional[Catalog] = None
+
+
+def catalog() -> Catalog:
+    """The current catalog, loading the bundled one on first use.
+
+    Returns:
+        The catalog; a refresh replaces it with `set_catalog`.
+    """
+    global _catalog
+    if _catalog is None:
+        _catalog = load_bundled_catalog()
+    return _catalog
+
+
+def set_catalog(new: Catalog) -> None:
+    """Swap in a new catalog with one assignment (§7), so no reader sees half of one.
+
+    Args:
+        new: The catalog to use from now on.
+    """
+    global _catalog
+    _catalog = new
