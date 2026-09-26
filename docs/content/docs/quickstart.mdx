@@ -27,7 +27,7 @@ services:
       - BROKER_SECRET=change-me
     volumes:
       - /path/to/config:/config
-      - /path/to/roms:/romm
+      - /path/to/library:/romm/library
     ports:
       - 3000:3000
       - 3001:3001
@@ -66,16 +66,16 @@ streaming:
       broker_secret: "change-me"
       protocol: webstation
       emulator: pcsx2
-      library_path: /romm
       label: WEBSTATION
 ```
 
 Two things trip people up here.
 
-`library_path` has to point at the same path the container sees as
-`ROM_ROOT` (default `/romm`). Activate rejects any rom path outside it with
-a 400 whose detail is literally `rom path must live under <root>`. Get this
-wrong and every launch from that library fails the same way.
+The library mount on this container has to use the same host folder and the
+same `/romm/library` path as the one on your RomM container. RomM sends ROM
+paths as it sees them, so a different mount fails every launch with a 404
+reading `rom not found at <path>`. If you can't match it, see [Mounting the
+library somewhere else](/docs/container#mounting-the-library-somewhere-else).
 
 `broker_secret` here and `BROKER_SECRET` on the container also have to be the
 exact same string. A mismatch fails every activate, join, and exit call with

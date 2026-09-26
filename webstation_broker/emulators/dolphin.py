@@ -18,7 +18,7 @@ from pathlib import Path, PurePosixPath
 from threading import Thread
 from typing import Any, Optional, Union
 
-from .. import imports
+from .. import imports, memcard
 from . import wii_nand
 from .base import Emulator, base_launch_env, xdg_config_dir, xdg_data_dir
 
@@ -168,6 +168,28 @@ _GCI_CODE_LEN = 4
 
 _CARD_IMAGE_SUFFIXES = (".raw", ".mcd", ".gcp")
 """Whole memory card images, whose saves have to be exported as GCIs before a folder card reads them."""
+
+_SRAM_NAME = "SRAM.raw"
+"""The console's settings file Dolphin keeps at the top of `GC`; a `.raw`, but not a card image."""
+
+_CARD_A = "Card A"
+"""The slot folder the broker pins slot A's GCI folder card to, under each region."""
+
+_REGION_BY_COUNTRY = {
+    **{c: "JAP" for c in "JWKQT"},
+    **{c: "USA" for c in "EBN"},
+    **{c: "EUR" for c in "DFHILMPRSUV"},
+}
+"""A GCI's region folder, keyed by the country letter that ends its four-character game code.
+
+Mirrors Dolphin's `DiscIO::CountryCodeToRegion` for a GameCube disc, which
+picks the folder the game boots with: Korean codes (`K`, `Q`, `T`, `W`) fall
+back to NTSC-J, since GameCube has no NTSC-K. `X`, `Y` and `Z` are left out
+because Dolphin settles them by the disc's own region, which a save does not
+carry. The folder names are Dolphin's legacy ones (`JAP`, not `JPN`), which is
+what its default GCI folder path uses. The one known miss is a Korean game in
+English coded `E`, which Dolphin files under `JAP` by the disc's revision.
+"""
 
 _PROTECTED = (
     f"{STATE_DIR.name}/{_UNDO_BUFFER_NAME}",
@@ -858,6 +880,33 @@ def _place_nand(
     return wii_nand.place_nand(member, session, subtree="Wii", wrappers=_WII_WRAPPERS)
 
 
+def _strip_gc_wrapper(parts: tuple[str, ...]) -> tuple[str, ...]:
+    """Drop the longest leading `_GC_WRAPPERS` folder a path arrived under, keeping at least its file.
+
+    Args:
+        parts: The path's parts.
+
+    Returns:
+        The parts below the wrapper, or `parts` unchanged when none applies.
+    """
+    for wrapper in _GC_WRAPPERS:
+        if wrapper and parts[: len(wrapper)] == wrapper and len(parts) > len(wrapper):
+            return parts[len(wrapper) :]
+    return parts
+
+
+def _in_card_a(parts: tuple[str, ...]) -> bool:
+    """Whether a path under `GC` is `<region>/Card A/<file>`, where the folder card reads its GCIs.
+
+    Args:
+        parts: The path's parts, relative to `GC`.
+
+    Returns:
+        True for a file directly in a region's `Card A` folder.
+    """
+    return len(parts) == 3 and bool(_REGION_RE.fullmatch(parts[0])) and parts[1] == _CARD_A
+
+
 def _place_gci(
     member: imports.ImportMember, session: imports.SessionIdentity
 ) -> Union[imports.Placement, imports.ImportRefusal]:
@@ -1004,6 +1053,94 @@ class Dolphin(Emulator):
         rather than guessing one.
         """
         return USER_DIR / "GC" if platform == _GC_PLATFORM else None
+
+    def arrange_card(self, heads: dict[str, bytes]) -> memcard.Placement:
+        """Move each GCI of a pushed card into `<region>/Card A`, the only place the folder card reads.
+
+        Players pack a card however their own Dolphin keeps it: loose GCIs, a
+        bare `Card A` folder, or the whole `GC` folder with its name on top.
+        All of those used to land a level off and boot to an empty card. A
+        wrapper such as `GC/` is dropped, and a misplaced GCI goes to the
+        region its game code names. The extension is matched without regard
+        to case, as Dolphin's own folder scan does.
+
+        Every member may always stay at the name it was packed under, so a
+        move is taken only when its destination is free of every other
+        member, packed or moved, and a member losing out stays put. Two
+        members can then never land on one file, which matters because
+        anything refused here aborts RomM's claim and locks the player out of
+        the game rather than starting it on an empty card. A GCI or card image
+        left where Dolphin will not read it is logged and reported back.
+
+        Args:
+            heads: Each member's zip name mapped to its first bytes.
+
+        Returns:
+            Each member name mapped to its destination under `GC`, and the
+            members left where the folder card will not read them.
+        """
+        files = set(heads)
+        dirs = {parent.as_posix() for name in heads for parent in PurePosixPath(name).parents}
+
+        def is_free(dest: str) -> bool:
+            """Whether `dest` would not overwrite, or sit inside or over, a file already claimed.
+
+            Args:
+                dest: A destination under `GC`.
+
+            Returns:
+                True when it is safe to write a member there.
+            """
+            parents = {parent.as_posix() for parent in PurePosixPath(dest).parents}
+            return dest not in files and dest not in dirs and not parents & files
+
+        wanted: dict[str, str] = {}
+        misplaced: dict[str, None] = {}
+        for name in heads:
+            parts = _strip_gc_wrapper(PurePosixPath(name).parts)
+            if parts and parts[-1].lower().endswith(".gci") and not _in_card_a(parts):
+                misplaced[name] = None
+            wanted[name] = "/".join(parts) or name
+        # Misplaced GCIs go last, so a copy already where Dolphin reads it keeps
+        # its spot over a stray copy of the same save.
+        for name in misplaced:
+            code = heads[name][:_GCI_CODE_LEN]
+            region = _REGION_BY_COUNTRY.get(chr(code[-1])) if len(code) == _GCI_CODE_LEN else None
+            wanted[name] = f"{region}/{_CARD_A}/{PurePosixPath(name).name}" if region else name
+        order = [name for name in heads if name not in misplaced] + list(misplaced)
+
+        dests: dict[str, str] = {}
+        unread: set[str] = set()
+        for name in order:
+            dest = wanted[name]
+            if dest != name and is_free(dest):
+                files.add(dest)
+                dirs.update(parent.as_posix() for parent in PurePosixPath(dest).parents)
+                if name in misplaced:
+                    log.info("memory-card replace: moved %s to %s", name, dest)
+            else:
+                dest = name
+            dests[name] = dest
+            parts = PurePosixPath(dest).parts
+            leaf = parts[-1] if parts else ""
+            if leaf.lower().endswith(".gci") and not _in_card_a(parts):
+                log.warning(
+                    "memory-card replace: left %s where it was, Dolphin only reads a GCI in "
+                    "<USA|EUR|JAP>/Card A/ (%s)",
+                    name,
+                    "its game code names no region the broker can place"
+                    if wanted[name] == name
+                    else f"{wanted[name]} is already taken",
+                )
+                unread.add(name)
+            elif leaf.lower().endswith(_CARD_IMAGE_SUFFIXES) and leaf != _SRAM_NAME:
+                log.warning(
+                    "memory-card replace: %s is a whole memory card image, which the GCI folder "
+                    "card never reads; export its saves as .gci files with Dolphin's Memory Card Manager",
+                    name,
+                )
+                unread.add(name)
+        return memcard.Placement({n: dests[n] for n in heads}, tuple(n for n in heads if n in unread))
 
     def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """Resolve a RomM path to the disc image to boot.

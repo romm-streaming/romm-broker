@@ -39,7 +39,6 @@ streaming:
       broker_host: http://192.168.1.51:3010
       protocol: webstation
       subfolder: /streaming
-      library_path: /romm
       label: Emulation station
       platforms:
         ps2:
@@ -51,14 +50,16 @@ streaming:
           label: Dolphin
 ```
 
-The `subfolder` and `library_path` values here should match this broker's
-own `SUBFOLDER` and `ROM_ROOT` environment variables (see
-[Broker settings](/docs/configuration)). Set them to whatever you actually
-use when you deploy the container.
+The `subfolder` value here should match this broker's own `SUBFOLDER`
+environment variable (see [Broker settings](/docs/configuration)). There is
+no path setting because the container mounts the library at `/romm/library`,
+the same as RomM. If yours can't, see [Mounting the library somewhere
+else](/docs/container#mounting-the-library-somewhere-else).
 
-Set up docker-webstation with this broker installed. Mount it at the same
-ROM library path your old per-emulator containers used, so your save and
-state history (which is tied to that path) doesn't reset. Make sure
+Set up docker-webstation with this broker installed. If your old
+per-emulator containers mounted the library at a path other than
+`/romm/library`, keep that path and set `library_path` to it, so your save
+and state history (which is tied to that path) doesn't reset. Make sure
 streaming works for each platform, then remove the old containers. See
 RomM's migration guide for the full walkthrough:
 https://docs.romm.app/latest/using/emulator-streaming-migration/

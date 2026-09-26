@@ -16,7 +16,7 @@ from collections.abc import Callable, Collection
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from .. import imports
+from .. import imports, memcard
 
 log = logging.getLogger(__name__)
 
@@ -1222,6 +1222,22 @@ class Emulator:
             The card directory, or None for emulators without a memory card.
         """
         return None
+
+    def arrange_card(self, heads: dict[str, bytes]) -> memcard.Placement:
+        """Where each member of a card pushed on the memory-card route goes inside the card.
+
+        The default writes every member where the image put it. An emulator
+        that reads only one layout overrides it to move a member the player
+        packed differently to where the emulator will look for it.
+
+        Args:
+            heads: Each member's zip name mapped to its first `memcard.HEAD_BYTES` bytes.
+
+        Returns:
+            Every member name mapped to its destination relative to the card
+            root, and the members left somewhere the emulator will not read.
+        """
+        return memcard.Placement({name: name for name in heads})
 
     def archive_core(self) -> Optional[str]:
         """The core or backend actually running the game, or None.

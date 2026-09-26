@@ -37,7 +37,7 @@ services:
       - BROKER_SECRET=change-me
     volumes:
       - /path/to/config:/config
-      - /path/to/roms:/romm
+      - /path/to/library:/romm/library
       # optional: pre-seed RetroArch BIOS/firmware instead of drag-and-drop
       # - /path/to/bios:/config/.config/retroarch/system
     ports:
@@ -60,7 +60,7 @@ docker run -d \
   -p 3000:3000 \
   -p 3001:3001 \
   -v /path/to/config:/config \
-  -v /path/to/roms:/romm \
+  -v /path/to/library:/romm/library \
   -v /path/to/bios:/config/.config/retroarch/system \
   --shm-size="1gb" \
   --restart unless-stopped \
@@ -81,7 +81,7 @@ for the matching path to mount for other emulators.
 | `-p 3000` | Plain, unencrypted web traffic (HTTP). This port must sit behind a reverse proxy. See [Reverse proxy](/docs/deployment/reverse-proxy). |
 | `-p 3001` | HTTPS (encrypted), using a self-signed certificate, for connecting directly to the container while testing. |
 | `-v /config` | The user's home directory inside the container. Holds emulator settings, BIOS and firmware, and save data. It's also where the broker keeps its pid record (a small file it uses to find the running emulator again after a restart) and its export directory. |
-| `-v /romm` | Your ROM library, which you can mount read-only if you like. Activate (the call that launches a game) rejects any ROM path outside `ROM_ROOT` (default `/romm`), so RomM's `library_path` for this container must point here. |
+| `-v /romm/library` | Your ROM library, which you can mount read-only if you like. Use the same host folder and the same `/romm/library` path as the library mount on your RomM container, so the ROM paths RomM sends are valid here without any extra config. See [Mounting the library somewhere else](#mounting-the-library-somewhere-else) if you can't. |
 | `-v .../retroarch/system` (optional) | A host folder already filled with BIOS and firmware, mounted at RetroArch's shared system directory (`RETROARCH_SYSTEM_DIR`, default `/config/.config/retroarch/system`) so you don't have to drag files into the desktop by hand afterward. See [Getting files into the container](/docs/emulators/setup#getting-files-into-the-container). |
 | `--shm-size=1gb` | Sets the container's shared memory size. Recommended for all desktop images like this one. |
 | `-e PUID` / `-e PGID` | The user ID and group ID (uid/gid) that the desktop, the emulators, and the broker all run as. Match them to the owner of your mounted directories so file permissions line up. |
@@ -221,7 +221,6 @@ streaming:
       broker_secret: "change-me"
       protocol: webstation
       emulator: pcsx2
-      library_path: /romm
       label: WEBSTATION
 ```
 
@@ -232,3 +231,23 @@ it can be the service name and port `3000` (`http://romm_webstation:3000`)
 instead of an IP. `subfolder` should match the container's
 `SUBFOLDER`. The full story, including why `host` is written as a path, is in
 [Reverse proxy](/docs/deployment/reverse-proxy).
+
+There is no path setting here. RomM sends each ROM as a path under its own
+library folder (`/romm/library` by default), and because this container
+mounts the same folder at the same path, that path already works here.
+
+### Mounting the library somewhere else
+
+If this container can't mount the library at `/romm/library` (a broker on
+another host with the library on a network share, say), mount it wherever it
+has to go and add `library_path` to the container entry in RomM's
+`config.yml`, naming the path this container sees:
+
+```yaml
+      library_path: /mnt/games/library
+```
+
+RomM then swaps its own library prefix for that one. If the new path isn't
+under `/romm`, also set the container's `ROM_ROOT` to it or a folder above it,
+since activate refuses any ROM path outside `ROM_ROOT`. See
+[Broker settings](/docs/configuration).

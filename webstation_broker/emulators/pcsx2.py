@@ -13,11 +13,13 @@ import os
 import re
 import socket as _socket
 import struct
+import subprocess
+import tempfile
 import time
 import zipfile
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Optional, Union
 
 from .. import imports, memcard
@@ -64,14 +66,66 @@ INI_PATH = DATA_DIR / "inis" / "PCSX2.ini"
 """The PCSX2.ini the broker patches before every launch, `inis/PCSX2.ini` under `DATA_DIR`."""
 SSTATE_DIR = DATA_DIR / "sstates"
 """Directory PCSX2 writes its `.p2s` save states into, `sstates` under `DATA_DIR`."""
-PATCHES_ZIP = DATA_DIR / "cache" / "patches.zip"
-"""The GameDB/cheat/widescreen patch bundle PCSX2 fetches from GitHub and re-opens on every launch.
+_PATCHES_ZIP_SYSTEM_PATH = Path("/usr/share/PCSX2/resources/patches.zip")
+"""The one path pcsx2-qt opens the patch bundle from, kept apart so tests can redirect `PATCHES_ZIP`."""
+PATCHES_ZIP = _PATCHES_ZIP_SYSTEM_PATH
+"""The GameDB/widescreen/fix patch bundle PCSX2 opens at boot, from its install resources.
 
-PCSX2 downloads this once and never re-validates it afterwards: a fetch cut
-short by a network drop or a full disk leaves a zero-byte or truncated zip
-behind, and every later launch just repeats "Failed to open patches.zip"
-instead of trying the download again. `_validate_patches_cache` clears a bad
-one before PCSX2 ever gets to open it.
+Not configurable, and not under `DATA_DIR`: pcsx2-qt reads this one path and
+no other (a copy under the user tree is ignored), and it never downloads the
+file itself. The Ubuntu `+dfsg` package ships without it, so a missing file
+means a permanent "Failed to open patches.zip" warning and no game fixes.
+`_ensure_patches_zip` fetches it before a launch.
+"""
+PATCHES_URL = "https://github.com/PCSX2/pcsx2_patches/releases/download/latest/patches.zip"
+"""Upstream's rolling release of the patch bundle, rebuilt by CI on every push to its main branch.
+
+Hardcoded, like the destination: this download ends in a root-owned file, so
+neither end of it may come from a request, the environment or config.
+Upstream publishes no checksum, so trust rests on TLS to GitHub plus
+`_patches_zip_problem`.
+"""
+_PATCHES_MAX_BYTES = 64 * 1024 * 1024
+"""Download ceiling handed to curl; the real bundle is about 2 MB."""
+_CURL = "/usr/bin/curl"
+"""Absolute, so a `PATH` entry ahead of `/usr/bin` cannot stand in for it."""
+_SUDO = "/usr/bin/sudo"
+"""Absolute for the same reason as `_CURL`; only the install and the rename run under it."""
+_INSTALL = "/usr/bin/install"
+"""Copies the validated download to a root-owned staging name beside `PATCHES_ZIP`."""
+_MV = "/usr/bin/mv"
+"""Renames the staged copy over `PATCHES_ZIP`, atomic because both sit in one directory."""
+_PATCHES_LOCK = Lock()
+"""Held for a whole fetch, so overlapping launches never run two at once."""
+
+
+def _fetch_enabled(value: str) -> bool:
+    """Read the `PCSX2_PATCHES_FETCH` switch, which is on unless it says off.
+
+    Accepts the spellings the other emulators' switches accept, so `0`, `no`
+    or `off` turn off sudo and network use just as `false` does.
+
+    Args:
+        value: The raw environment value.
+
+    Returns:
+        False for `0`, `false`, `no` or `off` in any case, True otherwise.
+    """
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+
+PATCHES_FETCH = _fetch_enabled(os.environ.get("PCSX2_PATCHES_FETCH", "true"))
+"""Whether launches fetch patches.zip (env `PCSX2_PATCHES_FETCH`, default `true`).
+
+Set it to `false` (or `0`, `no`, `off`) on a deploy with no route to GitHub, or one that should not
+use sudo at all: PCSX2 then runs without game patches, as it did before.
+"""
+PATCHES_MAX_AGE = 7 * 24 * 3600.0
+"""Age in seconds past which an installed bundle is refreshed in the background.
+
+Upstream rebuilds on every merge, but patches change slowly; a week keeps
+launches to one fetch between container recreations without letting fixes
+lag far behind.
 """
 PCSX2_LOG_PATH = Path(os.environ.get("PCSX2_LOG_PATH", "/config/pcsx2-qt.log"))
 """Log file the broker tails for this emulator (env `PCSX2_LOG_PATH`, default `/config/pcsx2-qt.log`)."""
@@ -406,40 +460,198 @@ def _patch_ini() -> None:
         ) from exc
 
 
-def _validate_patches_cache() -> None:
-    """Delete a corrupt cached patches.zip so PCSX2 re-downloads it instead of failing forever.
+def _patches_zip_problem(path: Path) -> Optional[str]:
+    """Say what, if anything, makes a patches.zip unusable to PCSX2.
 
-    Checked, not wiped, on every launch: PCSX2's own fetch is a multi-megabyte
-    GitHub download, so a good cache should survive as many launches as it can
-    rather than being forced through a fresh one every session. Only a file
-    that is empty or fails its own CRC check is removed; everything else is
-    left for PCSX2 to open. A failure to remove a bad file is logged, not
-    raised, the same as `_ensure_folder_card`: the game still boots, just
-    without official patches until a later launch's fetch succeeds.
+    Used on both the installed file and a fresh download, so a bad download
+    is never moved over a good install. Beyond opening and passing its CRC
+    check, the archive must hold at least one `.pnach`: an HTML error page or
+    a restructured release can arrive with a 200 and still be a valid zip.
+
+    Args:
+        path: The zip to check.
+
+    Returns:
+        None when the file is usable, otherwise a short reason: `"missing"`,
+        `"empty"`, `"failed its CRC check"`, `"holds no .pnach patches"`, or
+        the error the zip reader raised.
     """
-    if not PATCHES_ZIP.exists():
-        return
-    reason: Optional[str] = None
     try:
-        if PATCHES_ZIP.stat().st_size == 0:
-            reason = "empty"
-        else:
-            with zipfile.ZipFile(PATCHES_ZIP) as zf:
-                if zf.testzip() is not None:
-                    reason = "failed its CRC check"
-    except (OSError, zipfile.BadZipFile) as exc:
-        reason = str(exc)
-    if reason is None:
-        return
-    log.warning(
-        "pcsx2: cached patches.zip at %s is %s, removing it so PCSX2 re-downloads it",
-        PATCHES_ZIP,
-        reason,
-    )
+        if not path.exists():
+            return "missing"
+        if path.stat().st_size == 0:
+            return "empty"
+        with zipfile.ZipFile(path) as zf:
+            if zf.testzip() is not None:
+                return "failed its CRC check"
+            if not any(name.endswith(".pnach") for name in zf.namelist()):
+                return "holds no .pnach patches"
+    # testzip() decompresses every member, and each decompressor raises its own
+    # types (zlib.error, EOFError, lzma.LZMAError, RuntimeError for an
+    # encrypted member, NotImplementedError for an unknown method). A broken
+    # download must become a reason here, never an exception out of launch().
+    except Exception as exc:
+        return str(exc) or type(exc).__name__
+    return None
+
+
+def _run_step(verb: str, cmd: list[str], timeout: float) -> bool:
+    """Run one step of the patches fetch, logging rather than raising on failure.
+
+    Args:
+        verb: What the step does, for the log line (`"download"`, `"install"`, `"rename"`).
+        cmd: The argv, list-form.
+        timeout: Seconds before the step is abandoned.
+
+    Returns:
+        True when the step exited 0.
+    """
     try:
-        PATCHES_ZIP.unlink()
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, errors="replace", timeout=timeout
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("patches fetch: %s failed: %s", verb, exc)
+        return False
+    if result.returncode != 0:
+        log.warning(
+            "patches fetch: %s exited %s: %s", verb, result.returncode, result.stderr.strip()
+        )
+        return False
+    return True
+
+
+def _refresh_patches_zip() -> bool:
+    """Download the patch bundle and move it into the path PCSX2 reads.
+
+    The download and the validation run as the broker's own user in a private
+    temp directory. Only the copy into `/usr/share` and the rename over the
+    live file go through `sudo -n`, so neither curl nor anything it fetched
+    ever runs with root's rights. The live file only ever changes by rename,
+    so a PCSX2 booting mid-refresh sees the old bundle or the new one, never a
+    partial copy.
+
+    Every failure is logged and swallowed: patches are nice to have, and a
+    launch without them still plays. This includes an `OSError` raised by the
+    filesystem work around the subprocess steps (a full or read-only
+    `TMPDIR`, a permission error `Path.is_dir` does not swallow, a `stat` on a
+    file removed out from under it), not just a failed step: the caller in
+    `launch` relies on this never raising.
+
+    Returns:
+        True when a new bundle was put in place.
+    """
+    if not _PATCHES_LOCK.acquire(blocking=False):
+        # Only a background refresh can hold it (launches are serialized), so
+        # the bundle it is replacing is still there for this launch to use.
+        log.info("patches fetch: a refresh is already running, skipping")
+        return False
+    try:
+        if not PATCHES_ZIP.parent.is_dir():
+            log.warning(
+                "patches fetch: %s does not exist, is PCSX2 installed? skipping",
+                PATCHES_ZIP.parent,
+            )
+            return False
+        with tempfile.TemporaryDirectory(prefix="pcsx2-patches-") as tmp:
+            download = Path(tmp) / "patches.zip"
+            fetched = _run_step(
+                "download",
+                [
+                    _CURL,
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--location",
+                    "--proto",
+                    "=https",
+                    "--proto-redir",
+                    "=https",
+                    "--connect-timeout",
+                    "10",
+                    "--max-time",
+                    "30",
+                    "--max-filesize",
+                    str(_PATCHES_MAX_BYTES),
+                    "--output",
+                    str(download),
+                    "--",
+                    PATCHES_URL,
+                ],
+                timeout=40,
+            )
+            if not fetched:
+                return False
+            problem = _patches_zip_problem(download)
+            if problem is not None:
+                log.warning(
+                    "patches fetch: download from %s is %s, not installing it",
+                    PATCHES_URL,
+                    problem,
+                )
+                return False
+            size = download.stat().st_size
+            staged = PATCHES_ZIP.with_name(".patches.zip.new")
+            installed = _run_step(
+                "install",
+                [
+                    _SUDO,
+                    "-n",
+                    _INSTALL,
+                    "-m",
+                    "0644",
+                    "-o",
+                    "root",
+                    "-g",
+                    "root",
+                    "--",
+                    str(download),
+                    str(staged),
+                ],
+                timeout=10,
+            )
+            if not installed or not _run_step(
+                "rename", [_SUDO, "-n", _MV, "-f", "--", str(staged), str(PATCHES_ZIP)], timeout=10
+            ):
+                return False
+            log.info(
+                "patches fetch: installed %s (%d bytes) from %s", PATCHES_ZIP, size, PATCHES_URL
+            )
+            return True
     except OSError as exc:
-        log.warning("pcsx2: could not remove the bad patches.zip at %s: %s", PATCHES_ZIP, exc)
+        log.warning("patches fetch: failed: %s", exc)
+        return False
+    finally:
+        _PATCHES_LOCK.release()
+
+
+def _ensure_patches_zip() -> None:
+    """Make sure PCSX2 has a patch bundle to open, without ever failing the launch.
+
+    A missing or unusable bundle is fetched inline, since PCSX2 opens it at
+    boot and a later fetch would come too late for this session. A usable but
+    stale one is refreshed on a background thread and this launch boots with
+    what is there. A fresh one costs nothing.
+    """
+    if not PATCHES_FETCH:
+        return
+    problem = _patches_zip_problem(PATCHES_ZIP)
+    if problem is not None:
+        log.info("patches fetch: %s is %s, fetching it before launch", PATCHES_ZIP, problem)
+        _refresh_patches_zip()
+        return
+    try:
+        age = time.time() - PATCHES_ZIP.stat().st_mtime
+    except OSError as exc:
+        log.warning("patches fetch: could not stat %s: %s", PATCHES_ZIP, exc)
+        return
+    if age >= PATCHES_MAX_AGE:
+        log.info(
+            "patches fetch: %s is %.0f days old, refreshing in the background",
+            PATCHES_ZIP,
+            age / 86400,
+        )
+        Thread(target=_refresh_patches_zip, daemon=True).start()
 
 
 def _sstate_snapshot() -> dict[Path, tuple[int, float]]:
@@ -971,7 +1183,7 @@ class Pcsx2(Emulator):
             log.warning("could not create the slot 1 folder card at %s: %s", card, exc)
 
     def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
-        """Stop any running instance, prepare the config, patches cache and card, and start pcsx2-qt.
+        """Fetch the patch bundle if needed, stop the running instance, prepare config and card, then start.
 
         The binary comes from env `PCSX2_BIN` (default `pcsx2-qt`). A boot
         watchdog thread is always started; it verifies boot and only delivers
@@ -985,9 +1197,11 @@ class Pcsx2(Emulator):
             RuntimeError: When PCSX2.ini could not be patched, which leaves PINE off and
                 the session with no save states and no boot signal.
         """
+        # Before stop(): a slow fetch then keeps the old game on screen instead
+        # of a dead stream while the player waits.
+        _ensure_patches_zip()
         self.stop()
         _patch_ini()
-        _validate_patches_cache()
         self._ensure_folder_card()
         self.boot_failed = False  # every launch starts clean
         self._launch_seq += 1

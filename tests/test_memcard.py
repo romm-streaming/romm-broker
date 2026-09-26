@@ -130,9 +130,9 @@ def test_replace_wipes_the_previous_player_card(tmp_path: Path) -> None:
     (card / "BALEFT-BEHIND").mkdir()
     (card / "BALEFT-BEHIND" / "save.bin").write_bytes(b"previous player")
 
-    written = memcard.replace(card, _zip({"BMINE-00001/save.bin": b"mine"}), MARKER)
+    result = memcard.replace(card, _zip({"BMINE-00001/save.bin": b"mine"}), MARKER)
 
-    assert written == 1
+    assert result == memcard.Replaced(1, ())
     assert not (card / "BALEFT-BEHIND").exists()
     assert (card / "BMINE-00001" / "save.bin").read_bytes() == b"mine"
 
@@ -235,7 +235,7 @@ def test_replace_clears_a_stale_backup_left_by_a_previous_crash(tmp_path: Path) 
 
     result = memcard.replace(card, _zip({"BMINE-00001/save.bin": b"mine"}), MARKER)
 
-    assert result == 1
+    assert result == memcard.Replaced(1, ())
     assert not stale_backup.exists()
     assert sorted(p.name for p in tmp_path.iterdir()) == ["Slot 1"]
 
@@ -284,3 +284,131 @@ def test_capture_refuses_a_card_it_could_not_read_in_full(
     monkeypatch.setattr(zipfile.ZipFile, "write", _fail_after_the_first)
 
     assert memcard.build_archive(card, MARKER) == "memory card could not be read in full"
+
+
+def test_replace_writes_each_member_where_the_hook_places_it(tmp_path: Path) -> None:
+    """The hook sees each member's head, capped at `HEAD_BYTES`, and its placement is what lands."""
+    card = tmp_path / "GC"
+    seen: dict[str, bytes] = {}
+
+    def arrange(heads: dict[str, bytes]) -> memcard.Placement:
+        """Record the heads and move the one member into a region folder.
+
+        Args:
+            heads: Member names mapped to their first bytes.
+
+        Returns:
+            The placement.
+        """
+        seen.update(heads)
+        return memcard.Placement({"save.gci": "USA/Card A/save.gci"}, ("save.gci",))
+
+    body = b"G" * (memcard.HEAD_BYTES + 10)
+    result = memcard.replace(card, _zip({"save.gci": body}), None, arrange)
+
+    assert result == memcard.Replaced(1, ("save.gci",))
+    assert seen == {"save.gci": body[: memcard.HEAD_BYTES]}
+    assert (card / "USA" / "Card A" / "save.gci").read_bytes() == body
+    assert not (card / "save.gci").exists()
+
+
+@pytest.mark.parametrize(
+    ("placement", "error"),
+    [
+        ({"a": "../escaped", "b": "b"}, "placed outside the card dir"),
+        ({"a": "/abs", "b": "b"}, "placed outside the card dir"),
+        ({"a": "", "b": "b"}, "placed outside the card dir"),
+        ({"a": "same", "b": "same"}, "would land on same"),
+        ({"a": "a"}, "left unplaced: b"),
+    ],
+)
+def test_replace_refuses_a_placement_that_would_break_the_card(
+    tmp_path: Path, placement: dict[str, str], error: str
+) -> None:
+    """A hook leaving a member unplaced, sending one out of the card, or two onto one file, is refused.
+
+    The live card is left untouched.
+
+    Args:
+        tmp_path: The pytest temporary directory.
+        placement: What the hook returns.
+        error: Text the refusal carries.
+    """
+    card = tmp_path / "GC"
+    card.mkdir()
+    (card / "keep.gci").write_bytes(b"current card")
+
+    result = memcard.replace(
+        card, _zip({"a": b"1", "b": b"2"}), None, lambda heads: memcard.Placement(placement)
+    )
+
+    assert isinstance(result, str) and error in result
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["GC"]
+    assert (card / "keep.gci").read_bytes() == b"current card"
+    assert not (tmp_path / "escaped").exists()
+
+
+@pytest.mark.parametrize("name", [".", "./."])
+def test_replace_refuses_a_member_naming_the_card_itself(tmp_path: Path, name: str) -> None:
+    """A member whose path normalises to nothing would land on the card directory, so it is refused.
+
+    Args:
+        tmp_path: The pytest temporary directory.
+        name: The member's name.
+    """
+    card = tmp_path / "GC"
+    card.mkdir()
+    (card / "keep.gci").write_bytes(b"current card")
+
+    result = memcard.replace(
+        card, _zip({name: b"x"}), None, lambda heads: memcard.Placement({n: n for n in heads})
+    )
+
+    assert isinstance(result, str) and "escapes the card dir" in result
+    assert (card / "keep.gci").read_bytes() == b"current card"
+
+
+def _zip_unreadable(offset: int, value: int) -> bytes:
+    """Build a one-member zip whose central directory claims the member cannot be read.
+
+    zipfile trusts the central directory for both the encryption flag and the
+    compression method, so patching them there is enough for `ZipFile.open`
+    to raise.
+
+    Args:
+        offset: Byte offset of the field within the central directory entry,
+            8 for the flag bits and 10 for the compression method.
+        value: The little-endian 16-bit value to write there.
+
+    Returns:
+        The zip file contents.
+    """
+    data = bytearray(_zip({"save.gci": b"G" * 0x100}))
+    entry = data.index(b"PK\x01\x02")
+    data[entry + offset : entry + offset + 2] = value.to_bytes(2, "little")
+    return bytes(data)
+
+
+@pytest.mark.parametrize(("offset", "value"), [(8, 0x1), (10, 99)], ids=["encrypted", "compression"])
+@pytest.mark.parametrize("hooked", [True, False], ids=["hook", "no-hook"])
+def test_replace_answers_an_unreadable_member_with_an_error_not_a_crash(
+    tmp_path: Path, offset: int, value: int, hooked: bool
+) -> None:
+    """An encrypted member, or one zipfile cannot decompress, returns an error with the card untouched.
+
+    Args:
+        tmp_path: The pytest temporary directory.
+        offset: The central directory field to break.
+        value: The value to give it.
+        hooked: Whether an `arrange` hook reads the member heads first.
+    """
+    card = tmp_path / "GC"
+    card.mkdir()
+    (card / "keep.gci").write_bytes(b"current card")
+    arrange = (lambda heads: memcard.Placement({n: n for n in heads})) if hooked else None
+
+    result = memcard.replace(card, _zip_unreadable(offset, value), None, arrange)
+
+    assert isinstance(result, str) and "could not" in result
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["GC"]
+    assert (card / "keep.gci").read_bytes() == b"current card"

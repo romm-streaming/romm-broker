@@ -24,7 +24,7 @@ from starlette.websockets import WebSocketState
 
 from webstation_broker import api, callback, imports, saves, screenshot, selkies, session, settings
 from webstation_broker.app import create_app
-from webstation_broker.emulators import base, rpcs3, shadps4
+from webstation_broker.emulators import base, dolphin, rpcs3, shadps4
 
 from .conftest import PREFIX, SLEEPER_CMD, FakeEmulator, corrupt_zip_member, mangle_zip_member
 
@@ -251,14 +251,14 @@ def test_activate_refuses_a_rom_outside_the_library(
 def test_activate_reports_a_rom_that_is_not_there(
     client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
 ) -> None:
-    """Activate reports a ROM that is not there as 404."""
-    response = _activate(
-        client,
-        broker_dirs,
-        rom={"path": str(broker_dirs["roms"] / "gone.iso"), "platform": "ps2"},
-    )
+    """Activate reports a ROM that is not there as 404, naming the path and the mount fix."""
+    missing = str(broker_dirs["roms"] / "gone.iso")
+    response = _activate(client, broker_dirs, rom={"path": missing, "platform": "ps2"})
 
     assert response.status_code == 404
+    detail = response.json()["detail"]
+    assert missing in detail
+    assert "same path as in RomM" in detail
 
 
 def test_activate_reports_a_folder_holding_nothing_bootable(
@@ -1986,6 +1986,82 @@ def test_an_oversized_import_is_refused_without_keeping_the_body(
 
     assert response.status_code == 413
     assert list(broker_dirs["imports"].iterdir()) == []
+
+
+
+_ZELDA_GCI = b"GZLE01" + bytes(0x40 - 6 + 0x2000)
+"""A one-block GCI for `GZLE01`, whose `E` places it in Dolphin's `USA` card."""
+
+
+@pytest.mark.parametrize(
+    "members",
+    [
+        {"SRAM.raw": bytes(64), "USA/Card A/01-GZLE-zelda.gci": _ZELDA_GCI},
+        {"Card A/01-GZLE-zelda.gci": _ZELDA_GCI},
+        {"01-GZLE-zelda.gci": _ZELDA_GCI},
+        {"GC/USA/Card A/01-GZLE-zelda.gci": _ZELDA_GCI},
+    ],
+)
+def test_a_pushed_gamecube_card_lands_where_dolphin_reads_its_saves(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, members: dict[str, bytes]
+) -> None:
+    """However the player zipped their card, its GCI ends up in `GC/USA/Card A`.
+
+    A bare `Card A` folder, loose GCIs and the `GC` folder zipped by name all
+    used to answer 200 while landing a level off, so the game booted to an
+    empty card.
+
+    Args:
+        client: The broker test client.
+        tmp_path: The pytest temporary directory.
+        monkeypatch: The pytest monkeypatch fixture.
+        members: The pushed card's members.
+    """
+    monkeypatch.setattr(dolphin, "USER_DIR", tmp_path / "dolphin-emu")
+
+    response = client.put(
+        f"{API}/session/memory-card",
+        params={"emulator": "dolphin", "platform": "ngc"},
+        content=_zip(members),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "written": len(members), "unread": [], "slot": 1}
+    gc = tmp_path / "dolphin-emu" / "GC"
+    assert (gc / "USA" / "Card A" / "01-GZLE-zelda.gci").read_bytes() == _ZELDA_GCI
+    assert [p for p in gc.rglob("*.gci") if p.parent != gc / "USA" / "Card A"] == []
+
+
+def test_a_pushed_gamecube_card_names_the_saves_dolphin_will_not_read(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A GCI the broker cannot place still lands, answering 200, but is named in `unread`.
+
+    A refusal would abort RomM's claim and lock the player out, so the push
+    goes through; `unread` is how the caller learns the save will not show.
+
+    Args:
+        client: The broker test client.
+        tmp_path: The pytest temporary directory.
+        monkeypatch: The pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(dolphin, "USER_DIR", tmp_path / "dolphin-emu")
+    unplaceable = b"GZLX01" + _ZELDA_GCI[6:]
+
+    response = client.put(
+        f"{API}/session/memory-card",
+        params={"emulator": "dolphin", "platform": "ngc"},
+        content=_zip({"Card A/01-GZLX-zelda.gci": unplaceable, "card.raw": b"image"}),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "written": 2,
+        "unread": ["Card A/01-GZLX-zelda.gci", "card.raw"],
+        "slot": 1,
+    }
+    assert (tmp_path / "dolphin-emu" / "GC" / "Card A" / "01-GZLX-zelda.gci").read_bytes() == unplaceable
 
 
 def test_an_oversized_card_push_is_refused_without_keeping_the_body(
