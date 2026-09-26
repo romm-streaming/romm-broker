@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from .. import imports, memcard
+from .retroarch_cores import CoreRejectedError
 
 log = logging.getLogger(__name__)
 
@@ -726,6 +727,13 @@ class Emulator:
     assigns it whether or not the emulator reads it, and a reader of any
     subclass has to be able to find where it comes from.
     """
+    core: Optional[str] = None
+    """The core RomM asked for (`rom.core`), for a launcher that fronts many; None for its default.
+
+    Set by the activate route and the import-spec route, like `platform`.
+    """
+    experimental_cores: bool = False
+    """Whether RomM opted this launch in to known-broken cores (`rom.experimental_cores`)."""
     language: Optional[str] = None
     """The language the rom was activated for, or None.
 
@@ -1238,6 +1246,25 @@ class Emulator:
             root, and the members left somewhere the emulator will not read.
         """
         return memcard.Placement({name: name for name in heads})
+
+    def select_core(self) -> None:
+        """Resolve `core` for this launch, before anything is cleared.
+
+        Default: a launcher that is its own backend takes no core.
+
+        Raises:
+            CoreRejectedError: When `core` is set.
+        """
+        if self.core is not None:
+            raise CoreRejectedError(f"emulator {self.name} does not take a core")
+
+    def core_identity(self) -> dict[str, Any]:
+        """Extra manifest and activate-response fields describing the running core.
+
+        Returns:
+            Nothing by default.
+        """
+        return {}
 
     def archive_core(self) -> Optional[str]:
         """The core or backend actually running the game, or None.

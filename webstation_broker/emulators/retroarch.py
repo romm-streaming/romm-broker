@@ -68,7 +68,7 @@ import subprocess
 import threading
 import time
 import zipfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Optional, Union
 
@@ -1518,18 +1518,20 @@ _N3DS_PROTECTED = (
 """3DS destinations no import may write: the NAND's system save data, and every title's installed content."""
 
 
-def _layout(platform: Optional[str]) -> Optional[str]:
+def _layout(platform: Optional[str], info: Optional[Mapping[str, Any]] = None) -> Optional[str]:
     """Tell which folder layout, if any, the loaded platform's core keeps its saves in.
 
     Args:
         platform: The slug from the activate payload, or None.
+        info: The resolved profile, when the caller already has one; defaults
+            to the platform's own entry.
 
     Returns:
         `_LAYOUT_WII` for the Dolphin core on the Wii, `_LAYOUT_3DS` for the
         Azahar core, else None. GameCube runs the Dolphin core too, but keeps
         GCI files whose layout is not verified, so it has none.
     """
-    info = _platform_info(platform)
+    info = info if info is not None else _platform_info(platform)
     if info is None:
         return None
     if info["core"] == "azahar":
@@ -1539,7 +1541,9 @@ def _layout(platform: Optional[str]) -> Optional[str]:
     return None
 
 
-def _srm_dir(platform: Optional[str]) -> Union[str, imports.ImportRefusal]:
+def _srm_dir(
+    platform: Optional[str], info: Optional[Mapping[str, Any]] = None
+) -> Union[str, imports.ImportRefusal]:
     """Where an imported `.srm` lands on this platform, or why it lands nowhere.
 
     The one answer both `Retroarch.import_spec` and `Retroarch.place_import`
@@ -1551,12 +1555,14 @@ def _srm_dir(platform: Optional[str]) -> Union[str, imports.ImportRefusal]:
 
     Args:
         platform: The slug from the activate payload, or None.
+        info: The resolved profile, when the caller already has one; defaults
+            to the platform's own entry.
 
     Returns:
         The core's `library_name`, which names the sorted save dir, or the
         refusal a `.srm` gets here, with its `member` left unset.
     """
-    info = _platform_info(platform)
+    info = info if info is not None else _platform_info(platform)
     if info is None:
         return imports.ImportRefusal(
             "destination_unresolvable", None, None, detail=f"RetroArch has no core for platform {platform!r}"
@@ -1569,7 +1575,7 @@ def _srm_dir(platform: Optional[str]) -> Union[str, imports.ImportRefusal]:
             detail="the PPSSPP core keeps saves as SAVEDATA folders, not a .srm",
             suggest_emulator="ppsspp",
         )
-    layout = _layout(platform)
+    layout = _layout(platform, info)
     if layout == _LAYOUT_WII:
         return imports.ImportRefusal(
             "unrecognised_layout",
@@ -1594,7 +1600,7 @@ def _srm_dir(platform: Optional[str]) -> Union[str, imports.ImportRefusal]:
                 "which imports do not place yet"
             ),
         )
-    if not info["save_ram"]:
+    if info["save_ram"] is False:
         return imports.ImportRefusal(
             "destination_unresolvable",
             None,
@@ -1604,6 +1610,8 @@ def _srm_dir(platform: Optional[str]) -> Union[str, imports.ImportRefusal]:
                 "it keeps its save in a file of its own, or has none"
             ),
         )
+    # None is an untested core: nothing proves it reads a .srm, but one it
+    # ignores is harmless, so it is placed with a warning (§6.2).
     return info["library_name"]
 
 
@@ -1863,6 +1871,10 @@ class Retroarch(Emulator):
         same access time that read moves, so a handout landing mid-load reads
         as a false confirmation unless the wait knows to discount it.
         """
+        self._resolved: Optional[tuple[Optional[str], Optional[str], retroarch_cores.Profile]] = None
+        """The (platform, core) the profile was resolved for, and the profile; see `_profile`."""
+        self._observed_lib: Optional[str] = None
+        """An untested core's `library_name` as observed on disk or recorded in the manifest (§6.5)."""
 
     @property
     def save_subtrees(self) -> tuple[str, ...]:
@@ -1874,9 +1886,98 @@ class Retroarch(Emulator):
         Returns:
             The platform's `save_subtrees`, or `("states", "saves")` by default.
         """
-        info = _platform_info(self.platform)
+        info = self._profile()
         scoped = info.get("save_subtrees") if info else None
         return scoped or ("states", "saves")
+
+    def _experimental(self) -> bool:
+        """Whether a blocked core may run: RomM's flag or `RETROARCH_EXPERIMENTAL_CORES` (§6.4).
+
+        Returns:
+            True when either is on.
+        """
+        return self.experimental_cores or retroarch_cores.truthy(
+            os.environ.get("RETROARCH_EXPERIMENTAL_CORES")
+        )
+
+    def _profile(self) -> Optional[retroarch_cores.Profile]:
+        """The profile for the current platform and core, resolved once per pair.
+
+        Callers that only set `platform` (import-spec, most tests) get the
+        default profile. `select_core` is where a bad core raises; here an
+        unmapped platform with no core is None, as `_platform_info` was.
+
+        Returns:
+            The profile, or None when the platform is unset or unmapped.
+        """
+        key = ((self.platform or "").lower() or None, self.core)
+        if self._resolved is not None and self._resolved[:2] == key:
+            return self._resolved[2]
+        if key[0] is None or (key[0] not in PLATFORMS and self.core is None):
+            return None
+        profile = retroarch_cores.resolve_profile(
+            PLATFORMS,
+            key[0],
+            self.core,
+            experimental=self._experimental(),
+            catalog=retroarch_cores.catalog(),
+            tiers=retroarch_cores.TIERS,
+        )
+        self._resolved = (key[0], key[1], profile)
+        return profile
+
+    def select_core(self) -> None:
+        """Resolve the platform's profile now, and warn about an untested or blocked core.
+
+        Raises:
+            CoreRejectedError: For a core that is not offered, or blocked without the opt-in.
+        """
+        self._resolved = None
+        self._observed_lib = None
+        profile = self._profile()
+        if profile is None:
+            return
+        tier = profile["tier"]
+        if tier == "untested":
+            log.warning(
+                "retroarch: core %s on %s is untested; saves, states and imports may not work. "
+                "Report how it works: %s",
+                profile["core"],
+                self.platform,
+                retroarch_cores.REPORT_URL,
+            )
+        elif tier == "blocked":
+            reason = retroarch_cores.TIERS[profile["core"]].reason
+            log.error(
+                "retroarch: core %s on %s is known broken (%s) and runs only because experimental "
+                "cores are on. Report how it works: %s",
+                profile["core"],
+                self.platform,
+                reason,
+                retroarch_cores.REPORT_URL,
+            )
+
+    def library_name(self) -> Optional[str]:
+        """The sorted-dir name in effect: observed or recorded for an untested core, else the profile's.
+
+        Returns:
+            The name, or None when unmapped.
+        """
+        profile = self._profile()
+        if profile is None:
+            return None
+        return self._observed_lib or profile["library_name"]
+
+    def core_identity(self) -> dict[str, Any]:
+        """The tier and library name, for the manifest and the activate response.
+
+        Returns:
+            `core_tier` and `library_name`, or nothing when unmapped.
+        """
+        profile = self._profile()
+        if profile is None:
+            return {}
+        return {"core_tier": profile["tier"], "library_name": self.library_name()}
 
     @property
     def supports_states(self) -> bool:
@@ -1889,18 +1990,18 @@ class Retroarch(Emulator):
         Returns:
             True unless the platform entry sets `savestate` false.
         """
-        info = _platform_info(self.platform)
+        info = self._profile()
         return True if info is None else bool(info.get("savestate", True))
 
     def archive_core(self) -> Optional[str]:
         """The libretro core booting the loaded platform, or None when unmapped."""
-        info = _platform_info(self.platform)
+        info = self._profile()
         return info["core"] if info else None
 
     @property
     def rom_extensions(self) -> tuple[str, ...]:
         """The loaded platform's ROM extensions, or none when no platform is mapped."""
-        info = _platform_info(self.platform)
+        info = self._profile()
         return info["extensions"] if info else ()
 
     def resolve_rom_file(self, path: Path) -> Optional[Path]:
@@ -1916,7 +2017,7 @@ class Retroarch(Emulator):
             The file to boot, or None when the platform is unmapped, the path
             is neither file nor folder, or nothing in it qualifies.
         """
-        info = _platform_info(self.platform)
+        info = self._profile()
         if info is None:
             log.warning(
                 "retroarch: no core mapped for platform %r; mapped: %s",
@@ -1933,6 +2034,18 @@ class Retroarch(Emulator):
                     return None
             except OSError as exc:
                 log.debug("retroarch: could not resolve rom candidate %s: %s", path, exc)
+                return None
+            # A default or vetted core was tested against the platform's own
+            # files; an untested one only claims the extensions it shares with
+            # the platform, and a file outside them would reach a core that
+            # cannot boot it.
+            if info["tier"] in ("untested", "blocked") and path.suffix.lower() not in info["extensions"]:
+                log.warning(
+                    "retroarch: %s is not among core %s's extensions %s",
+                    path.name,
+                    info["core"],
+                    info["extensions"],
+                )
                 return None
             return path
         if not path.is_dir():
@@ -2110,7 +2223,7 @@ class Retroarch(Emulator):
                 RetroArch binary (`RETROARCH_BIN`) is not on `PATH`.
         """
         self.stop()
-        info = _platform_info(self.platform)
+        info = self._profile()
         if info is None:
             raise RuntimeError(
                 f"no retroarch core mapped for platform {self.platform!r}; "
@@ -2856,7 +2969,7 @@ class Retroarch(Emulator):
         # With no state yet, the core reads one from its sorted dir. The PUT
         # route creates the dir.
         name = _state_name(self._rom_base, STATE_SLOT)
-        lib = _library_name(self.platform)
+        lib = self.library_name()
         return STATE_DIR / lib / name if lib else STATE_DIR / name
 
     def import_spec(self) -> imports.ImportSpec:
@@ -2876,7 +2989,7 @@ class Retroarch(Emulator):
         """
         # counts_v1 stays False: the archive's other save files belong to other
         # content, and a file at a placed destination is already a conflict.
-        layout = _layout(self.platform)
+        layout = _layout(self.platform, self._profile())
         protected: tuple[str, ...] = ()
         if layout == _LAYOUT_WII:
             save = imports.KindSpec("save", (wii_nand.SAVE_SHAPE,))
@@ -2884,11 +2997,11 @@ class Retroarch(Emulator):
         elif layout == _LAYOUT_3DS:
             save = imports.KindSpec("save", _N3DS_SHAPES)
             protected = _N3DS_PROTECTED
-        elif isinstance(_srm_dir(self.platform), str):
+        elif isinstance(_srm_dir(self.platform, self._profile()), str):
             save = imports.KindSpec("save", ("<name>.srm",), max_members=1)
         else:
             save = imports.KindSpec("save", ())
-        mapped = _platform_info(self.platform) is not None
+        mapped = self._profile() is not None
         channel: imports.StateChannel = "push" if mapped and self.supports_states else "none"
         return imports.ImportSpec(kinds=(save,), state_channel=channel, protected=protected)
 
@@ -2903,7 +3016,7 @@ class Retroarch(Emulator):
             A GameCube/Wii disc-id source on the Wii, a sixteen-digit title-id
             source on the 3DS, and None on every other platform.
         """
-        layout = _layout(self.platform)
+        layout = _layout(self.platform, self._profile())
         if layout == _LAYOUT_WII:
             return imports.IdentitySource("gc_wii_disc")
         if layout == _LAYOUT_3DS:
@@ -2929,13 +3042,14 @@ class Retroarch(Emulator):
         Returns:
             The placement, or a refusal saying why this platform takes no such file.
         """
-        layout = _layout(self.platform)
+        profile = self._profile()
+        layout = _layout(self.platform, profile)
         if layout is not None and not _SRM_NAME_RE.fullmatch(member.parts[-1]):
             session = imports.identity_for(self, ctx)
             if layout == _LAYOUT_WII:
                 return wii_nand.place_nand(member, session, subtree=_WII_NAND, wrappers=_WII_WRAPPERS)
             return _place_n3ds(member, session)
-        lib = _srm_dir(self.platform)
+        lib = _srm_dir(self.platform, profile)
         if isinstance(lib, imports.ImportRefusal):
             return dataclasses.replace(lib, member=member.name)
         if ctx.rom_file is None:
@@ -2945,7 +3059,14 @@ class Retroarch(Emulator):
                 _SRM_EXPECTED,
                 detail="no rom file to name the save after",
             )
-        return _place_srm(member, lib, ctx.rom_file)
+        placed = _place_srm(member, lib, ctx.rom_file)
+        if isinstance(placed, imports.Placement) and profile is not None and profile["save_ram"] is None:
+            log.warning(
+                "retroarch: placed %s for untested core %s, which may not read a .srm",
+                placed.dest,
+                profile["core"],
+            )
+        return placed
 
     def _flush_sram(self) -> bool:
         """Ask RetroArch to write the game's SRAM out before the archive is dumped.

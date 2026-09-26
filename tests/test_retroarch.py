@@ -18,7 +18,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from webstation_broker import imports
-from webstation_broker.emulators import retroarch
+from webstation_broker.emulators import retroarch, retroarch_cores
 
 from .conftest import PREFIX, import_zip, preflight_import, restore_import
 
@@ -2737,7 +2737,7 @@ def test_a_launch_links_save_paths_and_pins_core_options(
     info = dict(retroarch._platform_info("snes"))
     info["save_links"] = {"neocd/neocd.srm": "NeoCD/neocd.srm"}
     info["core_options"] = {"some_option": "on"}
-    monkeypatch.setattr(retroarch, "_platform_info", lambda platform: info)
+    monkeypatch.setattr(retroarch.Retroarch, "_profile", lambda self: info)
     monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
     monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
     monkeypatch.setattr(retroarch, "_ensure_save_links", lambda links: linked.append(links))
@@ -2782,7 +2782,7 @@ def test_a_launch_resolves_seed_options_before_writing_them(
     monkeypatch.setattr(retroarch, "CORE_OPTIONS_CFG", tmp_path / "broker-core-options.cfg")
     info = dict(retroarch._platform_info("snes"))
     info["core_option_seeds"] = {"hatari_floppy_write_protection": "on"}
-    monkeypatch.setattr(retroarch, "_platform_info", lambda platform: info)
+    monkeypatch.setattr(retroarch.Retroarch, "_profile", lambda self: info)
     monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
     monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
     monkeypatch.setattr(retroarch, "_ensure_save_links", lambda links: None)
@@ -3811,3 +3811,114 @@ def test_only_wii_and_3ds_declare_an_identity_source(platform: Optional[str], fa
 
     assert (source.family if source else None) == family
     assert source is None or (source.rom_reader, source.use_save_target) == (None, False)
+
+
+def _with_core(platform: str, core: Optional[str], experimental: bool = False) -> retroarch.Retroarch:
+    """A RetroArch session on one platform with a core override.
+
+    Args:
+        platform: The RomM platform slug.
+        core: The core override, or None.
+        experimental: Whether blocked cores may run.
+
+    Returns:
+        The session.
+    """
+    emu = _on(platform)
+    emu.core = core
+    emu.experimental_cores = experimental
+    return emu
+
+
+def _untested_snes_core() -> str:
+    """A catalog core that shares an extension with snes and is neither default nor vetted."""
+    cat = retroarch_cores.catalog()
+    for core in ("mesen-s", "bsnes_mercury_balanced", "bsnes2014_accuracy"):
+        tier = retroarch_cores.tier_of(retroarch.PLATFORMS, "snes", core, cat, retroarch_cores.TIERS)
+        if tier == "untested":
+            return core
+    pytest.skip("no untested snes core in the bundled catalog")
+
+
+class TestCoreProfile:
+    """The launcher reads one resolved profile."""
+
+    def test_no_core_reads_the_platform_entry_unchanged(self) -> None:
+        """Byte-for-byte unchanged without core: (§2)."""
+        emu = _on("snes")
+        assert emu.archive_core() == "snes9x"
+        assert emu.rom_extensions == retroarch.PLATFORMS["snes"]["extensions"]
+        assert emu.core_identity() == {"core_tier": "default", "library_name": "Snes9x"}
+
+    def test_an_untested_core_changes_every_reader(self) -> None:
+        """archive_core, rom_extensions, save_subtrees and _srm_dir follow the profile."""
+        core = _untested_snes_core()
+        emu = _with_core("snes", core)
+        emu.select_core()
+        assert emu.archive_core() == core
+        assert emu.save_subtrees == ("states", "saves")
+        assert emu.core_identity()["core_tier"] == "untested"
+        assert set(emu.rom_extensions) <= set(retroarch.PLATFORMS["snes"]["extensions"])
+
+    def test_select_core_raises_for_an_unknown_core(self) -> None:
+        """Resolution failures surface at select_core, before any clear."""
+        with pytest.raises(retroarch_cores.CoreRejectedError):
+            _with_core("snes", "nosuchcore").select_core()
+
+    def test_env_opt_in_lifts_a_block(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """RETROARCH_EXPERIMENTAL_CORES works without the RomM flag (§6.4)."""
+        core = _untested_snes_core()
+        blocked = {core: retroarch_cores.TierEntry("blocked", "x", (), None)}
+        monkeypatch.setattr(retroarch_cores, "TIERS", blocked)
+        with pytest.raises(retroarch_cores.CoreRejectedError):
+            _with_core("snes", core).select_core()
+        monkeypatch.setenv("RETROARCH_EXPERIMENTAL_CORES", "yes")
+        emu = _with_core("snes", core)
+        emu.select_core()
+        assert emu.core_identity()["core_tier"] == "blocked"
+
+    def test_rom_opt_in_lifts_a_block(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """rom.experimental_cores from RomM is enough on its own."""
+        core = _untested_snes_core()
+        blocked = {core: retroarch_cores.TierEntry("blocked", "x", (), None)}
+        monkeypatch.setattr(retroarch_cores, "TIERS", blocked)
+        _with_core("snes", core, experimental=True).select_core()
+
+    def test_untested_core_refuses_a_file_rom_outside_its_extensions(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Review Focus 2: a single-file ROM is taken as is today; an untested core must check it."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        rom = tmp_path / "Game.zzz"
+        rom.write_bytes(b"x")
+        emu = _with_core("snes", _untested_snes_core())
+        emu.select_core()
+        assert emu.resolve_rom_file(rom) is None
+
+    def test_default_core_still_takes_any_file_rom(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unchanged behavior for the default."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        rom = tmp_path / "Game.zzz"
+        rom.write_bytes(b"x")
+        assert _on("snes").resolve_rom_file(rom) == rom
+
+    def test_untested_launch_logs_one_warning_with_the_report_link(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """§6.2: one warning naming core, platform, untested and the report URL."""
+        emu = _with_core("snes", _untested_snes_core())
+        with caplog.at_level(logging.WARNING):
+            emu.select_core()
+        warnings = [r.getMessage() for r in caplog.records if "untested" in r.getMessage()]
+        assert len(warnings) == 1 and retroarch_cores.REPORT_URL in warnings[0]
+
+    def test_base_emulator_refuses_a_core(self) -> None:
+        """Only RetroArch fronts many cores."""
+        from webstation_broker.emulators import get_emulator
+
+        emu = get_emulator("pcsx2")
+        emu.core = "x"
+        with pytest.raises(retroarch_cores.CoreRejectedError):
+            emu.select_core()
