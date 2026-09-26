@@ -1303,6 +1303,19 @@ class Emulator:
         """
         return None
 
+    def carry_save_across_cores(
+        self, identity: Optional[Mapping[str, Any]], rom_file: Optional[Path]
+    ) -> None:
+        """Move a battery save into the new core's save dir on a core switch (§8.2).
+
+        Default: nothing. A launcher that fronts many cores, each sorting its
+        saves under its own dir, overrides this to carry the file across.
+
+        Args:
+            identity: The restored archive's manifest `session`, or None.
+            rom_file: The file being booted, or None.
+        """
+
     def save_file_kind(self, rel: str) -> str:
         """What an archive member holds, for the manifest the parent reads.
 

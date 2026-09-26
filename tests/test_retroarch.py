@@ -10,14 +10,14 @@ import os
 import threading
 import time
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional, Union
 
 import pytest
 from fastapi.testclient import TestClient
 
-from webstation_broker import imports
+from webstation_broker import imports, saves
 from webstation_broker.emulators import retroarch, retroarch_cores
 
 from .conftest import PREFIX, import_zip, preflight_import, restore_import
@@ -4497,3 +4497,187 @@ class TestActivateCore:
         params = {"emulator": "retroarch", "platform": "snes", "core": _untested_snes_core()}
         body = client.get(f"{PREFIX}/api/session/import-spec", params=params).json()
         assert body["kinds"][0]["shapes"] == ["<name>.srm"]
+
+
+def _srm(root: Path, lib: str, stem: str = "Game", mtime: float = 1_000_000.0) -> Path:
+    """Write saves/<lib>/<stem>.srm with a fixed mtime.
+
+    Args:
+        root: The patched data root.
+        lib: The sorted dir.
+        stem: The content stem.
+        mtime: The mtime to set.
+
+    Returns:
+        The path.
+    """
+    path = root / "saves" / lib / f"{stem}.srm"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"sram")
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+def _dump_archive(root: Path, members: Mapping[str, bytes], identity: dict[str, Any]) -> bytes:
+    """Build a save archive from `members`, carrying `identity` in its manifest.
+
+    Args:
+        root: The data root the members are written under before zipping.
+        members: Relative path (e.g. "saves/Snes9x/Game.srm") to file content.
+        identity: The session identity the manifest should record.
+
+    Returns:
+        The archive's zip bytes.
+    """
+    for rel, data in members.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    report = saves.build_save_archive(root, ("states", "saves"), baseline=0, identity=identity)
+    assert report["zip_bytes"] is not None
+    return report["zip_bytes"]
+
+
+class TestCarryOver:
+    """§8.2 battery-save carry-over."""
+
+    def _emu(self, core: Optional[str]) -> retroarch.Retroarch:
+        emu = _with_core("snes", core)
+        emu.select_core()
+        return emu
+
+    def test_srm_is_renamed_with_its_mtime_kept(self, ra_dirs: Path) -> None:
+        """So it is not in the next exit dump unless the game writes it."""
+        core = _untested_snes_core()
+        old = _srm(ra_dirs, "Snes9x")
+        emu = self._emu(core)
+        emu.carry_save_across_cores(
+            {"core": "snes9x", "library_name": "Snes9x"}, ra_dirs / "Game.sfc"
+        )
+        new = ra_dirs / "saves" / emu.library_name() / "Game.srm"
+        assert new.read_bytes() == b"sram" and new.stat().st_mtime == 1_000_000.0
+        assert not old.exists()
+
+    def test_back_to_default_carries_the_other_way(self, ra_dirs: Path) -> None:
+        """Switching back follows the operator's choice."""
+        core = _untested_snes_core()
+        emu_new = self._emu(core)
+        _srm(ra_dirs, emu_new.library_name())
+        emu = self._emu(None)
+        emu.carry_save_across_cores(
+            {"core": core, "library_name": emu_new.library_name()}, ra_dirs / "Game.sfc"
+        )
+        assert (ra_dirs / "saves" / "Snes9x" / "Game.srm").exists()
+
+    def test_existing_target_is_kept_and_source_left(self, ra_dirs: Path) -> None:
+        """Never overwrite a save."""
+        core = _untested_snes_core()
+        emu = self._emu(core)
+        old = _srm(ra_dirs, "Snes9x")
+        target = _srm(ra_dirs, emu.library_name(), mtime=2_000_000.0)
+        emu.carry_save_across_cores({"core": "snes9x"}, ra_dirs / "Game.sfc")
+        assert old.exists() and target.stat().st_mtime == 2_000_000.0
+
+    @pytest.mark.parametrize("identity", [None, {}, {"core": None}])
+    def test_manifest_without_core_changes_nothing(
+        self, ra_dirs: Path, identity: Optional[dict]
+    ) -> None:
+        """Legacy archives are left as they are."""
+        old = _srm(ra_dirs, "Snes9x")
+        self._emu(_untested_snes_core()).carry_save_across_cores(identity, ra_dirs / "Game.sfc")
+        assert old.exists()
+
+    def test_several_candidates_carry_nothing(
+        self, ra_dirs: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An unresolvable old core with two .srm dirs is ambiguous."""
+        a, b = _srm(ra_dirs, "A"), _srm(ra_dirs, "B")
+        with caplog.at_level(logging.INFO):
+            self._emu(None).carry_save_across_cores({"core": "gone_core"}, ra_dirs / "Game.sfc")
+        assert a.exists() and b.exists() and "several" in caplog.text
+
+    def test_single_candidate_is_used_when_old_core_is_unknown(self, ra_dirs: Path) -> None:
+        """The archive's own saves/*/<stem>.srm, when exactly one exists."""
+        _srm(ra_dirs, "Whatever")
+        self._emu(None).carry_save_across_cores({"core": "gone_core"}, ra_dirs / "Game.sfc")
+        assert (ra_dirs / "saves" / "Snes9x" / "Game.srm").exists()
+
+    @pytest.mark.parametrize("bad_lib", ["../x", "a\\b"])
+    def test_bad_manifest_library_name_falls_through_to_the_profile(
+        self, ra_dirs: Path, bad_lib: str
+    ) -> None:
+        """An unsafe manifest library_name is ignored, not joined into a path."""
+        core = _untested_snes_core()
+        old = _srm(ra_dirs, "Snes9x")
+        emu = self._emu(core)
+        emu.carry_save_across_cores(
+            {"core": "snes9x", "library_name": bad_lib}, ra_dirs / "Game.sfc"
+        )
+        new = ra_dirs / "saves" / emu.library_name() / "Game.srm"
+        assert new.read_bytes() == b"sram"
+        assert not old.exists()
+
+    def test_glob_metacharacters_in_the_stem_do_not_confuse_the_single_candidate_fallback(
+        self, ra_dirs: Path
+    ) -> None:
+        """A stem with glob metacharacters still resolves through the single-candidate path."""
+        stem = "Game [USA]*"
+        _srm(ra_dirs, "Whatever", stem=stem)
+        self._emu(None).carry_save_across_cores({"core": "gone_core"}, ra_dirs / f"{stem}.sfc")
+        assert (ra_dirs / "saves" / "Snes9x" / f"{stem}.srm").exists()
+
+    def test_save_ram_false_target_carries_nothing(
+        self, ra_dirs: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A core that never reads .srm gets none."""
+        old = _srm(ra_dirs, "Snes9x")
+        emu = self._emu(None)
+        monkeypatch.setattr(
+            emu,
+            "_profile",
+            lambda: {
+                **retroarch.PLATFORMS["snes"],
+                "core": "x",
+                "library_name": "X",
+                "save_ram": False,
+                "tier": "vetted",
+            },
+        )
+        emu.carry_save_across_cores({"core": "snes9x"}, ra_dirs / "Game.sfc")
+        assert old.exists()
+
+    def test_switch_keeps_srm_and_ignores_old_state(
+        self,
+        client: TestClient,
+        broker_dirs: dict[str, Path],
+        ra_dirs: Path,
+        no_launch: list,
+    ) -> None:
+        """Review Focus 1, end to end: activate with an archive dumped by snes9x onto an untested core."""
+        core = _untested_snes_core()
+        archive = _dump_archive(
+            ra_dirs,
+            {"saves/Snes9x/Game.srm": b"sram", "states/Snes9x/Game.state": b"old"},
+            identity={
+                "emulator": "retroarch",
+                "core": "snes9x",
+                "platform": "snes",
+                "library_name": "Snes9x",
+            },
+        )
+        path = broker_dirs["imports"] / "a.zip"
+        path.write_bytes(archive)
+        game = broker_dirs["roms"] / "Game.sfc"
+        game.write_bytes(b"rom")
+        body = {
+            "session_id": "s",
+            "emulator": "retroarch",
+            "user": {"id": 1, "username": "a", "display_name": "A"},
+            "rom": {"platform": "snes", "path": str(game), "core": core},
+            "save": {"archive": str(path)},
+        }
+        assert client.post(f"{PREFIX}/api/session/activate", json=body).status_code == 200
+        emu = no_launch[0]
+        emu._rom_base = "Game"
+        assert (ra_dirs / "saves" / emu.library_name() / "Game.srm").read_bytes() == b"sram"
+        assert emu.state_path() is None

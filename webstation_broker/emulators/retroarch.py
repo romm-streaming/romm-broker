@@ -1869,6 +1869,63 @@ def _place_srm(
     return imports.Placement(member, dest)
 
 
+def _safe_dir_name(value: object) -> Optional[str]:
+    r"""A manifest field usable as a single sorted-dir path component, or None.
+
+    Shared by `_old_library_name` and `adopt_archive_identity`: both read a
+    manifest's `library_name` and must refuse anything that could name a
+    path outside the dir it gets joined under.
+
+    Args:
+        value: The manifest field to validate.
+
+    Returns:
+        `value` when it is a non-empty string, not "." or "..", and contains
+        neither "/" nor "\\"; otherwise None.
+    """
+    if not isinstance(value, str) or not value or value in (".", ".."):
+        return None
+    if "/" in value or "\\" in value:
+        return None
+    return value
+
+
+def _old_library_name(identity: Mapping[str, Any], platform: str, stem: str) -> Optional[str]:
+    """The sorted-dir name the archive's core saved under (§8.2).
+
+    Args:
+        identity: The archive manifest's `session`.
+        platform: The platform slug.
+        stem: The content stem the `.srm` is named after.
+
+    Returns:
+        The manifest's `library_name`; else the old core's, from the bundled
+        table and catalog only (a refresh must not change where an old save is
+        looked for); else the dir of the only `saves/*/<stem>.srm`; else None.
+    """
+    lib = _safe_dir_name(identity.get("library_name"))
+    if lib is not None:
+        return lib
+    try:
+        profile = retroarch_cores.resolve_profile(
+            PLATFORMS,
+            platform,
+            identity.get("core"),
+            experimental=True,
+            catalog=retroarch_cores.load_bundled_catalog(),
+            tiers=retroarch_cores.TIERS,
+        )
+        return profile["library_name"]
+    except retroarch_cores.CoreRejectedError:
+        pass
+    candidates = [p.parent.name for p in SAVE_DIR.glob(f"*/{glob.escape(stem)}.srm") if p.is_file()]
+    if len(candidates) == 1:
+        return candidates[0]
+    if candidates:
+        log.info("retroarch: no .srm carried: several candidates %s", sorted(candidates))
+    return None
+
+
 class Retroarch(Emulator):
     """RetroArch driven over its stdin command interface.
 
@@ -2237,13 +2294,58 @@ class Retroarch(Emulator):
         profile = self._profile()
         if not identity or profile is None or profile["tier"] in ("default", "vetted"):
             return
-        lib = identity.get("library_name")
-        if identity.get("core") != profile["core"] or not isinstance(lib, str):
+        raw_lib = identity.get("library_name")
+        if identity.get("core") != profile["core"] or not isinstance(raw_lib, str):
             return
-        if not lib or lib in (".", "..") or "/" in lib or "\\" in lib:
-            log.warning("retroarch: ignoring manifest library_name %r", lib)
+        lib = _safe_dir_name(raw_lib)
+        if lib is None:
+            log.warning("retroarch: ignoring manifest library_name %r", raw_lib)
             return
         self._seeded_lib = lib
+
+    def carry_save_across_cores(
+        self, identity: Optional[Mapping[str, Any]], rom_file: Optional[Path]
+    ) -> None:
+        """Move the battery save from the archive's core's dir into this core's (§8.2).
+
+        Runs after the archive is restored and before the baseline, so the
+        rename, which keeps the file's mtime, does not count as this session's
+        write. States are never carried.
+
+        Args:
+            identity: The restored archive's manifest `session`, or None.
+            rom_file: The file being booted; its stem names the `.srm`.
+        """
+        profile = self._profile()
+        old_core = identity.get("core") if identity else None
+        if profile is None or rom_file is None or not old_core or old_core == profile["core"]:
+            return
+        if profile["save_ram"] is False:
+            log.info("retroarch: no .srm carried: core %s does not read one", profile["core"])
+            return
+        stem = rom_file.stem
+        old_lib = _old_library_name(identity, (self.platform or "").lower(), stem)
+        new_lib = self.library_name()
+        if old_lib is None or new_lib is None or old_lib == new_lib:
+            return
+        source = SAVE_DIR / old_lib / f"{stem}.srm"
+        target = SAVE_DIR / new_lib / f"{stem}.srm"
+        if not source.is_file():
+            log.info("retroarch: no .srm carried: %s has none for %s", old_core, stem)
+            return
+        if target.exists():
+            log.info("retroarch: no .srm carried: %s already exists", target)
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(source, target)  # a rename keeps the mtime
+        if profile["save_ram"] is None:
+            log.warning(
+                "retroarch: carried .srm from %s to untested core %s, which may not read it",
+                old_core,
+                profile["core"],
+            )
+        else:
+            log.info("retroarch: carried .srm from %s to %s", old_core, profile["core"])
 
     def note_broker_state_write(self, path: Path) -> None:
         """Track `path` so `_observe_library_name` does not mistake it for a core's own write.

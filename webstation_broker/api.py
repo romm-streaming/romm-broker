@@ -673,6 +673,7 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     # has to fail with the slot still holding whatever it held.
     content = None
     restore_skipped = None
+    archive_identity = None
     if save and save.archive:
         archive_path = Path(save.archive)
         if subtrees:
@@ -682,7 +683,8 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
                     status_code=404, detail=f"save archive not found: {save.archive}"
                 )
             content = await anyio.to_thread.run_sync(archive_path.read_bytes)
-            emulator.adopt_archive_identity(saves.archive_session_identity(content))
+            archive_identity = saves.archive_session_identity(content)
+            emulator.adopt_archive_identity(archive_identity)
         else:
             # Dropping the archive and still answering "launching" is how a
             # player ends up booting a fresh save with nothing to tell them.
@@ -875,6 +877,9 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
             for p in placements
         ]
         log.info("save restore: %s", restore_report)
+
+    if content is not None:
+        await anyio.to_thread.run_sync(emulator.carry_save_across_cores, archive_identity, rom_file)
 
     payload = body.model_dump()
     payload["callback"] = _resolve_callback(body.callback, request)
