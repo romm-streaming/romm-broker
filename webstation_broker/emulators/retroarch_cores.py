@@ -11,6 +11,7 @@ launcher can import this module without a cycle.
 """
 
 import dataclasses
+import functools
 import hashlib
 import io
 import json
@@ -200,6 +201,7 @@ def build_catalog(zip_bytes: bytes, index_text: str, installed: frozenset[str] =
     return Catalog(MappingProxyType(cores), zip_bytes)
 
 
+@functools.cache
 def load_bundled_catalog(installed: frozenset[str] = frozenset()) -> Catalog:
     """Build the catalog from the bundled zip and the build list in its source file.
 

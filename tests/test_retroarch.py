@@ -21,6 +21,7 @@ from webstation_broker import imports
 from webstation_broker.emulators import retroarch, retroarch_cores
 
 from .conftest import PREFIX, import_zip, preflight_import, restore_import
+from .test_retroarch_cores import info_zip as info_zip_bytes
 
 
 def test_the_table_is_the_one_on_disk() -> None:
@@ -705,6 +706,7 @@ class TestResumeGate:
             The args tuple of every deferred-load thread launch() started, in order.
         """
         monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
+        monkeypatch.setattr(retroarch, "_ensure_core_info", lambda *a, **k: None)
         monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
         monkeypatch.setattr(retroarch, "_ensure_save_links", lambda links: None)
         monkeypatch.setattr(retroarch, "_write_core_options", lambda options: tmp_path / "core-options.cfg")
@@ -2202,6 +2204,77 @@ class TestCoreDownload:
         assert retroarch._ensure_core("snes9x") == so
 
 
+class TestCoreInfoInstall:
+    """§6.3: a core without its .info segfaults GET_STATUS."""
+
+    def test_missing_info_is_written_from_the_zip(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Written atomically next to the .so."""
+        monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path)
+        retroarch._ensure_core_info("snes9x", tier="default", has_source=False)
+        expected = retroarch_cores.load_bundled_catalog().info_file("snes9x")
+        assert (tmp_path / "snes9x_libretro.info").read_bytes() == expected
+        assert (tmp_path / "snes9x_libretro.info").stat().st_size > 0
+        assert not list(tmp_path.glob(".*.tmp"))
+
+    def test_existing_info_is_left_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An operator's own .info is never overwritten."""
+        monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path)
+        (tmp_path / "snes9x_libretro.info").write_bytes(b"mine")
+        retroarch._ensure_core_info("snes9x", tier="default", has_source=False)
+        assert (tmp_path / "snes9x_libretro.info").read_bytes() == b"mine"
+
+    def test_core_source_core_without_info_only_logs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Azahar may not be in the zip; the launch goes on."""
+        monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path)
+        with caplog.at_level(logging.WARNING):
+            retroarch._ensure_core_info("nosuchcore", tier="default", has_source=True)
+        assert "no .info" in caplog.text
+
+    def test_other_core_without_info_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Launching it would crash mid-session, so the launch fails now, naming the file."""
+        monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path)
+        with pytest.raises(RuntimeError, match="nosuchcore_libretro.info"):
+            retroarch._ensure_core_info("nosuchcore", tier="untested", has_source=False)
+
+    @pytest.mark.parametrize("tier", ["default", "vetted"])
+    def test_default_and_vetted_info_comes_from_the_bundle(
+        self, tier: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """§7: a refreshed cache never supplies a default or vetted core's .info."""
+        monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path)
+        bogus = retroarch_cores.build_catalog(
+            info_zip_bytes({"snes9x": {"corename": "EVIL"}}), "snes9x_libretro.so.zip"
+        )
+        monkeypatch.setattr(retroarch_cores, "_catalog", bogus)
+        retroarch._ensure_core_info("snes9x", tier=tier, has_source=False)
+        assert b"EVIL" not in (tmp_path / "snes9x_libretro.info").read_bytes()
+
+    def test_a_failed_info_install_leaves_no_temp_file_behind(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A rename that fails cleans up its temp file rather than leaving a stray .info."""
+        monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path)
+
+        def refuse(src: Any, dst: Any) -> None:
+            raise OSError("read-only")
+
+        monkeypatch.setattr(retroarch.os, "replace", refuse)
+
+        with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match="failed to install"):
+            retroarch._ensure_core_info("snes9x", tier="default", has_source=False)
+
+        assert list(tmp_path.glob(".*.tmp")) == []
+        assert not (tmp_path / "snes9x_libretro.info").is_file()
+
+
 class TestSaveStateAgainstResume:
     """A save landing while a deferred resume load is still in flight."""
 
@@ -2696,6 +2769,7 @@ def test_a_launch_tells_retroarch_which_config_the_broker_read(
 
     monkeypatch.setattr(retroarch, "RA_CONFIG_PATH", tmp_path / "ra" / "retroarch.cfg")
     monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
+    monkeypatch.setattr(retroarch, "_ensure_core_info", lambda *a, **k: None)
     monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
     monkeypatch.setattr(retroarch, "_ensure_save_links", lambda links: None)
     monkeypatch.setattr(retroarch, "_write_core_options", lambda options: tmp_path / "core-options.cfg")
@@ -2735,10 +2809,12 @@ def test_a_launch_links_save_paths_and_pins_core_options(
             """Start nothing."""
 
     info = dict(retroarch._platform_info("snes"))
+    info["tier"] = "default"
     info["save_links"] = {"neocd/neocd.srm": "NeoCD/neocd.srm"}
     info["core_options"] = {"some_option": "on"}
     monkeypatch.setattr(retroarch.Retroarch, "_profile", lambda self: info)
     monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
+    monkeypatch.setattr(retroarch, "_ensure_core_info", lambda *a, **k: None)
     monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
     monkeypatch.setattr(retroarch, "_ensure_save_links", lambda links: linked.append(links))
     monkeypatch.setattr(
@@ -2781,9 +2857,11 @@ def test_a_launch_resolves_seed_options_before_writing_them(
 
     monkeypatch.setattr(retroarch, "CORE_OPTIONS_CFG", tmp_path / "broker-core-options.cfg")
     info = dict(retroarch._platform_info("snes"))
+    info["tier"] = "default"
     info["core_option_seeds"] = {"hatari_floppy_write_protection": "on"}
     monkeypatch.setattr(retroarch.Retroarch, "_profile", lambda self: info)
     monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
+    monkeypatch.setattr(retroarch, "_ensure_core_info", lambda *a, **k: None)
     monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
     monkeypatch.setattr(retroarch, "_ensure_save_links", lambda links: None)
     monkeypatch.setattr(

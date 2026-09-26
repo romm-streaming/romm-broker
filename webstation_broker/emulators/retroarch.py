@@ -708,6 +708,55 @@ def _ensure_core(core: str, source: Optional[dict[str, Any]] = None) -> Path:
     return so
 
 
+def _ensure_core_info(core: str, *, tier: str, has_source: bool) -> None:
+    """Make sure `<core>_libretro.info` sits beside the core in `CORES_DIR` (§6.3).
+
+    `CORES_DIR` is also RetroArch's `libretro_info_path`, and a core loaded
+    without its info file leaves the core info unset, after which
+    `GET_STATUS` segfaults RetroArch mid-session.
+
+    Args:
+        core: The core name.
+        tier: The profile's tier; default and vetted cores always take the
+            bundled file, never one from a refreshed cache.
+        has_source: Whether the core comes from a `core_source` rather than
+            the buildbot, in which case the zip may not hold its info.
+
+    Raises:
+        RuntimeError: When the info file is missing, not in the catalog, and
+            the core is not a `core_source` one; or it cannot be written.
+    """
+    dest = CORES_DIR / f"{core}_libretro.info"
+    if dest.is_file():
+        return
+    catalog = (
+        retroarch_cores.load_bundled_catalog()
+        if tier in ("default", "vetted")
+        else retroarch_cores.catalog()
+    )
+    data = catalog.info_file(core)
+    if data is None:
+        if has_source:
+            log.warning(
+                "retroarch: core %s has no .info in the catalog; RetroArch may crash on status", core
+            )
+            return
+        raise RuntimeError(f"no {dest.name} in the core-info catalog")
+    CORES_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CORES_DIR / f".{dest.name}.{secrets.token_hex(8)}.tmp"
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, dest)
+    except OSError as exc:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError as cleanup_exc:
+            log.warning("retroarch: could not remove the partial info file %s: %s", tmp, cleanup_exc)
+        log.error("retroarch: info file %s could not be installed: %s", dest.name, exc)
+        raise RuntimeError(f"failed to install {dest.name}: {exc}") from exc
+    log.info("retroarch: installed %s", dest.name)
+
+
 def _ensure_core_assets(assets: dict[str, str]) -> None:
     """Link a core's asset directories into the RetroArch system dir.
 
@@ -2230,6 +2279,7 @@ class Retroarch(Emulator):
                 f"mapped: {', '.join(sorted(PLATFORMS))}"
             )
         core = _ensure_core(info["core"], info.get("core_source"))
+        _ensure_core_info(info["core"], tier=info["tier"], has_source="core_source" in info)
         _ensure_core_assets(info.get("assets", {}))
         _ensure_save_links(info.get("save_links", {}))
         _write_core_options(
