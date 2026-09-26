@@ -1244,7 +1244,7 @@ class TestSwapDisc:
             return True
 
         monkeypatch.setattr(emulator, "wait_for_state", fake_wait_for_state)
-        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: True)
+        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot, resume=False: True)
 
         t = threading.Thread(
             target=emulator._deferred_load_state, args=(0, emulator._launch_seq)
@@ -1736,6 +1736,71 @@ class TestLoadStateConfirmation:
             assert emulator.load_state(0) is False
 
         assert "never read Game.state" in caplog.text
+
+    @pytest.mark.parametrize("tier", ["untested", "blocked"])
+    def test_an_unread_resume_on_an_unvetted_core_names_the_state_dir(
+        self,
+        emulator: retroarch.Retroarch,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        tier: str,
+    ) -> None:
+        """§6.5: a resume an untested or blocked core never reads says its state dir may differ.
+
+        Args:
+            emulator: The live Retroarch.
+            monkeypatch: The pytest monkeypatch fixture.
+            caplog: The pytest log capture fixture.
+            tier: The running core's tier.
+        """
+        state = retroarch.STATE_DIR / "Game.state"
+        profile = {**retroarch.PLATFORMS["snes"], "core": "mesen-s", "library_name": "Mesen-S", "tier": tier}
+        monkeypatch.setattr(emulator, "_profile", lambda: profile)
+        monkeypatch.setattr(emulator, "state_path", lambda: state)
+        monkeypatch.setattr(retroarch, "_atime_tracked", lambda d: True)
+        monkeypatch.setattr(retroarch, "_wait_for_state_read", lambda *a, **k: False)
+        monkeypatch.setattr(emulator, "_send", lambda cmd, wait_prefix, timeout: cmd)
+
+        with caplog.at_level(logging.WARNING):
+            assert emulator._load_state_locked(0, resume=True) is False
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert [r.getMessage() for r in warnings] == [
+            f"resume state not read by {tier} core mesen-s; its state dir may differ"
+        ]
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    @pytest.mark.parametrize(("tier", "resume"), [("default", True), ("vetted", True), ("untested", False)])
+    def test_an_unread_load_keeps_the_error_otherwise(
+        self,
+        emulator: retroarch.Retroarch,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        tier: str,
+        resume: bool,
+    ) -> None:
+        """A default or vetted core's resume, and any manual load, keep the generic error.
+
+        Args:
+            emulator: The live Retroarch.
+            monkeypatch: The pytest monkeypatch fixture.
+            caplog: The pytest log capture fixture.
+            tier: The running core's tier.
+            resume: Whether the load is a resume attempt.
+        """
+        state = retroarch.STATE_DIR / "Game.state"
+        profile = {**retroarch.PLATFORMS["snes"], "tier": tier}
+        monkeypatch.setattr(emulator, "_profile", lambda: profile)
+        monkeypatch.setattr(emulator, "state_path", lambda: state)
+        monkeypatch.setattr(retroarch, "_atime_tracked", lambda d: True)
+        monkeypatch.setattr(retroarch, "_wait_for_state_read", lambda *a, **k: False)
+        monkeypatch.setattr(emulator, "_send", lambda cmd, wait_prefix, timeout: cmd)
+
+        with caplog.at_level(logging.WARNING):
+            assert emulator._load_state_locked(0, resume=resume) is False
+
+        assert "never read Game.state" in caplog.text
+        assert "its state dir may differ" not in caplog.text
 
     def test_no_echo_at_all_fails(
         self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch
@@ -2305,7 +2370,7 @@ class TestSaveStateAgainstResume:
         monkeypatch.setattr(emulator, "state_path", lambda: state)
         monkeypatch.setattr(emulator, "_try_save", lambda: emulator.events.append("save") or True)
         monkeypatch.setattr(
-            emulator, "_load_state_locked", lambda slot: emulator.events.append("load") or True
+            emulator, "_load_state_locked", lambda slot, resume=False: emulator.events.append("load") or True
         )
         return emulator
 
@@ -2439,7 +2504,7 @@ class TestResumeLoadRetry:
     ) -> None:
         """A core that was not ready for the first load gets another attempt."""
         results = [False, True]
-        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: results.pop(0))
+        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot, resume=False: results.pop(0))
 
         with caplog.at_level(logging.INFO):
             confirmed = emulator._load_until_confirmed(0, time.monotonic() + 5.0, emulator._launch_seq)
@@ -2455,7 +2520,7 @@ class TestResumeLoadRetry:
         """An unrestored game is an error, not one info line saying "failed"."""
         attempts: list[int] = []
         monkeypatch.setattr(
-            emulator, "_load_state_locked", lambda slot: attempts.append(slot) or False
+            emulator, "_load_state_locked", lambda slot, resume=False: attempts.append(slot) or False
         )
 
         with caplog.at_level(logging.WARNING):
@@ -2473,7 +2538,7 @@ class TestResumeLoadRetry:
         """Retries for a session that has been relaunched must not keep firing at the new one."""
         attempts: list[int] = []
 
-        def fail_and_relaunch(slot: int) -> bool:
+        def fail_and_relaunch(slot: int, resume: bool = False) -> bool:
             attempts.append(slot)
             emulator._launch_seq += 1
             return False
@@ -2499,7 +2564,9 @@ class TestResumeLoadRetry:
         appears = [False, True]
         monkeypatch.setattr(emulator, "wait_for_state", lambda deadline: appears.pop(0))
         loads: list[int] = []
-        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: loads.append(slot) or True)
+        monkeypatch.setattr(
+            emulator, "_load_state_locked", lambda slot, resume=False: loads.append(slot) or True
+        )
 
         with caplog.at_level(logging.WARNING):
             confirmed = emulator._load_until_confirmed(0, time.monotonic() + 5.0, emulator._launch_seq)
@@ -2521,7 +2588,7 @@ class TestResumeLoadRetry:
             return True
 
         monkeypatch.setattr(emulator, "wait_for_state", blocking_wait)
-        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: True)
+        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot, resume=False: True)
 
         t = threading.Thread(
             target=emulator._load_until_confirmed,
@@ -2540,7 +2607,7 @@ class TestResumeLoadRetry:
     ) -> None:
         """The deferred resume path itself retries, not just the helper under it."""
         results = [False, False, True]
-        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: results.pop(0))
+        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot, resume=False: results.pop(0))
         monkeypatch.setattr(
             emulator, "_send", lambda cmd, wait_prefix, timeout: "GET_STATUS PLAYING psp,Game,0"
         )
@@ -2566,7 +2633,9 @@ class TestResumeLoadRetry:
         paths = [original, clobbered]
         monkeypatch.setattr(emulator, "state_path", lambda: paths.pop(0))
         attempts: list[int] = []
-        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: attempts.append(slot) or False)
+        monkeypatch.setattr(
+            emulator, "_load_state_locked", lambda slot, resume=False: attempts.append(slot) or False
+        )
 
         with caplog.at_level(logging.ERROR):
             confirmed = emulator._load_until_confirmed(0, time.monotonic() + 5.0, emulator._launch_seq)
@@ -2582,7 +2651,9 @@ class TestResumeLoadRetry:
         """A stat failure right after the wait must not silently skip the fingerprint guard."""
         monkeypatch.setattr(retroarch, "_state_identity", lambda path: None)
         loads: list[int] = []
-        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: loads.append(slot) or True)
+        monkeypatch.setattr(
+            emulator, "_load_state_locked", lambda slot, resume=False: loads.append(slot) or True
+        )
 
         with caplog.at_level(logging.WARNING):
             confirmed = emulator._load_until_confirmed(0, time.monotonic() + 0.3, emulator._launch_seq)
@@ -4067,6 +4138,41 @@ class TestStateScope:
         emu._rom_base = "Game"
         assert emu.state_path() is None
 
+    def test_vetted_core_ignores_a_root_level_state(
+        self, ra_dirs: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """R6b: root states predate core overrides, so they are the default core's, never an alternate's."""
+        root = _root_state(ra_dirs, name="Game.state1", mtime=2000)
+        emu = _on("snes")
+        profile = {**retroarch.PLATFORMS["snes"], "core": "bsnes", "library_name": "bsnes", "tier": "vetted"}
+        monkeypatch.setattr(emu, "_profile", lambda: profile)
+        monkeypatch.setattr(retroarch, "STATE_SLOT", 1)
+        emu._rom_base = "Game"
+        assert emu._state_scope() == ("bsnes", frozenset(), False)
+        assert emu.state_path() is None
+        own = _state(ra_dirs, "bsnes", name="Game.state1", mtime=1000)
+        assert emu.state_path() == own != root
+
+    def test_an_imported_save_does_not_confirm_the_observer(
+        self, ra_dirs: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """M1: a .srm the broker placed before launch proves nothing about where the core writes."""
+        emu = _with_core("snes", _untested_snes_core())
+        emu.select_core()
+        ctx = imports.ImportCtx(
+            rom_file=ra_dirs / "Game.sfc", rom=None, memory_card_synced=False, excluded=(), resume_slot=None
+        )
+        placed = emu.place_import(_member("Game.srm", "save"), emu.import_spec(), ctx)
+        assert isinstance(placed, imports.Placement)
+        dest = ra_dirs / placed.dest
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"sram")
+        emu._launch_wall = time.time() - 5
+        with caplog.at_level(logging.INFO):
+            emu._observe_library_name()
+        assert emu._observed_lib is None
+        assert "library_name not yet confirmed" in caplog.text
+
     def test_a_seed_alone_does_not_narrow_the_open_scope(self, ra_dirs: Path) -> None:
         """R7a: a seed with no observation yet leaves scope open, so a wrong seed can't hide the real dir.
 
@@ -4470,6 +4576,19 @@ class TestActivateCore:
         }
         assert client.post(f"{PREFIX}/api/session/activate", json=body).status_code == 422
 
+    @pytest.mark.parametrize("core", ["../x", "Snes9x", "mesen-s", "a b"])
+    def test_import_spec_with_a_malformed_core_is_422(self, client: TestClient, core: str) -> None:
+        """M5: the query core is held to the same `^[a-z0-9_]+$` as `RomIn.core`.
+
+        Args:
+            client: The test client.
+            core: A name no buildbot core could have.
+        """
+        params = {"emulator": "retroarch", "platform": "snes", "core": core}
+        response = client.get(f"{PREFIX}/api/session/import-spec", params=params)
+        assert response.status_code == 422
+        assert response.json()["detail"] == "core must match ^[a-z0-9_]+$"
+
     def test_import_spec_with_blocked_core_is_422(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -4645,6 +4764,44 @@ class TestCarryOver:
         )
         emu.carry_save_across_cores({"core": "snes9x"}, ra_dirs / "Game.sfc")
         assert old.exists()
+
+    def test_an_unsafe_target_library_name_carries_nothing(
+        self, ra_dirs: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """I2: a new library_name that could leave saves/ is never joined into the move target."""
+        old = _srm(ra_dirs, "Snes9x")
+        emu = self._emu(_untested_snes_core())
+        monkeypatch.setattr(emu, "library_name", lambda: "../escaped")
+        with caplog.at_level(logging.WARNING):
+            emu.carry_save_across_cores({"core": "snes9x"}, ra_dirs / "Game.sfc")
+        assert old.read_bytes() == b"sram"
+        assert not (ra_dirs / "escaped").exists()
+        assert "unsafe library_name" in caplog.text
+
+    def test_a_failed_move_is_logged_and_never_raises(
+        self, ra_dirs: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """M6: a carry is best effort; an OSError must not fail activate, and the save stays put."""
+        old = _srm(ra_dirs, "Snes9x")
+        emu = self._emu(_untested_snes_core())
+
+        def refuse(src: Any, dst: Any) -> None:
+            """Fail every rename, as a read-only or full share would.
+
+            Args:
+                src: The source path.
+                dst: The destination path.
+
+            Raises:
+                OSError: Always.
+            """
+            raise OSError(30, "Read-only file system")
+
+        monkeypatch.setattr(retroarch.os, "rename", refuse)
+        with caplog.at_level(logging.WARNING):
+            emu.carry_save_across_cores({"core": "snes9x"}, ra_dirs / "Game.sfc")
+        assert old.read_bytes() == b"sram"
+        assert "no .srm carried from" in caplog.text and "Read-only file system" in caplog.text
 
     def test_switch_keeps_srm_and_ignores_old_state(
         self,

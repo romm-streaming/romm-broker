@@ -77,6 +77,7 @@ import httpx
 from .. import imports
 from . import retroarch_cores, wii_nand
 from .base import Emulator, _record_pid, base_launch_env, xdg_config_dir
+from .retroarch_cores import safe_dir_name
 
 log = logging.getLogger(__name__)
 
@@ -1191,13 +1192,13 @@ def _newest_state(
             file sitting directly in `dir_path` (no sorted subdirectory at
             all) is also dropped: that bare-root case is `include_root`'s
             alone, so an untested or blocked core's "everywhere except known
-            cores' dirs" search can't pick up a legacy default/vetted root
-            state by accident (R6a). A plain unscoped call (no `skip`) still
+            cores' dirs" search can't pick up a legacy default-core root
+            state by accident (R6a, R6b). A plain unscoped call (no `skip`) still
             matches a bare-root file, as before.
         include_root: Also match a file sitting directly in `dir_path`,
             non-recursively (ignored without `only`). `sort_savestates_enable`
             was only pinned on 2026-09-18 (451da72); an install or restored
-            archive from before that can still have a default/vetted core's
+            archive from before that can still have the default core's
             state sitting unsorted at the root, and resume has to keep
             finding it (R6a). This never reaches another core's subdirectory,
             which is the whole point of the `only`/`skip` scoping.
@@ -1869,27 +1870,6 @@ def _place_srm(
     return imports.Placement(member, dest)
 
 
-def _safe_dir_name(value: object) -> Optional[str]:
-    r"""A manifest field usable as a single sorted-dir path component, or None.
-
-    Shared by `_old_library_name` and `adopt_archive_identity`: both read a
-    manifest's `library_name` and must refuse anything that could name a
-    path outside the dir it gets joined under.
-
-    Args:
-        value: The manifest field to validate.
-
-    Returns:
-        `value` when it is a non-empty string, not "." or "..", and contains
-        neither "/" nor "\\"; otherwise None.
-    """
-    if not isinstance(value, str) or not value or value in (".", ".."):
-        return None
-    if "/" in value or "\\" in value:
-        return None
-    return value
-
-
 def _old_library_name(identity: Mapping[str, Any], platform: str, stem: str) -> Optional[str]:
     """The sorted-dir name the archive's core saved under (§8.2).
 
@@ -1903,7 +1883,7 @@ def _old_library_name(identity: Mapping[str, Any], platform: str, stem: str) -> 
         table and catalog only (a refresh must not change where an old save is
         looked for); else the dir of the only `saves/*/<stem>.srm`; else None.
     """
-    lib = _safe_dir_name(identity.get("library_name"))
+    lib = safe_dir_name(identity.get("library_name"))
     if lib is not None:
         return lib
     try:
@@ -2058,7 +2038,7 @@ class Retroarch(Emulator):
         self._launch_wall: float = 0.0
         """`time.time()` set right before the launch spawn; anchors `_observe_library_name`."""
         self._broker_written_states: set[Path] = set()
-        """State file paths this session's broker wrote itself, e.g. via a mid-session state push.
+        """Paths this session's broker wrote itself: a mid-session state push or an import placement.
 
         `_observe_library_name` excludes these: a file the broker itself put
         there cannot be evidence of where RetroArch writes, and would
@@ -2192,26 +2172,28 @@ class Retroarch(Emulator):
         return frozenset(names - own)
 
     def _state_scope(self) -> tuple[Optional[str], frozenset[str], bool]:
-        """Where this core's states may be looked up (§6.5, R6a).
+        """Where this core's states may be looked up (§6.5, R6a, R6b).
 
         Returns:
-            (`only`, `skip`, `include_root`) for `_newest_state`. A default or
-            vetted core looks in its own dir plus a legacy unsorted state
-            sitting at the root (R6a); an untested or blocked core whose dir
-            is confirmed by observation looks in its own dir only; otherwise
-            everywhere except other known cores' dirs. Root inclusion never
-            applies outside the default/vetted case, since it would otherwise
-            let an untested core's search reach into another core's
-            territory. A manifest seed (`_seeded_lib`) does NOT narrow this
-            (R7a): narrowing on a seed that turns out wrong would hide the
-            real dir, which is the exact failure R7 exists to fix, whereas
-            the open scope already finds a correct seed's dir on its own.
+            (`only`, `skip`, `include_root`) for `_newest_state`. The default
+            core looks in its own dir plus a legacy unsorted state sitting at
+            the root (R6a); a vetted core looks in its own dir only (R6b); an
+            untested or blocked core whose dir is confirmed by observation
+            looks in its own dir only; otherwise everywhere except other known
+            cores' dirs. Root inclusion is for the default core alone: the
+            unsorted layout predates core overrides, so every root state was
+            written by the default core, and handing one to any other core
+            would resume a state it cannot read. A manifest seed
+            (`_seeded_lib`) does NOT narrow this (R7a): narrowing on a seed
+            that turns out wrong would hide the real dir, which is the exact
+            failure R7 exists to fix, whereas the open scope already finds a
+            correct seed's dir on its own.
         """
         profile = self._profile()
         if profile is None:
             return None, frozenset(), False
         if profile["tier"] in ("default", "vetted"):
-            return self.library_name(), frozenset(), True
+            return self.library_name(), frozenset(), profile["tier"] == "default"
         if self._observed_lib:
             return self.library_name(), frozenset(), False
         return None, self._known_libs(), False
@@ -2297,7 +2279,7 @@ class Retroarch(Emulator):
         raw_lib = identity.get("library_name")
         if identity.get("core") != profile["core"] or not isinstance(raw_lib, str):
             return
-        lib = _safe_dir_name(raw_lib)
+        lib = safe_dir_name(raw_lib)
         if lib is None:
             log.warning("retroarch: ignoring manifest library_name %r", raw_lib)
             return
@@ -2310,7 +2292,9 @@ class Retroarch(Emulator):
 
         Runs after the archive is restored and before the baseline, so the
         rename, which keeps the file's mtime, does not count as this session's
-        write. States are never carried.
+        write. States are never carried. A move that fails, or a target dir
+        name that is not a single safe path component, is logged and skipped;
+        it never fails activate.
 
         Args:
             identity: The restored archive's manifest `session`, or None.
@@ -2328,6 +2312,11 @@ class Retroarch(Emulator):
         new_lib = self.library_name()
         if old_lib is None or new_lib is None or old_lib == new_lib:
             return
+        if safe_dir_name(new_lib) is None:
+            # The catalog parse already refuses an unsafe corename; this is the
+            # last check before the name is joined into a path the save moves to.
+            log.warning("retroarch: no .srm carried: unsafe library_name %r for %s", new_lib, stem)
+            return
         source = SAVE_DIR / old_lib / f"{stem}.srm"
         target = SAVE_DIR / new_lib / f"{stem}.srm"
         if not source.is_file():
@@ -2336,8 +2325,15 @@ class Retroarch(Emulator):
         if target.exists():
             log.info("retroarch: no .srm carried: %s already exists", target)
             return
-        target.parent.mkdir(parents=True, exist_ok=True)
-        os.rename(source, target)  # a rename keeps the mtime
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(source, target)  # a rename keeps the mtime
+        except OSError as exc:
+            # A carry is a convenience on top of the restored archive, which is
+            # already on disk untouched; failing activate over it would cost the
+            # player the session and gain nothing.
+            log.warning("retroarch: no .srm carried from %s to %s: %s", source, target, exc)
+            return
         if profile["save_ram"] is None:
             log.warning(
                 "retroarch: carried .srm from %s to untested core %s, which may not read it",
@@ -2350,8 +2346,12 @@ class Retroarch(Emulator):
     def note_broker_state_write(self, path: Path) -> None:
         """Track `path` so `_observe_library_name` does not mistake it for a core's own write.
 
+        Called for a mid-session state push and for every file a declared
+        import places (and its sidecars).
+
         Args:
-            path: The state file's path, as returned by `state_target`.
+            path: The file's absolute path: a pushed state as returned by
+                `state_target`, or `save_root` joined with a placement's dest.
         """
         self._broker_written_states.add(path)
 
@@ -2797,7 +2797,7 @@ class Retroarch(Emulator):
                             )
                             return False
                     if ready:
-                        loaded = self._load_state_locked(slot)
+                        loaded = self._load_state_locked(slot, resume=True)
                 finally:
                     self._disc_lock.release()
             if loaded:
@@ -3134,7 +3134,7 @@ class Retroarch(Emulator):
         finally:
             self._disc_lock.release()
 
-    def _load_state_locked(self, slot: int) -> bool:
+    def _load_state_locked(self, slot: int, *, resume: bool = False) -> bool:
         """Load `STATE_SLOT` into the running game and confirm the state was read.
 
         Assumes `_disc_lock` is already held; called by `load_state` and by
@@ -3168,8 +3168,13 @@ class Retroarch(Emulator):
         times rather than being reported as a failed load RetroArch actually
         performed.
 
+        A resume load an untested or blocked core never reads is logged as a
+        warning naming the likely cause (§6.5): a state pushed before the
+        core's sorted dir was known may sit where that core does not look.
+
         Args:
             slot: The slot RomM asked for; ignored in favour of `STATE_SLOT`.
+            resume: Whether this is a resume attempt rather than a manual load.
 
         Returns:
             True once RetroArch has read the slot's state file (or echoed the
@@ -3246,6 +3251,15 @@ class Retroarch(Emulator):
                 log.info("load state: slot %d restored from %s", STATE_SLOT, state.name)
                 return True
             if confirmed is False:
+                profile = self._profile()
+                if resume and profile is not None and profile["tier"] in ("untested", "blocked"):
+                    # The resume loop still escalates to an error once its budget
+                    # is spent; this only names the likely cause per attempt.
+                    log.warning(
+                        "resume state not read by %s core %s; its state dir may differ",
+                        profile["tier"], profile["core"],
+                    )
+                    return False
                 log.error(
                     "load state: retroarch echoed slot %d but never read %s within %.1fs, the "
                     "game is still running unrestored (platform=%s, rom=%s)",
@@ -3272,7 +3286,7 @@ class Retroarch(Emulator):
 
         Scoped to the running core's own sorted dir once it is known
         (default, vetted, or an untested core whose dir has been observed),
-        plus the legacy unsorted root for default/vetted (R6a); otherwise
+        plus the legacy unsorted root for the default core only (R6a, R6b); otherwise
         everywhere except another known core's dir (§6.5).
 
         Returns:
@@ -3428,6 +3442,27 @@ class Retroarch(Emulator):
         Args:
             member: The save member, already past the kind gate.
             spec: This emulator's spec.
+            ctx: The launch context.
+
+        Returns:
+            The placement, or a refusal saying why this platform takes no such file.
+        """
+        placed = self._place_import_unnoted(member, ctx)
+        if isinstance(placed, imports.Placement):
+            # The observer adopts the newest sorted dir written since launch; a
+            # file the broker itself placed there says nothing about where the
+            # core writes, so it is excluded just like a pushed state.
+            for dest in (placed.dest, *(d for d, _ in placed.sidecars)):
+                self.note_broker_state_write(self.save_root / dest)
+        return placed
+
+    def _place_import_unnoted(
+        self, member: imports.ImportMember, ctx: imports.ImportCtx
+    ) -> Union[imports.Placement, imports.ImportRefusal]:
+        """Work out `place_import`'s answer, before the placed paths are noted.
+
+        Args:
+            member: The save member, already past the kind gate.
             ctx: The launch context.
 
         Returns:

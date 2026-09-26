@@ -43,6 +43,13 @@ BUNDLED_ZIP = _HERE / "retroarch_core_info.zip"
 """libretro's info.zip, byte for byte, bundled so the catalog works offline."""
 BUNDLED_SOURCE = _HERE / "retroarch_core_info.source.json"
 """Where `BUNDLED_ZIP` came from, its sha256 and the x86_64 build list at that time."""
+INFO_MEMBER_CAP = 64 * 1024
+"""Largest decompressed `.info` member read from a core-info zip, 64 KiB.
+
+The zip cap (`ZIP_CAP`) bounds the compressed download only; a hostile member
+can inflate far past it. The largest bundled `.info` is under 14 KiB, so a
+member over this cap is not a real core-info file and is skipped.
+"""
 
 
 def truthy(value: Optional[str]) -> bool:
@@ -55,6 +62,47 @@ def truthy(value: Optional[str]) -> bool:
         True for `1`, `true`, `yes` or `on`, in any case and with whitespace around.
     """
     return value is not None and value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def safe_dir_name(value: object) -> Optional[str]:
+    r"""A value usable as a single path component under a sorted save or state dir, or None.
+
+    Shared by every place a name that came from outside the broker (a restored
+    archive's manifest, a core-info `corename`) is joined under `saves/` or
+    `states/`: none of them may name a path outside the dir it is joined under.
+
+    Args:
+        value: The candidate name.
+
+    Returns:
+        `value` when it is a non-empty string, not "." or "..", and contains
+        none of "/", "\\" or NUL; otherwise None.
+    """
+    if not isinstance(value, str) or not value or value in (".", ".."):
+        return None
+    if "/" in value or "\\" in value or "\0" in value:
+        return None
+    return value
+
+
+def _oversized(member: zipfile.ZipInfo) -> bool:
+    """Whether a zip member inflates past `INFO_MEMBER_CAP`, logging when it does.
+
+    Args:
+        member: The member.
+
+    Returns:
+        True when its declared decompressed size is over the cap.
+    """
+    if member.file_size <= INFO_MEMBER_CAP:
+        return False
+    log.warning(
+        "retroarch: core info member %s is %d bytes decompressed, over the %d byte cap; skipped",
+        member.filename,
+        member.file_size,
+        INFO_MEMBER_CAP,
+    )
+    return True
 
 
 def normalize_extensions(raw: str) -> tuple[str, ...]:
@@ -116,7 +164,8 @@ def parse_info_zip(data: bytes) -> dict[str, CoreInfo]:
 
     Returns:
         Core name to its info. Members that are not `<core>_libretro.info` with
-        a valid core name are skipped.
+        a valid core name, or that inflate past `INFO_MEMBER_CAP`, are skipped;
+        an unsafe `corename` is replaced by the core name.
 
     Raises:
         zipfile.BadZipFile: When `data` is not a zip.
@@ -128,13 +177,25 @@ def parse_info_zip(data: bytes) -> dict[str, CoreInfo]:
             if member.is_dir() or not leaf.endswith(_INFO_SUFFIX):
                 continue
             core = leaf[: -len(_INFO_SUFFIX)]
-            if not CORE_NAME_RE.match(core):
+            if not CORE_NAME_RE.match(core) or _oversized(member):
                 continue
             keys = _parse_info_text(zf.read(member).decode("utf-8", "replace"))
+            corename = keys.get("corename", core)
+            if safe_dir_name(corename) is None:
+                # An untested core's library_name defaults to its corename, which
+                # names a dir under saves/ and states/; a hostile catalog must not
+                # steer that outside them. The core name already matched
+                # CORE_NAME_RE, so it is a safe stand-in.
+                log.warning(
+                    "retroarch: core info for %s has an unsafe corename %r, using the core name",
+                    core,
+                    corename,
+                )
+                corename = core
             cores[core] = CoreInfo(
                 core=core,
                 display_name=keys.get("display_name", core),
-                corename=keys.get("corename", core),
+                corename=corename,
                 extensions=normalize_extensions(keys.get("supported_extensions", "")),
             )
     return cores
@@ -189,7 +250,8 @@ class Catalog:
             The file's bytes, or None when the catalog lacks it. A protected core
             is always read from `info_zip`; an unprotected one is looked up in
             `cache_zip` first and falls back to `info_zip`, so a core the cache no
-            longer lists still resolves to the bundled entry.
+            longer lists still resolves to the bundled entry. A member over
+            `INFO_MEMBER_CAP` is never read.
         """
         if core not in self.cores:
             return None
@@ -201,7 +263,9 @@ class Catalog:
         for zip_bytes in zips:
             with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
                 for member in zf.infolist():
-                    if PurePosixPath(member.filename).name == f"{core}{_INFO_SUFFIX}":
+                    if PurePosixPath(member.filename).name != f"{core}{_INFO_SUFFIX}":
+                        continue
+                    if not _oversized(member):
                         return zf.read(member)
         return None
 

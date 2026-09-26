@@ -56,6 +56,15 @@ def test_no_default_core_is_blocked_on_its_platform() -> None:
             assert entry.platforms is not None and slug not in entry.platforms, slug
 
 
+def test_melonds_is_blocked_on_every_ds_platform() -> None:
+    """M3: the tiers file blocks melonds, which the docs say crashes on launch."""
+    catalog = rc.load_bundled_catalog()
+    entry = rc.TIERS["melonds"]
+    assert entry.tier == "blocked" and entry.reason and entry.platforms is None
+    for slug in ("nds", "nintendo-dsi"):
+        assert rc.tier_of(retroarch.PLATFORMS, slug, "melonds", catalog, rc.TIERS) == "blocked"
+
+
 def test_alternates_and_vetted_tiers_agree() -> None:
     """Every alternate is vetted, and every vetted core has an alternate somewhere."""
     alternates = {core for info in retroarch.PLATFORMS.values() for core in info.get("alternates", {})}

@@ -1,1 +1,7 @@
-{}
+{
+  "melonds": {
+    "tier": "blocked",
+    "reason": "unmaintained and crashes on launch on current buildbot builds; use melondsds, the default",
+    "reports": []
+  }
+}

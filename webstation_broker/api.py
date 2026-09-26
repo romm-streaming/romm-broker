@@ -2002,10 +2002,16 @@ async def get_import_spec(
         archive) and every refusal code.
 
     Raises:
-        HTTPException: 403 on a bad secret; 422 for an unknown emulator or a
-            core that emulator will not take or launch.
+        HTTPException: 403 on a bad secret; 422 for an unknown emulator, a
+            `core` that is not a core name (`^[a-z0-9_]+$`, as `RomIn.core`),
+            or a core that emulator will not take or launch.
     """
     _check_secret(x_broker_secret)
+    # Checked here rather than with a Query pattern so a bad secret is still
+    # answered 403 first, and before `core` is set on the shared instance.
+    if core is not None and not retroarch_cores.CORE_NAME_RE.match(core):
+        log.warning("import-spec: refusing core %r: not a core name", core)
+        raise HTTPException(status_code=422, detail="core must match ^[a-z0-9_]+$")
     inst = get_emulator(emulator)
     if inst is None:
         log.debug("import-spec: unknown emulator: %s", emulator)

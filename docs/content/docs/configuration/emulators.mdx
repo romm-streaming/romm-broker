@@ -172,6 +172,8 @@ written) sits at the root of that folder, and saves live under
 | `RETROARCH_DISC_TRAY_SETTLE` | `1.5` | Pause after opening the tray before changing the disc index; an index change during the open is silently dropped. |
 | `RETROARCH_DISC_STEP_DELAY` | `0.1` | Pause between disc index presses. |
 | `RETROARCH_DISC_SWAP_WAIT` | `90.0` | How long a swap waits for the core to report a running game. |
+| `RETROARCH_OBSERVE_WINDOW_BEFORE_SLACK` | `2.0` | Seconds before launch a save or state write still counts when the broker looks for the directory an untested core actually saves into. Covers mounts (SMB, FAT) that round a file's mtime to a coarse unit. |
+| `RETROARCH_OBSERVE_WINDOW_AFTER_SLACK` | `30.0` | Seconds past the broker's own clock a write's mtime may sit and still count for that same lookup, to absorb clock skew between the share and the broker. A file dated further ahead is ignored. |
 | `RETROARCH_STOP_WAIT` | `15` | SIGTERM grace before SIGKILL once `QUIT` has been tried. |
 
 ## RPCS3

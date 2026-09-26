@@ -104,6 +104,81 @@ def test_parse_info_zip_skips_members_that_are_not_core_info() -> None:
     assert rc.parse_info_zip(buf.getvalue()) == {}
 
 
+@pytest.mark.parametrize("corename", ["../../../tmp/x", "a/b", "a\\b", "..", ".", "", "a\x00b"])
+def test_parse_info_zip_replaces_an_unsafe_corename_with_the_core_name(
+    corename: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """I2: a hostile catalog's corename becomes a dir name, so it falls back to the validated core name.
+
+    Args:
+        corename: A corename that could name a path outside `saves/` or `states/`.
+        caplog: The pytest log capture fixture.
+    """
+    with caplog.at_level(logging.WARNING):
+        cores = rc.parse_info_zip(info_zip({"evil": {**SNES9X, "corename": corename}}))
+    assert cores["evil"].corename == "evil"
+    assert "unsafe corename" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("Snes9x", "Snes9x"),
+        ("Mesen-S", "Mesen-S"),
+        ("", None),
+        (".", None),
+        ("..", None),
+        ("a/b", None),
+        ("a\\b", None),
+        ("a\x00b", None),
+        (None, None),
+        (3, None),
+    ],
+)
+def test_safe_dir_name_accepts_only_a_single_plain_component(value: object, expected: object) -> None:
+    """The shared guard refuses anything that is not one plain path component.
+
+    Args:
+        value: The candidate.
+        expected: What the guard answers.
+    """
+    assert rc.safe_dir_name(value) == expected
+
+
+def test_parse_info_zip_skips_a_member_over_the_decompressed_cap(caplog: pytest.LogCaptureFixture) -> None:
+    """M4: a member that inflates past INFO_MEMBER_CAP is skipped; the rest still parse.
+
+    Args:
+        caplog: The pytest log capture fixture.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("snes9x_libretro.info", "".join(f'{k} = "{v}"\n' for k, v in SNES9X.items()))
+        zf.writestr("bomb_libretro.info", 'corename = "bomb"\n' + " " * (rc.INFO_MEMBER_CAP + 1))
+    data = buf.getvalue()
+    assert len(data) < rc.INFO_MEMBER_CAP  # small on the wire, large once inflated
+    with caplog.at_level(logging.WARNING):
+        cores = rc.parse_info_zip(data)
+    assert set(cores) == {"snes9x"}
+    assert "bomb_libretro.info" in caplog.text and "over the" in caplog.text
+    catalog = rc.Catalog({"bomb": rc.CoreInfo("bomb", "Bomb", "bomb", ())}, data)
+    assert catalog.info_file("bomb") is None
+
+
+def test_the_cap_drops_no_bundled_core(monkeypatch: pytest.MonkeyPatch) -> None:
+    """M4: the bundled zip parses to the same cores with the cap as without it.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+    """
+    data = rc.BUNDLED_ZIP.read_bytes()
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        assert max(m.file_size for m in zf.infolist()) <= rc.INFO_MEMBER_CAP
+    capped = rc.parse_info_zip(data)
+    monkeypatch.setattr(rc, "INFO_MEMBER_CAP", len(data) * 1000)
+    assert capped == rc.parse_info_zip(data)
+
+
 @pytest.mark.parametrize(
     "line",
     ["snes9x_libretro.so.zip", "2026-09-01 0a1b2c3d snes9x_libretro.so.zip", "  snes9x_libretro.so.zip  "],
