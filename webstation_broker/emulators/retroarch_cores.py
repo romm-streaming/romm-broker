@@ -384,6 +384,49 @@ def tier_of(
     return "blocked" if _blocking_entry(tiers, core, platform) else "untested"
 
 
+_TIER_ORDER = {"default": 0, "vetted": 1, "untested": 2, "blocked": 3}
+"""Sort order for tiers in the cores route."""
+
+
+def cores_for_platform(
+    platforms: Mapping[str, Mapping[str, Any]],
+    platform: str,
+    catalog: Catalog,
+    tiers: Mapping[str, TierEntry],
+) -> list[dict[str, Any]]:
+    """Every core offered on `platform`, for the cores route and the docs table (§9).
+
+    Args:
+        platforms: The platform table.
+        platform: The platform slug.
+        catalog: The current catalog.
+        tiers: The tiers table.
+
+    Returns:
+        One row per core, default first.
+    """
+    entry = platforms[platform]
+    names = {entry["core"], *entry.get("alternates", {}), *catalog.cores}
+    rows = []
+    for core in names:
+        tier = tier_of(platforms, platform, core, catalog, tiers)
+        if tier is None:
+            continue
+        info = catalog.cores.get(core)
+        tier_entry = tiers.get(core)
+        rows.append({
+            "core": core,
+            "display_name": info.display_name if info else core,
+            "tier": tier,
+            "reason": tier_entry.reason if tier_entry and tier == "blocked" else None,
+            "reports": list(tier_entry.reports) if tier_entry else [],
+            "verified": tier in ("default", "vetted"),
+            "report_url": f"{REPORT_URL}&core={core}&platform={platform}",
+        })
+    rows.sort(key=lambda r: (_TIER_ORDER[r["tier"]], r["core"]))
+    return rows
+
+
 def _options_detail(
     platforms: Mapping[str, Mapping[str, Any]],
     platform: str,

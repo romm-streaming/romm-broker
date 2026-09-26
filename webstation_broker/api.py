@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field, field_validator
 from starlette.websockets import WebSocketState
 
 from . import callback, imports, memcard, saves, screenshot, selkies, session, settings
-from .emulators import get_emulator, retroarch_cores
+from .emulators import get_emulator, retroarch, retroarch_cores
 from .emulators.base import STATE_HEAD_BYTES, Emulator, reap_orphan
 
 log = logging.getLogger(__name__)
@@ -2030,6 +2030,42 @@ async def get_import_spec(
         "state_slot": inst.state_slot if (inst.supports_states or spec.state_channel == "archive") else None,
         "reasons": sorted(imports.REASONS),
     }
+
+
+@router.get("/api/retroarch/cores")
+async def get_retroarch_cores(
+    platform: Optional[str] = Query(default=None),
+    x_broker_secret: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    """List the libretro cores an operator may set with `core:`, by tier (§9).
+
+    Args:
+        platform: One RomM platform slug, or None for every platform.
+        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
+
+    Returns:
+        For one platform, its `default` core and `cores` rows; for none,
+        `platforms` mapping every slug to the same.
+
+    Raises:
+        HTTPException: 403 on a bad secret; 404 for a platform RetroArch does not serve.
+    """
+    _check_secret(x_broker_secret)
+    table, cat, tiers = retroarch.PLATFORMS, retroarch_cores.catalog(), retroarch_cores.TIERS
+
+    def one(slug: str) -> dict[str, Any]:
+        """One platform's default core and its cores list."""
+        return {
+            "default": table[slug]["core"],
+            "cores": retroarch_cores.cores_for_platform(table, slug, cat, tiers),
+        }
+
+    if platform is None:
+        return {"platforms": {slug: one(slug) for slug in sorted(table)}}
+    slug = platform.lower()
+    if slug not in table:
+        raise HTTPException(status_code=404, detail=f"RetroArch has no core for platform {platform!r}")
+    return {"platform": slug, **one(slug)}
 
 
 @router.get("/api/session/memory-card")

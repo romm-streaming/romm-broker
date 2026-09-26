@@ -4,8 +4,11 @@ import io
 import zipfile
 
 import pytest
+from fastapi.testclient import TestClient
 
 from webstation_broker.emulators import retroarch_cores as rc
+
+from .conftest import PREFIX
 
 
 def info_zip(infos: dict[str, dict[str, str]]) -> bytes:
@@ -154,8 +157,9 @@ PLATFORMS = {
 CATALOG = rc.build_catalog(
     info_zip({"snes9x": SNES9X, "bsnes": BSNES, "mgba": MGBA,
               "mesen": {"corename": "Mesen", "supported_extensions": "nes"},
-              "beetle_snes": {"corename": "Mednafen bSNES", "supported_extensions": "sfc|smc"}}),
-    "\n".join(f"{c}_libretro.so.zip" for c in ("snes9x", "bsnes", "mgba", "mesen", "beetle_snes")),
+              "beetle_snes": {"corename": "Mednafen bSNES", "supported_extensions": "sfc|smc"},
+              "armsnes": {"corename": "ARM SNES", "supported_extensions": "sfc|smc"}}),
+    "\n".join(f"{c}_libretro.so.zip" for c in ("snes9x", "bsnes", "mgba", "mesen", "beetle_snes", "armsnes")),
 )
 TIERS = {"beetle_snes": rc.TierEntry("blocked", "hangs on boot", ("#7",), None),
          "bsnes": rc.TierEntry("vetted", None, (), None)}
@@ -267,3 +271,69 @@ def test_a_platform_scoped_block_does_apply_on_a_listed_platform() -> None:
         rc.resolve_profile(platforms, "snes", "bsnes", experimental=False, catalog=CATALOG, tiers=tiers)
     profile = rc.resolve_profile(platforms, "snes", "bsnes", experimental=True, catalog=CATALOG, tiers=tiers)
     assert profile["tier"] == "blocked"
+
+
+def test_cores_for_platform_lists_every_tier_in_order() -> None:
+    """All cores offered on a platform, sorted default first, then vetted, untested, blocked."""
+    cores = rc.cores_for_platform(PLATFORMS, "snes", CATALOG, TIERS)
+
+    tiers = [c["tier"] for c in cores]
+    assert tiers == sorted(tiers, key=lambda t: rc._TIER_ORDER[t])
+    assert cores[0]["core"] == "snes9x"
+    assert cores[0]["tier"] == "default"
+
+
+def test_cores_for_platform_includes_display_name_and_verified() -> None:
+    """Every core row has its display_name and verified flag."""
+    cores = rc.cores_for_platform(PLATFORMS, "snes", CATALOG, TIERS)
+
+    default = [c for c in cores if c["core"] == "snes9x"][0]
+    assert (default["display_name"], default["verified"]) == (SNES9X["display_name"], True)
+    untested = [c for c in cores if c["tier"] == "untested"]
+    assert untested and all(c["verified"] is False for c in untested)
+
+
+def test_cores_for_platform_includes_report_url() -> None:
+    """Every core row includes a report_url with core and platform."""
+    cores = rc.cores_for_platform(PLATFORMS, "snes", CATALOG, TIERS)
+
+    for core in cores:
+        assert f"core={core['core']}" in core["report_url"]
+        assert "platform=snes" in core["report_url"]
+        assert rc.REPORT_URL in core["report_url"]
+
+
+def test_cores_for_platform_blocked_includes_reason() -> None:
+    """Blocked cores include the reason."""
+    cores = rc.cores_for_platform(PLATFORMS, "snes", CATALOG, TIERS)
+
+    blocked = [c for c in cores if c["tier"] == "blocked"]
+    assert blocked and all(c["reason"] is not None for c in blocked)
+    untested = [c for c in cores if c["tier"] == "untested"]
+    assert untested and all(c["reason"] is None for c in untested)
+
+
+def test_cores_route_needs_the_secret(secret_client: TestClient) -> None:
+    """Every route is gated (CONTRIBUTING)."""
+    assert secret_client.get(f"{PREFIX}/api/retroarch/cores", params={"platform": "snes"}).status_code == 403
+
+
+def test_cores_route_lists_one_platform(client: TestClient) -> None:
+    """The default comes first and is verified; untested rows carry a report link."""
+    body = client.get(f"{PREFIX}/api/retroarch/cores", params={"platform": "snes"}).json()
+    assert body["default"] == "snes9x"
+    first = body["cores"][0]
+    assert (first["core"], first["tier"], first["verified"]) == ("snes9x", "default", True)
+    untested = [c for c in body["cores"] if c["tier"] == "untested"]
+    assert untested and all(not c["verified"] and "core-report" in c["report_url"] for c in untested)
+
+
+def test_cores_route_lists_every_platform_without_one(client: TestClient) -> None:
+    """No platform: all of them."""
+    body = client.get(f"{PREFIX}/api/retroarch/cores").json()
+    assert body["platforms"]["snes"]["default"] == "snes9x"
+
+
+def test_cores_route_404s_an_unknown_platform(client: TestClient) -> None:
+    """Not a RetroArch platform."""
+    assert client.get(f"{PREFIX}/api/retroarch/cores", params={"platform": "ps2"}).status_code == 404
