@@ -152,6 +152,10 @@ written) sits at the root of that folder, and saves live under
 | `GITHUB_API_BASE` | `https://api.github.com` | API base for cores whose platform entry names a GitHub release source. |
 | `GITHUB_TOKEN` | unset | Bearer token for those GitHub release lookups. |
 | `RETROARCH_CORE_DOWNLOAD_TIMEOUT` | `180` | Timeout on a core download. |
+| `RETROARCH_EXPERIMENTAL_CORES` | `false` | Container-wide opt-in to launch a core the tier table lists as `blocked`; RomM's own `experimental_cores: true` lifts the same block. |
+| `RETROARCH_CORE_INFO_REFRESH` | `false` | Keep the bundled core-info catalog current with upstream in the background, at most every 7 days. |
+| `RETROARCH_CORE_INFO_URL` | `https://buildbot.libretro.com/assets/frontend/info.zip` | Where a refresh downloads the core-info zip from. |
+| `RETROARCH_CORE_INDEX_URL` | `https://buildbot.libretro.com/nightly/linux/x86_64/latest/.index` | Where a refresh downloads the x86_64 build index from. |
 | `RETROARCH_DATA_DIR` | `/config/.retroarch` | Broker-managed `states/`, `saves/` and the `broker.cfg` layered on with `--appendconfig`. |
 | `RETROARCH_LOG_PATH` | `/config/retroarch.log` | Where RetroArch's stdout/stderr is captured. |
 | `RETROARCH_JOYPAD_DRIVER` | `linuxraw` | Joypad driver forced at launch; the udev driver sees the selkies pads as one device plugged eight times. Set empty to leave the user's own driver alone. |

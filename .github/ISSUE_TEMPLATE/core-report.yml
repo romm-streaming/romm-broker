@@ -1,0 +1,33 @@
+name: RetroArch core report
+description: Tell us how a libretro core works on a platform
+title: "[core] <core> on <platform>"
+labels: ["core-report"]
+body:
+  - type: input
+    id: core
+    attributes: {label: Core, description: "The core: value, e.g. bsnes"}
+    validations: {required: true}
+  - type: input
+    id: platform
+    attributes: {label: Platform, description: "RomM platform slug, e.g. snes"}
+    validations: {required: true}
+  - type: input
+    id: broker
+    attributes: {label: Broker version}
+    validations: {required: true}
+  - type: input
+    id: retroarch
+    attributes: {label: RetroArch version}
+    validations: {required: true}
+  - type: checkboxes
+    id: results
+    attributes:
+      label: What works
+      options:
+        - label: The game boots
+        - label: An in-game save survives exit and relaunch
+        - label: RetroArch hotkey save and load state work
+        - label: Switching to or from the default core keeps the save
+  - type: textarea
+    id: notes
+    attributes: {label: Notes, description: "Anything that broke, with logs if you have them"}
