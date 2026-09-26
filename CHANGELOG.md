@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.11.0](https://github.com/romm-streaming/romm-broker/compare/v0.10.0...v0.11.0) (2026-09-26)
+
+
+### Features
+
+* **pcsx2:** fetch patches.zip before a launch when missing, invalid or a week old ([71b9f16](https://github.com/romm-streaming/romm-broker/commit/71b9f16b2dec0d1f43a55f21834bbb2e118d5a77))
+* **pcsx2:** fetch patches.zip from pcsx2_patches with an unprivileged download and a sudo install ([46295c8](https://github.com/romm-streaming/romm-broker/commit/46295c8a81367db0498ae5da777440d9291e66c9))
+* **retroarch:** add nintendo-dsi on the melondsds core ([3a8e7a3](https://github.com/romm-streaming/romm-broker/commit/3a8e7a31c9f1187315f02ac8af5ee8298931b905))
+
+
+### Bug Fixes
+
+* **dolphin:** lay a pushed GameCube card where the folder card reads it ([092396a](https://github.com/romm-streaming/romm-broker/commit/092396a63aa12f34739bc29db081b65eae264157))
+* **pcsx2:** point patches.zip at /usr/share/PCSX2/resources and validate its contents ([c0adfcd](https://github.com/romm-streaming/romm-broker/commit/c0adfcde587ca5fe058ec0d66fcb84e8e917da30))
+* **retroarch:** scope 3ds save_subtrees to the core's real doubled Azahar path ([7bbf91e](https://github.com/romm-streaming/romm-broker/commit/7bbf91e1e11387beeab13f46c55d63cf42756e38))
+* **saves:** refuse restores that would fail after the slot is cleared ([48178ff](https://github.com/romm-streaming/romm-broker/commit/48178ffdfc506ae666059bab1cb48a16d0c98f57))
+
+
+### Documentation
+
+* full Traefik recipe and shared Docker network setup ([6c452c7](https://github.com/romm-streaming/romm-broker/commit/6c452c707e26d98cab383f70570a0c066998f80a))
+* install pytest-asyncio in every dev setup command and refresh the test count ([5567f7d](https://github.com/romm-streaming/romm-broker/commit/5567f7d1ab6fdf4c77baf5089a14c5989304f987))
+* mount the library at /romm/library like RomM, and explain a missing rom ([9ed7c56](https://github.com/romm-streaming/romm-broker/commit/9ed7c56a22443e469c56652147c44efc47596989))
+* update migrating example ([d6fb797](https://github.com/romm-streaming/romm-broker/commit/d6fb79758b26ee5e57b8bdee925fc8d491c219cb))
+* update migrating example ([80dbf4f](https://github.com/romm-streaming/romm-broker/commit/80dbf4fd86eeff4485e8867710b79754dccb1552))
+
 ## [0.10.0](https://github.com/romm-streaming/romm-broker/compare/v0.9.0...v0.10.0) (2026-09-24)
 
 
