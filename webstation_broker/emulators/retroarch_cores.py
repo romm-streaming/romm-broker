@@ -20,7 +20,7 @@ import zipfile
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Optional
+from typing import Any, Optional
 
 log = logging.getLogger(__name__)
 
@@ -219,3 +219,80 @@ def load_bundled_catalog(installed: frozenset[str] = frozenset()) -> Catalog:
         raise ValueError(f"{BUNDLED_ZIP.name} does not match the sha256 in {BUNDLED_SOURCE.name}")
     index = "\n".join(f"{core}_libretro.so.zip" for core in source["x86_64_cores"])
     return build_catalog(data, index, installed)
+
+
+LIBRARY_NAME_FIXES: Mapping[str, str] = MappingProxyType(
+    {"dolphin": "dolphin-emu", "vecx": "VecX", "freeintv": "freeintv"}
+)
+"""Cores whose real `library_name` (from their own source) differs from core-info's `corename`."""
+
+CORE_OWNED_FIELDS = frozenset({
+    "save_subtrees", "core_options", "core_option_seeds", "core_source", "assets",
+    "save_links", "resume_settle", "state_confirm_wait", "savestate", "extra_extensions",
+})
+"""Profile fields that belong to a core, so an alternate never inherits them from the default."""
+
+TIERS_FILE = _HERE / "retroarch_core_tiers.json"
+"""Tier of every non-default core that is not `untested`."""
+
+_TIER_KEYS = {"tier", "reason", "reports", "platforms"}
+
+
+@dataclasses.dataclass(frozen=True)
+class TierEntry:
+    """One core's row in the tiers file.
+
+    Attributes:
+        tier: `vetted` or `blocked`.
+        reason: Why a blocked core is blocked; None for vetted.
+        reports: Issue references backing the tier.
+        platforms: Platforms a block is narrowed to, or None for all.
+    """
+
+    tier: str
+    reason: Optional[str]
+    reports: tuple[str, ...]
+    platforms: Optional[frozenset[str]]
+
+
+def load_tiers(raw: Mapping[str, Any]) -> dict[str, TierEntry]:
+    """Validate the tiers file (§5.2).
+
+    Args:
+        raw: The parsed JSON.
+
+    Returns:
+        Core name to its entry.
+
+    Raises:
+        ValueError: On a bad core name, an unknown key or tier, a blocked core
+            with no reason, or `platforms` on anything but a block.
+    """
+    tiers: dict[str, TierEntry] = {}
+    for core, entry in raw.items():
+        where = f"{TIERS_FILE.name}: {core}"
+        if not CORE_NAME_RE.match(core):
+            raise ValueError(f"{where}: not a core name")
+        unknown = set(entry) - _TIER_KEYS
+        if unknown:
+            raise ValueError(f"{where}: unknown key {sorted(unknown)}")
+        tier = entry.get("tier")
+        if tier not in ("vetted", "blocked"):
+            raise ValueError(f"{where}: tier must be vetted or blocked, not {tier!r}")
+        reason = entry.get("reason")
+        if tier == "blocked" and not reason:
+            raise ValueError(f"{where}: a blocked core needs a reason")
+        platforms = entry.get("platforms")
+        if platforms is not None and tier != "blocked":
+            raise ValueError(f"{where}: platforms only narrows a block")
+        tiers[core] = TierEntry(
+            tier,
+            reason,
+            tuple(entry.get("reports", ())),
+            frozenset(platforms) if platforms is not None else None,
+        )
+    return tiers
+
+
+TIERS: Mapping[str, TierEntry] = MappingProxyType(load_tiers(json.loads(TIERS_FILE.read_text())))
+"""The loaded tiers file."""

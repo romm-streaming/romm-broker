@@ -114,3 +114,30 @@ def test_truthy_matches_the_brokers_other_boolean_env_vars(
 ) -> None:
     """Same spelling as rpcs3's `_truthy`."""
     assert rc.truthy(value) is expected
+
+
+def test_tiers_accept_vetted_and_scoped_blocked() -> None:
+    """A blocked core may be narrowed to some platforms; reports are optional."""
+    tiers = rc.load_tiers({
+        "bsnes": {"tier": "vetted"},
+        "melonds": {"tier": "blocked", "reason": "crashes", "reports": ["#12"], "platforms": ["nds"]},
+    })
+    assert tiers["melonds"] == rc.TierEntry("blocked", "crashes", ("#12",), frozenset({"nds"}))
+    assert tiers["bsnes"].platforms is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"x": {"tier": "blocked"}},                       # blocked needs a reason
+        {"x": {"tier": "default"}},                       # default is implied by the platform table
+        {"x": {"tier": "untested"}},                       # untested is implied by absence
+        {"x": {"tier": "vetted", "colour": "red"}},       # unknown key
+        {"Bad-Name": {"tier": "vetted"}},                 # bad core name
+        {"x": {"tier": "vetted", "platforms": ["snes"]}}, # platforms only narrows a block
+    ],
+)
+def test_tiers_reject_bad_entries(raw: dict) -> None:
+    """Every rule in §5.2 is a load-time error."""
+    with pytest.raises(ValueError):
+        rc.load_tiers(raw)

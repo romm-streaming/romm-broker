@@ -34,6 +34,36 @@ def test_the_table_is_the_one_on_disk() -> None:
     assert set(retroarch.PLATFORMS) == set(on_disk)
 
 
+_BASE = {"core": "snes9x", "library_name": "Snes9x", "save_ram": True, "extensions": (".sfc",)}
+
+
+def test_platform_entry_rejects_unknown_keys() -> None:
+    """A typo'd key would otherwise be silently ignored."""
+    with pytest.raises(ValueError, match="unknown key"):
+        retroarch._validate_entry("snes", {**_BASE, "save_rma": True}, alternate=False)
+
+
+def test_alternate_needs_its_own_boolean_save_ram() -> None:
+    """save_ram is never inherited from the default core."""
+    with pytest.raises(ValueError, match="save_ram"):
+        retroarch._validate_entry("snes", {"library_name": "bsnes"}, alternate=True)
+
+
+def test_alternate_may_not_set_core_or_extensions() -> None:
+    """An alternate's name is its key and its extensions are the platform's."""
+    with pytest.raises(ValueError, match="unknown key"):
+        retroarch._validate_entry(
+            "snes", {"library_name": "bsnes", "save_ram": True, "extensions": [".sfc"]}, alternate=True
+        )
+
+
+def test_every_shipped_alternate_loaded_with_tuples() -> None:
+    """List fields of alternates are tuples like the default's."""
+    for info in retroarch.PLATFORMS.values():
+        for alt in info.get("alternates", {}).values():
+            assert not isinstance(alt.get("save_subtrees", ()), list)
+
+
 @pytest.mark.parametrize("slug", ["psp", "nes", "gba", "n64", "snes", "genesis", "dc"])
 def test_the_common_platforms_are_mapped(slug: str) -> None:
     """Each everyday platform maps to a core with a non-empty extension list."""

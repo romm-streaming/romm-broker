@@ -75,7 +75,7 @@ from typing import Any, Callable, Optional, Union
 import httpx
 
 from .. import imports
-from . import wii_nand
+from . import retroarch_cores, wii_nand
 from .base import Emulator, _record_pid, base_launch_env, xdg_config_dir
 
 log = logging.getLogger(__name__)
@@ -394,25 +394,57 @@ _PLATFORMS_FILE = Path(__file__).with_name("retroarch_platforms.json")
 """The RomM platform slug to libretro core table, `retroarch_platforms.json` next to this module."""
 
 
-def _load_platforms() -> dict[str, dict[str, Any]]:
-    """Read the platform table, turning its list fields into tuples.
+_ENTRY_KEYS = (
+    frozenset({"core", "library_name", "save_ram", "extensions", "alternates"})
+    | retroarch_cores.CORE_OWNED_FIELDS
+)
+"""Every key a platform entry may carry."""
+_ALTERNATE_KEYS = frozenset({"library_name", "save_ram"}) | retroarch_cores.CORE_OWNED_FIELDS
+"""Every key an alternate may carry: its name is its key and its extensions are the platform's."""
 
-    Returns:
-        Platform slug to its entry, with `extensions` and any `save_subtrees`
-        as tuples.
+
+def _validate_entry(slug: str, info: dict[str, Any], *, alternate: bool) -> None:
+    """Check one platform entry or alternate, turning its list fields into tuples.
+
+    Args:
+        slug: The platform (and core, for an alternate) the entry is for, for the message.
+        info: The entry, modified in place.
+        alternate: Whether it is an `alternates` profile rather than a default.
 
     Raises:
-        ValueError: When an entry has no boolean `save_ram`. It decides whether
-            an import may place a `.srm`, so a missing one is never read as
-            either answer.
+        ValueError: On an unknown key, a missing `library_name`, or a
+            `save_ram` that is not a boolean. It decides whether an import may
+            place a `.srm`, so a missing one is never read as either answer.
+    """
+    unknown = set(info) - (_ALTERNATE_KEYS if alternate else _ENTRY_KEYS)
+    if unknown:
+        raise ValueError(f"{_PLATFORMS_FILE.name}: {slug} has unknown key {sorted(unknown)}")
+    if not isinstance(info.get("save_ram"), bool):
+        raise ValueError(f"{_PLATFORMS_FILE.name}: {slug} needs a true or false save_ram")
+    if not isinstance(info.get("library_name"), str):
+        raise ValueError(f"{_PLATFORMS_FILE.name}: {slug} needs a library_name")
+    for key in ("extensions", "save_subtrees", "extra_extensions"):
+        if key in info:
+            info[key] = tuple(info[key])
+
+
+def _load_platforms() -> dict[str, dict[str, Any]]:
+    """Read and validate the platform table, turning its list fields into tuples.
+
+    Returns:
+        Platform slug to its entry, alternates included.
+
+    Raises:
+        ValueError: When an entry or alternate fails `_validate_entry`, or an
+            alternate is keyed by a name that is not a core name.
     """
     platforms = json.loads(_PLATFORMS_FILE.read_text())
     for slug, info in platforms.items():
-        if not isinstance(info.get("save_ram"), bool):
-            raise ValueError(f"{_PLATFORMS_FILE.name}: {slug} needs a true or false save_ram")
-        info["extensions"] = tuple(info["extensions"])
-        if "save_subtrees" in info:
-            info["save_subtrees"] = tuple(info["save_subtrees"])
+        _validate_entry(slug, info, alternate=False)
+        for core, alt in info.get("alternates", {}).items():
+            if not retroarch_cores.CORE_NAME_RE.match(core):
+                raise ValueError(f"{_PLATFORMS_FILE.name}: {slug} alternate {core!r} is not a core name")
+            _validate_entry(f"{slug}/{core}", alt, alternate=True)
     return platforms
 
 
@@ -464,6 +496,16 @@ floppy saves back.
 for a core that keeps a fixed-path save file outside every `save_subtree`
 (NeoCD's backup RAM); `_ensure_save_links` symlinks the source at the
 destination so the save archive's existing per-game isolation reaches it.
+
+`alternates` names other cores vetted for the platform, keyed by core name,
+for an operator's `core:` override to pick. An alternate takes only the
+platform's `extensions`; it never inherits a core-owned field from the
+default (the fields in `retroarch_cores.CORE_OWNED_FIELDS`), since those
+belong to the core that set them, not to the platform.
+
+`extra_extensions` lists extensions a core handles that core-info's
+`supported_extensions` omits, so the offline check that `extensions` is a
+subset of what the core supports (plus this list) still passes.
 """
 
 _ROM_SEARCH_GLOBS = ("*", "*/*")
