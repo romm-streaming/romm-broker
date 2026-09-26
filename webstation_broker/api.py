@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field, field_validator
 from starlette.websockets import WebSocketState
 
 from . import callback, imports, memcard, saves, screenshot, selkies, session, settings
-from .emulators import get_emulator
+from .emulators import get_emulator, retroarch_cores
 from .emulators.base import STATE_HEAD_BYTES, Emulator, reap_orphan
 
 log = logging.getLogger(__name__)
@@ -121,6 +121,8 @@ class RomIn(BaseModel):
         save_target: RomM's name for where this game keeps its saves, if it has one.
         save_target_layout: How `save_target` names that place; see `KNOWN_SAVE_TARGET_LAYOUTS`.
         path: Absolute container path to the rom, validated against ROM_ROOT on activate.
+        core: The libretro core to boot instead of the platform's default (RetroArch only).
+        experimental_cores: RomM's opt-in to a core the broker lists as known broken (§6.4).
     """
 
     id: Optional[int] = None
@@ -141,6 +143,10 @@ class RomIn(BaseModel):
     save_target_layout: Optional[str] = None
     """How `save_target` names that place; see `KNOWN_SAVE_TARGET_LAYOUTS`."""
     path: str
+    core: Optional[str] = None
+    """The libretro core to boot instead of the platform's default (RetroArch only)."""
+    experimental_cores: bool = False
+    """RomM's opt-in to a core the broker lists as known broken (§6.4)."""
 
     @field_validator("save_target_layout")
     @classmethod
@@ -155,6 +161,24 @@ class RomIn(BaseModel):
         """
         if value is not None and value not in KNOWN_SAVE_TARGET_LAYOUTS:
             log.warning("activate: unknown save_target_layout %r, passing it through", value)
+        return value
+
+    @field_validator("core")
+    @classmethod
+    def _check_core(cls, value: Optional[str]) -> Optional[str]:
+        """Refuse a core name the buildbot could not have.
+
+        Args:
+            value: The core RomM sent.
+
+        Returns:
+            The value, unchanged.
+
+        Raises:
+            ValueError: When it does not match `^[a-z0-9_]+$`.
+        """
+        if value is not None and not retroarch_cores.CORE_NAME_RE.match(value):
+            raise ValueError("core must match ^[a-z0-9_]+$")
         return value
 
 
@@ -403,14 +427,16 @@ def _archive_identity(sess: dict[str, Any], emulator: Emulator) -> dict[str, Any
         emulator: The emulator that just exited.
 
     Returns:
-        The emulator, its core (for a launcher that fronts many), the platform,
-        the ROM's RomM id, name and file, and the state slot the archive was
-        taken in.
+        The emulator, its core (for a launcher that fronts many) with the
+        core's tier and library name when the emulator identifies one, the
+        platform, the ROM's RomM id, name and file, and the state slot the
+        archive was taken in.
     """
     rom = sess.get("rom") or {}
     return {
         "emulator": emulator.name,
         "core": emulator.archive_core(),
+        **emulator.core_identity(),
         "platform": rom.get("platform"),
         "rom_id": rom.get("id"),
         "rom": rom.get("name"),
@@ -543,14 +569,16 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
         A dict with `status`, `session_id`, `rom_file`, `save_restore` (the
         restore report, its `imported` a list of `{member, dest, sidecars}`
         for each placed import, or None when nothing was restored),
-        `save_restore_skipped`, `selkies_tokens_pushed` and the controller's
-        landing `url`.
+        `save_restore_skipped`, `selkies_tokens_pushed`, the controller's
+        landing `url`, `core` (the resolved libretro core, for RetroArch) and
+        `core_tier` when the emulator identifies one.
 
     Raises:
         HTTPException: 409 when a session is already active; 422 for an unknown
-            emulator, a missing rom on an emulator that needs one, no bootable
-            file, or a failed restore; 422 with an `import_refused` body when
-            an archive's declared imports cannot be placed; 500 with
+            emulator, a core the emulator will not take or launch, a missing
+            rom on an emulator that needs one, no bootable file, or a failed
+            restore; 422 with an `import_refused` body when an archive's
+            declared imports cannot be placed; 500 with
             `import_preflight_failed` when placing them crashed; 400 for a rom
             path that cannot be resolved or lies outside ROM_ROOT; 404 for a
             rom path or save archive that does not exist.
@@ -582,6 +610,15 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     if body.rom is not None:
         emulator.platform = body.rom.platform
         emulator.language = body.rom.language
+        emulator.core = body.rom.core
+        emulator.experimental_cores = body.rom.experimental_cores
+    try:
+        # Before resolve_rom_file and long before clear_working_slot: a core
+        # that will not launch must leave the working slot as it was.
+        emulator.select_core()
+    except retroarch_cores.CoreRejectedError as exc:
+        log.warning("activate: %s", exc.detail)
+        raise HTTPException(status_code=422, detail=exc.detail)
 
     rom_file = None
     if emulator.requires_rom:
@@ -873,6 +910,9 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
 
     tokens_pushed = await _push_seat_tokens(sess, "activate")
 
+    # core_identity() also carries library_name, which belongs in the exit
+    # manifest but not here: only core and its tier are activate's contract.
+    ident = emulator.core_identity()
     return {
         "status": "launching",
         "session_id": sess["id"],
@@ -881,6 +921,8 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
         "save_restore_skipped": restore_skipped,
         "selkies_tokens_pushed": tokens_pushed,
         "url": _landing_url(sess["controller_token"]),
+        "core": emulator.archive_core(),
+        **({"core_tier": ident["core_tier"]} if "core_tier" in ident else {}),
     }
 
 
@@ -1909,6 +1951,8 @@ def _memory_card(name: str, platform: Optional[str]) -> tuple[Path, Optional[str
 async def get_import_spec(
     emulator: str = Query(...),
     platform: Optional[str] = Query(default=None),
+    core: Optional[str] = Query(default=None),
+    experimental_cores: bool = Query(default=False),
     x_broker_secret: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     """Tell RomM what an emulator accepts as a declared import, before it builds an archive.
@@ -1916,6 +1960,10 @@ async def get_import_spec(
     Args:
         emulator: The emulator's name.
         platform: The platform slug, for an emulator whose spec depends on it.
+        core: The libretro core RomM would activate with (RetroArch only), so
+            discovery and activate agree on whether it is offered.
+        experimental_cores: RomM's opt-in to a core the broker lists as known
+            broken (§6.4), lifting the same block `rom.experimental_cores` lifts.
         x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
@@ -1924,7 +1972,8 @@ async def get_import_spec(
         archive) and every refusal code.
 
     Raises:
-        HTTPException: 403 on a bad secret; 422 for an unknown emulator.
+        HTTPException: 403 on a bad secret; 422 for an unknown emulator or a
+            core that emulator will not take or launch.
     """
     _check_secret(x_broker_secret)
     inst = get_emulator(emulator)
@@ -1932,6 +1981,13 @@ async def get_import_spec(
         log.debug("import-spec: unknown emulator: %s", emulator)
         raise HTTPException(status_code=422, detail=f"unknown emulator: {emulator}")
     inst.platform = platform
+    inst.core = core
+    inst.experimental_cores = experimental_cores
+    try:
+        inst.select_core()
+    except retroarch_cores.CoreRejectedError as exc:
+        log.warning("import-spec: %s", exc.detail)
+        raise HTTPException(status_code=422, detail=exc.detail)
     spec = inst.import_spec()
     return {
         "import_api": 1,

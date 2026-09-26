@@ -3922,3 +3922,144 @@ class TestCoreProfile:
         emu.core = "x"
         with pytest.raises(retroarch_cores.CoreRejectedError):
             emu.select_core()
+
+
+def _ra_activate(client: TestClient, roms: Path, **rom: object) -> Any:
+    """Activate retroarch on snes with `launch` stubbed out.
+
+    Args:
+        client: The app client.
+        roms: The redirected ROM root.
+        **rom: Extra `rom` fields (core, experimental_cores).
+
+    Returns:
+        The response.
+    """
+    game = roms / "Game.sfc"
+    game.write_bytes(b"rom")
+    body = {
+        "session_id": "sess-1", "emulator": "retroarch",
+        "user": {"id": 1, "username": "ana", "display_name": "Ana"},
+        "rom": {"id": 5, "name": "Game", "platform": "snes", "path": str(game), **rom},
+    }
+    return client.post(f"{PREFIX}/api/session/activate", json=body)
+
+
+@pytest.fixture
+def no_launch(
+    monkeypatch: pytest.MonkeyPatch, ra_dirs: Path, broker_dirs: dict[str, Path]
+) -> list[retroarch.Retroarch]:
+    """Stub Retroarch.launch, recording the instances launched.
+
+    Also syncs `retroarch.ROM_ROOT` to `broker_dirs["roms"]`: the two fixtures
+    redirect different module globals, and `resolve_rom_file` checks the rom
+    against `retroarch.ROM_ROOT` independently of the route's own ROM_ROOT check.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        ra_dirs: The patched data root.
+        broker_dirs: The redirected ROM root and archive directories.
+
+    Returns:
+        The launched instances.
+    """
+    monkeypatch.setattr(retroarch, "ROM_ROOT", broker_dirs["roms"])
+    launched: list[retroarch.Retroarch] = []
+    monkeypatch.setattr(retroarch.Retroarch, "launch", lambda self, rom, slot: launched.append(self))
+    return launched
+
+
+class TestActivateCore:
+    """rom.core through activate (§4)."""
+
+    def test_no_core_answers_default(
+        self, client: TestClient, broker_dirs: dict[str, Path], no_launch: list
+    ) -> None:
+        """Response gains core and core_tier; nothing else changes."""
+        r = _ra_activate(client, broker_dirs["roms"])
+        assert r.status_code == 200
+        assert (r.json()["core"], r.json()["core_tier"]) == ("snes9x", "default")
+
+    def test_no_core_response_has_no_library_name(
+        self, client: TestClient, broker_dirs: dict[str, Path], no_launch: list
+    ) -> None:
+        """Ruling R4: activate gains only `core` and `core_tier`, never `library_name`.
+
+        `library_name` belongs to the exit manifest (`_archive_identity`), not
+        the activate response; §4.7 and the plan's global constraints name
+        exactly the two keys activate may add.
+        """
+        r = _ra_activate(client, broker_dirs["roms"])
+        assert r.status_code == 200
+        assert "library_name" not in r.json()
+
+    def test_untested_core_launches_with_its_tier(
+        self, client: TestClient, broker_dirs: dict[str, Path], no_launch: list
+    ) -> None:
+        """Nothing blocks an unvetted core (§2)."""
+        core = _untested_snes_core()
+        r = _ra_activate(client, broker_dirs["roms"], core=core)
+        assert r.status_code == 200
+        assert (r.json()["core"], r.json()["core_tier"]) == (core, "untested")
+        assert no_launch[0].archive_core() == core
+
+    @pytest.mark.parametrize("core", ["BSNES", "bs nes", "", "../x"])
+    def test_bad_core_name_is_rejected_by_validation(
+        self, client: TestClient, broker_dirs: dict[str, Path], no_launch: list, core: str
+    ) -> None:
+        """RomIn.core must match ^[a-z0-9_]+$."""
+        assert _ra_activate(client, broker_dirs["roms"], core=core).status_code == 422
+        assert no_launch == []
+
+    def test_bad_core_leaves_working_slot_untouched(
+        self, client: TestClient, broker_dirs: dict[str, Path], ra_dirs: Path, no_launch: list
+    ) -> None:
+        """Review Focus 3: the 422 comes before clear_working_slot."""
+        keep = ra_dirs / "saves" / "Snes9x" / "Game.srm"
+        keep.parent.mkdir(parents=True)
+        keep.write_bytes(b"sram")
+        r = _ra_activate(client, broker_dirs["roms"], core="nosuchcore")
+        assert r.status_code == 422
+        assert "/api/retroarch/cores" in r.json()["detail"]
+        assert keep.read_bytes() == b"sram"
+
+    def test_core_on_a_non_retroarch_emulator_is_422(
+        self, client: TestClient, broker_dirs: dict[str, Path]
+    ) -> None:
+        """Only RetroArch takes a core."""
+        game = broker_dirs["roms"] / "Game.iso"
+        game.write_bytes(b"iso")
+        body = {
+            "session_id": "s", "emulator": "pcsx2",
+            "user": {"id": 1, "username": "a", "display_name": "A"},
+            "rom": {"platform": "ps2", "path": str(game), "core": "x"},
+        }
+        assert client.post(f"{PREFIX}/api/session/activate", json=body).status_code == 422
+
+    def test_import_spec_with_blocked_core_is_422(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Review Focus 4: discovery and activate agree."""
+        core = _untested_snes_core()
+        blocked = {core: retroarch_cores.TierEntry("blocked", "x", (), None)}
+        monkeypatch.setattr(retroarch_cores, "TIERS", blocked)
+        params = {"emulator": "retroarch", "platform": "snes", "core": core}
+        assert client.get(f"{PREFIX}/api/session/import-spec", params=params).status_code == 422
+
+    def test_import_spec_with_blocked_core_and_opt_in_is_accepted(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The query opt-in lifts the block, as `rom.experimental_cores` does on activate."""
+        core = _untested_snes_core()
+        blocked = {core: retroarch_cores.TierEntry("blocked", "x", (), None)}
+        monkeypatch.setattr(retroarch_cores, "TIERS", blocked)
+        params = {
+            "emulator": "retroarch", "platform": "snes", "core": core, "experimental_cores": "1"
+        }
+        assert client.get(f"{PREFIX}/api/session/import-spec", params=params).status_code == 200
+
+    def test_import_spec_with_untested_core_offers_srm(self, client: TestClient) -> None:
+        """An untested core still takes a .srm, with a warning at placement (§6.2)."""
+        params = {"emulator": "retroarch", "platform": "snes", "core": _untested_snes_core()}
+        body = client.get(f"{PREFIX}/api/session/import-spec", params=params).json()
+        assert body["kinds"][0]["shapes"] == ["<name>.srm"]
