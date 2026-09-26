@@ -12,9 +12,10 @@ import logging
 import os
 import shutil
 import zipfile
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from threading import Lock
-from typing import Optional, Union
+from typing import NamedTuple, Optional, Union
 
 from . import settings
 from .saves import SAVE_FILE_MAX_BYTES
@@ -30,6 +31,34 @@ concurrent replaces would rmtree each other mid-write.
 
 _FILE_CARD_ERROR = "slot 1 holds a single-file memory card, a folder card is required"
 """Error string returned when the slot holds a single-file card instead of a folder card."""
+
+HEAD_BYTES = 0x40
+"""Bytes of each member an `arrange` hook is shown: a GameCube save's whole directory entry."""
+
+
+
+class Placement(NamedTuple):
+    """Where an emulator's `arrange` hook sends each member of a pushed card."""
+
+    dests: dict[str, str]
+    """Every member name mapped to its destination, relative to the card root."""
+
+    unread: tuple[str, ...] = ()
+    """Members left where they were packed, somewhere the emulator will not read them."""
+
+
+class Replaced(NamedTuple):
+    """What a successful `replace` laid down."""
+
+    written: int
+    """Files written into the card, not counting the marker."""
+
+    unread: tuple[str, ...] = ()
+    """Members written where the emulator will not read them, as its hook reported."""
+
+
+Arrange = Callable[[dict[str, bytes]], Placement]
+"""An emulator's hook placing a pushed card's members, given each zip name and its first `HEAD_BYTES`."""
 
 
 def _card_files(card: Path) -> list[Path]:
@@ -138,7 +167,51 @@ def build_archive(card: Path, marker: Optional[str] = None) -> Optional[Union[by
     return buf.getvalue()
 
 
-def replace(card: Path, content: bytes, marker: Optional[str] = None) -> Union[int, str]:
+def _arrange(
+    zf: zipfile.ZipFile, infos: list[zipfile.ZipInfo], arrange: Optional[Arrange]
+) -> Union[tuple[dict[str, PurePosixPath], tuple[str, ...]], str]:
+    """Work out where each member of a pushed card is written, relative to the card root.
+
+    Args:
+        zf: The open card image.
+        infos: Its file members, already checked to stay inside the card.
+        arrange: The emulator's placement hook, or None to keep every member's own path.
+
+    Returns:
+        Each member name mapped to its destination, with the members the hook
+        reported the emulator will not read; or an error string when the hook
+        leaves a member unplaced, sends one outside the card, or sends two onto
+        one file.
+    """
+    if arrange is None:
+        return {i.filename: PurePosixPath(i.filename) for i in infos}, ()
+    heads: dict[str, bytes] = {}
+    for info in infos:
+        with zf.open(info) as f:
+            heads[info.filename] = f.read(HEAD_BYTES)
+    placement = arrange(heads)
+    dests: dict[str, PurePosixPath] = {}
+    claimed: set[PurePosixPath] = set()
+    for name in heads:
+        # A member the hook forgot is a hook bug; writing it at its own path
+        # would hide the bug behind a card the emulator may not read.
+        if name not in placement.dests:
+            return f"memory card member left unplaced: {name}"
+        dest = PurePosixPath(placement.dests[name])
+        # The hook is emulator code, so its output gets the same escape check
+        # the member names did rather than being trusted to stay in the card.
+        if dest.is_absolute() or ".." in dest.parts or not dest.parts:
+            return f"memory card member placed outside the card dir: {name}"
+        if dest in claimed:
+            return f"two memory card members would land on {dest.as_posix()}"
+        claimed.add(dest)
+        dests[name] = dest
+    return dests, placement.unread
+
+
+def replace(
+    card: Path, content: bytes, marker: Optional[str] = None, arrange: Optional[Arrange] = None
+) -> Union[Replaced, str]:
     """Wipe the card at `card` and lay the pulled image down in its place.
 
     The whole card is replaced with no per-file merge: that is what isolates
@@ -151,11 +224,15 @@ def replace(card: Path, content: bytes, marker: Optional[str] = None) -> Union[i
         content: The zip image of the card, members relative to the card root.
         marker: The marker filename to lay down before the members, or None to
             skip it.
+        arrange: The emulator's hook for moving members to where it reads them,
+            or None to write every member where the image put it.
 
     Returns:
-        The number of files written, or an error string when the slot holds a
-        single-file card, the body is not a zip, the archive is too large, a
-        member escapes the card dir, or the swap fails.
+        The files written and the members the emulator will not read, or an
+        error string when the slot holds a single-file card, the body is not a
+        zip, the archive is too large, a member escapes the card dir, the hook
+        misplaces a member, two members would land on one file, or the swap
+        fails.
     """
     if card.exists() and not card.is_dir():
         return _FILE_CARD_ERROR
@@ -171,8 +248,20 @@ def replace(card: Path, content: bytes, marker: Optional[str] = None) -> Union[i
             return f"archive holds more than {settings.SAVE_FILE_MAX_ENTRIES} entries"
         for info in infos:
             member = PurePosixPath(info.filename)
-            if member.is_absolute() or ".." in member.parts:
+            # A name that normalises to nothing (`.`, `./`) would be written
+            # onto the card directory itself.
+            if member.is_absolute() or ".." in member.parts or not member.parts:
                 return f"archive member escapes the card dir: {info.filename}"
+        try:
+            arranged = _arrange(zf, infos, arrange)
+        except (OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile) as exc:
+            # RuntimeError is an encrypted member, NotImplementedError a
+            # compression method zipfile cannot read.
+            log.error("memory-card replace: could not read a member to place it: %s", exc)
+            return f"could not read the memory card: {exc}"
+        if isinstance(arranged, str):
+            return arranged
+        dests, unread = arranged
 
         parent = card.parent
         staging = parent / f".{card.name}.new"
@@ -189,7 +278,7 @@ def replace(card: Path, content: bytes, marker: Optional[str] = None) -> Union[i
                 (staging / marker).touch()
             staging_real = staging.resolve()
             for info in infos:
-                target = staging / PurePosixPath(info.filename)
+                target = staging / dests[info.filename]
                 # Belt-and-suspenders on top of the member-path check above:
                 # confirms the resolved write location is still under the
                 # (still-empty, pre-swap) staging dir.
@@ -203,7 +292,7 @@ def replace(card: Path, content: bytes, marker: Optional[str] = None) -> Union[i
             if card.exists():
                 os.replace(card, backup)
             os.replace(staging, card)
-        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+        except (OSError, ValueError, RuntimeError, NotImplementedError, zipfile.BadZipFile) as exc:
             shutil.rmtree(staging, ignore_errors=True)
             if not card.exists() and backup.exists():
                 try:
@@ -220,4 +309,4 @@ def replace(card: Path, content: bytes, marker: Optional[str] = None) -> Union[i
             shutil.rmtree(backup, ignore_errors=True)
             return f"could not write the memory card: {exc}"
         shutil.rmtree(backup, ignore_errors=True)
-    return written
+    return Replaced(written, unread)

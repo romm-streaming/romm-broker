@@ -152,6 +152,32 @@ region's `Card A` folder, since a game library can mix regions and a sync
 has to cover all of them. PCSX2 needs no `platform` value, since its Slot 1
 card doesn't depend on one.
 
+Dolphin only reads a GameCube save that sits at `<USA|EUR|JAP>/Card A/<name>.gci`
+inside that folder, so a card pushed to Dolphin is tidied on the way in. A
+leading `GC/` folder is dropped, and a `.gci` anywhere else (loose, under a
+bare `Card A/`, or under `Card B/`) moves to the `Card A` folder of the
+region Dolphin boots its game in, read from the last letter of its game code
+the same way Dolphin reads it: `E`, `B` and `N` are `USA`; `J`, and the
+Korean `K`, `Q`, `T` and `W`, are `JAP`; `D`, `F`, `H`, `I`, `L`, `M`, `P`,
+`R`, `S`, `U` and `V` are `EUR`. `SRAM.raw`, Dolphin's console settings file,
+stays at the top. A move never lands on a path another file in the zip
+already uses, packed or moved, so a copy already in place keeps its spot.
+
+A `.gci` the broker cannot place stays where it was packed: one coded `X`,
+`Y` or `Z`, which Dolphin files by the disc's region rather than the code, or
+one whose spot is already taken. So does a whole card image (`.raw`, `.mcd`,
+`.gcp`), which the folder card never reads: export its saves as `.gci` files
+with Dolphin's Memory Card Manager first. The push still answers `200`,
+because a refused push makes RomM abort the launch, and names each such file
+in an `unread` list:
+
+```json
+{"status": "ok", "written": 2, "unread": ["Card A/01-GZLX-zelda.gci"], "slot": 1}
+```
+
+`written` counts every file laid down, `unread` included. For PCSX2, and for
+a Dolphin card that needed no help, `unread` is empty.
+
 When you sync a card this way, tell activate about it with
 `save.memory_card_synced: true`. The card then travels as its own file,
 separate from the save archive: a restore will skip a stale card folder if

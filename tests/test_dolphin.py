@@ -5,14 +5,16 @@ naming contract, the undo buffer, finding the render window, and confirming
 a hotkey load off the access time of the state Dolphin reads back.
 """
 
+import io
 import os
 import time
+import zipfile
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Union
 
 import pytest
 
-from webstation_broker import imports, saves
+from webstation_broker import imports, memcard, saves
 from webstation_broker.emulators import dolphin
 
 from .conftest import import_zip, preflight_import, restore_import
@@ -744,6 +746,254 @@ def test_only_a_gamecube_session_takes_the_card_out_of_the_save_archive() -> Non
     emu.platform = "ngc"
     assert emu.memory_card_subtree == "GC"
     assert emu.memory_card_subtree in emu.save_subtrees
+
+
+def _card_gci(code: bytes) -> bytes:
+    """A one-block GCI whose directory entry opens with `code`.
+
+    Args:
+        code: The six-byte game id, e.g. `GZLE01`.
+
+    Returns:
+        The GCI's bytes.
+    """
+    return code + bytes(0x40 - len(code) + 0x2000)
+
+
+def _arrange(members: dict[str, bytes]) -> memcard.Placement:
+    """Run Dolphin's card placement over members the way `memcard.replace` shows them.
+
+    Args:
+        members: Member names mapped to their full bytes.
+
+    Returns:
+        Where each member goes under `GC`, and which ones Dolphin will not read.
+    """
+    return dolphin.Dolphin().arrange_card({n: b[: memcard.HEAD_BYTES] for n, b in members.items()})
+
+
+def _push(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, members: dict[str, bytes]
+) -> Union[memcard.Replaced, str]:
+    """Push a zip of `members` to Dolphin's card through `memcard.replace`, as the PUT route does.
+
+    Args:
+        tmp_path: The pytest temporary directory, standing in for Dolphin's user folder.
+        monkeypatch: The pytest monkeypatch fixture.
+        members: Member names mapped to their bytes.
+
+    Returns:
+        What `memcard.replace` returned.
+    """
+    monkeypatch.setattr(dolphin, "USER_DIR", tmp_path)
+    emu = dolphin.Dolphin()
+    card = emu.memory_card_path(platform="ngc")
+    assert card is not None
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, data in members.items():
+            zf.writestr(name, data)
+    return memcard.replace(card, buf.getvalue(), None, emu.arrange_card)
+
+
+@pytest.mark.parametrize(
+    "members",
+    [
+        {"SRAM.raw": bytes(64), "USA/Card A/01-GZLE-zelda.gci": _card_gci(b"GZLE01")},
+        {"USA/Card A/01-GZLE-zelda.gci": _card_gci(b"GZLE01")},
+        {"EUR/Card A/01-GZLP-zelda.gci": _card_gci(b"GZLP01"), "JAP/Card A/01-GZLJ-zelda.gci": b"x"},
+    ],
+)
+def test_a_card_packed_the_way_dolphin_keeps_it_is_left_as_it_is(members: dict[str, bytes]) -> None:
+    """The contents of Dolphin's own `GC` folder, SRAM included, land exactly as packed.
+
+    Args:
+        members: The pushed card's members.
+    """
+    assert _arrange(members) == ({n: n for n in members}, ())
+
+
+@pytest.mark.parametrize(
+    ("name", "code", "dest"),
+    [
+        ("01-GZLE-zelda.gci", b"GZLE01", "USA/Card A/01-GZLE-zelda.gci"),
+        ("Card A/01-GZLE-zelda.gci", b"GZLE01", "USA/Card A/01-GZLE-zelda.gci"),
+        ("Card A/01-GZLP-zelda.gci", b"GZLP01", "EUR/Card A/01-GZLP-zelda.gci"),
+        ("Card A/01-GZLJ-zelda.gci", b"GZLJ01", "JAP/Card A/01-GZLJ-zelda.gci"),
+        ("Card A/01-GZLD-zelda.gci", b"GZLD01", "EUR/Card A/01-GZLD-zelda.gci"),
+        ("Card A/save.gci", b"GAAB01", "USA/Card A/save.gci"),
+        ("Card A/save.gci", b"GAAN01", "USA/Card A/save.gci"),
+        ("Card A/save.gci", b"GAAK01", "JAP/Card A/save.gci"),
+        ("Card A/save.gci", b"GAAW01", "JAP/Card A/save.gci"),
+        ("Card A/save.gci", b"GAAT01", "JAP/Card A/save.gci"),
+        ("Card A/save.gci", b"GAAH01", "EUR/Card A/save.gci"),
+        ("USA/01-GZLE-zelda.gci", b"GZLE01", "USA/Card A/01-GZLE-zelda.gci"),
+        ("USA/Card B/01-GZLE-zelda.gci", b"GZLE01", "USA/Card A/01-GZLE-zelda.gci"),
+        ("USA/Card A/sub/01-GZLE-zelda.gci", b"GZLE01", "USA/Card A/01-GZLE-zelda.gci"),
+        # Dolphin's folder scan matches the extension case-insensitively, so it reads this one too.
+        ("01-GZLE-zelda.GCI", b"GZLE01", "USA/Card A/01-GZLE-zelda.GCI"),
+    ],
+)
+def test_a_misplaced_gci_moves_to_the_card_its_game_code_names(name: str, code: bytes, dest: str) -> None:
+    """A loose GCI, or one under a bare or wrong slot folder, goes to the region Dolphin boots its game in.
+
+    Args:
+        name: Where the player packed the GCI.
+        code: The game id its directory entry opens with.
+        dest: Where Dolphin reads it.
+    """
+    assert _arrange({name: _card_gci(code)}) == ({name: dest}, ())
+
+
+@pytest.mark.parametrize("wrapper", ["GC/", "saves/dolphin-emu/User/GC/"])
+def test_the_gc_folder_packed_by_name_loses_its_wrapper(wrapper: str) -> None:
+    """Zipping the `GC` folder itself, not its contents, still lands the card at the card root.
+
+    Args:
+        wrapper: The folders the card was packed under.
+    """
+    members = {
+        f"{wrapper}SRAM.raw": bytes(64),
+        f"{wrapper}USA/Card A/01-GZLE-zelda.gci": _card_gci(b"GZLE01"),
+    }
+
+    placement = _arrange(members)
+
+    assert sorted(placement.dests.values()) == ["SRAM.raw", "USA/Card A/01-GZLE-zelda.gci"]
+    assert placement.unread == ()
+
+
+@pytest.mark.parametrize("code", [b"GZLX01", b"GZLY01", b"GZLZ01", b"GZLA01", b"GZL", b""])
+def test_a_gci_whose_region_is_unknown_stays_where_it_was(
+    code: bytes, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A code Dolphin settles by the disc, or with no region at all, is left in place and reported.
+
+    Args:
+        code: The GCI's opening bytes.
+        caplog: The pytest log capture fixture.
+    """
+    member = code + bytes(0x40 - len(code)) if len(code) == 6 else code
+
+    name = "Card A/save.gci"
+
+    assert _arrange({name: member}) == ({name: name}, (name,))
+    assert "names no region" in caplog.text
+
+
+def test_a_stray_copy_never_displaces_the_gci_already_in_place(caplog: pytest.LogCaptureFixture) -> None:
+    """The copy already in `<region>/Card A` keeps its spot; the stray stays put and is reported.
+
+    Args:
+        caplog: The pytest log capture fixture.
+    """
+    members = {
+        "01-GZLE-zelda.gci": _card_gci(b"GZLE01"),
+        "USA/Card A/01-GZLE-zelda.gci": _card_gci(b"GZLE01"),
+    }
+
+    assert _arrange(members) == ({n: n for n in members}, ("01-GZLE-zelda.gci",))
+    assert "already taken" in caplog.text
+
+
+def test_two_strays_of_one_save_move_only_the_first() -> None:
+    """Two misplaced copies bound for one file: the first moves, the second stays put."""
+    members = {"01-GZLE-zelda.gci": _card_gci(b"GZLE01"), "Card A/01-GZLE-zelda.gci": _card_gci(b"GZLE01")}
+
+    assert _arrange(members) == (
+        {
+            "01-GZLE-zelda.gci": "USA/Card A/01-GZLE-zelda.gci",
+            "Card A/01-GZLE-zelda.gci": "Card A/01-GZLE-zelda.gci",
+        },
+        ("Card A/01-GZLE-zelda.gci",),
+    )
+
+
+def test_a_wrapper_never_strips_a_member_onto_one_packed_bare() -> None:
+    """`GC/SRAM.raw` beside a bare `SRAM.raw` keeps its wrapper rather than overwrite it."""
+    members = {"GC/SRAM.raw": bytes(64), "SRAM.raw": bytes(64)}
+
+    assert _arrange(members).dests == {n: n for n in members}
+
+
+@pytest.mark.parametrize(
+    "members",
+    [
+        {"GC/SRAM.raw": bytes(64), "SRAM.raw": bytes(64)},
+        {"GC/USA/Card A/a.gci": _card_gci(b"GAAE01"), "USA/Card A/a.gci": _card_gci(b"GAAE01")},
+        {"a.gci": _card_gci(b"GAAE01"), "USA/Card A/a.gci": _card_gci(b"GAAE01"), "GC/a.gci": b"GAAE"},
+        {"USA": b"a file", "Card A/a.gci": _card_gci(b"GAAE01")},
+        {"USA/Card A": b"a file", "a.gci": _card_gci(b"GAAE01")},
+        {"USA/Card A/a.gci/x": b"a file", "a.gci": _card_gci(b"GAAE01")},
+        {
+            "GC/USA/Card A/a.gci": _card_gci(b"GAAE01"),
+            "Card A/a.gci": _card_gci(b"GAAE01"),
+            "a.gci": b"GAAE",
+        },
+    ],
+)
+def test_no_packing_makes_two_members_collide_and_refuse_the_push(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, members: dict[str, bytes]
+) -> None:
+    """However a card is packed, tidying it never sends two members onto one path.
+
+    A refused push makes RomM abort its claim, so a card that wrote fine
+    before the tidying has to write fine after it.
+
+    Args:
+        tmp_path: The pytest temporary directory.
+        monkeypatch: The pytest monkeypatch fixture.
+        members: The pushed card's members.
+    """
+    result = _push(tmp_path, monkeypatch, members)
+
+    assert isinstance(result, memcard.Replaced), result
+    assert result.written == len(members)
+
+
+def test_a_member_naming_no_file_does_not_crash_the_hook() -> None:
+    """A member whose path normalises to nothing is handed back as is, for `memcard.replace` to refuse."""
+    assert _arrange({".": b""}).dests == {".": "."}
+
+
+@pytest.mark.parametrize("name", ["MemoryCardA.USA.raw", "card.mcd", "card.gcp", "GC/MemoryCardA.EUR.raw"])
+def test_a_whole_card_image_is_kept_but_reported(name: str, caplog: pytest.LogCaptureFixture) -> None:
+    """A card image stays in the card as before, reported and logged as one the folder card never reads.
+
+    Args:
+        name: The image's name in the pushed card.
+        caplog: The pytest log capture fixture.
+    """
+    assert _arrange({name: bytes(0x40)}) == ({name: PurePosixPath(name).name}, (name,))
+    assert "Memory Card Manager" in caplog.text
+
+
+def test_sram_is_never_mistaken_for_a_card_image(caplog: pytest.LogCaptureFixture) -> None:
+    """`SRAM.raw` is Dolphin's own settings file, so it is not reported as an unreadable card.
+
+    Args:
+        caplog: The pytest log capture fixture.
+    """
+    assert _arrange({"SRAM.raw": bytes(64)}) == ({"SRAM.raw": "SRAM.raw"}, ())
+    assert "Memory Card Manager" not in caplog.text
+
+
+def test_a_pushed_card_lays_its_saves_where_dolphin_reads_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through `memcard.replace`: a zipped bare `Card A` lands in `USA/Card A`.
+
+    Args:
+        tmp_path: The pytest temporary directory.
+        monkeypatch: The pytest monkeypatch fixture.
+    """
+    gci = _card_gci(b"GZLE01")
+
+    result = _push(tmp_path, monkeypatch, {"Card A/01-GZLE-zelda.gci": gci})
+
+    assert result == memcard.Replaced(1, ())
+    assert (tmp_path / "GC" / "USA" / "Card A" / "01-GZLE-zelda.gci").read_bytes() == gci
+    assert not (tmp_path / "GC" / "Card A").exists()
 
 
 def test_exit_reports_the_working_slot_without_a_running_emulator(

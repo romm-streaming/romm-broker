@@ -1872,7 +1872,7 @@ def _refuse_while_session_active(action: str) -> None:
         )
 
 
-def _memory_card(name: str, platform: Optional[str]) -> tuple[Path, Optional[str]]:
+def _memory_card(name: str, platform: Optional[str]) -> tuple[Path, Optional[str], memcard.Arrange]:
     """Return the card the named emulator syncs, and the marker file it needs inside.
 
     Named rather than read off the session, because the card is container
@@ -1885,8 +1885,8 @@ def _memory_card(name: str, platform: Optional[str]) -> tuple[Path, Optional[str
         platform: The platform slug, when the emulator's card depends on it.
 
     Returns:
-        The card's path and the marker filename, the latter None when the
-        emulator needs no marker.
+        The card's path, the marker filename (None when the emulator needs no
+        marker), and the emulator's hook for placing a pushed card's members.
 
     Raises:
         HTTPException: 422 for an unknown emulator; 400 when it has no memory card to sync.
@@ -1902,7 +1902,7 @@ def _memory_card(name: str, platform: Optional[str]) -> tuple[Path, Optional[str
             status_code=400,
             detail=f"{emulator.display_name} has no memory card to sync",
         )
-    return card, emulator.memory_card_marker
+    return card, emulator.memory_card_marker, emulator.arrange_card
 
 
 @router.get("/api/session/import-spec")
@@ -1974,7 +1974,7 @@ async def get_memory_card(
             be captured; 404 with `X-Memory-Card: absent` when the slot is empty.
     """
     _check_secret(x_broker_secret)
-    card, marker = _memory_card(emulator, platform)
+    card, marker, _ = _memory_card(emulator, platform)
     # The session lock keeps an activate from launching over the capture, the
     # card lock keeps another card operation off the same staging paths.
     # Contention on either means the caller should come back rather than queue.
@@ -2028,7 +2028,9 @@ async def put_memory_card(
         x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
-        A dict with `status`, the number of files `written` and the `slot`.
+        A dict with `status`, the number of files `written`, the members
+        left `unread` (written where the emulator will not read them), and the
+        `slot`.
 
     Raises:
         HTTPException: 403 on a bad secret; 422 for an unknown emulator; 400
@@ -2038,7 +2040,7 @@ async def put_memory_card(
             active; 500 when the body cannot be staged on disk.
     """
     _check_secret(x_broker_secret)
-    card, marker = _memory_card(emulator, platform)
+    card, marker, arrange = _memory_card(emulator, platform)
 
     # Staged on disk rather than buffered: a card runs to the whole size limit,
     # and holding both the body and the copy handed to memcard.replace costs
@@ -2068,7 +2070,9 @@ async def put_memory_card(
             try:
                 _refuse_while_session_active("replace")
                 content = await anyio.to_thread.run_sync(tmp.read_bytes)
-                result = await anyio.to_thread.run_sync(memcard.replace, card, content, marker)
+                result = await anyio.to_thread.run_sync(
+                    memcard.replace, card, content, marker, arrange
+                )
             finally:
                 memcard.LOCK.release()
     except OSError as exc:
@@ -2079,8 +2083,8 @@ async def put_memory_card(
     if isinstance(result, str):
         log.error("memory-card: could not replace slot 1 at %s: %s", card, result)
         raise HTTPException(status_code=400, detail=result)
-    log.info("memory-card: replaced slot 1, %d file(s)", result)
-    return {"status": "ok", "written": result, "slot": 1}
+    log.info("memory-card: replaced slot 1, %d file(s), %d unread", result.written, len(result.unread))
+    return {"status": "ok", "written": result.written, "unread": list(result.unread), "slot": 1}
 
 
 @router.get("/api/session/status")
