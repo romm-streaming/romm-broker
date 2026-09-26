@@ -366,6 +366,25 @@ The settle is not optional: RetroArch drops a disc index change that arrives
 while the tray is still opening, and the failure is silent (the old disc stays
 mounted).
 """
+OBSERVE_WINDOW_BEFORE_SLACK = float(os.environ.get("RETROARCH_OBSERVE_WINDOW_BEFORE_SLACK", "2.0"))
+"""Seconds `_observe_library_name` backdates `_launch_wall` by, from
+`RETROARCH_OBSERVE_WINDOW_BEFORE_SLACK` (default 2.0).
+
+Some network mounts (SMB, FAT) round a file's mtime to a coarse unit (as
+little as 2 seconds), so a state written right at launch can read back as a
+hair older than `_launch_wall` itself; without this slack that write would
+be mistaken for stale save data from a previous session.
+"""
+OBSERVE_WINDOW_AFTER_SLACK = float(os.environ.get("RETROARCH_OBSERVE_WINDOW_AFTER_SLACK", "30.0"))
+"""Seconds `_observe_library_name` extends past "now" by, from
+`RETROARCH_OBSERVE_WINDOW_AFTER_SLACK` (default 30.0).
+
+The share and the broker's clocks are not guaranteed to agree; a mtime that
+is genuinely from this session but arrives slightly ahead of the broker's
+own clock should not be discarded as bogus. Wide enough to absorb ordinary
+skew, narrow enough that a stale future-dated file (a bad clock, a copied
+save) still fails the check.
+"""
 DISC_STEP_DELAY = float(os.environ.get("RETROARCH_DISC_STEP_DELAY", "0.1"))
 """Seconds between `DISK_NEXT` presses, from `RETROARCH_DISC_STEP_DELAY` (default 0.1)."""
 DISC_SWAP_WAIT = float(os.environ.get("RETROARCH_DISC_SWAP_WAIT", "90.0"))
@@ -1145,7 +1164,15 @@ def _wait_for_state_file(
     return False
 
 
-def _newest_state(dir_path: Path, base: str, slot: int) -> Optional[Path]:
+def _newest_state(
+    dir_path: Path,
+    base: str,
+    slot: int,
+    *,
+    only: Optional[str] = None,
+    skip: frozenset[str] = frozenset(),
+    include_root: bool = False,
+) -> Optional[Path]:
     """Find the most recently written file named for `base` and `slot`.
 
     Searched recursively, since RetroArch sorts every core's states into
@@ -1156,29 +1183,64 @@ def _newest_state(dir_path: Path, base: str, slot: int) -> Optional[Path]:
         dir_path: The savestate directory to walk.
         base: The content basename of the loaded game.
         slot: The slot whose file to find.
+        only: Restrict the search to `dir_path/only`, when given (§6.5).
+        skip: Drop a match whose first path component under `dir_path` is in
+            this set; has no effect when `only` is also given, since every
+            match then already sits under `only` itself, never under one of
+            the names in `skip`. When `skip` is given and `only` is not, a
+            file sitting directly in `dir_path` (no sorted subdirectory at
+            all) is also dropped: that bare-root case is `include_root`'s
+            alone, so an untested or blocked core's "everywhere except known
+            cores' dirs" search can't pick up a legacy default/vetted root
+            state by accident (R6a). A plain unscoped call (no `skip`) still
+            matches a bare-root file, as before.
+        include_root: Also match a file sitting directly in `dir_path`,
+            non-recursively (ignored without `only`). `sort_savestates_enable`
+            was only pinned on 2026-09-18 (451da72); an install or restored
+            archive from before that can still have a default/vetted core's
+            state sitting unsorted at the root, and resume has to keep
+            finding it (R6a). This never reaches another core's subdirectory,
+            which is the whole point of the `only`/`skip` scoping.
 
     Returns:
         The newest matching file, or None when there is none or the directory
         cannot be read.
     """
     name = _state_name(base, slot)
+    root = dir_path / only if only is not None else dir_path
+    # `base` is a ROM content basename, not a pattern: bracketed region tags
+    # like "[USA]" are near-universal in ROM sets and glob.escape is what
+    # keeps a `[U]` character class from swallowing them, the same way a
+    # plain `*` or `?` in a title would otherwise silently make the glob
+    # match nothing (or the wrong thing) instead of raising.
+    pattern = f"{glob.escape(base)}.state*"
     best: Optional[tuple[float, Path]] = None
     try:
-        # `base` is a ROM content basename, not a pattern: bracketed region
-        # tags like "[USA]" are near-universal in ROM sets and glob.escape is
-        # what keeps a `[U]` character class from swallowing them, the same
-        # way a plain `*` or `?` in a title would otherwise silently make the
-        # glob match nothing (or the wrong thing) instead of raising.
-        for p in dir_path.rglob(f"{glob.escape(base)}.state*"):
+        # A missing `root` (an untested core's dir not yet observed, or a
+        # default core's dir never written) yields no matches from rglob
+        # rather than raising: that is "the slot is empty", not an error.
+        for p in root.rglob(pattern):
             if not p.is_file() or p.name != name:
+                continue
+            rel_parts = p.relative_to(dir_path).parts
+            if skip and only is None and len(rel_parts) == 1:
+                continue
+            if skip and only is None and rel_parts[0] in skip:
                 continue
             st = p.stat()
             if best is None or st.st_mtime > best[0]:
                 best = (st.st_mtime, p)
+        if include_root and root != dir_path:
+            for p in dir_path.glob(pattern):
+                if not p.is_file() or p.name != name:
+                    continue
+                st = p.stat()
+                if best is None or st.st_mtime > best[0]:
+                    best = (st.st_mtime, p)
     except OSError as exc:
         # Every caller treats None as "slot is empty"; log so a directory
         # that failed to read doesn't pass for a game that was never saved.
-        log.warning("retroarch: could not search %s for %s's state: %s", dir_path, name, exc)
+        log.warning("retroarch: could not search %s for %s's state: %s", root, name, exc)
         return None
     return best[1] if best is not None else None
 
@@ -1923,7 +1985,28 @@ class Retroarch(Emulator):
         self._resolved: Optional[tuple[Optional[str], Optional[str], retroarch_cores.Profile]] = None
         """The (platform, core) the profile was resolved for, and the profile; see `_profile`."""
         self._observed_lib: Optional[str] = None
-        """An untested core's `library_name` as observed on disk or recorded in the manifest (§6.5)."""
+        """An untested core's `library_name` as confirmed on disk (§6.5).
+
+        Unlike `_seeded_lib`, this is never overridden once set: it came from
+        watching RetroArch actually write the dir, not from a guess.
+        """
+        self._seeded_lib: Optional[str] = None
+        """An untested core's `library_name` as recorded in a restored archive's manifest (§6.5, R7).
+
+        Only a seed, not a confirmation: `adopt_archive_identity` sets this,
+        but `_observe_library_name` keeps running and its result overrides it
+        (§6.2 says the manifest only seeds the name; observation may still
+        correct it).
+        """
+        self._launch_wall: float = 0.0
+        """`time.time()` set right before the launch spawn; anchors `_observe_library_name`."""
+        self._broker_written_states: set[Path] = set()
+        """State file paths this session's broker wrote itself, e.g. via a mid-session state push.
+
+        `_observe_library_name` excludes these: a file the broker itself put
+        there cannot be evidence of where RetroArch writes, and would
+        otherwise falsely confirm whatever dir the push happened to target.
+        """
 
     @property
     def save_subtrees(self) -> tuple[str, ...]:
@@ -1983,6 +2066,7 @@ class Retroarch(Emulator):
         """
         self._resolved = None
         self._observed_lib = None
+        self._seeded_lib = None
         profile = self._profile()
         if profile is None:
             return
@@ -2007,7 +2091,11 @@ class Retroarch(Emulator):
             )
 
     def library_name(self) -> Optional[str]:
-        """The sorted-dir name in effect: observed or recorded for an untested core, else the profile's.
+        """The sorted-dir name in effect: observed, then seeded, then the profile's (R7).
+
+        An observed name (confirmed on disk) always wins. Absent that, a
+        manifest seed from `adopt_archive_identity` is used until observation
+        either confirms it or replaces it with something else.
 
         Returns:
             The name, or None when unmapped.
@@ -2015,7 +2103,7 @@ class Retroarch(Emulator):
         profile = self._profile()
         if profile is None:
             return None
-        return self._observed_lib or profile["library_name"]
+        return self._observed_lib or self._seeded_lib or profile["library_name"]
 
     def core_identity(self) -> dict[str, Any]:
         """The tier and library name, for the manifest and the activate response.
@@ -2027,6 +2115,143 @@ class Retroarch(Emulator):
         if profile is None:
             return {}
         return {"core_tier": profile["tier"], "library_name": self.library_name()}
+
+    def _known_libs(self) -> frozenset[str]:
+        """Sorted-dir names that belong to cores other than the running one.
+
+        Returns:
+            Every library_name in the platform table (defaults and alternates)
+            and every catalog corename, minus the running core's own.
+        """
+        profile = self._profile()
+        own = {profile["library_name"]} if profile else set()
+        names = {info["library_name"] for info in PLATFORMS.values()}
+        names |= {
+            alt["library_name"]
+            for info in PLATFORMS.values()
+            for alt in info.get("alternates", {}).values()
+        }
+        names |= {info.corename for info in retroarch_cores.catalog().cores.values()}
+        return frozenset(names - own)
+
+    def _state_scope(self) -> tuple[Optional[str], frozenset[str], bool]:
+        """Where this core's states may be looked up (§6.5, R6a).
+
+        Returns:
+            (`only`, `skip`, `include_root`) for `_newest_state`. A default or
+            vetted core looks in its own dir plus a legacy unsorted state
+            sitting at the root (R6a); an untested or blocked core whose dir
+            is confirmed by observation looks in its own dir only; otherwise
+            everywhere except other known cores' dirs. Root inclusion never
+            applies outside the default/vetted case, since it would otherwise
+            let an untested core's search reach into another core's
+            territory. A manifest seed (`_seeded_lib`) does NOT narrow this
+            (R7a): narrowing on a seed that turns out wrong would hide the
+            real dir, which is the exact failure R7 exists to fix, whereas
+            the open scope already finds a correct seed's dir on its own.
+        """
+        profile = self._profile()
+        if profile is None:
+            return None, frozenset(), False
+        if profile["tier"] in ("default", "vetted"):
+            return self.library_name(), frozenset(), True
+        if self._observed_lib:
+            return self.library_name(), frozenset(), False
+        return None, self._known_libs(), False
+
+    def _observe_library_name(self) -> None:
+        """Adopt the sorted dir RetroArch actually wrote for an untested core (§6.5).
+
+        Takes the newest subdirectory of `saves/` or `states/` holding a file
+        genuinely written since launch. Called after PLAYING and after each
+        confirmed save; a no-op once a name is confirmed (`_observed_lib`
+        set), and for default and vetted cores. Keeps running even after a
+        manifest seed (`_seeded_lib`) is in place: per §6.2 the manifest only
+        seeds the name, and this observer's result, once it has one,
+        overrides that seed (R7).
+
+        A candidate file's mtime has to fall in
+        `[launch - OBSERVE_WINDOW_BEFORE_SLACK, now + OBSERVE_WINDOW_AFTER_SLACK]`:
+        the lower bound is "since launch" from the spec, loosened by
+        `OBSERVE_WINDOW_BEFORE_SLACK` for a mount that only tracks mtime to a
+        coarse unit; the upper bound discards a clock-skewed or otherwise
+        bogus future timestamp, widened by `OBSERVE_WINDOW_AFTER_SLACK` to
+        tolerate the share and the broker's clocks disagreeing slightly.
+        Files this session's own broker wrote (`_broker_written_states`) are
+        skipped outright: they prove nothing about where RetroArch writes.
+        """
+        profile = self._profile()
+        if profile is None or profile["tier"] in ("default", "vetted") or self._observed_lib:
+            return
+        now = time.time()
+        window_start = self._launch_wall - OBSERVE_WINDOW_BEFORE_SLACK
+        window_end = now + OBSERVE_WINDOW_AFTER_SLACK
+        best: Optional[tuple[float, str]] = None
+        for parent in (SAVE_DIR, STATE_DIR):
+            try:
+                children = list(parent.iterdir())
+            except OSError:
+                continue
+            for child in children:
+                if not child.is_dir():
+                    continue
+                try:
+                    files = list(child.iterdir())
+                except OSError:
+                    continue
+                for f in files:
+                    if not f.is_file() or f in self._broker_written_states:
+                        continue
+                    try:
+                        mtime = f.stat().st_mtime
+                    except OSError:
+                        continue
+                    in_window = window_start <= mtime <= window_end
+                    if in_window and (best is None or mtime > best[0]):
+                        best = (mtime, child.name)
+        if best is None:
+            log.info(
+                "retroarch: untested core %s: library_name not yet confirmed, using %s",
+                profile["core"],
+                profile["library_name"],
+            )
+            return
+        self._observed_lib = best[1]
+        if best[1] != profile["library_name"]:
+            log.warning(
+                "retroarch: untested core %s: library_name is %s, not %s",
+                profile["core"],
+                best[1],
+                profile["library_name"],
+            )
+
+    def adopt_archive_identity(self, identity: Optional[Mapping[str, Any]]) -> None:
+        """Seed the library name from the restored archive's manifest (§6.2, R7).
+
+        Only a seed: `_observe_library_name` keeps running afterward, and its
+        result overrides this one once it has confirmed a real dir.
+
+        Args:
+            identity: The restored archive's manifest `session`, or None.
+        """
+        profile = self._profile()
+        if not identity or profile is None or profile["tier"] in ("default", "vetted"):
+            return
+        lib = identity.get("library_name")
+        if identity.get("core") != profile["core"] or not isinstance(lib, str):
+            return
+        if not lib or lib in (".", "..") or "/" in lib or "\\" in lib:
+            log.warning("retroarch: ignoring manifest library_name %r", lib)
+            return
+        self._seeded_lib = lib
+
+    def note_broker_state_write(self, path: Path) -> None:
+        """Track `path` so `_observe_library_name` does not mistake it for a core's own write.
+
+        Args:
+            path: The state file's path, as returned by `state_target`.
+        """
+        self._broker_written_states.add(path)
 
     @property
     def supports_states(self) -> bool:
@@ -2324,6 +2549,7 @@ class Retroarch(Emulator):
             rom_path,
             resume_slot,
         )
+        self._launch_wall = time.time()
         self._spawn_ra(cmd, env)
         self._playing_monotonic = None
         threading.Thread(target=self._track_first_playing, args=(seq,), daemon=True).start()
@@ -2619,6 +2845,7 @@ class Retroarch(Emulator):
             reply = self._send("GET_STATUS", wait_prefix="GET_STATUS", timeout=2.0)
             if reply and reply.startswith("GET_STATUS PLAYING"):
                 self._playing_monotonic = time.monotonic()
+                self._observe_library_name()
                 return
             time.sleep(0.2)
 
@@ -2763,12 +2990,16 @@ class Retroarch(Emulator):
                     STATE_SLOT, self.platform, self._rom_base,
                 )
             if self._try_save():
+                self._observe_library_name()
                 return True
             if not self.alive():
                 return False
             log.info("retroarch: save missed slot %d, re-homing and retrying", STATE_SLOT)
             self._home_state_slot()
-            return self._try_save()
+            saved = self._try_save()
+            if saved:
+                self._observe_library_name()
+            return saved
         finally:
             self._disc_lock.release()
 
@@ -2937,13 +3168,21 @@ class Retroarch(Emulator):
     def state_path(self) -> Optional[Path]:
         """The newest state file for the loaded content in `STATE_SLOT`, or None.
 
+        Scoped to the running core's own sorted dir once it is known
+        (default, vetted, or an untested core whose dir has been observed),
+        plus the legacy unsorted root for default/vetted (R6a); otherwise
+        everywhere except another known core's dir (§6.5).
+
         Returns:
             The file found by `_newest_state`, or None before a launch has set
             the content basename or when the slot is empty.
         """
         if not self._rom_base:
             return None
-        return _newest_state(STATE_DIR, self._rom_base, STATE_SLOT)
+        only, skip, include_root = self._state_scope()
+        return _newest_state(
+            STATE_DIR, self._rom_base, STATE_SLOT, only=only, skip=skip, include_root=include_root
+        )
 
     def note_state_handout(self) -> None:
         """Record now as the last time the state-file GET route read our state.
@@ -3145,6 +3384,7 @@ class Retroarch(Emulator):
             )
             return False
         log.info("retroarch: SRAM flushed for %s", self._rom_base)
+        self._observe_library_name()
         return True
 
     def save_and_exit(self, slot: Optional[int]) -> dict[str, Any]:

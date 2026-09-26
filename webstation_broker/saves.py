@@ -519,6 +519,28 @@ def read_archive(content: bytes) -> ArchiveView:
     return ArchiveView(error, tuple(v1), tuple(imports), manifest, manifest_error)
 
 
+def archive_session_identity(content: bytes) -> Optional[dict[str, Any]]:
+    """The `session` block of an archive's manifest, read on its own.
+
+    `read_archive` only parses the manifest when the archive holds imports,
+    but a core switch needs the previous session's core on every restore.
+
+    Args:
+        content: The archive bytes.
+
+    Returns:
+        The session identity, or None when there is no usable manifest.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            info = zf.getinfo(MANIFEST_NAME)
+            manifest, _ = _read_manifest(zf, info)
+    except (KeyError, *ZIP_READ_ERRORS):
+        return None
+    session = manifest.get("session") if isinstance(manifest, dict) else None
+    return session if isinstance(session, dict) else None
+
+
 def under_subtrees(member: PurePosixPath, subtrees: tuple[str, ...]) -> bool:
     """Whether an archive member path lies strictly inside one of the subtrees.
 

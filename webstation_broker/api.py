@@ -682,6 +682,7 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
                     status_code=404, detail=f"save archive not found: {save.archive}"
                 )
             content = await anyio.to_thread.run_sync(archive_path.read_bytes)
+            emulator.adopt_archive_identity(saves.archive_session_identity(content))
         else:
             # Dropping the archive and still answering "launching" is how a
             # player ends up booting a fresh save with nothing to tell them.
@@ -1866,6 +1867,7 @@ async def put_state_file(
             log.error("state-file: could not write %s: %s", target, exc)
             raise HTTPException(status_code=500, detail="could not write state file")
 
+        emulator.note_broker_state_write(target)
         log.info("state-file: stored %s (%d bytes)", target.name, written)
         return {"status": "ok", "filename": target.name, "slot": emulator.state_slot}
 

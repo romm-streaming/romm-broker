@@ -12,7 +12,7 @@ import shutil
 import signal
 import subprocess
 import time
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -1082,6 +1082,21 @@ class Emulator:
         """
         return None
 
+    def note_broker_state_write(self, path: Path) -> None:
+        """Record that the broker itself just wrote `path` as a state file.
+
+        Called right after a mid-session state push (the state-file PUT
+        route) lands the file on disk. An implementation that infers where a
+        core actually saves by watching the filesystem needs to tell its own
+        writes apart from the core's, since a push the broker made itself
+        proves nothing about the core's own behavior. The default does
+        nothing, for implementations with no such inference to protect.
+
+        Args:
+            path: The state file's path, as returned by `state_target`.
+        """
+        return None
+
     def lock_for_state_write(self) -> bool:
         """Take whatever lock a pushed state file should hold before it overwrites the working slot.
 
@@ -1265,6 +1280,16 @@ class Emulator:
             Nothing by default.
         """
         return {}
+
+    def adopt_archive_identity(self, identity: Optional[Mapping[str, Any]]) -> None:
+        """Learn from the restored archive's session identity, before the launch.
+
+        Default: nothing. A launcher that fronts many cores reads the
+        previous session's core here.
+
+        Args:
+            identity: The restored archive's manifest `session`, or None.
+        """
 
     def archive_core(self) -> Optional[str]:
         """The core or backend actually running the game, or None.
