@@ -4681,3 +4681,85 @@ class TestCarryOver:
         emu._rom_base = "Game"
         assert (ra_dirs / "saves" / emu.library_name() / "Game.srm").read_bytes() == b"sram"
         assert emu.state_path() is None
+
+
+class TestStateCoreHeader:
+    """Per-platform RetroArch libretro core override (section 8.3)."""
+
+    def _running(
+        self,
+        client: TestClient,
+        broker_dirs: dict[str, Path],
+        ra_dirs: Path,
+        no_launch: list[retroarch.Retroarch],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> retroarch.Retroarch:
+        """Activate a game, stub the emulator as running, and return it.
+
+        Args:
+            client: The test client.
+            broker_dirs: The redirected ROM root and archive directories.
+            ra_dirs: The patched data root.
+            no_launch: The launched instances list.
+            monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            The active emulator.
+        """
+        assert _ra_activate(client, broker_dirs["roms"]).status_code == 200
+        emu = no_launch[0]
+        emu._rom_base = "Game"
+        monkeypatch.setattr(emu, "alive", lambda: True)
+        emu.check_state_bytes = lambda head: True
+        return emu
+
+    def test_get_names_the_core(
+        self,
+        client: TestClient,
+        broker_dirs: dict[str, Path],
+        ra_dirs: Path,
+        no_launch: list[retroarch.Retroarch],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """GET state-file sets X-State-Core header to the running core."""
+        self._running(client, broker_dirs, ra_dirs, no_launch, monkeypatch)
+        _state(ra_dirs, "Snes9x")
+        r = client.get(f"{PREFIX}/api/session/state-file", params={"slot": 0})
+        assert r.headers["X-State-Core"] == "snes9x"
+
+    def test_put_with_another_core_is_409_and_writes_nothing(
+        self,
+        client: TestClient,
+        broker_dirs: dict[str, Path],
+        ra_dirs: Path,
+        no_launch: list[retroarch.Retroarch],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """PUT state-file returns 409 when core in header differs from running core."""
+        self._running(client, broker_dirs, ra_dirs, no_launch, monkeypatch)
+        r = client.put(
+            f"{PREFIX}/api/session/state-file",
+            params={"filename": "Game.state"},
+            content=b"state",
+            headers={"X-State-Core": "bsnes"},
+        )
+        assert r.status_code == 409
+        assert r.json()["detail"]["error"] == "state_core_mismatch"
+        assert not list((ra_dirs / "states").rglob("Game.state"))
+
+    def test_put_without_the_header_behaves_as_before(
+        self,
+        client: TestClient,
+        broker_dirs: dict[str, Path],
+        ra_dirs: Path,
+        no_launch: list[retroarch.Retroarch],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """PUT state-file without X-State-Core header accepts the state."""
+        self._running(client, broker_dirs, ra_dirs, no_launch, monkeypatch)
+        r = client.put(
+            f"{PREFIX}/api/session/state-file",
+            params={"filename": "Game.state"},
+            content=b"state",
+        )
+        assert r.status_code != 409

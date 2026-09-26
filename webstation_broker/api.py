@@ -1721,13 +1721,17 @@ async def get_state_file(x_broker_secret: Optional[str] = Header(default=None)) 
             log.error("state-file: could not read %s: %s", path, exc)
             raise HTTPException(status_code=500, detail="could not read state file")
         log.info("state-file: serving %s (%d bytes)", path.name, len(body))
+        headers = {
+            "X-State-Filename": _header_token(path.name, "state"),
+            "X-State-Slot": str(emulator.state_slot),
+        }
+        core = emulator.archive_core()
+        if core:
+            headers["X-State-Core"] = core
         return Response(
             content=body,
             media_type="application/octet-stream",
-            headers={
-                "X-State-Filename": _header_token(path.name, "state"),
-                "X-State-Slot": str(emulator.state_slot),
-            },
+            headers=headers,
         )
 
 
@@ -1780,6 +1784,7 @@ async def put_state_file(
     request: Request,
     filename: str = Query(...),
     x_broker_secret: Optional[str] = Header(default=None),
+    x_state_core: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     """Write a state RomM is sending back into the working slot.
 
@@ -1793,17 +1798,19 @@ async def put_state_file(
         request: The request whose raw body is the state file, streamed to disk.
         filename: The name RomM filed the state under; only its basename is used.
         x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
+        x_state_core: The core that wrote the state, from X-State-Core header; when
+            set and different from the running core, the push is refused.
 
     Returns:
         A dict with `status`, the `filename` it was stored under and the `slot`.
 
     Raises:
         HTTPException: 403 on a bad secret; 409 when no session is active, the
-            emulator is not running, or another session operation is in flight;
-            400 when the emulator has no save states, the name is not one it
-            would write, the body is empty, or the state opens as another game's;
-            413 when the body exceeds STATE_FILE_MAX_BYTES; 500 when the file
-            cannot be written.
+            emulator is not running, another session operation is in flight, or
+            the sent state is from a different core; 400 when the emulator has
+            no save states, the name is not one it would write, the body is
+            empty, or the state opens as another game's; 413 when the body
+            exceeds STATE_FILE_MAX_BYTES; 500 when the file cannot be written.
     """
     _check_secret(x_broker_secret)
     # Held across the upload, not just the rename: the slot this publishes into
@@ -1811,6 +1818,22 @@ async def put_state_file(
     # a teardown hands RomM back a different state than the one it just took.
     with _session_operation("state-file push"):
         emulator = _state_emulator()
+        running_core = emulator.archive_core()
+        if (x_state_core is not None and running_core is not None
+                and x_state_core != running_core):
+            log.warning(
+                "state-file push refused: state is from core %s, %s is running",
+                x_state_core,
+                running_core,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "state_core_mismatch",
+                    "expected": running_core,
+                    "got": x_state_core,
+                },
+            )
         name = Path(filename).name
         target = emulator.state_target(name)
         if target is None:
