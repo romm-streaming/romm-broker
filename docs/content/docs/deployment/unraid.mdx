@@ -1,0 +1,154 @@
+---
+title: "Unraid with an older NVIDIA GPU"
+description: "Getting Vulkan working in the container on Unraid with a pre-595 NVIDIA driver (Pascal cards like the GTX 1050 Ti): host checks, the missing modeset device, and the template settings."
+---
+
+This is for someone running the container on Unraid with an older NVIDIA
+card, one that can't use driver 595 or newer. That mostly means Pascal
+cards (the GTX 10-series). [Running the container](/docs/container#gpu)
+lists 595.80 as the minimum, but these cards can still work on the 580
+driver if you do a few steps by hand. It's been confirmed on a GTX 1050 Ti
+with driver 580.173.02, with the stream encoded on the card and PPSSPP and
+RetroArch running smoothly.
+
+On driver 595 or newer, you can most likely skip this page. The newer
+driver and NVIDIA container toolkit (1.20.1 and later) handle these steps
+for you. See the selkies
+[NVIDIA proprietary drivers](https://docs.linuxserver.io/selkies/user-guide/gpu/#nvidia-proprietary-drivers)
+section.
+
+Commands marked "on the host" run in Unraid's own terminal (the **>_**
+icon at the top of the web UI), not inside the container.
+
+<Callout title="The GPU showing up doesn't mean it works">
+`docker exec webstation nvidia-smi` can list your card while games still
+fail to draw. `nvidia-smi` only proves the container can see the GPU. Vulkan
+(the graphics system most emulators draw with) needs more than that, and
+it's what the steps below fix. You can test it directly with
+`docker exec webstation vulkaninfo --summary`: if that crashes or doesn't
+name your NVIDIA card, Vulkan isn't working yet.
+</Callout>
+
+<Steps>
+<Step>
+### Check the NVIDIA driver settings on the host
+
+On the host, run:
+
+```bash
+cat /sys/module/nvidia_drm/parameters/modeset
+cat /sys/module/nvidia_drm/parameters/fbdev
+lsmod | grep nvidia
+```
+
+The first two should each print `Y`. The last one lists the NVIDIA driver
+pieces that are loaded, and should include `nvidia`, `nvidia_modeset`,
+`nvidia_drm` and `nvidia_uvm`.
+</Step>
+<Step>
+### Check for `/dev/nvidia-modeset`
+
+This is the step that trips people up, and it was the actual fix in the
+confirmed setup. On the host, run:
+
+```bash
+ls -l /dev/nvidia*
+```
+
+You need all four of these in the list:
+
+```txt
+/dev/nvidia0
+/dev/nvidiactl
+/dev/nvidia-uvm
+/dev/nvidia-modeset
+```
+
+With older drivers, Unraid can load the modeset part of the driver (it
+shows up as `nvidia_modeset` in the previous step) and still never create
+the `/dev/nvidia-modeset` device file (the file the container uses to reach
+that part of the driver). Without that file, Vulkan fails inside the
+container even though `nvidia-smi` works fine.
+</Step>
+<Step>
+### Create it if it's missing
+
+On the host, run:
+
+```bash
+nvidia-modprobe -m
+ls -l /dev/nvidia-modeset
+```
+
+The second command should now show `/dev/nvidia-modeset`. If it says
+`nvidia-modprobe: command not found`, check that the Nvidia Driver plugin
+is installed.
+
+<Callout type="warn" title="It can disappear after a reboot">
+Unraid may not recreate this file when it restarts. If it's gone after a
+reboot, have `nvidia-modprobe -m` run at startup. The standard Unraid way
+to do that is a script in the User Scripts plugin set to run at array
+start. Adding the line to `/boot/config/go` also works. It needs to exist before the container starts, or the
+container won't start.
+</Callout>
+</Step>
+<Step>
+### Add the Extra Parameters
+
+Edit the container in Unraid, switch to **Advanced View** at the top right,
+and paste this into **Extra Parameters**:
+
+```txt
+--shm-size=2gb --gpus=all --runtime=nvidia --device=/dev/dri --device=/dev/nvidia-modeset
+```
+
+What each part does:
+
+- `--gpus=all` and `--runtime=nvidia` hand the NVIDIA card to the
+  container.
+- `--device=/dev/dri` passes in the render node (a device file for the
+  GPU) that the desktop draws with.
+- `--device=/dev/nvidia-modeset` passes in the file from the previous step.
+  On this driver, nothing adds it for you.
+- `--shm-size=2gb` gives the browser, desktop and emulators more shared
+  memory to work with. It won't make games faster, but it can prevent
+  crashes from running out of it.
+</Step>
+<Step>
+### Add the environment variables
+
+Still in the template, add these three variables (**Add another Path,
+Port, Variable, Label or Device** at the bottom, then pick **Variable**):
+
+| Name | Value |
+| --- | --- |
+| `NVIDIA_DRIVER_CAPABILITIES` | `all` |
+| `NVIDIA_VISIBLE_DEVICES` | Your card's ID. Run `nvidia-smi -L` on the host and copy the part that starts with `GPU-`. |
+| `PIXELFLUX_WAYLAND` | `true` |
+
+Apply, and let the container restart. To double-check what it picked up:
+
+```bash
+docker inspect webstation --format '{{range .Config.Env}}{{println .}}{{end}}' \
+  | grep -E 'NVIDIA|PIXELFLUX'
+```
+</Step>
+<Step>
+### Check that it worked
+
+Open the container's log. You're looking for two lines saying the stream is
+being encoded on your NVIDIA card:
+
+```txt
+[Wayland] Encoder: NVENC H264 4:2:0 on NVIDIA GeForce GTX 1050 Ti (render node 0, nvidia driver).
+[Wayland] Zero-copy capture: output 1 1280x720 rendered on /dev/dri/renderD128, encoded in place on NVENC.
+```
+
+The stats in the stream's sidebar show the same thing. Running
+`docker exec webstation vulkaninfo --summary` again should now name your
+card.
+
+If you switched any emulators to OpenGL to get around broken Vulkan, you
+can switch them back now.
+</Step>
+</Steps>
