@@ -29,6 +29,7 @@ from typing import Any, Callable, Optional
 import anyio.to_thread
 import httpx
 
+from .. import settings
 from .base import CoreRejectedError
 
 log = logging.getLogger(__name__)
@@ -52,18 +53,6 @@ The zip cap (`ZIP_CAP`) bounds the compressed download only; a hostile member
 can inflate far past it. The largest bundled `.info` is under 14 KiB, so a
 member over this cap is not a real core-info file and is skipped.
 """
-
-
-def truthy(value: Optional[str]) -> bool:
-    """Read a boolean env var the way the broker's other ones are read.
-
-    Args:
-        value: The raw value, or None when unset.
-
-    Returns:
-        True for `1`, `true`, `yes` or `on`, in any case and with whitespace around.
-    """
-    return value is not None and value.strip().lower() in ("1", "true", "yes", "on")
 
 
 def safe_dir_name(value: object) -> Optional[str]:
@@ -659,6 +648,8 @@ INDEX_CAP = 256 * 1024
 """Largest buildbot index a refresh accepts, 256 KiB."""
 REFRESH_EVERY = 7 * 24 * 3600
 """Seconds between background refreshes, 7 days."""
+REFRESH_RETRY = 3600
+"""Seconds before a failed background refresh is tried again, 1 hour."""
 CACHE_ZIP = "core_info_cache.zip"
 """File name the refreshed core-info zip is cached under, in `RA_DATA_DIR`."""
 CACHE_INDEX = "core_info_cache.index"
@@ -776,17 +767,9 @@ def refresh_once(
     Returns:
         Whether a new catalog was swapped in.
     """
-    zip_url = (
-        os.environ.get("RETROARCH_CORE_INFO_URL", "").strip()
-        or "https://buildbot.libretro.com/assets/frontend/info.zip"
-    )
-    index_url = (
-        os.environ.get("RETROARCH_CORE_INDEX_URL", "").strip()
-        or "https://buildbot.libretro.com/nightly/linux/x86_64/latest/.index"
-    )
     try:
-        zip_bytes = fetch(zip_url, ZIP_CAP)
-        index_text = fetch(index_url, INDEX_CAP).decode("utf-8", "replace")
+        zip_bytes = fetch(settings.RETROARCH_CORE_INFO_URL, ZIP_CAP)
+        index_text = fetch(settings.RETROARCH_CORE_INDEX_URL, INDEX_CAP).decode("utf-8", "replace")
         if not parse_info_zip(zip_bytes):
             raise ValueError("the zip holds no .info members")
     except Exception as exc:  # noqa: BLE001 - a hostile or corrupt zip can raise
@@ -869,7 +852,7 @@ def load_startup_catalog(
 async def refresh_forever(
     cache_dir: Path, cores_dir: Path, platforms: Mapping[str, Mapping[str, Any]]
 ) -> None:
-    """Refresh at startup when the cache is stale, then every 7 days.
+    """Refresh at startup when the cache is stale, then every 7 days, retrying a failure hourly.
 
     Args:
         cache_dir: Where the cache files go.
@@ -882,8 +865,9 @@ async def refresh_forever(
         except OSError:
             age = REFRESH_EVERY
         if age >= REFRESH_EVERY:
+            refreshed = False
             try:
-                await anyio.to_thread.run_sync(
+                refreshed = await anyio.to_thread.run_sync(
                     functools.partial(
                         refresh_once, cache_dir, cores_dir, fetch=_http_fetch, platforms=platforms
                     ),
@@ -894,5 +878,5 @@ async def refresh_forever(
                 # something unexpected escaping it, and a refresh must never end
                 # the loop for the life of the process.
                 log.exception("retroarch: core info refresh crashed, keeping the current catalog")
-            age = 0
+            age = 0 if refreshed else REFRESH_EVERY - REFRESH_RETRY
         await anyio.sleep(REFRESH_EVERY - age)

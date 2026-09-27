@@ -270,6 +270,12 @@ of the two forms above.
   the old core and the new core also takes one; RetroArch writes it into the
   new core's own save folder from then on. Switching back later carries it
   the other way.
+- On an untested or blocked core the save is copied, not moved, because
+  that core's save folder is a guess until it writes there. The original
+  stays in the old core's folder.
+- A carry never replaces a save that is as new as the incoming one. When the
+  incoming save is newer, the one it replaces is kept beside it as
+  `<game>.srm.bak`.
 - A save state never carries over. A state left behind by another core is
   never loaded, even if one still exists on disk for it.
 - The pre-switch archive isn't deleted: it stays in RomM's own save picker,

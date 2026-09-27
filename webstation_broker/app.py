@@ -7,7 +7,6 @@ mode vite serves the frontend instead.
 """
 
 import logging
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -100,7 +99,7 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         retroarch_cores.load_startup_catalog, retroarch.RA_DATA_DIR, retroarch.CORES_DIR, retroarch.PLATFORMS
     )
     async with anyio.create_task_group() as tg:
-        if retroarch_cores.truthy(os.environ.get("RETROARCH_CORE_INFO_REFRESH")):
+        if settings.RETROARCH_CORE_INFO_REFRESH:
             # In the background: startup never waits on the network.
             tg.start_soon(
                 retroarch_cores.refresh_forever,

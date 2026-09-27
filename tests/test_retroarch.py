@@ -4238,6 +4238,19 @@ class TestStateScope:
         emu._observe_library_name()
         assert emu.library_name() == "Observed Name"
 
+    def test_a_file_untouched_since_launch_does_not_confirm_the_observer(self, ra_dirs: Path) -> None:
+        """A restored or carried file with an in-window mtime proves nothing until the core rewrites it."""
+        emu = _with_core("snes", _untested_snes_core())
+        emu.select_core()
+        restored = _state(ra_dirs, "OtherCore")
+        emu._prelaunch_mtimes = retroarch._sorted_dir_mtimes()
+        emu._launch_wall = time.time() - 5
+        emu._observe_library_name()
+        assert emu._observed_lib is None
+        os.utime(restored, (time.time() + 1, time.time() + 1))
+        emu._observe_library_name()
+        assert emu._observed_lib == "OtherCore"
+
     def test_a_broker_written_state_does_not_confirm_a_seed(
         self, ra_dirs: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -4326,7 +4339,7 @@ class TestCoreProfile:
         monkeypatch.setattr(retroarch_cores, "TIERS", blocked)
         with pytest.raises(retroarch_cores.CoreRejectedError):
             _with_core("snes", core).select_core()
-        monkeypatch.setenv("RETROARCH_EXPERIMENTAL_CORES", "yes")
+        monkeypatch.setattr(retroarch.settings, "RETROARCH_EXPERIMENTAL_CORES", True)
         emu = _with_core("snes", core)
         emu.select_core()
         assert emu.core_identity()["core_tier"] == "blocked"
@@ -4751,8 +4764,8 @@ class TestCarryOver:
         emu.select_core()
         return emu
 
-    def test_srm_is_renamed_with_its_mtime_kept(self, ra_dirs: Path) -> None:
-        """So it is not in the next exit dump unless the game writes it."""
+    def test_srm_is_copied_to_an_untested_core_with_its_mtime_kept(self, ra_dirs: Path) -> None:
+        """The untested dir is a guess, so the original stays; the mtime keeps both out of the dump."""
         core = _untested_snes_core()
         old = _srm(ra_dirs, "Snes9x")
         emu = self._emu(core)
@@ -4761,27 +4774,43 @@ class TestCarryOver:
         )
         new = ra_dirs / "saves" / emu.library_name() / "Game.srm"
         assert new.read_bytes() == b"sram" and new.stat().st_mtime == 1_000_000.0
-        assert not old.exists()
+        assert old.read_bytes() == b"sram"
 
     def test_back_to_default_carries_the_other_way(self, ra_dirs: Path) -> None:
-        """Switching back follows the operator's choice."""
+        """Switching back follows the operator's choice, and a known dir takes a move."""
         core = _untested_snes_core()
         emu_new = self._emu(core)
-        _srm(ra_dirs, emu_new.library_name())
+        source = _srm(ra_dirs, emu_new.library_name())
         emu = self._emu(None)
         emu.carry_save_across_cores(
             {"core": core, "library_name": emu_new.library_name()}, ra_dirs / "Game.sfc"
         )
         assert (ra_dirs / "saves" / "Snes9x" / "Game.srm").exists()
+        assert not source.exists()
 
-    def test_existing_target_is_kept_and_source_left(self, ra_dirs: Path) -> None:
-        """Never overwrite a save."""
+    def test_a_newer_source_replaces_the_target_and_keeps_a_backup(self, ra_dirs: Path) -> None:
+        """Progress made on the other core wins; the save it replaces stays as .srm.bak."""
+        core = _untested_snes_core()
+        played = _srm(ra_dirs, self._emu(core).library_name(), mtime=2_000_000.0)
+        played.write_bytes(b"newer")
+        os.utime(played, (2_000_000.0, 2_000_000.0))
+        stale = _srm(ra_dirs, "Snes9x")
+        emu = self._emu(None)
+        emu.carry_save_across_cores({"core": core}, ra_dirs / "Game.sfc")
+        assert stale.read_bytes() == b"newer" and stale.stat().st_mtime == 2_000_000.0
+        backup = stale.with_name("Game.srm.bak")
+        assert backup.read_bytes() == b"sram" and backup.stat().st_mtime == 1_000_000.0
+
+    @pytest.mark.parametrize("source_mtime", [1_000_000.0, 2_000_000.0])
+    def test_a_target_as_new_as_the_source_is_kept(self, ra_dirs: Path, source_mtime: float) -> None:
+        """Never overwrite a save with one that is not strictly newer."""
         core = _untested_snes_core()
         emu = self._emu(core)
-        old = _srm(ra_dirs, "Snes9x")
+        old = _srm(ra_dirs, "Snes9x", mtime=source_mtime)
         target = _srm(ra_dirs, emu.library_name(), mtime=2_000_000.0)
         emu.carry_save_across_cores({"core": "snes9x"}, ra_dirs / "Game.sfc")
         assert old.exists() and target.stat().st_mtime == 2_000_000.0
+        assert not target.with_name("Game.srm.bak").exists()
 
     @pytest.mark.parametrize("identity", [None, {}, {"core": None}])
     def test_manifest_without_core_changes_nothing(
@@ -4832,8 +4861,7 @@ class TestCarryOver:
             {"core": "snes9x", "library_name": bad_lib}, ra_dirs / "Game.sfc"
         )
         new = ra_dirs / "saves" / emu.library_name() / "Game.srm"
-        assert new.read_bytes() == b"sram"
-        assert not old.exists()
+        assert new.read_bytes() == b"sram" and old.read_bytes() == b"sram"
 
     def test_glob_metacharacters_in_the_stem_do_not_confuse_the_single_candidate_fallback(
         self, ra_dirs: Path
@@ -4885,7 +4913,7 @@ class TestCarryOver:
         emu = self._emu(_untested_snes_core())
 
         def refuse(src: Any, dst: Any) -> None:
-            """Fail every rename, as a read-only or full share would.
+            """Fail every copy, as a read-only or full share would.
 
             Args:
                 src: The source path.
@@ -4896,7 +4924,7 @@ class TestCarryOver:
             """
             raise OSError(30, "Read-only file system")
 
-        monkeypatch.setattr(retroarch.os, "rename", refuse)
+        monkeypatch.setattr(retroarch.shutil, "copy2", refuse)
         with caplog.at_level(logging.WARNING):
             emu.carry_save_across_cores({"core": "snes9x"}, ra_dirs / "Game.sfc")
         assert old.read_bytes() == b"sram"

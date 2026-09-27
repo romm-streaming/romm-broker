@@ -207,7 +207,7 @@ def test_truthy_matches_the_brokers_other_boolean_env_vars(
     value: str, expected: bool
 ) -> None:
     """Same spelling as rpcs3's `_truthy`."""
-    assert rc.truthy(value) is expected
+    assert settings.truthy(value) is expected
 
 
 def test_tiers_accept_vetted_and_scoped_blocked() -> None:
@@ -679,6 +679,48 @@ class TestRefresh:
 
         assert len(calls) == 2
 
+    @pytest.mark.parametrize(("refreshed", "wait"), [(False, rc.REFRESH_RETRY), (True, rc.REFRESH_EVERY)])
+    async def test_refresh_forever_retries_a_failure_within_the_hour(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refreshed: bool, wait: int
+    ) -> None:
+        """A failed refresh is retried after `REFRESH_RETRY`, not a full 7 days later."""
+        sleeps: list[float] = []
+
+        class Sentinel(Exception):
+            """Stops the infinite loop once the first sleep is reached."""
+
+        def fake_refresh_once(*args: object, **kwargs: object) -> bool:
+            """Report the parametrized outcome.
+
+            Args:
+                args: Unused.
+                kwargs: Unused.
+
+            Returns:
+                Whether the refresh succeeded.
+            """
+            return refreshed
+
+        async def fake_sleep(seconds: float) -> None:
+            """Record the wait and end the loop.
+
+            Args:
+                seconds: The seconds `refresh_forever` asked to sleep.
+
+            Raises:
+                Sentinel: Always.
+            """
+            sleeps.append(seconds)
+            raise Sentinel
+
+        monkeypatch.setattr(rc, "refresh_once", fake_refresh_once)
+        monkeypatch.setattr(rc.anyio, "sleep", fake_sleep)
+
+        with pytest.raises(Sentinel):
+            await rc.refresh_forever(tmp_path, tmp_path, PLATFORMS)
+
+        assert sleeps == [wait]
+
     def test_http_fetch_enforces_the_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A response over `cap` bytes is cut off before it is fully buffered."""
 
@@ -810,7 +852,7 @@ def test_lifespan_starts_the_refresh_task_when_opted_in(
         monkeypatch: Pytest's attribute patcher, undone when the test ends.
         tmp_path: The per-test temporary directory.
     """
-    monkeypatch.setenv("RETROARCH_CORE_INFO_REFRESH", "true")
+    monkeypatch.setattr(settings, "RETROARCH_CORE_INFO_REFRESH", True)
     monkeypatch.setattr(retroarch, "RA_DATA_DIR", tmp_path / "data")
     monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path / "cores")
 

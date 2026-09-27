@@ -318,19 +318,14 @@ def no_selkies(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
-def clean_retroarch_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Scrub the RetroArch core catalog env vars, so a developer's shell never changes a test.
+def clean_retroarch_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the RetroArch core catalog settings, so a developer's shell never changes a test.
 
     Args:
         monkeypatch: Pytest's attribute patcher, undone when the test ends.
     """
-    for name in (
-        "RETROARCH_CORE_INFO_REFRESH",
-        "RETROARCH_CORE_INFO_URL",
-        "RETROARCH_CORE_INDEX_URL",
-        "RETROARCH_EXPERIMENTAL_CORES",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(settings, "RETROARCH_EXPERIMENTAL_CORES", False)
+    monkeypatch.setattr(settings, "RETROARCH_CORE_INFO_REFRESH", False)
 
 
 @pytest.fixture(autouse=True)

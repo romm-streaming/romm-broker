@@ -7,6 +7,19 @@ the variable is unset.
 
 import os
 from pathlib import Path
+from typing import Optional
+
+
+def truthy(value: Optional[str]) -> bool:
+    """Read a boolean env var.
+
+    Args:
+        value: The raw value, or None when unset.
+
+    Returns:
+        True for `1`, `true`, `yes` or `on`, in any case and with whitespace around.
+    """
+    return value is not None and value.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _prefix() -> str:
@@ -147,3 +160,27 @@ anonymous arrival on one mints a new seat with nothing to de-duplicate
 against. At the ceiling, a disconnected anonymous seat is reclaimed for the
 new arrival; a named user's seat is never reclaimed.
 """
+
+RETROARCH_EXPERIMENTAL_CORES = truthy(os.environ.get("RETROARCH_EXPERIMENTAL_CORES"))
+"""Whether a blocked RetroArch core may launch, from `RETROARCH_EXPERIMENTAL_CORES` (default off).
+
+RomM's per-ROM `experimental_cores` flag lifts the same block for one launch.
+"""
+
+RETROARCH_CORE_INFO_REFRESH = truthy(os.environ.get("RETROARCH_CORE_INFO_REFRESH"))
+"""Whether the RetroArch core catalog refreshes in the background.
+
+From `RETROARCH_CORE_INFO_REFRESH` (default off).
+"""
+
+RETROARCH_CORE_INFO_URL = (
+    os.environ.get("RETROARCH_CORE_INFO_URL", "").strip()
+    or "https://buildbot.libretro.com/assets/frontend/info.zip"
+)
+"""Where a catalog refresh downloads the core-info zip from, from `RETROARCH_CORE_INFO_URL`."""
+
+RETROARCH_CORE_INDEX_URL = (
+    os.environ.get("RETROARCH_CORE_INDEX_URL", "").strip()
+    or "https://buildbot.libretro.com/nightly/linux/x86_64/latest/.index"
+)
+"""Where a catalog refresh downloads the buildbot core index from, from `RETROARCH_CORE_INDEX_URL`."""

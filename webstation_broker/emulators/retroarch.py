@@ -74,7 +74,7 @@ from typing import Any, Callable, Optional, Union
 
 import httpx
 
-from .. import imports
+from .. import imports, settings
 from . import extraction_cache, retroarch_cores, wii_nand
 from .base import Emulator, _record_pid, base_launch_env, xdg_config_dir
 from .retroarch_cores import safe_dir_name
@@ -1948,6 +1948,33 @@ def _old_library_name(identity: Mapping[str, Any], platform: str, stem: str) -> 
     return None
 
 
+def _sorted_dir_mtimes() -> dict[Path, float]:
+    """Map every file one level under a `saves/` or `states/` subdirectory to its mtime.
+
+    Returns:
+        The files RetroArch's sorted save and state dirs hold now; unreadable
+        entries are left out.
+    """
+    found: dict[Path, float] = {}
+    for parent in (SAVE_DIR, STATE_DIR):
+        try:
+            children = [c for c in parent.iterdir() if c.is_dir()]
+        except OSError:
+            continue
+        for child in children:
+            try:
+                files = list(child.iterdir())
+            except OSError:
+                continue
+            for f in files:
+                try:
+                    if f.is_file():
+                        found[f] = f.stat().st_mtime
+                except OSError:
+                    continue
+    return found
+
+
 class Retroarch(Emulator):
     """RetroArch driven over its stdin command interface.
 
@@ -2078,6 +2105,13 @@ class Retroarch(Emulator):
         """
         self._launch_wall: float = 0.0
         """`time.time()` set right before the launch spawn; anchors `_observe_library_name`."""
+        self._prelaunch_mtimes: dict[Path, float] = {}
+        """Every sorted-dir file's mtime just before the launch spawn.
+
+        `_observe_library_name` skips a file still at its recorded mtime: the
+        restore and the save carry stamp old mtimes, so an untouched file
+        proves nothing about where RetroArch writes.
+        """
         self._broker_written_states: set[Path] = set()
         """Paths this session's broker wrote itself: a mid-session state push or an import placement.
 
@@ -2106,9 +2140,7 @@ class Retroarch(Emulator):
         Returns:
             True when either is on.
         """
-        return self.experimental_cores or retroarch_cores.truthy(
-            os.environ.get("RETROARCH_EXPERIMENTAL_CORES")
-        )
+        return self.experimental_cores or settings.RETROARCH_EXPERIMENTAL_CORES
 
     def _profile(self) -> Optional[retroarch_cores.Profile]:
         """The profile for the current platform and core, resolved once per pair.
@@ -2256,7 +2288,8 @@ class Retroarch(Emulator):
         coarse unit; the upper bound discards a clock-skewed or otherwise
         bogus future timestamp, widened by `OBSERVE_WINDOW_AFTER_SLACK` to
         tolerate the share and the broker's clocks disagreeing slightly.
-        Files this session's own broker wrote (`_broker_written_states`) are
+        Files this session's own broker wrote (`_broker_written_states`), and
+        files still at their pre-launch mtime (`_prelaunch_mtimes`), are
         skipped outright: they prove nothing about where RetroArch writes.
         """
         profile = self._profile()
@@ -2266,28 +2299,12 @@ class Retroarch(Emulator):
         window_start = self._launch_wall - OBSERVE_WINDOW_BEFORE_SLACK
         window_end = now + OBSERVE_WINDOW_AFTER_SLACK
         best: Optional[tuple[float, str]] = None
-        for parent in (SAVE_DIR, STATE_DIR):
-            try:
-                children = list(parent.iterdir())
-            except OSError:
+        for f, mtime in _sorted_dir_mtimes().items():
+            if f in self._broker_written_states or self._prelaunch_mtimes.get(f) == mtime:
                 continue
-            for child in children:
-                if not child.is_dir():
-                    continue
-                try:
-                    files = list(child.iterdir())
-                except OSError:
-                    continue
-                for f in files:
-                    if not f.is_file() or f in self._broker_written_states:
-                        continue
-                    try:
-                        mtime = f.stat().st_mtime
-                    except OSError:
-                        continue
-                    in_window = window_start <= mtime <= window_end
-                    if in_window and (best is None or mtime > best[0]):
-                        best = (mtime, child.name)
+            in_window = window_start <= mtime <= window_end
+            if in_window and (best is None or mtime > best[0]):
+                best = (mtime, f.parent.name)
         if best is None:
             log.info(
                 "retroarch: untested core %s: library_name not yet confirmed, using %s",
@@ -2328,13 +2345,17 @@ class Retroarch(Emulator):
     def carry_save_across_cores(
         self, identity: Optional[Mapping[str, Any]], rom_file: Optional[Path]
     ) -> None:
-        """Move the battery save from the archive's core's dir into this core's.
+        """Carry the battery save from the archive's core's dir into this core's.
 
         Runs after the archive is restored and before the baseline, so the
-        rename, which keeps the file's mtime, does not count as this session's
-        write. States are never carried. A move that fails, or a target dir
-        name that is not a single safe path component, is logged and skipped;
-        it never fails activate.
+        carry, which keeps the file's mtime, does not count as this session's
+        write. A default or vetted core's dir is known, so the save moves; an
+        untested or blocked core's dir is a guess, so the save is copied and
+        the original stays where the old core reads it. An existing target is
+        replaced only by a strictly newer source, and kept beside it as
+        `.srm.bak`. States are never carried. A carry that fails, or a target
+        dir name that is not a single safe path component, is logged and
+        skipped; it never fails activate.
 
         Args:
             identity: The restored archive's manifest `session`, or None.
@@ -2371,12 +2392,18 @@ class Retroarch(Emulator):
         if not source.is_file():
             log.info("retroarch: no .srm carried: %s has none for %s", old_core, stem)
             return
-        if target.exists():
-            log.info("retroarch: no .srm carried: %s already exists", target)
-            return
         try:
+            if target.exists():
+                if source.stat().st_mtime <= target.stat().st_mtime:
+                    log.info("retroarch: no .srm carried: %s is as new as %s", target, source)
+                    return
+                os.rename(target, target.with_name(f"{target.name}.bak"))
             target.parent.mkdir(parents=True, exist_ok=True)
-            os.rename(source, target)  # a rename keeps the mtime
+            # Both keep the mtime.
+            if profile["tier"] in ("default", "vetted"):
+                os.rename(source, target)
+            else:
+                shutil.copy2(source, target)
         except OSError as exc:
             # A carry is a convenience on top of the restored archive, which is
             # already on disk untouched; failing activate over it would cost the
@@ -2694,6 +2721,7 @@ class Retroarch(Emulator):
             rom_path,
             resume_slot,
         )
+        self._prelaunch_mtimes = _sorted_dir_mtimes()
         self._launch_wall = time.time()
         self._spawn_ra(cmd, env)
         self._playing_monotonic = None
