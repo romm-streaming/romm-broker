@@ -139,7 +139,7 @@ def test_safe_dir_name_accepts_only_a_single_plain_component(value: object, expe
 
 
 def test_parse_info_zip_skips_a_member_over_the_decompressed_cap(caplog: pytest.LogCaptureFixture) -> None:
-    """M4: a member that inflates past INFO_MEMBER_CAP is skipped; the rest still parse.
+    """A member that inflates past INFO_MEMBER_CAP is skipped; the rest still parse.
 
     Args:
         caplog: The pytest log capture fixture.
@@ -159,7 +159,7 @@ def test_parse_info_zip_skips_a_member_over_the_decompressed_cap(caplog: pytest.
 
 
 def test_the_cap_drops_no_bundled_core(monkeypatch: pytest.MonkeyPatch) -> None:
-    """M4: the bundled zip parses to the same cores with the cap as without it.
+    """The bundled zip parses to the same cores with the cap as without it.
 
     Args:
         monkeypatch: The pytest monkeypatch fixture.
@@ -232,7 +232,7 @@ def test_tiers_accept_vetted_and_scoped_blocked() -> None:
     ],
 )
 def test_tiers_reject_bad_entries(raw: dict) -> None:
-    """Every rule in §5.2 is a load-time error."""
+    """Every platform-table rule is a load-time error."""
     with pytest.raises(ValueError):
         rc.load_tiers(raw)
 
@@ -265,13 +265,13 @@ def resolve(platform: str, core: str | None, experimental: bool = False) -> rc.P
 
 @pytest.mark.parametrize("core", [None, "snes9x"])
 def test_no_core_or_the_default_core_is_the_platform_entry(core: str | None) -> None:
-    """§6.1 row 1."""
+    """No core, or the default core named, resolves to the platform entry."""
     profile = resolve("snes", core)
     assert (profile["core"], profile["tier"], profile["resume_settle"]) == ("snes9x", "default", 3.0)
 
 
 def test_an_alternate_is_vetted_and_inherits_no_core_owned_field() -> None:
-    """§6.1 row 2 and §5.1: resume_settle belongs to snes9x, not bsnes."""
+    """Resume_settle belongs to snes9x, not bsnes."""
     profile = resolve("snes", "bsnes")
     assert (profile["core"], profile["tier"], profile["library_name"]) == ("bsnes", "vetted", "bsnes")
     assert profile["extensions"] == (".sfc", ".smc", ".bin")
@@ -279,7 +279,7 @@ def test_an_alternate_is_vetted_and_inherits_no_core_owned_field() -> None:
 
 
 def test_a_vetted_core_is_untested_on_a_platform_without_an_alternate() -> None:
-    """§5.2: vetted is per platform in practice."""
+    """Vetted is per platform in practice."""
     gb_entry = {"core": "gambatte", "library_name": "Gambatte", "save_ram": True, "extensions": (".gb",)}
     profile = rc.resolve_profile(
         {**PLATFORMS, "gb": gb_entry},
@@ -289,7 +289,7 @@ def test_a_vetted_core_is_untested_on_a_platform_without_an_alternate() -> None:
 
 
 def test_an_untested_core_takes_the_extension_intersection_in_platform_order() -> None:
-    """§5.4: `.bin` is not in mGBA-for-SNES terms; order follows the platform."""
+    """`.bin` is not in mGBA-for-SNES terms; order follows the platform."""
     profile = resolve("snes", "beetle_snes", experimental=True)
     assert profile["extensions"] == (".sfc", ".smc")
     tier_ram_name = (profile["tier"], profile["save_ram"], profile["library_name"])
@@ -298,7 +298,7 @@ def test_an_untested_core_takes_the_extension_intersection_in_platform_order() -
 
 
 def test_a_blocked_core_needs_the_opt_in() -> None:
-    """§6.1 row 3: the detail names the reason and both ways to opt in."""
+    """The detail names the reason and both ways to opt in."""
     with pytest.raises(rc.CoreRejectedError) as err:
         resolve("snes", "beetle_snes")
     assert "hangs on boot" in err.value.detail
@@ -320,7 +320,7 @@ def test_a_platform_scoped_block_does_not_apply_elsewhere() -> None:
     ("platform", "core"), [("snes", "mesen"), ("snes", "nosuchcore"), ("gba", "bsnes"), ("n64", "bsnes")]
 )
 def test_unknown_core_or_no_shared_extension_is_rejected_with_options(platform: str, core: str) -> None:
-    """§6.1 last row: the detail lists the default and points at the cores route."""
+    """The detail lists the default and points at the cores route."""
     with pytest.raises(rc.CoreRejectedError) as err:
         resolve(platform, core)
     assert "/api/retroarch/cores" in err.value.detail
@@ -358,7 +358,7 @@ _GB_PLATFORMS = {
 def test_tier_of_covers_all_four_tiers(
     platforms: dict[str, dict], platform: str, core: str, expected: str
 ) -> None:
-    """`tier_of` directly, one case per tier (§6.1): default, vetted, untested, blocked."""
+    """`tier_of` directly, one case per tier: default, vetted, untested, blocked."""
     assert rc.tier_of(platforms, platform, core, CATALOG, TIERS) == expected
 
 
@@ -471,7 +471,7 @@ def _fetcher(zip_bytes: bytes, index: str) -> Callable[[str, int], bytes]:
 
 
 class TestRefresh:
-    """§7, all offline."""
+    """Background catalog refresh, all offline."""
 
     def test_refresh_adds_an_untested_core_and_writes_the_cache(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -548,7 +548,7 @@ class TestRefresh:
     def test_load_startup_catalog_falls_back_on_a_corrupt_cache(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
     ) -> None:
-        """Ruling R8: a corrupt on-disk cache must not stop the broker from booting.
+        """A corrupt on-disk cache must not stop the broker from booting.
 
         A truncated zip raises `zipfile.BadZipFile` on its own. The second case
         stands in for a member that fails to decompress (`zlib.error`), which
@@ -640,7 +640,7 @@ class TestRefresh:
     async def test_refresh_forever_survives_a_crash_and_keeps_looping(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Ruling R8: an exception escaping refresh_once must not end the loop."""
+        """An exception escaping refresh_once must not end the loop."""
         calls: list[float] = []
 
         class Sentinel(Exception):
@@ -720,7 +720,7 @@ class TestRefresh:
             rc._http_fetch("https://example.invalid/x", 5)
 
     def test_http_fetch_enforces_the_deadline(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Ruling R8: `timeout=60` is per read, so a trickling server needs a total deadline too."""
+        """`timeout=60` is per read, so a trickling server needs a total deadline too."""
         times = iter([0.0, 0.0, rc.FETCH_DEADLINE + 1])
         monkeypatch.setattr(rc.time, "monotonic", lambda: next(times))
 
@@ -763,9 +763,9 @@ class TestRefresh:
             rc._http_fetch("https://example.invalid/x", 1_000_000)
 
     def test_refresh_does_not_change_a_running_profile(self) -> None:
-        """Review Focus 5: a resolved profile is a snapshot.
+        """A resolved profile is a snapshot.
 
-        Ruling R3: this cannot fail as written, because `resolve` builds its
+        This cannot fail as written, because `resolve` builds its
         profile from the module-level `CATALOG` fixture it is passed
         explicitly, not from `rc.catalog()`. Kept anyway, alongside the test
         below that drives the same scenario through a real `Retroarch`
@@ -801,7 +801,7 @@ class TestRefresh:
 def test_lifespan_starts_the_refresh_task_when_opted_in(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """§7: RETROARCH_CORE_INFO_REFRESH starts the background loop, which runs once at once.
+    """RETROARCH_CORE_INFO_REFRESH starts the background loop, which runs once at once.
 
     The app still shuts down cleanly: the lifespan's task group cancels the
     loop rather than waiting out its 7 day sleep.

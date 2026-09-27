@@ -1,4 +1,4 @@
-"""Offline checks on the bundled RetroArch catalog data (§10.2); no network."""
+"""Offline checks on the bundled RetroArch catalog data; no network."""
 
 import ctypes
 import hashlib
@@ -49,7 +49,7 @@ def test_bundled_catalog_loads_and_is_not_empty() -> None:
 
 
 def test_no_default_core_is_blocked_on_its_platform() -> None:
-    """§5.2: a platform's own core is `default` there."""
+    """A platform's own core is `default` there."""
     for slug, info in retroarch.PLATFORMS.items():
         entry = rc.TIERS.get(info["core"])
         if entry and entry.tier == "blocked":
@@ -57,7 +57,7 @@ def test_no_default_core_is_blocked_on_its_platform() -> None:
 
 
 def test_melonds_is_blocked_on_every_ds_platform() -> None:
-    """M3: the tiers file blocks melonds, which the docs say crashes on launch."""
+    """The tiers file blocks melonds, which the docs say crashes on launch."""
     catalog = rc.load_bundled_catalog()
     entry = rc.TIERS["melonds"]
     assert entry.tier == "blocked" and entry.reason and entry.platforms is None
@@ -221,7 +221,7 @@ def test_probe_returns_0_when_every_core_matches(monkeypatch: pytest.MonkeyPatch
 
 
 def test_table_extensions_are_a_subset_of_the_cores_plus_extra() -> None:
-    """§5.4: an entry's extensions are what the core supports plus its extra_extensions."""
+    """An entry's extensions are what the core supports plus its extra_extensions."""
     catalog = rc.load_bundled_catalog()
     for slug, info in retroarch.PLATFORMS.items():
         if info["core"] not in catalog.cores:

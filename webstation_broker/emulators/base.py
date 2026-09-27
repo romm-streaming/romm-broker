@@ -1319,7 +1319,7 @@ class Emulator:
     def carry_save_across_cores(
         self, identity: Optional[Mapping[str, Any]], rom_file: Optional[Path]
     ) -> None:
-        """Move a battery save into the new core's save dir on a core switch (§8.2).
+        """Move a battery save into the new core's save dir on a core switch.
 
         Default: nothing. A launcher that fronts many cores, each sorting its
         saves under its own dir, overrides this to carry the file across.

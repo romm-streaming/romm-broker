@@ -640,7 +640,7 @@ def client(
     """Serve the app through a TestClient with no secret and dev mode off.
 
     Also redirects RetroArch's data dir and core dir into tmp_path before the
-    app starts, so the lifespan's core catalog load (§7) never reads a real
+    app starts, so the lifespan's core catalog load never reads a real
     container's config tree.
 
     Args:

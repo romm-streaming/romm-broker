@@ -235,7 +235,7 @@ class Catalog:
         cores: Core name to its info, read-only.
         info_zip: The zip the catalog was built from, for installing `.info` files.
         cache_zip: The zip a background refresh wrote, or None before any refresh has
-            landed (§7).
+            landed.
         protected: Cores a refresh may never change: every default, every alternate
             and every core in `TIERS`. `info_file` never serves one of these from
             `cache_zip`, even when the merged catalog holds one.
@@ -283,7 +283,7 @@ def build_catalog(zip_bytes: bytes, index_text: str, installed: frozenset[str] =
         zip_bytes: libretro's `info.zip`.
         index_text: The buildbot x86_64 `.index`.
         installed: Cores whose `.so` is already in `CORES_DIR`; a refresh
-            dropping one from the index must not lock players out of it (§7).
+            dropping one from the index must not lock players out of it.
 
     Returns:
         The catalog.
@@ -365,7 +365,7 @@ class TierEntry:
 
 
 def load_tiers(raw: Mapping[str, Any]) -> dict[str, TierEntry]:
-    """Validate the tiers file (§5.2).
+    """Validate the tiers file.
 
     Args:
         raw: The parsed JSON.
@@ -410,7 +410,7 @@ Profile = Mapping[str, Any]
 """A resolved, read-only platform profile: the platform entry's keys plus `tier` and `display_name`."""
 
 REPORT_URL = "https://github.com/romm-streaming/romm-broker/issues/new?template=core-report.yml"
-"""Where players report how a core works (§9)."""
+"""Where players report how a core works."""
 
 
 def _blocking_entry(tiers: Mapping[str, TierEntry], core: str, platform: str) -> Optional[TierEntry]:
@@ -433,7 +433,7 @@ def _blocking_entry(tiers: Mapping[str, TierEntry], core: str, platform: str) ->
 
 
 def _untested_extensions(platform_exts: tuple[str, ...], info: CoreInfo) -> tuple[str, ...]:
-    """The platform's extensions the core also supports, in platform order (§5.4).
+    """The platform's extensions the core also supports, in platform order.
 
     Args:
         platform_exts: The platform entry's extensions.
@@ -488,7 +488,7 @@ def cores_for_platform(
     catalog: Catalog,
     tiers: Mapping[str, TierEntry],
 ) -> list[dict[str, Any]]:
-    """Every core offered on `platform`, for the cores route and the docs table (§9).
+    """Every core offered on `platform`, for the cores route and the docs table.
 
     Args:
         platforms: The platform table.
@@ -563,13 +563,13 @@ def resolve_profile(
     catalog: Catalog,
     tiers: Mapping[str, TierEntry],
 ) -> Profile:
-    """Resolve the profile a launch uses (§6.1).
+    """Resolve the profile a launch uses.
 
     Args:
         platforms: The platform table.
         platform: The platform slug, lowercase.
         core: The requested core, or None for the platform's default.
-        experimental: Whether a known-broken core may run (§6.4).
+        experimental: Whether a known-broken core may run.
         catalog: The current catalog.
         tiers: The tiers table.
 
@@ -644,7 +644,7 @@ def catalog() -> Catalog:
 
 
 def set_catalog(new: Catalog) -> None:
-    """Swap in a new catalog with one assignment (§7), so no reader sees half of one.
+    """Swap in a new catalog with one assignment, so no reader sees half of one.
 
     Args:
         new: The catalog to use from now on.
@@ -654,17 +654,17 @@ def set_catalog(new: Catalog) -> None:
 
 
 ZIP_CAP = 5 * 1024 * 1024
-"""Largest core-info zip a refresh accepts, 5 MiB (§7)."""
+"""Largest core-info zip a refresh accepts, 5 MiB."""
 INDEX_CAP = 256 * 1024
-"""Largest buildbot index a refresh accepts, 256 KiB (§7)."""
+"""Largest buildbot index a refresh accepts, 256 KiB."""
 REFRESH_EVERY = 7 * 24 * 3600
-"""Seconds between background refreshes, 7 days (§7)."""
+"""Seconds between background refreshes, 7 days."""
 CACHE_ZIP = "core_info_cache.zip"
 """File name the refreshed core-info zip is cached under, in `RA_DATA_DIR`."""
 CACHE_INDEX = "core_info_cache.index"
 """File name the refreshed buildbot index is cached under, in `RA_DATA_DIR`."""
 FETCH_DEADLINE = 120
-"""Total seconds a single fetch may take (§7). `timeout=60` below is a per-read
+"""Total seconds a single fetch may take. `timeout=60` below is a per-read
 timeout, so without this a server that trickles a byte every 59 seconds would
 otherwise never finish."""
 
@@ -684,7 +684,7 @@ def protected_cores(platforms: Mapping[str, Mapping[str, Any]]) -> frozenset[str
 
 
 def merge_catalogs(bundled: Catalog, cache: Catalog, protected: frozenset[str]) -> Catalog:
-    """Bundled first, then the cache, never overriding a protected core (§7).
+    """Bundled first, then the cache, never overriding a protected core.
 
     Args:
         bundled: The catalog from the package.
@@ -792,7 +792,7 @@ def refresh_once(
     except Exception as exc:  # noqa: BLE001 - a hostile or corrupt zip can raise
         # far more than httpx.HTTPError/OSError/ValueError/zipfile.BadZipFile
         # (zlib.error, RuntimeError for an encrypted member, NotImplementedError,
-        # EOFError, ...); §7 says any failure here keeps the current catalog.
+        # EOFError, ...); any failure here keeps the current catalog.
         log.warning("retroarch: core info refresh failed, keeping the current catalog: %s", exc)
         return False
     lines = [line for line in index_text.splitlines() if line.strip()]
@@ -869,7 +869,7 @@ def load_startup_catalog(
 async def refresh_forever(
     cache_dir: Path, cores_dir: Path, platforms: Mapping[str, Mapping[str, Any]]
 ) -> None:
-    """Refresh at startup when the cache is stale, then every 7 days (§7).
+    """Refresh at startup when the cache is stale, then every 7 days.
 
     Args:
         cache_dir: Where the cache files go.
@@ -892,7 +892,7 @@ async def refresh_forever(
             except Exception:  # noqa: BLE001 - refresh_once already turns its own
                 # known failures into a returned bool; this only guards against
                 # something unexpected escaping it, and a refresh must never end
-                # the loop for the life of the process (§7).
+                # the loop for the life of the process.
                 log.exception("retroarch: core info refresh crashed, keeping the current catalog")
             age = 0
         await anyio.sleep(REFRESH_EVERY - age)

@@ -122,7 +122,7 @@ class RomIn(BaseModel):
         save_target_layout: How `save_target` names that place; see `KNOWN_SAVE_TARGET_LAYOUTS`.
         path: Absolute container path to the rom, validated against ROM_ROOT on activate.
         core: The libretro core to boot instead of the platform's default (RetroArch only).
-        experimental_cores: RomM's opt-in to a core the broker lists as known broken (§6.4).
+        experimental_cores: RomM's opt-in to a core the broker lists as known broken.
     """
 
     id: Optional[int] = None
@@ -146,7 +146,7 @@ class RomIn(BaseModel):
     core: Optional[str] = None
     """The libretro core to boot instead of the platform's default (RetroArch only)."""
     experimental_cores: bool = False
-    """RomM's opt-in to a core the broker lists as known broken (§6.4)."""
+    """RomM's opt-in to a core the broker lists as known broken."""
 
     @field_validator("save_target_layout")
     @classmethod
@@ -2008,7 +2008,7 @@ async def get_import_spec(
         core: The libretro core RomM would activate with (RetroArch only), so
             discovery and activate agree on whether it is offered.
         experimental_cores: RomM's opt-in to a core the broker lists as known
-            broken (§6.4), lifting the same block `rom.experimental_cores` lifts.
+            broken, lifting the same block `rom.experimental_cores` lifts.
         x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
@@ -2054,7 +2054,7 @@ def get_retroarch_cores(
     platform: Optional[str] = Query(default=None),
     x_broker_secret: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
-    """List the libretro cores an operator may set with `core:`, by tier (§9).
+    """List the libretro cores an operator may set with `core:`, by tier.
 
     Args:
         platform: One RomM platform slug, or None for every platform.

@@ -720,7 +720,7 @@ def _ensure_core(core: str, source: Optional[dict[str, Any]] = None) -> Path:
 
 
 def _ensure_core_info(core: str, *, tier: str, has_source: bool) -> None:
-    """Make sure `<core>_libretro.info` sits beside the core in `CORES_DIR` (§6.3).
+    """Make sure `<core>_libretro.info` sits beside the core in `CORES_DIR`.
 
     `CORES_DIR` is also RetroArch's `libretro_info_path`, and a core loaded
     without its info file leaves the core info unset, after which
@@ -1169,7 +1169,7 @@ def _newest_state(
         dir_path: The savestate directory to walk.
         base: The content basename of the loaded game.
         slot: The slot whose file to find.
-        only: Restrict the search to `dir_path/only`, when given (§6.5).
+        only: Restrict the search to `dir_path/only`, when given.
         skip: Drop a match whose first path component under `dir_path` is in
             this set; has no effect when `only` is also given, since every
             match then already sits under `only` itself, never under one of
@@ -1178,14 +1178,14 @@ def _newest_state(
             all) is also dropped: that bare-root case is `include_root`'s
             alone, so an untested or blocked core's "everywhere except known
             cores' dirs" search can't pick up a legacy default-core root
-            state by accident (R6a, R6b). A plain unscoped call (no `skip`)
+            state by accident. A plain unscoped call (no `skip`)
             matches a bare-root file.
         include_root: Also match a file sitting directly in `dir_path`,
             non-recursively (ignored without `only`). `sort_savestates_enable`
             was only pinned on 2026-09-18 (451da72); an install or restored
             archive from before that can still have the default core's
             state sitting unsorted at the root, and resume has to keep
-            finding it (R6a). This never reaches another core's subdirectory,
+            finding it. This never reaches another core's subdirectory,
             which is the whole point of the `only`/`skip` scoping.
 
     Returns:
@@ -1765,7 +1765,7 @@ def _srm_dir(
             ),
         )
     # None is an untested core: nothing proves it reads a .srm, but one it
-    # ignores is harmless, so it is placed with a warning (§6.2).
+    # ignores is harmless, so it is placed with a warning.
     return info["library_name"]
 
 
@@ -1913,7 +1913,7 @@ def _place_srm(
 
 
 def _old_library_name(identity: Mapping[str, Any], platform: str, stem: str) -> Optional[str]:
-    """The sorted-dir name the archive's core saved under (§8.2).
+    """The sorted-dir name the archive's core saved under.
 
     Args:
         identity: The archive manifest's `session`.
@@ -2064,18 +2064,17 @@ class Retroarch(Emulator):
         self._resolved: Optional[tuple[Optional[str], Optional[str], retroarch_cores.Profile]] = None
         """The (platform, core) the profile was resolved for, and the profile; see `_profile`."""
         self._observed_lib: Optional[str] = None
-        """An untested core's `library_name` as confirmed on disk (§6.5).
+        """An untested core's `library_name` as confirmed on disk.
 
         Unlike `_seeded_lib`, this is never overridden once set: it came from
         watching RetroArch actually write the dir, not from a guess.
         """
         self._seeded_lib: Optional[str] = None
-        """An untested core's `library_name` as recorded in a restored archive's manifest (§6.5, R7).
+        """An untested core's `library_name` as recorded in a restored archive's manifest.
 
         Only a seed, not a confirmation: `adopt_archive_identity` sets this,
         but `_observe_library_name` keeps running and its result overrides it
-        (§6.2 says the manifest only seeds the name; observation may still
-        correct it).
+        (the manifest only seeds the name; observation may still correct it).
         """
         self._launch_wall: float = 0.0
         """`time.time()` set right before the launch spawn; anchors `_observe_library_name`."""
@@ -2102,7 +2101,7 @@ class Retroarch(Emulator):
         return scoped or ("states", "saves")
 
     def _experimental(self) -> bool:
-        """Whether a blocked core may run: RomM's flag or `RETROARCH_EXPERIMENTAL_CORES` (§6.4).
+        """Whether a blocked core may run: RomM's flag or `RETROARCH_EXPERIMENTAL_CORES`.
 
         Returns:
             True when either is on.
@@ -2170,7 +2169,7 @@ class Retroarch(Emulator):
             )
 
     def library_name(self) -> Optional[str]:
-        """The sorted-dir name in effect: observed, then seeded, then the profile's (R7).
+        """The sorted-dir name in effect: observed, then seeded, then the profile's.
 
         An observed name (confirmed on disk) always wins. Absent that, a
         manifest seed from `adopt_archive_identity` is used until observation
@@ -2214,22 +2213,21 @@ class Retroarch(Emulator):
         return frozenset(names - own)
 
     def _state_scope(self) -> tuple[Optional[str], frozenset[str], bool]:
-        """Where this core's states may be looked up (§6.5, R6a, R6b).
+        """Where this core's states may be looked up.
 
         Returns:
             (`only`, `skip`, `include_root`) for `_newest_state`. The default
             core looks in its own dir plus a legacy unsorted state sitting at
-            the root (R6a); a vetted core looks in its own dir only (R6b); an
+            the root; a vetted core looks in its own dir only; an
             untested or blocked core whose dir is confirmed by observation
             looks in its own dir only; otherwise everywhere except other known
             cores' dirs. Root inclusion is for the default core alone: the
             unsorted layout predates core overrides, so every root state was
             written by the default core, and handing one to any other core
             would resume a state it cannot read. A manifest seed
-            (`_seeded_lib`) does NOT narrow this (R7a): narrowing on a seed
-            that turns out wrong would hide the real dir, which is the exact
-            failure R7 exists to fix, whereas the open scope already finds a
-            correct seed's dir on its own.
+            (`_seeded_lib`) does NOT narrow this: narrowing on a seed
+            that turns out wrong would hide the real dir, whereas the open
+            scope already finds a correct seed's dir on its own.
         """
         profile = self._profile()
         if profile is None:
@@ -2241,15 +2239,15 @@ class Retroarch(Emulator):
         return None, self._known_libs(), False
 
     def _observe_library_name(self) -> None:
-        """Adopt the sorted dir RetroArch actually wrote for an untested core (§6.5).
+        """Adopt the sorted dir RetroArch actually wrote for an untested core.
 
         Takes the newest subdirectory of `saves/` or `states/` holding a file
         genuinely written since launch. Called after PLAYING and after each
         confirmed save; a no-op once a name is confirmed (`_observed_lib`
         set), and for default and vetted cores. Keeps running even after a
-        manifest seed (`_seeded_lib`) is in place: per §6.2 the manifest only
+        manifest seed (`_seeded_lib`) is in place: the manifest only
         seeds the name, and this observer's result, once it has one,
-        overrides that seed (R7).
+        overrides that seed.
 
         A candidate file's mtime has to fall in
         `[launch - OBSERVE_WINDOW_BEFORE_SLACK, now + OBSERVE_WINDOW_AFTER_SLACK]`:
@@ -2307,7 +2305,7 @@ class Retroarch(Emulator):
             )
 
     def adopt_archive_identity(self, identity: Optional[Mapping[str, Any]]) -> None:
-        """Seed the library name from the restored archive's manifest (§6.2, R7).
+        """Seed the library name from the restored archive's manifest.
 
         Only a seed: `_observe_library_name` keeps running afterward, and its
         result overrides this one once it has confirmed a real dir.
@@ -2330,7 +2328,7 @@ class Retroarch(Emulator):
     def carry_save_across_cores(
         self, identity: Optional[Mapping[str, Any]], rom_file: Optional[Path]
     ) -> None:
-        """Move the battery save from the archive's core's dir into this core's (§8.2).
+        """Move the battery save from the archive's core's dir into this core's.
 
         Runs after the archive is restored and before the baseline, so the
         rename, which keeps the file's mtime, does not count as this session's
@@ -3214,7 +3212,7 @@ class Retroarch(Emulator):
         performed.
 
         A resume load an untested or blocked core never reads is logged as a
-        warning naming the likely cause (§6.5): a state pushed before the
+        warning naming the likely cause: a state pushed before the
         core's sorted dir was known may sit where that core does not look.
 
         Args:
@@ -3331,8 +3329,8 @@ class Retroarch(Emulator):
 
         Scoped to the running core's own sorted dir once it is known
         (default, vetted, or an untested core whose dir has been observed),
-        plus the legacy unsorted root for the default core only (R6a, R6b); otherwise
-        everywhere except another known core's dir (§6.5).
+        plus the legacy unsorted root for the default core only; otherwise
+        everywhere except another known core's dir.
 
         Returns:
             The file found by `_newest_state`, or None before a launch has set

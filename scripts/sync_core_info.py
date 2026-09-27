@@ -129,7 +129,7 @@ def tiers(platform: Optional[str]) -> int:
 
 
 def check() -> int:
-    """Compare the bundle and table with live upstream (§10.1).
+    """Compare the bundle and table with live upstream.
 
     Returns:
         1 when a default or vetted core is renamed, removed or not built for
