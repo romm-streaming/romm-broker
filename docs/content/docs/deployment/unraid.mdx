@@ -24,9 +24,8 @@ icon at the top of the web UI), not inside the container.
 `docker exec webstation nvidia-smi` can list your card while games still
 fail to draw. `nvidia-smi` only proves the container can see the GPU. Vulkan
 (the graphics system most emulators draw with) needs more than that, and
-it's what the steps below fix. You can test it directly with
-`docker exec webstation vulkaninfo --summary`: if that crashes or doesn't
-name your NVIDIA card, Vulkan isn't working yet.
+it's what the steps below fix. The last step has a test that tells you
+whether Vulkan works.
 </Callout>
 
 <Steps>
@@ -144,11 +143,50 @@ being encoded on your NVIDIA card:
 [Wayland] Zero-copy capture: output 1 1280x720 rendered on /dev/dri/renderD128, encoded in place on NVENC.
 ```
 
-The stats in the stream's sidebar show the same thing. Running
-`docker exec webstation vulkaninfo --summary` again should now name your
-card.
+The stats in the stream's sidebar show the same thing.
+
+That proves the stream works, not the emulators, so test Vulkan too. On
+the host, run:
+
+```bash
+docker exec webstation bash -c '
+unset DISPLAY
+unset WAYLAND_DISPLAY
+unset XDG_RUNTIME_DIR
+
+export VK_DRIVER_FILES=/etc/vulkan/icd.d/nvidia_icd.json
+
+vulkaninfo --summary
+RC=$?
+
+echo
+echo "EXIT=$RC"
+'
+```
+
+The `unset` lines keep the desktop (Wayland or X11) out of the test, so
+you're checking the driver and nothing else. `VK_DRIVER_FILES` makes Vulkan
+load only the NVIDIA driver. Without it, Vulkan can quietly fall back to a
+software renderer and the test looks like it passed.
+
+When it works, your card shows up under `Devices`:
+
+```txt
+Devices:
+========
+GPU0:
+    deviceType = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+    deviceName = NVIDIA GeForce ...
+    driverName = NVIDIA
+    driverInfo = ...
+```
+
+and the last line is `EXIT=0`. If it crashes, lists no NVIDIA card, or
+ends with any other number, Vulkan still isn't working. Check
+[`/dev/nvidia-modeset`](#check-for-devnvidia-modeset) again first. That was
+the fix in the confirmed setup.
 
 If you switched any emulators to OpenGL to get around broken Vulkan, you
-can switch them back now.
+can switch them back now. Vulkan usually runs them faster.
 </Step>
 </Steps>
