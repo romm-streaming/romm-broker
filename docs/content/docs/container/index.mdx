@@ -130,7 +130,9 @@ should use:
 <Tab value="NVIDIA">
 
 Needs the NVIDIA container runtime installed on the host, with driver
-version 595.80 or newer.
+version 595.80 or newer. Older cards stuck on the 580 driver (Pascal, like
+the GTX 10-series) can work with extra host steps; see [Unraid with an older
+NVIDIA GPU](/docs/deployment/unraid).
 
 ```yaml title="docker-compose"
     deploy:
