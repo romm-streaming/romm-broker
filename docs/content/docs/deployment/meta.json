@@ -1,4 +1,4 @@
 {
   "title": "Deployment",
-  "pages": ["reverse-proxy", "migrating", "troubleshooting"]
+  "pages": ["reverse-proxy", "unraid", "migrating", "troubleshooting"]
 }

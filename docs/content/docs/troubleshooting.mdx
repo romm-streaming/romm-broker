@@ -30,7 +30,10 @@ NVIDIA specifically: if the GPU is detected and encoding/compute work but
 nothing ever reaches the screen, the missing piece is almost always the
 `/dev/nvidia-modeset` device. The NVIDIA container toolkit adds
 nvidia0/nvidiactl/uvm automatically, but not this one. `nvidia-modprobe
---modeset` creates it if it doesn't already exist on the host.
+--modeset` creates it if it doesn't already exist on the host. On Unraid
+with an older (pre-595) driver, the module can be loaded while the device
+file is still missing; see [Unraid with an older NVIDIA
+GPU](/docs/deployment/unraid).
 
 PCSX2 on AMD integrated graphics specifically: a "Failed to initialize GS"
 error at startup means RADV (AMD's Vulkan driver) failed on that hardware.
