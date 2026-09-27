@@ -626,6 +626,37 @@ def test_build_leaves_the_manifest_out_without_an_identity(tmp_path: Path) -> No
         assert zf.namelist() == ["GC/card.raw"]
 
 
+def _archive_with_manifest(tmp_path: Path, identity: dict[str, Any]) -> bytes:
+    """Build a dump archive whose manifest carries `identity`.
+
+    Args:
+        tmp_path: A per-test temporary directory to root the dump in.
+        identity: The session identity to record.
+
+    Returns:
+        The archive's zip bytes.
+    """
+    root = tmp_path / "identity-root"
+    _write(root / "states" / "game.state", b"s", mtime=NEW)
+    report = saves.build_save_archive(root, ("states",), baseline=0, identity=identity)
+    assert report["zip_bytes"] is not None
+    return report["zip_bytes"]
+
+
+def test_archive_session_identity_reads_the_manifest_session(tmp_path: Path) -> None:
+    """The identity is read even when the archive has no imports."""
+    identity = {"emulator": "retroarch", "core": "snes9x", "platform": "snes", "library_name": "Snes9x"}
+    body = _archive_with_manifest(tmp_path, identity)
+
+    assert saves.archive_session_identity(body) == identity
+
+
+@pytest.mark.parametrize("body", [b"not a zip", b""])
+def test_archive_session_identity_never_raises(body: bytes) -> None:
+    """A bad archive is None; the restore path reports it elsewhere."""
+    assert saves.archive_session_identity(body) is None
+
+
 def test_restore_drops_the_manifest_instead_of_refusing_the_archive(tmp_path: Path) -> None:
     """The manifest sits outside every subtree, so a restore has to pass it over."""
     target = tmp_path / "target"

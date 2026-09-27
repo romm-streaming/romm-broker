@@ -4,23 +4,26 @@ Also covers the core asset links, the per-launch config overlay, the resume
 gate, and playlist-driven disc swapping.
 """
 
+import dataclasses
 import json
 import logging
 import os
 import threading
 import time
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import Any, Optional, Union
 
 import pytest
 from fastapi.testclient import TestClient
 
-from webstation_broker import imports
-from webstation_broker.emulators import retroarch
+from webstation_broker import imports, saves
+from webstation_broker.emulators import retroarch, retroarch_cores
 
 from .conftest import PREFIX, import_zip, preflight_import, restore_import
+from .test_retroarch_cores import info_zip as info_zip_bytes
 
 
 def test_the_table_is_the_one_on_disk() -> None:
@@ -32,6 +35,36 @@ def test_the_table_is_the_one_on_disk() -> None:
     on_disk = json.loads(retroarch._PLATFORMS_FILE.read_text())
 
     assert set(retroarch.PLATFORMS) == set(on_disk)
+
+
+_BASE = {"core": "snes9x", "library_name": "Snes9x", "save_ram": True, "extensions": (".sfc",)}
+
+
+def test_platform_entry_rejects_unknown_keys() -> None:
+    """A typo'd key would otherwise be silently ignored."""
+    with pytest.raises(ValueError, match="unknown key"):
+        retroarch._validate_entry("snes", {**_BASE, "save_rma": True}, alternate=False)
+
+
+def test_alternate_needs_its_own_boolean_save_ram() -> None:
+    """save_ram is never inherited from the default core."""
+    with pytest.raises(ValueError, match="save_ram"):
+        retroarch._validate_entry("snes", {"library_name": "bsnes"}, alternate=True)
+
+
+def test_alternate_may_not_set_core_or_extensions() -> None:
+    """An alternate's name is its key and its extensions are the platform's."""
+    with pytest.raises(ValueError, match="unknown key"):
+        retroarch._validate_entry(
+            "snes", {"library_name": "bsnes", "save_ram": True, "extensions": [".sfc"]}, alternate=True
+        )
+
+
+def test_every_shipped_alternate_loaded_with_tuples() -> None:
+    """List fields of alternates are tuples like the default's."""
+    for info in retroarch.PLATFORMS.values():
+        for alt in info.get("alternates", {}).values():
+            assert not isinstance(alt.get("save_subtrees", ()), list)
 
 
 @pytest.mark.parametrize("slug", ["psp", "nes", "gba", "n64", "snes", "genesis", "dc"])
@@ -563,7 +596,7 @@ def test_a_platform_names_the_sorted_dir_its_core_reports(platform: str, name: s
         platform: The RomM platform slug.
         name: The name the core reports in `retro_get_system_info`.
     """
-    assert retroarch._library_name(platform) == name
+    assert _on(platform).library_name() == name
 
 
 @pytest.mark.parametrize("platform", [None, "", "ps2"])
@@ -573,7 +606,7 @@ def test_an_unmapped_platform_names_no_sorted_dir(platform: Optional[str]) -> No
     Args:
         platform: The slug, or None.
     """
-    assert retroarch._library_name(platform) is None
+    assert _on(platform).library_name() is None
 
 
 def test_every_library_name_is_one_safe_directory_name() -> None:
@@ -675,6 +708,7 @@ class TestResumeGate:
             The args tuple of every deferred-load thread launch() started, in order.
         """
         monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
+        monkeypatch.setattr(retroarch, "_ensure_core_info", lambda *a, **k: None)
         monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
         monkeypatch.setattr(retroarch, "_ensure_save_links", lambda links: None)
         monkeypatch.setattr(retroarch, "_write_core_options", lambda options: tmp_path / "core-options.cfg")
@@ -1212,7 +1246,7 @@ class TestSwapDisc:
             return True
 
         monkeypatch.setattr(emulator, "wait_for_state", fake_wait_for_state)
-        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: True)
+        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot, resume=False: True)
 
         t = threading.Thread(
             target=emulator._deferred_load_state, args=(0, emulator._launch_seq)
@@ -1705,6 +1739,71 @@ class TestLoadStateConfirmation:
 
         assert "never read Game.state" in caplog.text
 
+    @pytest.mark.parametrize("tier", ["untested", "blocked"])
+    def test_an_unread_resume_on_an_unvetted_core_names_the_state_dir(
+        self,
+        emulator: retroarch.Retroarch,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        tier: str,
+    ) -> None:
+        """A resume an untested or blocked core never reads says its state dir may differ.
+
+        Args:
+            emulator: The live Retroarch.
+            monkeypatch: The pytest monkeypatch fixture.
+            caplog: The pytest log capture fixture.
+            tier: The running core's tier.
+        """
+        state = retroarch.STATE_DIR / "Game.state"
+        profile = {**retroarch.PLATFORMS["snes"], "core": "mesen-s", "library_name": "Mesen-S", "tier": tier}
+        monkeypatch.setattr(emulator, "_profile", lambda: profile)
+        monkeypatch.setattr(emulator, "state_path", lambda: state)
+        monkeypatch.setattr(retroarch, "_atime_tracked", lambda d: True)
+        monkeypatch.setattr(retroarch, "_wait_for_state_read", lambda *a, **k: False)
+        monkeypatch.setattr(emulator, "_send", lambda cmd, wait_prefix, timeout: cmd)
+
+        with caplog.at_level(logging.WARNING):
+            assert emulator._load_state_locked(0, resume=True) is False
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert [r.getMessage() for r in warnings] == [
+            f"resume state not read by {tier} core mesen-s; its state dir may differ"
+        ]
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    @pytest.mark.parametrize(("tier", "resume"), [("default", True), ("vetted", True), ("untested", False)])
+    def test_an_unread_load_keeps_the_error_otherwise(
+        self,
+        emulator: retroarch.Retroarch,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        tier: str,
+        resume: bool,
+    ) -> None:
+        """A default or vetted core's resume, and any manual load, keep the generic error.
+
+        Args:
+            emulator: The live Retroarch.
+            monkeypatch: The pytest monkeypatch fixture.
+            caplog: The pytest log capture fixture.
+            tier: The running core's tier.
+            resume: Whether the load is a resume attempt.
+        """
+        state = retroarch.STATE_DIR / "Game.state"
+        profile = {**retroarch.PLATFORMS["snes"], "tier": tier}
+        monkeypatch.setattr(emulator, "_profile", lambda: profile)
+        monkeypatch.setattr(emulator, "state_path", lambda: state)
+        monkeypatch.setattr(retroarch, "_atime_tracked", lambda d: True)
+        monkeypatch.setattr(retroarch, "_wait_for_state_read", lambda *a, **k: False)
+        monkeypatch.setattr(emulator, "_send", lambda cmd, wait_prefix, timeout: cmd)
+
+        with caplog.at_level(logging.WARNING):
+            assert emulator._load_state_locked(0, resume=resume) is False
+
+        assert "never read Game.state" in caplog.text
+        assert "its state dir may differ" not in caplog.text
+
     def test_no_echo_at_all_fails(
         self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2172,6 +2271,77 @@ class TestCoreDownload:
         assert retroarch._ensure_core("snes9x") == so
 
 
+class TestCoreInfoInstall:
+    """A core without its .info segfaults GET_STATUS."""
+
+    def test_missing_info_is_written_from_the_zip(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Written atomically next to the .so."""
+        monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path)
+        retroarch._ensure_core_info("snes9x", tier="default", has_source=False)
+        expected = retroarch_cores.load_bundled_catalog().info_file("snes9x")
+        assert (tmp_path / "snes9x_libretro.info").read_bytes() == expected
+        assert (tmp_path / "snes9x_libretro.info").stat().st_size > 0
+        assert not list(tmp_path.glob(".*.tmp"))
+
+    def test_existing_info_is_left_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An operator's own .info is never overwritten."""
+        monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path)
+        (tmp_path / "snes9x_libretro.info").write_bytes(b"mine")
+        retroarch._ensure_core_info("snes9x", tier="default", has_source=False)
+        assert (tmp_path / "snes9x_libretro.info").read_bytes() == b"mine"
+
+    def test_core_source_core_without_info_only_logs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Azahar may not be in the zip; the launch goes on."""
+        monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path)
+        with caplog.at_level(logging.WARNING):
+            retroarch._ensure_core_info("nosuchcore", tier="default", has_source=True)
+        assert "no .info" in caplog.text
+
+    def test_other_core_without_info_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Launching it would crash mid-session, so the launch fails now, naming the file."""
+        monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path)
+        with pytest.raises(RuntimeError, match="nosuchcore_libretro.info"):
+            retroarch._ensure_core_info("nosuchcore", tier="untested", has_source=False)
+
+    @pytest.mark.parametrize("tier", ["default", "vetted"])
+    def test_default_and_vetted_info_comes_from_the_bundle(
+        self, tier: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A refreshed cache never supplies a default or vetted core's .info."""
+        monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path)
+        bogus = retroarch_cores.build_catalog(
+            info_zip_bytes({"snes9x": {"corename": "EVIL"}}), "snes9x_libretro.so.zip"
+        )
+        monkeypatch.setattr(retroarch_cores, "_catalog", bogus)
+        retroarch._ensure_core_info("snes9x", tier=tier, has_source=False)
+        assert b"EVIL" not in (tmp_path / "snes9x_libretro.info").read_bytes()
+
+    def test_a_failed_info_install_leaves_no_temp_file_behind(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A rename that fails cleans up its temp file rather than leaving a stray .info."""
+        monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path)
+
+        def refuse(src: Any, dst: Any) -> None:
+            raise OSError("read-only")
+
+        monkeypatch.setattr(retroarch.os, "replace", refuse)
+
+        with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match="failed to install"):
+            retroarch._ensure_core_info("snes9x", tier="default", has_source=False)
+
+        assert list(tmp_path.glob(".*.tmp")) == []
+        assert not (tmp_path / "snes9x_libretro.info").is_file()
+
+
 class TestSaveStateAgainstResume:
     """A save landing while a deferred resume load is still in flight."""
 
@@ -2202,7 +2372,7 @@ class TestSaveStateAgainstResume:
         monkeypatch.setattr(emulator, "state_path", lambda: state)
         monkeypatch.setattr(emulator, "_try_save", lambda: emulator.events.append("save") or True)
         monkeypatch.setattr(
-            emulator, "_load_state_locked", lambda slot: emulator.events.append("load") or True
+            emulator, "_load_state_locked", lambda slot, resume=False: emulator.events.append("load") or True
         )
         return emulator
 
@@ -2336,7 +2506,7 @@ class TestResumeLoadRetry:
     ) -> None:
         """A core that was not ready for the first load gets another attempt."""
         results = [False, True]
-        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: results.pop(0))
+        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot, resume=False: results.pop(0))
 
         with caplog.at_level(logging.INFO):
             confirmed = emulator._load_until_confirmed(0, time.monotonic() + 5.0, emulator._launch_seq)
@@ -2352,7 +2522,7 @@ class TestResumeLoadRetry:
         """An unrestored game is an error, not one info line saying "failed"."""
         attempts: list[int] = []
         monkeypatch.setattr(
-            emulator, "_load_state_locked", lambda slot: attempts.append(slot) or False
+            emulator, "_load_state_locked", lambda slot, resume=False: attempts.append(slot) or False
         )
 
         with caplog.at_level(logging.WARNING):
@@ -2370,7 +2540,7 @@ class TestResumeLoadRetry:
         """Retries for a session that has been relaunched must not keep firing at the new one."""
         attempts: list[int] = []
 
-        def fail_and_relaunch(slot: int) -> bool:
+        def fail_and_relaunch(slot: int, resume: bool = False) -> bool:
             attempts.append(slot)
             emulator._launch_seq += 1
             return False
@@ -2396,7 +2566,9 @@ class TestResumeLoadRetry:
         appears = [False, True]
         monkeypatch.setattr(emulator, "wait_for_state", lambda deadline: appears.pop(0))
         loads: list[int] = []
-        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: loads.append(slot) or True)
+        monkeypatch.setattr(
+            emulator, "_load_state_locked", lambda slot, resume=False: loads.append(slot) or True
+        )
 
         with caplog.at_level(logging.WARNING):
             confirmed = emulator._load_until_confirmed(0, time.monotonic() + 5.0, emulator._launch_seq)
@@ -2418,7 +2590,7 @@ class TestResumeLoadRetry:
             return True
 
         monkeypatch.setattr(emulator, "wait_for_state", blocking_wait)
-        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: True)
+        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot, resume=False: True)
 
         t = threading.Thread(
             target=emulator._load_until_confirmed,
@@ -2437,7 +2609,7 @@ class TestResumeLoadRetry:
     ) -> None:
         """The deferred resume path itself retries, not just the helper under it."""
         results = [False, False, True]
-        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: results.pop(0))
+        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot, resume=False: results.pop(0))
         monkeypatch.setattr(
             emulator, "_send", lambda cmd, wait_prefix, timeout: "GET_STATUS PLAYING psp,Game,0"
         )
@@ -2463,7 +2635,9 @@ class TestResumeLoadRetry:
         paths = [original, clobbered]
         monkeypatch.setattr(emulator, "state_path", lambda: paths.pop(0))
         attempts: list[int] = []
-        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: attempts.append(slot) or False)
+        monkeypatch.setattr(
+            emulator, "_load_state_locked", lambda slot, resume=False: attempts.append(slot) or False
+        )
 
         with caplog.at_level(logging.ERROR):
             confirmed = emulator._load_until_confirmed(0, time.monotonic() + 5.0, emulator._launch_seq)
@@ -2479,7 +2653,9 @@ class TestResumeLoadRetry:
         """A stat failure right after the wait must not silently skip the fingerprint guard."""
         monkeypatch.setattr(retroarch, "_state_identity", lambda path: None)
         loads: list[int] = []
-        monkeypatch.setattr(emulator, "_load_state_locked", lambda slot: loads.append(slot) or True)
+        monkeypatch.setattr(
+            emulator, "_load_state_locked", lambda slot, resume=False: loads.append(slot) or True
+        )
 
         with caplog.at_level(logging.WARNING):
             confirmed = emulator._load_until_confirmed(0, time.monotonic() + 0.3, emulator._launch_seq)
@@ -2666,6 +2842,7 @@ def test_a_launch_tells_retroarch_which_config_the_broker_read(
 
     monkeypatch.setattr(retroarch, "RA_CONFIG_PATH", tmp_path / "ra" / "retroarch.cfg")
     monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
+    monkeypatch.setattr(retroarch, "_ensure_core_info", lambda *a, **k: None)
     monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
     monkeypatch.setattr(retroarch, "_ensure_save_links", lambda links: None)
     monkeypatch.setattr(retroarch, "_write_core_options", lambda options: tmp_path / "core-options.cfg")
@@ -2705,10 +2882,12 @@ def test_a_launch_links_save_paths_and_pins_core_options(
             """Start nothing."""
 
     info = dict(retroarch._platform_info("snes"))
+    info["tier"] = "default"
     info["save_links"] = {"neocd/neocd.srm": "NeoCD/neocd.srm"}
     info["core_options"] = {"some_option": "on"}
-    monkeypatch.setattr(retroarch, "_platform_info", lambda platform: info)
+    monkeypatch.setattr(retroarch.Retroarch, "_profile", lambda self: info)
     monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
+    monkeypatch.setattr(retroarch, "_ensure_core_info", lambda *a, **k: None)
     monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
     monkeypatch.setattr(retroarch, "_ensure_save_links", lambda links: linked.append(links))
     monkeypatch.setattr(
@@ -2751,9 +2930,11 @@ def test_a_launch_resolves_seed_options_before_writing_them(
 
     monkeypatch.setattr(retroarch, "CORE_OPTIONS_CFG", tmp_path / "broker-core-options.cfg")
     info = dict(retroarch._platform_info("snes"))
+    info["tier"] = "default"
     info["core_option_seeds"] = {"hatari_floppy_write_protection": "on"}
-    monkeypatch.setattr(retroarch, "_platform_info", lambda platform: info)
+    monkeypatch.setattr(retroarch.Retroarch, "_profile", lambda self: info)
     monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
+    monkeypatch.setattr(retroarch, "_ensure_core_info", lambda *a, **k: None)
     monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
     monkeypatch.setattr(retroarch, "_ensure_save_links", lambda links: None)
     monkeypatch.setattr(
@@ -3781,3 +3962,1088 @@ def test_only_wii_and_3ds_declare_an_identity_source(platform: Optional[str], fa
 
     assert (source.family if source else None) == family
     assert source is None or (source.rom_reader, source.use_save_target) == (None, False)
+
+
+def _with_core(platform: str, core: Optional[str], experimental: bool = False) -> retroarch.Retroarch:
+    """A RetroArch session on one platform with a core override.
+
+    Args:
+        platform: The RomM platform slug.
+        core: The core override, or None.
+        experimental: Whether blocked cores may run.
+
+    Returns:
+        The session.
+    """
+    emu = _on(platform)
+    emu.core = core
+    emu.experimental_cores = experimental
+    return emu
+
+
+def _untested_snes_core() -> str:
+    """A catalog core that shares an extension with snes and is neither default nor vetted."""
+    cat = retroarch_cores.catalog()
+    for core in ("mesen-s", "bsnes_mercury_balanced", "bsnes2014_accuracy"):
+        tier = retroarch_cores.tier_of(retroarch.PLATFORMS, "snes", core, cat, retroarch_cores.TIERS)
+        if tier == "untested":
+            return core
+    pytest.skip("no untested snes core in the bundled catalog")
+
+
+def _state(root: Path, lib: str, name: str = "Game.state", mtime: Optional[float] = None) -> Path:
+    """Write a state file under states/<lib>/.
+
+    Args:
+        root: The patched data root.
+        lib: The sorted dir.
+        name: The file name.
+        mtime: An mtime to set, or None for now.
+
+    Returns:
+        The path.
+    """
+    path = root / "states" / lib / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"state")
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
+    return path
+
+
+def _root_state(root: Path, name: str = "Game.state", mtime: Optional[float] = None) -> Path:
+    """Write a state file directly at states/, the pre-2026-09-18 unsorted layout.
+
+    Args:
+        root: The patched data root.
+        name: The file name.
+        mtime: An mtime to set, or None for now.
+
+    Returns:
+        The path.
+    """
+    path = root / "states" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"state")
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
+    return path
+
+
+class TestStateScope:
+    """States are scoped to the running core."""
+
+    def test_default_core_sees_only_its_own_dir(self, ra_dirs: Path) -> None:
+        """A newer state from another core's dir is never picked."""
+        own = _state(ra_dirs, "Snes9x", mtime=1000)
+        _state(ra_dirs, "bsnes", mtime=2000)
+        emu = _on("snes")
+        emu._rom_base = "Game"
+        assert emu.state_path() == own
+
+    def test_untested_core_skips_other_known_cores_until_observed(self, ra_dirs: Path) -> None:
+        """Before its dir is seen it looks everywhere except known cores' dirs."""
+        core = _untested_snes_core()
+        _state(ra_dirs, "Snes9x", mtime=2000)
+        mine = _state(ra_dirs, "SomethingElse", mtime=1000)
+        emu = _with_core("snes", core)
+        emu.select_core()
+        emu._rom_base = "Game"
+        assert emu.state_path() == mine
+
+    def test_untested_core_uses_only_its_dir_once_observed(self, ra_dirs: Path) -> None:
+        """After observation the scope narrows to that dir."""
+        core = _untested_snes_core()
+        emu = _with_core("snes", core)
+        emu.select_core()
+        emu._rom_base = "Game"
+        emu._launch_wall = time.time() - 5
+        observed = _state(ra_dirs, "Observed Name")
+        _state(ra_dirs, "Other", mtime=time.time() + 100)
+        emu._observe_library_name()
+        assert emu.library_name() == "Observed Name"
+        assert emu.state_path() == observed
+
+    def test_nothing_observed_keeps_corename_and_logs(
+        self, ra_dirs: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A write from before launch does not confirm anything; corename stays and it says so."""
+        emu = _with_core("snes", _untested_snes_core())
+        emu.select_core()
+        emu._launch_wall = time.time() + 100
+        _state(ra_dirs, "SomeOtherDir", mtime=time.time() - 1000)
+        before = emu.library_name()
+        with caplog.at_level(logging.INFO):
+            emu._observe_library_name()
+        assert emu.library_name() == before
+        assert "library_name not yet confirmed" in caplog.text
+
+    def test_manifest_library_name_seeds_the_next_session(self) -> None:
+        """The recorded name is used from the start."""
+        core = _untested_snes_core()
+        emu = _with_core("snes", core)
+        emu.select_core()
+        emu.adopt_archive_identity({"core": core, "library_name": "Recorded"})
+        assert emu.library_name() == "Recorded"
+
+    @pytest.mark.parametrize("lib", ["../x", "a/b", ".", ""])
+    def test_manifest_library_name_must_be_a_plain_dir_name(self, lib: str) -> None:
+        """A manifest from the archive is data RomM relayed; it must not steer paths."""
+        core = _untested_snes_core()
+        emu = _with_core("snes", core)
+        emu.select_core()
+        before = emu.library_name()
+        emu.adopt_archive_identity({"core": core, "library_name": lib})
+        assert emu.library_name() == before
+
+    def test_manifest_from_another_core_is_ignored(self) -> None:
+        """Only the same core's record seeds the name."""
+        emu = _with_core("snes", _untested_snes_core())
+        emu.select_core()
+        before = emu.library_name()
+        emu.adopt_archive_identity({"core": "snes9x", "library_name": "Snes9x"})
+        assert emu.library_name() == before
+
+    def test_state_target_uses_the_scoped_dir(self, ra_dirs: Path) -> None:
+        """A push after a switch lands exactly in the running core's own dir, never the old one's."""
+        _state(ra_dirs, "Snes9x")
+        emu = _with_core("snes", _untested_snes_core())
+        emu.select_core()
+        emu._rom_base = "Game"
+        target = emu.state_target("Game.state")
+        assert target == ra_dirs / "states" / emu.library_name() / "Game.state"
+
+    def test_default_core_prefers_a_newer_root_state_over_another_cores_dir(
+        self, ra_dirs: Path
+    ) -> None:
+        """Root is checked, but another core's subdir never is."""
+        _state(ra_dirs, "bsnes", mtime=2000)
+        root = _root_state(ra_dirs, mtime=1000)
+        emu = _on("snes")
+        emu._rom_base = "Game"
+        assert emu.state_path() == root
+
+    def test_default_core_picks_the_newer_of_root_and_its_own_dir(self, ra_dirs: Path) -> None:
+        """Root and states/<library_name>/ are both checked; newest wins."""
+        _root_state(ra_dirs, mtime=1000)
+        own = _state(ra_dirs, "Snes9x", mtime=2000)
+        emu = _on("snes")
+        emu._rom_base = "Game"
+        assert emu.state_path() == own
+
+    def test_untested_core_ignores_a_root_level_state(self, ra_dirs: Path) -> None:
+        """The legacy root fallback is default/vetted only; an untested core never uses it."""
+        _root_state(ra_dirs, mtime=2000)
+        core = _untested_snes_core()
+        emu = _with_core("snes", core)
+        emu.select_core()
+        emu._rom_base = "Game"
+        assert emu.state_path() is None
+
+    def test_vetted_core_ignores_a_root_level_state(
+        self, ra_dirs: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Root states predate core overrides, so they are the default core's, never an alternate's."""
+        root = _root_state(ra_dirs, name="Game.state1", mtime=2000)
+        emu = _on("snes")
+        profile = {**retroarch.PLATFORMS["snes"], "core": "bsnes", "library_name": "bsnes", "tier": "vetted"}
+        monkeypatch.setattr(emu, "_profile", lambda: profile)
+        monkeypatch.setattr(retroarch, "STATE_SLOT", 1)
+        emu._rom_base = "Game"
+        assert emu._state_scope() == ("bsnes", frozenset(), False)
+        assert emu.state_path() is None
+        own = _state(ra_dirs, "bsnes", name="Game.state1", mtime=1000)
+        assert emu.state_path() == own != root
+
+    def test_an_imported_save_does_not_confirm_the_observer(
+        self, ra_dirs: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A .srm the broker placed before launch proves nothing about where the core writes."""
+        emu = _with_core("snes", _untested_snes_core())
+        emu.select_core()
+        ctx = imports.ImportCtx(
+            rom_file=ra_dirs / "Game.sfc", rom=None, memory_card_synced=False, excluded=(), resume_slot=None
+        )
+        placed = emu.place_import(_member("Game.srm", "save"), emu.import_spec(), ctx)
+        assert isinstance(placed, imports.Placement)
+        dest = ra_dirs / placed.dest
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"sram")
+        emu._launch_wall = time.time() - 5
+        with caplog.at_level(logging.INFO):
+            emu._observe_library_name()
+        assert emu._observed_lib is None
+        assert "library_name not yet confirmed" in caplog.text
+
+    def test_an_imported_save_lands_in_the_seeded_dir(self, ra_dirs: Path) -> None:
+        """The .srm goes where the manifest says the core wrote, the same dir `state_target` uses."""
+        core = _untested_snes_core()
+        emu = _with_core("snes", core)
+        emu.select_core()
+        emu.adopt_archive_identity({"core": core, "library_name": "Recorded"})
+        emu._rom_base = "Game"
+        ctx = imports.ImportCtx(
+            rom_file=ra_dirs / "Game.sfc", rom=None, memory_card_synced=False, excluded=(), resume_slot=None
+        )
+        placed = emu.place_import(_member("Game.srm", "save"), emu.import_spec(), ctx)
+        assert isinstance(placed, imports.Placement)
+        assert placed.dest.parts[-2] == "Recorded"
+        assert emu.state_target("Game.state").parent.name == "Recorded"
+
+    def test_a_seed_alone_does_not_narrow_the_open_scope(self, ra_dirs: Path) -> None:
+        """A seed with no observation yet leaves scope open, so a wrong seed can't hide the real dir.
+
+        The open "everywhere except known cores' dirs" scope already finds a
+        correct seed's dir on its own; narrowing to the seed would instead
+        hide the real dir when the seed turns out wrong, which is the failure
+        observation exists to correct.
+        """
+        core = _untested_snes_core()
+        emu = _with_core("snes", core)
+        emu.select_core()
+        emu.adopt_archive_identity({"core": core, "library_name": "Recorded"})
+        emu._rom_base = "Game"
+
+        # (a) A state in the seeded dir is found.
+        seeded = _state(ra_dirs, "Recorded", mtime=1000)
+        assert emu.state_path() == seeded
+
+        # (b) A state in a different, unknown-named dir (the real one, when the
+        # seed is wrong) is also eligible, and wins here as the newer of the two.
+        real = _state(ra_dirs, "ActualDir", mtime=2000)
+        assert emu.state_path() == real
+
+    def test_observation_overrides_a_seeded_library_name(self, ra_dirs: Path) -> None:
+        """Observation still corrects a manifest seed once it finds a real dir."""
+        core = _untested_snes_core()
+        emu = _with_core("snes", core)
+        emu.select_core()
+        emu.adopt_archive_identity({"core": core, "library_name": "Recorded"})
+        emu._rom_base = "Game"
+        emu._launch_wall = time.time() - 5
+        observed = _state(ra_dirs, "Observed Name")
+        emu._observe_library_name()
+        assert emu.library_name() == "Observed Name"
+        assert emu.state_path() == observed
+
+    def test_a_write_slightly_before_launch_is_still_observed(self, ra_dirs: Path) -> None:
+        """I2: coarse mtime rounding on some mounts can land a real write a touch before launch."""
+        core = _untested_snes_core()
+        emu = _with_core("snes", core)
+        emu.select_core()
+        emu._rom_base = "Game"
+        now = time.time()
+        emu._launch_wall = now
+        _state(ra_dirs, "Observed Name", mtime=now - 1)
+        emu._observe_library_name()
+        assert emu.library_name() == "Observed Name"
+
+    def test_a_file_untouched_since_launch_does_not_confirm_the_observer(self, ra_dirs: Path) -> None:
+        """A restored or carried file with an in-window mtime proves nothing until the core rewrites it."""
+        emu = _with_core("snes", _untested_snes_core())
+        emu.select_core()
+        restored = _state(ra_dirs, "OtherCore")
+        emu._prelaunch_mtimes = retroarch._sorted_dir_mtimes()
+        emu._launch_wall = time.time() - 5
+        emu._observe_library_name()
+        assert emu._observed_lib is None
+        os.utime(restored, (time.time() + 1, time.time() + 1))
+        emu._observe_library_name()
+        assert emu._observed_lib == "OtherCore"
+
+    def test_a_broker_written_state_does_not_confirm_a_seed(
+        self, ra_dirs: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A mid-session push through state_target cannot itself confirm the observer."""
+        core = _untested_snes_core()
+        emu = _with_core("snes", core)
+        emu.select_core()
+        emu._rom_base = "Game"
+        emu._launch_wall = time.time() - 5
+        pushed = _state(ra_dirs, "PushedHere")
+        emu.note_broker_state_write(pushed)
+        with caplog.at_level(logging.INFO):
+            emu._observe_library_name()
+        assert emu._observed_lib is None
+        assert "library_name not yet confirmed" in caplog.text
+
+    def test_blocked_core_accepts_a_manifest_seed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A blocked core seeds its library_name from the manifest exactly like untested."""
+        core = _untested_snes_core()
+        blocked = {core: retroarch_cores.TierEntry("blocked", "x", (), None)}
+        monkeypatch.setattr(retroarch_cores, "TIERS", blocked)
+        emu = _with_core("snes", core, experimental=True)
+        emu.select_core()
+        emu.adopt_archive_identity({"core": core, "library_name": "Recorded"})
+        assert emu.library_name() == "Recorded"
+
+    def test_blocked_core_state_scope_matches_untested(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A blocked core is scoped like untested: open until observed, own dir only once it is.
+
+        A seed alone (no observation yet) must not narrow the scope,
+        for a blocked core exactly as for an untested one.
+        """
+        core = _untested_snes_core()
+        blocked = {core: retroarch_cores.TierEntry("blocked", "x", (), None)}
+        monkeypatch.setattr(retroarch_cores, "TIERS", blocked)
+        emu = _with_core("snes", core, experimental=True)
+        emu.select_core()
+        emu.adopt_archive_identity({"core": core, "library_name": "Recorded"})
+        assert emu._state_scope() == (None, emu._known_libs(), False)
+        emu._observed_lib = "Recorded"
+        assert emu._state_scope() == ("Recorded", frozenset(), False)
+
+    def test_blocked_core_ignores_a_root_level_state(
+        self, ra_dirs: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The legacy root fallback is default/vetted only; a blocked core never uses it."""
+        _root_state(ra_dirs, mtime=2000)
+        core = _untested_snes_core()
+        blocked = {core: retroarch_cores.TierEntry("blocked", "x", (), None)}
+        monkeypatch.setattr(retroarch_cores, "TIERS", blocked)
+        emu = _with_core("snes", core, experimental=True)
+        emu.select_core()
+        emu._rom_base = "Game"
+        assert emu.state_path() is None
+
+
+class TestCoreProfile:
+    """The launcher reads one resolved profile."""
+
+    def test_no_core_reads_the_platform_entry_unchanged(self) -> None:
+        """Byte-for-byte unchanged without core:."""
+        emu = _on("snes")
+        assert emu.archive_core() == "snes9x"
+        assert emu.rom_extensions == retroarch.PLATFORMS["snes"]["extensions"]
+        assert emu.core_identity() == {"core_tier": "default", "library_name": "Snes9x"}
+
+    def test_an_untested_core_changes_every_reader(self) -> None:
+        """archive_core, rom_extensions, save_subtrees and _srm_dir follow the profile."""
+        core = _untested_snes_core()
+        emu = _with_core("snes", core)
+        emu.select_core()
+        assert emu.archive_core() == core
+        assert emu.save_subtrees == ("states", "saves")
+        assert emu.core_identity()["core_tier"] == "untested"
+        assert set(emu.rom_extensions) <= set(retroarch.PLATFORMS["snes"]["extensions"])
+
+    def test_select_core_raises_for_an_unknown_core(self) -> None:
+        """Resolution failures surface at select_core, before any clear."""
+        with pytest.raises(retroarch_cores.CoreRejectedError):
+            _with_core("snes", "nosuchcore").select_core()
+
+    def test_env_opt_in_lifts_a_block(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """RETROARCH_EXPERIMENTAL_CORES works without the RomM flag."""
+        core = _untested_snes_core()
+        blocked = {core: retroarch_cores.TierEntry("blocked", "x", (), None)}
+        monkeypatch.setattr(retroarch_cores, "TIERS", blocked)
+        with pytest.raises(retroarch_cores.CoreRejectedError):
+            _with_core("snes", core).select_core()
+        monkeypatch.setattr(retroarch.settings, "RETROARCH_EXPERIMENTAL_CORES", True)
+        emu = _with_core("snes", core)
+        emu.select_core()
+        assert emu.core_identity()["core_tier"] == "blocked"
+
+    def test_rom_opt_in_lifts_a_block(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """rom.experimental_cores from RomM is enough on its own."""
+        core = _untested_snes_core()
+        blocked = {core: retroarch_cores.TierEntry("blocked", "x", (), None)}
+        monkeypatch.setattr(retroarch_cores, "TIERS", blocked)
+        _with_core("snes", core, experimental=True).select_core()
+
+    def test_untested_core_refuses_a_file_rom_outside_its_extensions(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A default core takes a single-file ROM as is; an untested core checks it."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        rom = tmp_path / "Game.zzz"
+        rom.write_bytes(b"x")
+        emu = _with_core("snes", _untested_snes_core())
+        emu.select_core()
+        assert emu.resolve_rom_file(rom) is None
+
+    def test_untested_core_takes_a_zip_holding_its_content(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """RetroArch extracts a zip itself, so a zipped ROM reaches an untested core."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        rom = tmp_path / "Game.zip"
+        with zipfile.ZipFile(rom, "w") as zf:
+            zf.writestr("Game.sfc", b"x")
+        emu = _with_core("snes", "bsnes")
+        emu.select_core()
+        assert emu.resolve_rom_file(rom) == rom
+
+    def test_untested_core_takes_a_7z_holding_its_content(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A .7z is listed with `7z l` and taken when a member fits the core."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        rom = tmp_path / "Game.7z"
+        rom.write_bytes(b"7z")
+        monkeypatch.setattr(
+            retroarch.extraction_cache, "_7z_member_paths", lambda archive, timeout: ["dir/Game.SMC"]
+        )
+        emu = _with_core("snes", "bsnes")
+        emu.select_core()
+        assert emu.resolve_rom_file(rom) == rom
+
+    def test_untested_core_refuses_an_archive_holding_none_of_its_content(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A zipped ROM for another system is refused before launch, not at boot."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        rom = tmp_path / "Game.zip"
+        with zipfile.ZipFile(rom, "w") as zf:
+            zf.writestr("Game.gba", b"x")
+        emu = _with_core("snes", "bsnes")
+        emu.select_core()
+        with caplog.at_level(logging.WARNING):
+            assert emu.resolve_rom_file(rom) is None
+        assert "holds nothing among core bsnes's extensions" in caplog.text
+
+    def test_untested_core_refuses_an_archive_it_cannot_list(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A corrupt zip is refused rather than handed to RetroArch."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        rom = tmp_path / "Game.zip"
+        rom.write_bytes(b"not a zip")
+        emu = _with_core("snes", "bsnes")
+        emu.select_core()
+        assert emu.resolve_rom_file(rom) is None
+
+    def test_untested_core_that_blocks_extraction_refuses_an_archive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A core-info `block_extract` core would get the archive unopened, which it can't boot."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        rom = tmp_path / "Game.zip"
+        with zipfile.ZipFile(rom, "w") as zf:
+            zf.writestr("Game.sfc", b"x")
+        cat = retroarch_cores.catalog()
+        info = dataclasses.replace(cat.cores["bsnes"], block_extract=True)
+        monkeypatch.setattr(
+            retroarch_cores,
+            "_catalog",
+            dataclasses.replace(cat, cores=MappingProxyType({**cat.cores, "bsnes": info})),
+        )
+        emu = _with_core("snes", "bsnes")
+        emu.select_core()
+        assert emu.resolve_rom_file(rom) is None
+
+    def test_default_core_still_takes_any_file_rom(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unchanged behavior for the default."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        rom = tmp_path / "Game.zzz"
+        rom.write_bytes(b"x")
+        assert _on("snes").resolve_rom_file(rom) == rom
+
+    def test_untested_launch_logs_one_warning_with_the_report_link(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """One warning naming core, platform, untested and the report URL."""
+        emu = _with_core("snes", _untested_snes_core())
+        with caplog.at_level(logging.WARNING):
+            emu.select_core()
+        warnings = [r.getMessage() for r in caplog.records if "untested" in r.getMessage()]
+        assert len(warnings) == 1 and retroarch_cores.REPORT_URL in warnings[0]
+
+    def test_base_emulator_refuses_a_core(self) -> None:
+        """Only RetroArch fronts many cores."""
+        from webstation_broker.emulators import get_emulator
+
+        emu = get_emulator("pcsx2")
+        emu.core = "x"
+        with pytest.raises(retroarch_cores.CoreRejectedError):
+            emu.select_core()
+
+
+def _ra_activate(client: TestClient, roms: Path, **rom: object) -> Any:
+    """Activate retroarch on snes with `launch` stubbed out.
+
+    Args:
+        client: The app client.
+        roms: The redirected ROM root.
+        **rom: Extra `rom` fields (core, experimental_cores).
+
+    Returns:
+        The response.
+    """
+    game = roms / "Game.sfc"
+    game.write_bytes(b"rom")
+    body = {
+        "session_id": "sess-1", "emulator": "retroarch",
+        "user": {"id": 1, "username": "ana", "display_name": "Ana"},
+        "rom": {"id": 5, "name": "Game", "platform": "snes", "path": str(game), **rom},
+    }
+    return client.post(f"{PREFIX}/api/session/activate", json=body)
+
+
+@pytest.fixture
+def no_launch(
+    monkeypatch: pytest.MonkeyPatch, ra_dirs: Path, broker_dirs: dict[str, Path]
+) -> list[retroarch.Retroarch]:
+    """Stub Retroarch.launch, recording the instances launched.
+
+    Also syncs `retroarch.ROM_ROOT` to `broker_dirs["roms"]`: the two fixtures
+    redirect different module globals, and `resolve_rom_file` checks the rom
+    against `retroarch.ROM_ROOT` independently of the route's own ROM_ROOT check.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        ra_dirs: The patched data root.
+        broker_dirs: The redirected ROM root and archive directories.
+
+    Returns:
+        The launched instances.
+    """
+    monkeypatch.setattr(retroarch, "ROM_ROOT", broker_dirs["roms"])
+    launched: list[retroarch.Retroarch] = []
+    monkeypatch.setattr(retroarch.Retroarch, "launch", lambda self, rom, slot: launched.append(self))
+    return launched
+
+
+class TestObserverWiring:
+    """I3: every hook that can learn the running core's real dir is actually wired to it."""
+
+    def test_start_session_calls_adopt_archive_identity_before_launch(
+        self,
+        client: TestClient,
+        broker_dirs: dict[str, Path],
+        no_launch: list[retroarch.Retroarch],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Activate's restore path adopts the archive's session identity before the launch."""
+        calls: list[Any] = []
+        monkeypatch.setattr(
+            retroarch.Retroarch,
+            "adopt_archive_identity",
+            lambda self, identity: calls.append(identity),
+        )
+        archive = tmp_path / "incoming.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("saves/Game.srm", b"sram")
+        game = broker_dirs["roms"] / "Game.sfc"
+        game.write_bytes(b"rom")
+        body = {
+            "session_id": "sess-1", "emulator": "retroarch",
+            "user": {"id": 1, "username": "ana", "display_name": "Ana"},
+            "rom": {"id": 5, "name": "Game", "platform": "snes", "path": str(game)},
+            "save": {"archive": str(archive)},
+        }
+
+        r = client.post(f"{PREFIX}/api/session/activate", json=body)
+
+        assert r.status_code == 200
+        assert len(calls) == 1
+        assert len(no_launch) == 1
+
+    def test_track_first_playing_calls_the_observer_on_playing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Recognizing PLAYING for the first time triggers the library-name observer."""
+        emu = retroarch.Retroarch()
+        emu.platform = "snes"
+        emu._launch_seq = 1
+        calls: list[int] = []
+        monkeypatch.setattr(emu, "_observe_library_name", lambda: calls.append(1))
+        monkeypatch.setattr(emu, "alive", lambda: True)
+        monkeypatch.setattr(
+            emu, "_send", lambda cmd, wait_prefix, timeout: "GET_STATUS PLAYING snes,Game,0"
+        )
+
+        emu._track_first_playing(1)
+
+        assert calls == [1]
+
+    def test_save_into_slot_calls_the_observer_on_the_first_try(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A save confirmed on its first try also triggers the observer."""
+        emu = retroarch.Retroarch()
+        emu.platform = "snes"
+        emu._rom_base = "Game"
+        emu._slot_homed = True
+        calls: list[int] = []
+        monkeypatch.setattr(emu, "alive", lambda: True)
+        monkeypatch.setattr(emu, "_observe_library_name", lambda: calls.append(1))
+        monkeypatch.setattr(emu, "_try_save", lambda: True)
+
+        assert emu._save_into_slot(1.0) is True
+        assert calls == [1]
+
+    def test_save_into_slot_calls_the_observer_after_a_rehomed_retry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The re-homed retry branch (a save that missed its slot) also triggers the observer."""
+        emu = retroarch.Retroarch()
+        emu.platform = "snes"
+        emu._rom_base = "Game"
+        emu._slot_homed = True
+        calls: list[int] = []
+        monkeypatch.setattr(emu, "alive", lambda: True)
+        monkeypatch.setattr(emu, "_observe_library_name", lambda: calls.append(1))
+        monkeypatch.setattr(emu, "_home_state_slot", lambda: True)
+        attempts = iter([False, True])
+        monkeypatch.setattr(emu, "_try_save", lambda: next(attempts))
+
+        assert emu._save_into_slot(1.0) is True
+        assert calls == [1]
+
+    def test_flush_sram_calls_the_observer_on_a_confirmed_flush(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A confirmed SAVE_FILES flush also triggers the observer."""
+        emu = retroarch.Retroarch()
+        emu.platform = "snes"
+        emu._rom_base = "Game"
+        calls: list[int] = []
+        monkeypatch.setattr(emu, "_observe_library_name", lambda: calls.append(1))
+        monkeypatch.setattr(emu, "_send", lambda cmd, wait_prefix, timeout: "OK")
+
+        assert emu._flush_sram() is True
+        assert calls == [1]
+
+
+class TestActivateCore:
+    """`rom.core` through activate."""
+
+    def test_no_core_answers_default(
+        self, client: TestClient, broker_dirs: dict[str, Path], no_launch: list
+    ) -> None:
+        """Response gains core and core_tier; nothing else changes."""
+        r = _ra_activate(client, broker_dirs["roms"])
+        assert r.status_code == 200
+        assert (r.json()["core"], r.json()["core_tier"]) == ("snes9x", "default")
+
+    def test_no_core_response_has_no_library_name(
+        self, client: TestClient, broker_dirs: dict[str, Path], no_launch: list
+    ) -> None:
+        """Activate gains only `core` and `core_tier`, never `library_name`.
+
+        `library_name` belongs to the exit manifest (`_archive_identity`), not
+        the activate response, which adds exactly these two keys.
+        """
+        r = _ra_activate(client, broker_dirs["roms"])
+        assert r.status_code == 200
+        assert "library_name" not in r.json()
+
+    def test_untested_core_launches_with_its_tier(
+        self, client: TestClient, broker_dirs: dict[str, Path], no_launch: list
+    ) -> None:
+        """Nothing blocks an unvetted core."""
+        core = _untested_snes_core()
+        r = _ra_activate(client, broker_dirs["roms"], core=core)
+        assert r.status_code == 200
+        assert (r.json()["core"], r.json()["core_tier"]) == (core, "untested")
+        assert no_launch[0].archive_core() == core
+
+    @pytest.mark.parametrize("core", ["BSNES", "bs nes", "", "../x"])
+    def test_bad_core_name_is_rejected_by_validation(
+        self, client: TestClient, broker_dirs: dict[str, Path], no_launch: list, core: str
+    ) -> None:
+        """RomIn.core must match ^[a-z0-9_]+$."""
+        assert _ra_activate(client, broker_dirs["roms"], core=core).status_code == 422
+        assert no_launch == []
+
+    def test_bad_core_leaves_working_slot_untouched(
+        self, client: TestClient, broker_dirs: dict[str, Path], ra_dirs: Path, no_launch: list
+    ) -> None:
+        """The 422 comes before clear_working_slot."""
+        keep = ra_dirs / "saves" / "Snes9x" / "Game.srm"
+        keep.parent.mkdir(parents=True)
+        keep.write_bytes(b"sram")
+        r = _ra_activate(client, broker_dirs["roms"], core="nosuchcore")
+        assert r.status_code == 422
+        assert "/api/retroarch/cores" in r.json()["detail"]
+        assert keep.read_bytes() == b"sram"
+
+    def test_core_on_a_non_retroarch_emulator_is_422(
+        self, client: TestClient, broker_dirs: dict[str, Path]
+    ) -> None:
+        """Only RetroArch takes a core."""
+        game = broker_dirs["roms"] / "Game.iso"
+        game.write_bytes(b"iso")
+        body = {
+            "session_id": "s", "emulator": "pcsx2",
+            "user": {"id": 1, "username": "a", "display_name": "A"},
+            "rom": {"platform": "ps2", "path": str(game), "core": "x"},
+        }
+        assert client.post(f"{PREFIX}/api/session/activate", json=body).status_code == 422
+
+    @pytest.mark.parametrize("core", ["../x", "Snes9x", "mesen-s", "a b"])
+    def test_import_spec_with_a_malformed_core_is_422(self, client: TestClient, core: str) -> None:
+        """The query core is held to the same `^[a-z0-9_]+$` as `RomIn.core`.
+
+        Args:
+            client: The test client.
+            core: A name no buildbot core could have.
+        """
+        params = {"emulator": "retroarch", "platform": "snes", "core": core}
+        response = client.get(f"{PREFIX}/api/session/import-spec", params=params)
+        assert response.status_code == 422
+        assert response.json()["detail"] == "core must match ^[a-z0-9_]+$"
+
+    def test_import_spec_with_blocked_core_is_422(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Discovery and activate agree."""
+        core = _untested_snes_core()
+        blocked = {core: retroarch_cores.TierEntry("blocked", "x", (), None)}
+        monkeypatch.setattr(retroarch_cores, "TIERS", blocked)
+        params = {"emulator": "retroarch", "platform": "snes", "core": core}
+        assert client.get(f"{PREFIX}/api/session/import-spec", params=params).status_code == 422
+
+    def test_import_spec_with_blocked_core_and_opt_in_is_accepted(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The query opt-in lifts the block, as `rom.experimental_cores` does on activate."""
+        core = _untested_snes_core()
+        blocked = {core: retroarch_cores.TierEntry("blocked", "x", (), None)}
+        monkeypatch.setattr(retroarch_cores, "TIERS", blocked)
+        params = {
+            "emulator": "retroarch", "platform": "snes", "core": core, "experimental_cores": "1"
+        }
+        assert client.get(f"{PREFIX}/api/session/import-spec", params=params).status_code == 200
+
+    def test_import_spec_with_untested_core_offers_srm(self, client: TestClient) -> None:
+        """An untested core still takes a .srm, with a warning at placement."""
+        params = {"emulator": "retroarch", "platform": "snes", "core": _untested_snes_core()}
+        body = client.get(f"{PREFIX}/api/session/import-spec", params=params).json()
+        assert body["kinds"][0]["shapes"] == ["<name>.srm"]
+
+
+def _srm(root: Path, lib: str, stem: str = "Game", mtime: float = 1_000_000.0) -> Path:
+    """Write saves/<lib>/<stem>.srm with a fixed mtime.
+
+    Args:
+        root: The patched data root.
+        lib: The sorted dir.
+        stem: The content stem.
+        mtime: The mtime to set.
+
+    Returns:
+        The path.
+    """
+    path = root / "saves" / lib / f"{stem}.srm"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"sram")
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+def _dump_archive(root: Path, members: Mapping[str, bytes], identity: dict[str, Any]) -> bytes:
+    """Build a save archive from `members`, carrying `identity` in its manifest.
+
+    Args:
+        root: The data root the members are written under before zipping.
+        members: Relative path (e.g. "saves/Snes9x/Game.srm") to file content.
+        identity: The session identity the manifest should record.
+
+    Returns:
+        The archive's zip bytes.
+    """
+    for rel, data in members.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    report = saves.build_save_archive(root, ("states", "saves"), baseline=0, identity=identity)
+    assert report["zip_bytes"] is not None
+    return report["zip_bytes"]
+
+
+class TestCarryOver:
+    """Battery-save carry-over across a core switch."""
+
+    def _emu(self, core: Optional[str]) -> retroarch.Retroarch:
+        emu = _with_core("snes", core)
+        emu.select_core()
+        return emu
+
+    def test_srm_is_copied_to_an_untested_core_with_its_mtime_kept(self, ra_dirs: Path) -> None:
+        """The untested dir is a guess, so the original stays; the mtime keeps both out of the dump."""
+        core = _untested_snes_core()
+        old = _srm(ra_dirs, "Snes9x")
+        emu = self._emu(core)
+        emu.carry_save_across_cores(
+            {"core": "snes9x", "library_name": "Snes9x"}, ra_dirs / "Game.sfc"
+        )
+        new = ra_dirs / "saves" / emu.library_name() / "Game.srm"
+        assert new.read_bytes() == b"sram" and new.stat().st_mtime == 1_000_000.0
+        assert old.read_bytes() == b"sram"
+
+    def test_back_to_default_carries_the_other_way(self, ra_dirs: Path) -> None:
+        """Switching back follows the operator's choice, and a known dir takes a move."""
+        core = _untested_snes_core()
+        emu_new = self._emu(core)
+        source = _srm(ra_dirs, emu_new.library_name())
+        emu = self._emu(None)
+        emu.carry_save_across_cores(
+            {"core": core, "library_name": emu_new.library_name()}, ra_dirs / "Game.sfc"
+        )
+        assert (ra_dirs / "saves" / "Snes9x" / "Game.srm").exists()
+        assert not source.exists()
+
+    def test_a_newer_source_replaces_the_target_and_keeps_a_backup(self, ra_dirs: Path) -> None:
+        """Progress made on the other core wins; the save it replaces stays as .srm.bak."""
+        core = _untested_snes_core()
+        played = _srm(ra_dirs, self._emu(core).library_name(), mtime=2_000_000.0)
+        played.write_bytes(b"newer")
+        os.utime(played, (2_000_000.0, 2_000_000.0))
+        stale = _srm(ra_dirs, "Snes9x")
+        emu = self._emu(None)
+        emu.carry_save_across_cores({"core": core}, ra_dirs / "Game.sfc")
+        assert stale.read_bytes() == b"newer" and stale.stat().st_mtime == 2_000_000.0
+        backup = stale.with_name("Game.srm.bak")
+        assert backup.read_bytes() == b"sram" and backup.stat().st_mtime == 1_000_000.0
+
+    @pytest.mark.parametrize("source_mtime", [1_000_000.0, 2_000_000.0])
+    def test_a_target_as_new_as_the_source_is_kept(self, ra_dirs: Path, source_mtime: float) -> None:
+        """Never overwrite a save with one that is not strictly newer."""
+        core = _untested_snes_core()
+        emu = self._emu(core)
+        old = _srm(ra_dirs, "Snes9x", mtime=source_mtime)
+        target = _srm(ra_dirs, emu.library_name(), mtime=2_000_000.0)
+        emu.carry_save_across_cores({"core": "snes9x"}, ra_dirs / "Game.sfc")
+        assert old.exists() and target.stat().st_mtime == 2_000_000.0
+        assert not target.with_name("Game.srm.bak").exists()
+
+    @pytest.mark.parametrize("identity", [None, {}, {"core": None}])
+    def test_manifest_without_core_changes_nothing(
+        self, ra_dirs: Path, identity: Optional[dict]
+    ) -> None:
+        """Legacy archives are left as they are."""
+        old = _srm(ra_dirs, "Snes9x")
+        self._emu(_untested_snes_core()).carry_save_across_cores(identity, ra_dirs / "Game.sfc")
+        assert old.exists()
+
+    @pytest.mark.parametrize("bad_core", [["snes9x"], {"snes9x": 1}])
+    def test_a_manifest_core_that_is_not_a_string_carries_nothing(
+        self, ra_dirs: Path, caplog: pytest.LogCaptureFixture, bad_core: object
+    ) -> None:
+        """An unhashable manifest core is logged and skipped, never a TypeError that fails activate."""
+        old = _srm(ra_dirs, "Snes9x")
+        with caplog.at_level(logging.WARNING):
+            self._emu(_untested_snes_core()).carry_save_across_cores(
+                {"core": bad_core}, ra_dirs / "Game.sfc"
+            )
+        assert old.read_bytes() == b"sram"
+        assert "not a core name" in caplog.text
+
+    def test_several_candidates_carry_nothing(
+        self, ra_dirs: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An unresolvable old core with two .srm dirs is ambiguous."""
+        a, b = _srm(ra_dirs, "A"), _srm(ra_dirs, "B")
+        with caplog.at_level(logging.INFO):
+            self._emu(None).carry_save_across_cores({"core": "gone_core"}, ra_dirs / "Game.sfc")
+        assert a.exists() and b.exists() and "several" in caplog.text
+
+    def test_single_candidate_is_used_when_old_core_is_unknown(self, ra_dirs: Path) -> None:
+        """The archive's own saves/*/<stem>.srm, when exactly one exists."""
+        _srm(ra_dirs, "Whatever")
+        self._emu(None).carry_save_across_cores({"core": "gone_core"}, ra_dirs / "Game.sfc")
+        assert (ra_dirs / "saves" / "Snes9x" / "Game.srm").exists()
+
+    @pytest.mark.parametrize("bad_lib", ["../x", "a\\b"])
+    def test_bad_manifest_library_name_falls_through_to_the_profile(
+        self, ra_dirs: Path, bad_lib: str
+    ) -> None:
+        """An unsafe manifest library_name is ignored, not joined into a path."""
+        core = _untested_snes_core()
+        old = _srm(ra_dirs, "Snes9x")
+        emu = self._emu(core)
+        emu.carry_save_across_cores(
+            {"core": "snes9x", "library_name": bad_lib}, ra_dirs / "Game.sfc"
+        )
+        new = ra_dirs / "saves" / emu.library_name() / "Game.srm"
+        assert new.read_bytes() == b"sram" and old.read_bytes() == b"sram"
+
+    def test_glob_metacharacters_in_the_stem_do_not_confuse_the_single_candidate_fallback(
+        self, ra_dirs: Path
+    ) -> None:
+        """A stem with glob metacharacters still resolves through the single-candidate path."""
+        stem = "Game [USA]*"
+        _srm(ra_dirs, "Whatever", stem=stem)
+        self._emu(None).carry_save_across_cores({"core": "gone_core"}, ra_dirs / f"{stem}.sfc")
+        assert (ra_dirs / "saves" / "Snes9x" / f"{stem}.srm").exists()
+
+    def test_save_ram_false_target_carries_nothing(
+        self, ra_dirs: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A core that never reads .srm gets none."""
+        old = _srm(ra_dirs, "Snes9x")
+        emu = self._emu(None)
+        monkeypatch.setattr(
+            emu,
+            "_profile",
+            lambda: {
+                **retroarch.PLATFORMS["snes"],
+                "core": "x",
+                "library_name": "X",
+                "save_ram": False,
+                "tier": "vetted",
+            },
+        )
+        emu.carry_save_across_cores({"core": "snes9x"}, ra_dirs / "Game.sfc")
+        assert old.exists()
+
+    def test_an_unsafe_target_library_name_carries_nothing(
+        self, ra_dirs: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """I2: a new library_name that could leave saves/ is never joined into the move target."""
+        old = _srm(ra_dirs, "Snes9x")
+        emu = self._emu(_untested_snes_core())
+        monkeypatch.setattr(emu, "library_name", lambda: "../escaped")
+        with caplog.at_level(logging.WARNING):
+            emu.carry_save_across_cores({"core": "snes9x"}, ra_dirs / "Game.sfc")
+        assert old.read_bytes() == b"sram"
+        assert not (ra_dirs / "escaped").exists()
+        assert "unsafe library_name" in caplog.text
+
+    def test_a_failed_move_is_logged_and_never_raises(
+        self, ra_dirs: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A carry is best effort; an OSError must not fail activate, and the save stays put."""
+        old = _srm(ra_dirs, "Snes9x")
+        emu = self._emu(_untested_snes_core())
+
+        def refuse(src: Any, dst: Any) -> None:
+            """Fail every copy, as a read-only or full share would.
+
+            Args:
+                src: The source path.
+                dst: The destination path.
+
+            Raises:
+                OSError: Always.
+            """
+            raise OSError(30, "Read-only file system")
+
+        monkeypatch.setattr(retroarch.shutil, "copy2", refuse)
+        with caplog.at_level(logging.WARNING):
+            emu.carry_save_across_cores({"core": "snes9x"}, ra_dirs / "Game.sfc")
+        assert old.read_bytes() == b"sram"
+        assert "no .srm carried from" in caplog.text and "Read-only file system" in caplog.text
+
+    def test_switch_keeps_srm_and_ignores_old_state(
+        self,
+        client: TestClient,
+        broker_dirs: dict[str, Path],
+        ra_dirs: Path,
+        no_launch: list,
+    ) -> None:
+        """Activate with an archive dumped by snes9x onto an untested core."""
+        core = _untested_snes_core()
+        archive = _dump_archive(
+            ra_dirs,
+            {"saves/Snes9x/Game.srm": b"sram", "states/Snes9x/Game.state": b"old"},
+            identity={
+                "emulator": "retroarch",
+                "core": "snes9x",
+                "platform": "snes",
+                "library_name": "Snes9x",
+            },
+        )
+        path = broker_dirs["imports"] / "a.zip"
+        path.write_bytes(archive)
+        game = broker_dirs["roms"] / "Game.sfc"
+        game.write_bytes(b"rom")
+        body = {
+            "session_id": "s",
+            "emulator": "retroarch",
+            "user": {"id": 1, "username": "a", "display_name": "A"},
+            "rom": {"platform": "snes", "path": str(game), "core": core},
+            "save": {"archive": str(path)},
+        }
+        assert client.post(f"{PREFIX}/api/session/activate", json=body).status_code == 200
+        emu = no_launch[0]
+        emu._rom_base = "Game"
+        assert (ra_dirs / "saves" / emu.library_name() / "Game.srm").read_bytes() == b"sram"
+        assert emu.state_path() is None
+
+
+class TestStateCoreHeader:
+    """Per-platform RetroArch libretro core override (section 8.3)."""
+
+    def _running(
+        self,
+        client: TestClient,
+        broker_dirs: dict[str, Path],
+        ra_dirs: Path,
+        no_launch: list[retroarch.Retroarch],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> retroarch.Retroarch:
+        """Activate a game, stub the emulator as running, and return it.
+
+        Args:
+            client: The test client.
+            broker_dirs: The redirected ROM root and archive directories.
+            ra_dirs: The patched data root.
+            no_launch: The launched instances list.
+            monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            The active emulator.
+        """
+        assert _ra_activate(client, broker_dirs["roms"]).status_code == 200
+        emu = no_launch[0]
+        emu._rom_base = "Game"
+        monkeypatch.setattr(emu, "alive", lambda: True)
+        emu.check_state_bytes = lambda head: True
+        return emu
+
+    def test_get_names_the_core(
+        self,
+        client: TestClient,
+        broker_dirs: dict[str, Path],
+        ra_dirs: Path,
+        no_launch: list[retroarch.Retroarch],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """GET state-file sets X-State-Core header to the running core."""
+        self._running(client, broker_dirs, ra_dirs, no_launch, monkeypatch)
+        _state(ra_dirs, "Snes9x")
+        r = client.get(f"{PREFIX}/api/session/state-file", params={"slot": 0})
+        assert r.headers["X-State-Core"] == "snes9x"
+
+    def test_put_with_another_core_is_409_and_writes_nothing(
+        self,
+        client: TestClient,
+        broker_dirs: dict[str, Path],
+        ra_dirs: Path,
+        no_launch: list[retroarch.Retroarch],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """PUT state-file returns 409 when core in header differs from running core."""
+        self._running(client, broker_dirs, ra_dirs, no_launch, monkeypatch)
+        r = client.put(
+            f"{PREFIX}/api/session/state-file",
+            params={"filename": "Game.state"},
+            content=b"state",
+            headers={"X-State-Core": "bsnes"},
+        )
+        assert r.status_code == 409
+        assert r.json()["detail"]["error"] == "state_core_mismatch"
+        assert not list((ra_dirs / "states").rglob("Game.state"))
+
+    def test_put_without_the_header_behaves_as_before(
+        self,
+        client: TestClient,
+        broker_dirs: dict[str, Path],
+        ra_dirs: Path,
+        no_launch: list[retroarch.Retroarch],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """PUT state-file without X-State-Core header accepts the state."""
+        self._running(client, broker_dirs, ra_dirs, no_launch, monkeypatch)
+        r = client.put(
+            f"{PREFIX}/api/session/state-file",
+            params={"filename": "Game.state"},
+            content=b"state",
+        )
+        assert r.status_code != 409

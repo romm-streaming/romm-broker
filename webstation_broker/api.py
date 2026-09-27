@@ -27,8 +27,8 @@ from pydantic import BaseModel, Field, field_validator
 from starlette.websockets import WebSocketState
 
 from . import callback, imports, memcard, saves, screenshot, selkies, session, settings
-from .emulators import get_emulator
-from .emulators.base import STATE_HEAD_BYTES, Emulator, reap_orphan
+from .emulators import get_emulator, retroarch, retroarch_cores
+from .emulators.base import STATE_HEAD_BYTES, CoreRejectedError, Emulator, reap_orphan
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -121,6 +121,8 @@ class RomIn(BaseModel):
         save_target: RomM's name for where this game keeps its saves, if it has one.
         save_target_layout: How `save_target` names that place; see `KNOWN_SAVE_TARGET_LAYOUTS`.
         path: Absolute container path to the rom, validated against ROM_ROOT on activate.
+        core: The libretro core to boot instead of the platform's default (RetroArch only).
+        experimental_cores: RomM's opt-in to a core the broker lists as known broken.
     """
 
     id: Optional[int] = None
@@ -141,6 +143,10 @@ class RomIn(BaseModel):
     save_target_layout: Optional[str] = None
     """How `save_target` names that place; see `KNOWN_SAVE_TARGET_LAYOUTS`."""
     path: str
+    core: Optional[str] = None
+    """The libretro core to boot instead of the platform's default (RetroArch only)."""
+    experimental_cores: bool = False
+    """RomM's opt-in to a core the broker lists as known broken."""
 
     @field_validator("save_target_layout")
     @classmethod
@@ -155,6 +161,24 @@ class RomIn(BaseModel):
         """
         if value is not None and value not in KNOWN_SAVE_TARGET_LAYOUTS:
             log.warning("activate: unknown save_target_layout %r, passing it through", value)
+        return value
+
+    @field_validator("core")
+    @classmethod
+    def _check_core(cls, value: Optional[str]) -> Optional[str]:
+        """Refuse a core name the buildbot could not have.
+
+        Args:
+            value: The core RomM sent.
+
+        Returns:
+            The value, unchanged.
+
+        Raises:
+            ValueError: When it does not match `^[a-z0-9_]+$`.
+        """
+        if value is not None and not retroarch_cores.CORE_NAME_RE.match(value):
+            raise ValueError("core must match ^[a-z0-9_]+$")
         return value
 
 
@@ -403,14 +427,16 @@ def _archive_identity(sess: dict[str, Any], emulator: Emulator) -> dict[str, Any
         emulator: The emulator that just exited.
 
     Returns:
-        The emulator, its core (for a launcher that fronts many), the platform,
-        the ROM's RomM id, name and file, and the state slot the archive was
-        taken in.
+        The emulator, its core (for a launcher that fronts many) with the
+        core's tier and library name when the emulator identifies one, the
+        platform, the ROM's RomM id, name and file, and the state slot the
+        archive was taken in.
     """
     rom = sess.get("rom") or {}
     return {
         "emulator": emulator.name,
         "core": emulator.archive_core(),
+        **emulator.core_identity(),
         "platform": rom.get("platform"),
         "rom_id": rom.get("id"),
         "rom": rom.get("name"),
@@ -524,6 +550,23 @@ async def activate(
         return await _start_session(body, request)
 
 
+def _select_core(emulator: Emulator, route: str) -> None:
+    """Resolve the emulator's requested core, answering 422 when it will not launch.
+
+    Args:
+        emulator: The emulator, with `platform`, `core` and `experimental_cores` set.
+        route: The route name the refusal is logged under.
+
+    Raises:
+        HTTPException: 422 with the player-facing detail when the core is refused.
+    """
+    try:
+        emulator.select_core()
+    except CoreRejectedError as exc:
+        log.warning("%s: %s", route, exc.detail)
+        raise HTTPException(status_code=422, detail=exc.detail)
+
+
 async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     """Do the launch itself, with the session lock already held.
 
@@ -543,14 +586,16 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
         A dict with `status`, `session_id`, `rom_file`, `save_restore` (the
         restore report, its `imported` a list of `{member, dest, sidecars}`
         for each placed import, or None when nothing was restored),
-        `save_restore_skipped`, `selkies_tokens_pushed` and the controller's
-        landing `url`.
+        `save_restore_skipped`, `selkies_tokens_pushed`, the controller's
+        landing `url`, `core` (the resolved libretro core, for RetroArch) and
+        `core_tier` when the emulator identifies one.
 
     Raises:
         HTTPException: 409 when a session is already active; 422 for an unknown
-            emulator, a missing rom on an emulator that needs one, no bootable
-            file, or a failed restore; 422 with an `import_refused` body when
-            an archive's declared imports cannot be placed; 500 with
+            emulator, a core the emulator will not take or launch, a missing
+            rom on an emulator that needs one, no bootable file, or a failed
+            restore; 422 with an `import_refused` body when an archive's
+            declared imports cannot be placed; 500 with
             `import_preflight_failed` when placing them crashed; 400 for a rom
             path that cannot be resolved or lies outside ROM_ROOT; 404 for a
             rom path or save archive that does not exist.
@@ -582,6 +627,11 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     if body.rom is not None:
         emulator.platform = body.rom.platform
         emulator.language = body.rom.language
+        emulator.core = body.rom.core
+        emulator.experimental_cores = body.rom.experimental_cores
+    # Before resolve_rom_file and long before clear_working_slot: a core
+    # that will not launch must leave the working slot as it was.
+    _select_core(emulator, "activate")
 
     rom_file = None
     if emulator.requires_rom:
@@ -615,7 +665,7 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
                     " RomM's config.yml"
                 ),
             )
-        rom_file = emulator.resolve_rom_file(rom_path)
+        rom_file = await anyio.to_thread.run_sync(emulator.resolve_rom_file, rom_path)
         if rom_file is None:
             log.debug(
                 "activate: no bootable file found under %s for %s", rom_path, body.emulator
@@ -636,6 +686,7 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     # has to fail with the slot still holding whatever it held.
     content = None
     restore_skipped = None
+    archive_identity = None
     if save and save.archive:
         archive_path = Path(save.archive)
         if subtrees:
@@ -645,6 +696,10 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
                     status_code=404, detail=f"save archive not found: {save.archive}"
                 )
             content = await anyio.to_thread.run_sync(archive_path.read_bytes)
+            archive_identity = await anyio.to_thread.run_sync(
+                saves.archive_session_identity, content
+            )
+            emulator.adopt_archive_identity(archive_identity)
         else:
             # Dropping the archive and still answering "launching" is how a
             # player ends up booting a fresh save with nothing to tell them.
@@ -838,6 +893,9 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
         ]
         log.info("save restore: %s", restore_report)
 
+    if content is not None:
+        await anyio.to_thread.run_sync(emulator.carry_save_across_cores, archive_identity, rom_file)
+
     payload = body.model_dump()
     payload["callback"] = _resolve_callback(body.callback, request)
     sess = session.new_session(
@@ -873,6 +931,9 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
 
     tokens_pushed = await _push_seat_tokens(sess, "activate")
 
+    # core_identity() also carries library_name, which belongs in the exit
+    # manifest but not here: only core and its tier are activate's contract.
+    ident = emulator.core_identity()
     return {
         "status": "launching",
         "session_id": sess["id"],
@@ -881,6 +942,8 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
         "save_restore_skipped": restore_skipped,
         "selkies_tokens_pushed": tokens_pushed,
         "url": _landing_url(sess["controller_token"]),
+        "core": emulator.archive_core(),
+        **({"core_tier": ident["core_tier"]} if "core_tier" in ident else {}),
     }
 
 
@@ -1673,13 +1736,17 @@ async def get_state_file(x_broker_secret: Optional[str] = Header(default=None)) 
             log.error("state-file: could not read %s: %s", path, exc)
             raise HTTPException(status_code=500, detail="could not read state file")
         log.info("state-file: serving %s (%d bytes)", path.name, len(body))
+        headers = {
+            "X-State-Filename": _header_token(path.name, "state"),
+            "X-State-Slot": str(emulator.state_slot),
+        }
+        core = emulator.archive_core()
+        if core:
+            headers["X-State-Core"] = core
         return Response(
             content=body,
             media_type="application/octet-stream",
-            headers={
-                "X-State-Filename": _header_token(path.name, "state"),
-                "X-State-Slot": str(emulator.state_slot),
-            },
+            headers=headers,
         )
 
 
@@ -1732,6 +1799,7 @@ async def put_state_file(
     request: Request,
     filename: str = Query(...),
     x_broker_secret: Optional[str] = Header(default=None),
+    x_state_core: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     """Write a state RomM is sending back into the working slot.
 
@@ -1745,17 +1813,19 @@ async def put_state_file(
         request: The request whose raw body is the state file, streamed to disk.
         filename: The name RomM filed the state under; only its basename is used.
         x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
+        x_state_core: The core that wrote the state, from X-State-Core header; when
+            set and different from the running core, the push is refused.
 
     Returns:
         A dict with `status`, the `filename` it was stored under and the `slot`.
 
     Raises:
         HTTPException: 403 on a bad secret; 409 when no session is active, the
-            emulator is not running, or another session operation is in flight;
-            400 when the emulator has no save states, the name is not one it
-            would write, the body is empty, or the state opens as another game's;
-            413 when the body exceeds STATE_FILE_MAX_BYTES; 500 when the file
-            cannot be written.
+            emulator is not running, another session operation is in flight, or
+            the sent state is from a different core; 400 when the emulator has
+            no save states, the name is not one it would write, the body is
+            empty, or the state opens as another game's; 413 when the body
+            exceeds STATE_FILE_MAX_BYTES; 500 when the file cannot be written.
     """
     _check_secret(x_broker_secret)
     # Held across the upload, not just the rename: the slot this publishes into
@@ -1763,6 +1833,22 @@ async def put_state_file(
     # a teardown hands RomM back a different state than the one it just took.
     with _session_operation("state-file push"):
         emulator = _state_emulator()
+        running_core = emulator.archive_core()
+        if (x_state_core is not None and running_core is not None
+                and x_state_core != running_core):
+            log.warning(
+                "state-file push refused: state is from core %s, %s is running",
+                x_state_core,
+                running_core,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "state_core_mismatch",
+                    "expected": running_core,
+                    "got": x_state_core,
+                },
+            )
         name = Path(filename).name
         target = emulator.state_target(name)
         if target is None:
@@ -1824,6 +1910,7 @@ async def put_state_file(
             log.error("state-file: could not write %s: %s", target, exc)
             raise HTTPException(status_code=500, detail="could not write state file")
 
+        emulator.note_broker_state_write(target)
         log.info("state-file: stored %s (%d bytes)", target.name, written)
         return {"status": "ok", "filename": target.name, "slot": emulator.state_slot}
 
@@ -1909,6 +1996,8 @@ def _memory_card(name: str, platform: Optional[str]) -> tuple[Path, Optional[str
 async def get_import_spec(
     emulator: str = Query(...),
     platform: Optional[str] = Query(default=None),
+    core: Optional[str] = Query(default=None),
+    experimental_cores: bool = Query(default=False),
     x_broker_secret: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     """Tell RomM what an emulator accepts as a declared import, before it builds an archive.
@@ -1916,6 +2005,10 @@ async def get_import_spec(
     Args:
         emulator: The emulator's name.
         platform: The platform slug, for an emulator whose spec depends on it.
+        core: The libretro core RomM would activate with (RetroArch only), so
+            discovery and activate agree on whether it is offered.
+        experimental_cores: RomM's opt-in to a core the broker lists as known
+            broken, lifting the same block `rom.experimental_cores` lifts.
         x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
@@ -1924,14 +2017,24 @@ async def get_import_spec(
         archive) and every refusal code.
 
     Raises:
-        HTTPException: 403 on a bad secret; 422 for an unknown emulator.
+        HTTPException: 403 on a bad secret; 422 for an unknown emulator, a
+            `core` that is not a core name (`^[a-z0-9_]+$`, as `RomIn.core`),
+            or a core that emulator will not take or launch.
     """
     _check_secret(x_broker_secret)
+    # Checked here rather than with a Query pattern so a bad secret is still
+    # answered 403 first, and before `core` is set on the shared instance.
+    if core is not None and not retroarch_cores.CORE_NAME_RE.match(core):
+        log.warning("import-spec: refusing core %r: not a core name", core)
+        raise HTTPException(status_code=422, detail="core must match ^[a-z0-9_]+$")
     inst = get_emulator(emulator)
     if inst is None:
         log.debug("import-spec: unknown emulator: %s", emulator)
         raise HTTPException(status_code=422, detail=f"unknown emulator: {emulator}")
     inst.platform = platform
+    inst.core = core
+    inst.experimental_cores = experimental_cores
+    _select_core(inst, "import-spec")
     spec = inst.import_spec()
     return {
         "import_api": 1,
@@ -1944,6 +2047,43 @@ async def get_import_spec(
         "state_slot": inst.state_slot if (inst.supports_states or spec.state_channel == "archive") else None,
         "reasons": sorted(imports.REASONS),
     }
+
+
+@router.get("/api/retroarch/cores")
+def get_retroarch_cores(
+    platform: Optional[str] = Query(default=None),
+    x_broker_secret: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    """List the libretro cores an operator may set with `core:`, by tier.
+
+    Args:
+        platform: One RomM platform slug, or None for every platform.
+        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
+
+    Returns:
+        For one platform, its `default` core and `cores` rows; for none,
+        `platforms` mapping every slug to the same.
+
+    Raises:
+        HTTPException: 403 on a bad secret; 404 for a platform RetroArch does not serve.
+    """
+    _check_secret(x_broker_secret)
+    table, cat, tiers = retroarch.PLATFORMS, retroarch_cores.catalog(), retroarch_cores.TIERS
+
+    def one(slug: str) -> dict[str, Any]:
+        """One platform's default core and its cores list."""
+        return {
+            "default": table[slug]["core"],
+            "cores": retroarch_cores.cores_for_platform(table, slug, cat, tiers),
+        }
+
+    if platform is None:
+        return {"platforms": {slug: one(slug) for slug in sorted(table)}}
+    slug = platform.lower()
+    if slug not in table:
+        log.debug("retroarch cores: no core for platform %r", platform)
+        raise HTTPException(status_code=404, detail=f"RetroArch has no core for platform {platform!r}")
+    return {"platform": slug, **one(slug)}
 
 
 @router.get("/api/session/memory-card")

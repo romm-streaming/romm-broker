@@ -26,7 +26,7 @@ from fastapi.testclient import TestClient
 
 from webstation_broker import imports, saves, screenshot, selkies, session, settings
 from webstation_broker.app import create_app
-from webstation_broker.emulators import base, xemu
+from webstation_broker.emulators import base, retroarch, retroarch_cores, xemu
 from webstation_broker.emulators.base import Emulator
 
 PREFIX = settings.PREFIX
@@ -318,6 +318,31 @@ def no_selkies(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def clean_retroarch_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the RetroArch core catalog settings, so a developer's shell never changes a test.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher, undone when the test ends.
+    """
+    monkeypatch.setattr(settings, "RETROARCH_EXPERIMENTAL_CORES", False)
+    monkeypatch.setattr(settings, "RETROARCH_CORE_INFO_REFRESH", False)
+
+
+@pytest.fixture(autouse=True)
+def clean_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reset the module-global RetroArch core catalog before and after every test.
+
+    `retroarch_cores._catalog` is module-global state, so a test's `set_catalog`
+    would otherwise leak into the next one.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher, undone (restoring the pre-test
+            value, which this same fixture already reset to None) when the test ends.
+    """
+    monkeypatch.setattr(retroarch_cores, "_catalog", None)
+
+
+@pytest.fixture(autouse=True)
 def pid_record(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """Point the emulator pid record at tmp_path and hand back its path.
 
@@ -604,13 +629,20 @@ def fake_emulator(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[FakeE
 
 
 @pytest.fixture
-def client(broker_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+def client(
+    broker_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Iterator[TestClient]:
     """Serve the app through a TestClient with no secret and dev mode off.
+
+    Also redirects RetroArch's data dir and core dir into tmp_path before the
+    app starts, so the lifespan's core catalog load never reads a real
+    container's config tree.
 
     Args:
         broker_dirs: The redirected ROM root and archive directories. Requested so they exist before
             the app starts.
         monkeypatch: Pytest's attribute patcher, undone when the test ends.
+        tmp_path: The per-test temporary directory.
 
     Yields:
         A client whose app lifespan is running for the duration of the test.
@@ -620,6 +652,8 @@ def client(broker_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch) -> Ite
     # the very shape these tests drive the unauthenticated routes in. Dev mode
     # covers the construction and comes straight back off for the requests.
     monkeypatch.setattr(settings, "DEV_MODE", True)
+    monkeypatch.setattr(retroarch, "RA_DATA_DIR", tmp_path / "retroarch_data")
+    monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path / "retroarch_cores")
     app = create_app()
     monkeypatch.setattr(settings, "DEV_MODE", False)
     with TestClient(app) as c:

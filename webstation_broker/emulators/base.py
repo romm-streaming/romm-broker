@@ -12,13 +12,27 @@ import shutil
 import signal
 import subprocess
 import time
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping
 from pathlib import Path
 from typing import Any, Optional, Union
 
 from .. import imports, memcard
 
 log = logging.getLogger(__name__)
+
+
+class CoreRejectedError(ValueError):
+    """A `core:` the broker will not launch on this platform; `detail` is shown to the player."""
+
+    def __init__(self, detail: str) -> None:
+        """Keep the detail for the 422.
+
+        Args:
+            detail: The message, naming the options.
+        """
+        super().__init__(detail)
+        self.detail = detail
+
 
 XDG_RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/config/.XDG")
 """The session's runtime directory, from `XDG_RUNTIME_DIR` (default `/config/.XDG`)."""
@@ -726,6 +740,13 @@ class Emulator:
     assigns it whether or not the emulator reads it, and a reader of any
     subclass has to be able to find where it comes from.
     """
+    core: Optional[str] = None
+    """The core RomM asked for (`rom.core`), for a launcher that fronts many; None for its default.
+
+    Set by the activate route and the import-spec route, like `platform`.
+    """
+    experimental_cores: bool = False
+    """Whether RomM opted this launch in to known-broken cores (`rom.experimental_cores`)."""
     language: Optional[str] = None
     """The language the rom was activated for, or None.
 
@@ -1074,6 +1095,21 @@ class Emulator:
         """
         return None
 
+    def note_broker_state_write(self, path: Path) -> None:
+        """Record that the broker itself just wrote `path` as a state file.
+
+        Called right after a mid-session state push (the state-file PUT
+        route) lands the file on disk. An implementation that infers where a
+        core actually saves by watching the filesystem needs to tell its own
+        writes apart from the core's, since a push the broker made itself
+        proves nothing about the core's own behavior. The default does
+        nothing, for implementations with no such inference to protect.
+
+        Args:
+            path: The state file's path, as returned by `state_target`.
+        """
+        return None
+
     def lock_for_state_write(self) -> bool:
         """Take whatever lock a pushed state file should hold before it overwrites the working slot.
 
@@ -1239,6 +1275,35 @@ class Emulator:
         """
         return memcard.Placement({name: name for name in heads})
 
+    def select_core(self) -> None:
+        """Resolve `core` for this launch, before anything is cleared.
+
+        Default: a launcher that is its own backend takes no core.
+
+        Raises:
+            CoreRejectedError: When `core` is set.
+        """
+        if self.core is not None:
+            raise CoreRejectedError(f"emulator {self.name} does not take a core")
+
+    def core_identity(self) -> dict[str, Any]:
+        """Extra manifest and activate-response fields describing the running core.
+
+        Returns:
+            Nothing by default.
+        """
+        return {}
+
+    def adopt_archive_identity(self, identity: Optional[Mapping[str, Any]]) -> None:
+        """Learn from the restored archive's session identity, before the launch.
+
+        Default: nothing. A launcher that fronts many cores reads the
+        previous session's core here.
+
+        Args:
+            identity: The restored archive's manifest `session`, or None.
+        """
+
     def archive_core(self) -> Optional[str]:
         """The core or backend actually running the game, or None.
 
@@ -1250,6 +1315,19 @@ class Emulator:
             The core name, or None for emulators that are their own backend.
         """
         return None
+
+    def carry_save_across_cores(
+        self, identity: Optional[Mapping[str, Any]], rom_file: Optional[Path]
+    ) -> None:
+        """Move a battery save into the new core's save dir on a core switch.
+
+        Default: nothing. A launcher that fronts many cores, each sorting its
+        saves under its own dir, overrides this to carry the file across.
+
+        Args:
+            identity: The restored archive's manifest `session`, or None.
+            rom_file: The file being booted, or None.
+        """
 
     def save_file_kind(self, rel: str) -> str:
         """What an archive member holds, for the manifest the parent reads.

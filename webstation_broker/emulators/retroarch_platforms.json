@@ -21,25 +21,29 @@
     "core": "snes9x",
     "library_name": "Snes9x",
     "save_ram": true,
-    "extensions": [".sfc", ".smc", ".fig", ".swc", ".st", ".gd3", ".gd7", ".dx2", ".bs", ".bin"]
+    "extensions": [".sfc", ".smc", ".fig", ".swc", ".st", ".gd3", ".gd7", ".dx2", ".bs", ".bin"],
+    "extra_extensions": [".gd3", ".gd7", ".dx2", ".bin"]
   },
   "sfam": {
     "core": "snes9x",
     "library_name": "Snes9x",
     "save_ram": true,
-    "extensions": [".sfc", ".smc", ".fig", ".swc", ".st", ".gd3", ".gd7", ".dx2", ".bs", ".bin"]
+    "extensions": [".sfc", ".smc", ".fig", ".swc", ".st", ".gd3", ".gd7", ".dx2", ".bs", ".bin"],
+    "extra_extensions": [".gd3", ".gd7", ".dx2", ".bin"]
   },
   "n64": {
     "core": "mupen64plus_next",
     "library_name": "Mupen64Plus-Next",
     "save_ram": true,
-    "extensions": [".n64", ".z64", ".v64", ".rom", ".ndd"]
+    "extensions": [".n64", ".z64", ".v64", ".rom", ".ndd"],
+    "extra_extensions": [".rom"]
   },
   "ngc": {
     "core": "dolphin",
     "library_name": "dolphin-emu",
     "save_ram": false,
     "extensions": [".rvz", ".gcz", ".iso", ".gcm", ".wbfs", ".ciso", ".chd", ".wad", ".dol", ".elf"],
+    "extra_extensions": [".chd"],
     "save_subtrees": [
       "states",
       "saves/dolphin-emu/User/GC",
@@ -52,6 +56,7 @@
     "library_name": "dolphin-emu",
     "save_ram": false,
     "extensions": [".rvz", ".gcz", ".iso", ".gcm", ".wbfs", ".ciso", ".chd", ".wad", ".dol", ".elf"],
+    "extra_extensions": [".chd"],
     "save_subtrees": [
       "states",
       "saves/dolphin-emu/User/GC",
@@ -75,7 +80,8 @@
     "core": "mgba",
     "library_name": "mGBA",
     "save_ram": true,
-    "extensions": [".gba", ".agb"]
+    "extensions": [".gba", ".agb"],
+    "extra_extensions": [".agb"]
   },
   "virtualboy": {
     "core": "mednafen_vb",
@@ -87,7 +93,8 @@
     "core": "melondsds",
     "library_name": "melonDS DS",
     "save_ram": true,
-    "extensions": [".nds", ".srl"]
+    "extensions": [".nds", ".srl"],
+    "extra_extensions": [".srl"]
   },
   "nintendo-dsi": {
     "core": "melondsds",
@@ -153,19 +160,22 @@
     "library_name": "Flycast",
     "save_ram": false,
     "extensions": [".m3u", ".gdi", ".cdi", ".chd", ".cue", ".iso", ".bin"],
+    "extra_extensions": [".iso"],
     "core_options": {"flycast_per_content_vmus": "All VMUs"}
   },
   "saturn": {
     "core": "yabasanshiro",
     "library_name": "YabaSanshiro",
     "save_ram": false,
-    "extensions": [".m3u", ".cue", ".chd", ".iso", ".bin", ".ccd", ".toc"]
+    "extensions": [".m3u", ".cue", ".chd", ".iso", ".bin", ".ccd", ".toc"],
+    "extra_extensions": [".m3u", ".toc"]
   },
   "psx": {
     "core": "swanstation",
     "library_name": "SwanStation",
     "save_ram": true,
-    "extensions": [".m3u", ".chd", ".cue", ".pbp", ".ccd", ".mds", ".iso", ".img", ".ecm", ".bin", ".exe", ".psexe"]
+    "extensions": [".m3u", ".chd", ".cue", ".pbp", ".ccd", ".mds", ".iso", ".img", ".ecm", ".bin", ".exe", ".psexe"],
+    "extra_extensions": [".ccd"]
   },
   "psp": {
     "core": "ppsspp",
@@ -350,7 +360,8 @@
     "core": "fbneo",
     "library_name": "FinalBurn Neo",
     "save_ram": false,
-    "extensions": [".zip", ".7z", ".chd"]
+    "extensions": [".zip", ".7z", ".chd"],
+    "extra_extensions": [".chd"]
   },
   "cps1": {
     "core": "fbneo",
@@ -374,7 +385,8 @@
     "core": "mednafen_pcfx",
     "save_ram": false,
     "library_name": "Beetle PC-FX",
-    "extensions": [".m3u", ".cue", ".chd", ".ccd", ".toc"]
+    "extensions": [".m3u", ".cue", ".chd", ".ccd", ".toc"],
+    "extra_extensions": [".m3u"]
   },
   "appleii": {
     "core": "applewin",
@@ -390,7 +402,8 @@
     "core": "freechaf",
     "save_ram": false,
     "library_name": "FreeChaF",
-    "extensions": [".bin", ".chf", ".zip"]
+    "extensions": [".bin", ".chf", ".zip"],
+    "extra_extensions": [".zip"]
   },
   "pc-9800-series": {
     "core": "np2kai",
@@ -408,19 +421,22 @@
     "core": "px68k",
     "save_ram": false,
     "library_name": "PX68k",
-    "extensions": [".dim", ".img", ".d88", ".88d", ".hdm", ".dup", ".2hd", ".xdf", ".hdf", ".cmd", ".m3u", ".zip"]
+    "extensions": [".dim", ".img", ".d88", ".88d", ".hdm", ".dup", ".2hd", ".xdf", ".hdf", ".cmd", ".m3u", ".zip"],
+    "extra_extensions": [".zip"]
   },
   "arcadia-2001": {
     "core": "amiarcadia",
     "save_ram": false,
     "library_name": "AmiArcadia",
-    "extensions": [".bin", ".tvc", ".zip"]
+    "extensions": [".bin", ".tvc", ".zip"],
+    "extra_extensions": [".zip"]
   },
   "supervision": {
     "core": "potator",
     "save_ram": false,
     "library_name": "Potator",
-    "extensions": [".sv", ".bin", ".zip", ".7z"]
+    "extensions": [".sv", ".bin", ".zip", ".7z"],
+    "extra_extensions": [".zip", ".7z"]
   },
   "model3": {
     "core": "supermodel",
@@ -432,7 +448,8 @@
     "core": "mednafen_wswan",
     "save_ram": false,
     "library_name": "Beetle WonderSwan",
-    "extensions": [".pc2", ".zip"]
+    "extensions": [".pc2", ".zip"],
+    "extra_extensions": [".zip"]
   },
   "epoch-super-cassette-vision": {
     "core": "emuscv",
@@ -462,6 +479,7 @@
     "core": "atari800",
     "save_ram": false,
     "library_name": "Atari800",
-    "extensions": [".xfd", ".atr", ".atx", ".cdm", ".cas", ".bin", ".a52", ".xex", ".zip"]
+    "extensions": [".xfd", ".atr", ".atx", ".cdm", ".cas", ".bin", ".a52", ".xex", ".zip"],
+    "extra_extensions": [".cdm"]
   }
 }

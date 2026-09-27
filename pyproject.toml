@@ -25,7 +25,7 @@ asyncio_mode = "auto"
 include = ["webstation_broker*"]
 
 [tool.setuptools.package-data]
-webstation_broker = ["**/*.json"]
+webstation_broker = ["**/*.json", "**/*.zip"]
 
 [tool.ruff]
 line-length = 110
