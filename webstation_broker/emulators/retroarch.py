@@ -75,7 +75,7 @@ from typing import Any, Callable, Optional, Union
 import httpx
 
 from .. import imports
-from . import retroarch_cores, wii_nand
+from . import extraction_cache, retroarch_cores, wii_nand
 from .base import Emulator, _record_pid, base_launch_env, xdg_config_dir
 from .retroarch_cores import safe_dir_name
 
@@ -528,6 +528,10 @@ belong to the core that set them, not to the platform.
 subset of what the core supports (plus this list) still passes.
 """
 
+RA_ARCHIVE_EXTS = (".zip", ".7z")
+"""Archives RetroArch extracts itself before handing a core the content inside."""
+ARCHIVE_LIST_TIMEOUT = 30.0
+"""Seconds `7z l` gets to list a ROM archive for an untested core's extension check."""
 _ROM_SEARCH_GLOBS = ("*", "*/*")
 """Globs a ROM folder is searched with: its top level and one level of subfolders."""
 _ADDON_RE = re.compile(
@@ -1464,6 +1468,63 @@ def _m3u_index_for_path(playlist: Path, target: Path) -> Optional[int]:
         if entry == wanted:
             return index
     return None
+
+
+def _archive_member_names(archive: Path) -> Optional[list[str]]:
+    """The member paths of a ROM archive RetroArch opens itself.
+
+    Args:
+        archive: A `.zip` or `.7z` file.
+
+    Returns:
+        Its member paths, or None when it cannot be listed.
+    """
+    try:
+        if archive.suffix.lower() == ".zip":
+            with zipfile.ZipFile(archive) as zf:
+                return zf.namelist()
+        return extraction_cache._7z_member_paths(archive, ARCHIVE_LIST_TIMEOUT)
+    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        log.warning("retroarch: could not list archive %s: %s", archive.name, exc)
+        return None
+
+
+def _untested_core_takes(path: Path, profile: Mapping[str, Any]) -> bool:
+    """Whether an untested or blocked core can boot a single-file ROM.
+
+    A file with one of the profile's extensions boots as is. A `.zip` or `.7z`
+    boots when the core lets RetroArch extract it and a member carries one of
+    those extensions, since RetroArch then hands the core that member.
+
+    Args:
+        path: The ROM file.
+        profile: The resolved profile.
+
+    Returns:
+        True when the core can boot it; a refusal is logged.
+    """
+    ext = path.suffix.lower()
+    extensions = profile["extensions"]
+    if ext in extensions:
+        return True
+    if ext not in RA_ARCHIVE_EXTS:
+        log.warning(
+            "retroarch: %s is not among core %s's extensions %s", path.name, profile["core"], extensions
+        )
+        return False
+    info = retroarch_cores.catalog().cores.get(profile["core"])
+    if info is None or info.block_extract:
+        log.warning("retroarch: core %s takes no archive, refusing %s", profile["core"], path.name)
+        return False
+    members = _archive_member_names(path)
+    if members is None:
+        return False
+    if any(PurePosixPath(m).suffix.lower() in extensions for m in members):
+        return True
+    log.warning(
+        "retroarch: %s holds nothing among core %s's extensions %s", path.name, profile["core"], extensions
+    )
+    return False
 
 
 def _pick_rom_file(candidates: Iterable[Path], base: Path, extensions: tuple[str, ...]) -> Optional[Path]:
@@ -2411,13 +2472,7 @@ class Retroarch(Emulator):
             # files; an untested one only claims the extensions it shares with
             # the platform, and a file outside them would reach a core that
             # cannot boot it.
-            if info["tier"] in ("untested", "blocked") and path.suffix.lower() not in info["extensions"]:
-                log.warning(
-                    "retroarch: %s is not among core %s's extensions %s",
-                    path.name,
-                    info["core"],
-                    info["extensions"],
-                )
+            if info["tier"] in ("untested", "blocked") and not _untested_core_takes(path, info):
                 return None
             return path
         if not path.is_dir():

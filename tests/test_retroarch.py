@@ -4,6 +4,7 @@ Also covers the core asset links, the per-launch config overlay, the resume
 gate, and playlist-driven disc swapping.
 """
 
+import dataclasses
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import time
 import zipfile
 from collections.abc import Callable, Mapping
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import Any, Optional, Union
 
 import pytest
@@ -4344,6 +4346,76 @@ class TestCoreProfile:
         rom = tmp_path / "Game.zzz"
         rom.write_bytes(b"x")
         emu = _with_core("snes", _untested_snes_core())
+        emu.select_core()
+        assert emu.resolve_rom_file(rom) is None
+
+    def test_untested_core_takes_a_zip_holding_its_content(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """RetroArch extracts a zip itself, so a zipped ROM reaches an untested core."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        rom = tmp_path / "Game.zip"
+        with zipfile.ZipFile(rom, "w") as zf:
+            zf.writestr("Game.sfc", b"x")
+        emu = _with_core("snes", "bsnes")
+        emu.select_core()
+        assert emu.resolve_rom_file(rom) == rom
+
+    def test_untested_core_takes_a_7z_holding_its_content(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A .7z is listed with `7z l` and taken when a member fits the core."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        rom = tmp_path / "Game.7z"
+        rom.write_bytes(b"7z")
+        monkeypatch.setattr(
+            retroarch.extraction_cache, "_7z_member_paths", lambda archive, timeout: ["dir/Game.SMC"]
+        )
+        emu = _with_core("snes", "bsnes")
+        emu.select_core()
+        assert emu.resolve_rom_file(rom) == rom
+
+    def test_untested_core_refuses_an_archive_holding_none_of_its_content(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A zipped ROM for another system is refused before launch, not at boot."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        rom = tmp_path / "Game.zip"
+        with zipfile.ZipFile(rom, "w") as zf:
+            zf.writestr("Game.gba", b"x")
+        emu = _with_core("snes", "bsnes")
+        emu.select_core()
+        with caplog.at_level(logging.WARNING):
+            assert emu.resolve_rom_file(rom) is None
+        assert "holds nothing among core bsnes's extensions" in caplog.text
+
+    def test_untested_core_refuses_an_archive_it_cannot_list(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A corrupt zip is refused rather than handed to RetroArch."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        rom = tmp_path / "Game.zip"
+        rom.write_bytes(b"not a zip")
+        emu = _with_core("snes", "bsnes")
+        emu.select_core()
+        assert emu.resolve_rom_file(rom) is None
+
+    def test_untested_core_that_blocks_extraction_refuses_an_archive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A core-info `block_extract` core would get the archive unopened, which it can't boot."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        rom = tmp_path / "Game.zip"
+        with zipfile.ZipFile(rom, "w") as zf:
+            zf.writestr("Game.sfc", b"x")
+        cat = retroarch_cores.catalog()
+        info = dataclasses.replace(cat.cores["bsnes"], block_extract=True)
+        monkeypatch.setattr(
+            retroarch_cores,
+            "_catalog",
+            dataclasses.replace(cat, cores=MappingProxyType({**cat.cores, "bsnes": info})),
+        )
+        emu = _with_core("snes", "bsnes")
         emu.select_core()
         assert emu.resolve_rom_file(rom) is None
 

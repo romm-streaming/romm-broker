@@ -7,7 +7,7 @@ import zipfile
 import zlib
 from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import pytest
 from fastapi.testclient import TestClient
@@ -93,6 +93,13 @@ def test_parse_info_zip_reads_name_corename_and_extensions() -> None:
         (".smc", ".sfc", ".swc", ".fig", ".bs", ".st"),
     )
     assert cores["snes9x"] == expected
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("true", True), ("false", False), (None, False)])
+def test_parse_info_zip_reads_block_extract(raw: Optional[str], expected: bool) -> None:
+    """`block_extract = "true"` means RetroArch hands the core an archive unopened."""
+    keys = dict(SNES9X) if raw is None else {**SNES9X, "block_extract": raw}
+    assert rc.parse_info_zip(info_zip({"snes9x": keys}))["snes9x"].block_extract is expected
 
 
 def test_parse_info_zip_skips_members_that_are_not_core_info() -> None:

@@ -248,7 +248,9 @@ of the two forms above.
   with the platform. It launches with every feature a vetted core has, but
   the broker can't be certain of its save layout ahead of time, so it
   launches with a warning and a checked, rather than fixed, save/state
-  location.
+  location. It boots only files with one of those shared extensions, or a
+  `.zip` or `.7z` holding one, which RetroArch unpacks before the core
+  sees it.
 - **blocked**: a core this repo has confirmed is broken on that platform. It
   refuses to launch unless you opt in: `experimental_cores: true` on the
   container or on a platform block in RomM's `config.yml` (the platform

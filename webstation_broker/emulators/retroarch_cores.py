@@ -131,12 +131,15 @@ class CoreInfo:
         display_name: The human name core-info gives it.
         corename: The name core-info records, usually the core's `library_name`.
         extensions: Normalized supported extensions.
+        block_extract: Whether RetroArch must hand the core an archive unopened
+            instead of extracting the content inside it.
     """
 
     core: str
     display_name: str
     corename: str
     extensions: tuple[str, ...]
+    block_extract: bool = False
 
 
 def _parse_info_text(text: str) -> dict[str, str]:
@@ -197,6 +200,7 @@ def parse_info_zip(data: bytes) -> dict[str, CoreInfo]:
                 display_name=keys.get("display_name", core),
                 corename=corename,
                 extensions=normalize_extensions(keys.get("supported_extensions", "")),
+                block_extract=keys.get("block_extract", "").strip().lower() == "true",
             )
     return cores
 

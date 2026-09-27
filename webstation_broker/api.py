@@ -652,7 +652,7 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
                     " RomM's config.yml"
                 ),
             )
-        rom_file = emulator.resolve_rom_file(rom_path)
+        rom_file = await anyio.to_thread.run_sync(emulator.resolve_rom_file, rom_path)
         if rom_file is None:
             log.debug(
                 "activate: no bootable file found under %s for %s", rom_path, body.emulator
