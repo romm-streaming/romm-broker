@@ -594,7 +594,7 @@ def test_a_platform_names_the_sorted_dir_its_core_reports(platform: str, name: s
         platform: The RomM platform slug.
         name: The name the core reports in `retro_get_system_info`.
     """
-    assert retroarch._library_name(platform) == name
+    assert _on(platform).library_name() == name
 
 
 @pytest.mark.parametrize("platform", [None, "", "ps2"])
@@ -604,7 +604,7 @@ def test_an_unmapped_platform_names_no_sorted_dir(platform: Optional[str]) -> No
     Args:
         platform: The slug, or None.
     """
-    assert retroarch._library_name(platform) is None
+    assert _on(platform).library_name() is None
 
 
 def test_every_library_name_is_one_safe_directory_name() -> None:
@@ -4173,6 +4173,21 @@ class TestStateScope:
         assert emu._observed_lib is None
         assert "library_name not yet confirmed" in caplog.text
 
+    def test_an_imported_save_lands_in_the_seeded_dir(self, ra_dirs: Path) -> None:
+        """The .srm goes where the manifest says the core wrote, the same dir `state_target` uses."""
+        core = _untested_snes_core()
+        emu = _with_core("snes", core)
+        emu.select_core()
+        emu.adopt_archive_identity({"core": core, "library_name": "Recorded"})
+        emu._rom_base = "Game"
+        ctx = imports.ImportCtx(
+            rom_file=ra_dirs / "Game.sfc", rom=None, memory_card_synced=False, excluded=(), resume_slot=None
+        )
+        placed = emu.place_import(_member("Game.srm", "save"), emu.import_spec(), ctx)
+        assert isinstance(placed, imports.Placement)
+        assert placed.dest.parts[-2] == "Recorded"
+        assert emu.state_target("Game.state").parent.name == "Recorded"
+
     def test_a_seed_alone_does_not_narrow_the_open_scope(self, ra_dirs: Path) -> None:
         """R7a: a seed with no observation yet leaves scope open, so a wrong seed can't hide the real dir.
 
@@ -4705,6 +4720,19 @@ class TestCarryOver:
         old = _srm(ra_dirs, "Snes9x")
         self._emu(_untested_snes_core()).carry_save_across_cores(identity, ra_dirs / "Game.sfc")
         assert old.exists()
+
+    @pytest.mark.parametrize("bad_core", [["snes9x"], {"snes9x": 1}])
+    def test_a_manifest_core_that_is_not_a_string_carries_nothing(
+        self, ra_dirs: Path, caplog: pytest.LogCaptureFixture, bad_core: object
+    ) -> None:
+        """An unhashable manifest core is logged and skipped, never a TypeError that fails activate."""
+        old = _srm(ra_dirs, "Snes9x")
+        with caplog.at_level(logging.WARNING):
+            self._emu(_untested_snes_core()).carry_save_across_cores(
+                {"core": bad_core}, ra_dirs / "Game.sfc"
+            )
+        assert old.read_bytes() == b"sram"
+        assert "not a core name" in caplog.text
 
     def test_several_candidates_carry_nothing(
         self, ra_dirs: Path, caplog: pytest.LogCaptureFixture

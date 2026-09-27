@@ -683,7 +683,9 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
                     status_code=404, detail=f"save archive not found: {save.archive}"
                 )
             content = await anyio.to_thread.run_sync(archive_path.read_bytes)
-            archive_identity = saves.archive_session_identity(content)
+            archive_identity = await anyio.to_thread.run_sync(
+                saves.archive_session_identity, content
+            )
             emulator.adopt_archive_identity(archive_identity)
         else:
             # Dropping the archive and still answering "launching" is how a
@@ -2070,6 +2072,7 @@ async def get_retroarch_cores(
         return {"platforms": {slug: one(slug) for slug in sorted(table)}}
     slug = platform.lower()
     if slug not in table:
+        log.debug("retroarch cores: no core for platform %r", platform)
         raise HTTPException(status_code=404, detail=f"RetroArch has no core for platform {platform!r}")
     return {"platform": slug, **one(slug)}
 

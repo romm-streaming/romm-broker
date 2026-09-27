@@ -333,6 +333,14 @@ def test_unknown_core_or_no_shared_extension_is_rejected_with_options(platform: 
     assert "/api/retroarch/cores" in err.value.detail
 
 
+@pytest.mark.parametrize("core", [["bsnes"], {"bsnes": 1}, 5])
+def test_a_core_that_is_not_a_string_is_rejected(core: object) -> None:
+    """A manifest's `core` is archive content; an unhashable one must not raise TypeError."""
+    with pytest.raises(rc.CoreRejectedError) as err:
+        resolve("snes", core)  # type: ignore[arg-type]
+    assert "not a" in err.value.detail
+
+
 def test_profile_is_read_only() -> None:
     """The resolved profile is frozen; an observed library_name lives on the instance."""
     with pytest.raises(TypeError):

@@ -556,19 +556,6 @@ def _platform_info(platform: Optional[str]) -> Optional[dict[str, Any]]:
     return PLATFORMS.get(platform.lower())
 
 
-def _library_name(platform: Optional[str]) -> Optional[str]:
-    """The name the platform's core reports, which RetroArch names its sorted dirs after.
-
-    Args:
-        platform: The slug from the activate payload, or None.
-
-    Returns:
-        The core's `library_name`, or None when the platform is unset or unmapped.
-    """
-    info = _platform_info(platform)
-    return info["library_name"] if info else None
-
-
 def _github_release_asset(repo: str, asset_pattern: str) -> str:
     """Download URL of the newest release asset matching `asset_pattern`.
 
@@ -1193,8 +1180,8 @@ def _newest_state(
             all) is also dropped: that bare-root case is `include_root`'s
             alone, so an untested or blocked core's "everywhere except known
             cores' dirs" search can't pick up a legacy default-core root
-            state by accident (R6a, R6b). A plain unscoped call (no `skip`) still
-            matches a bare-root file, as before.
+            state by accident (R6a, R6b). A plain unscoped call (no `skip`)
+            matches a bare-root file.
         include_root: Also match a file sitting directly in `dir_path`,
             non-recursively (ignored without `only`). `sort_savestates_enable`
             was only pinned on 2026-09-18 (451da72); an install or restored
@@ -2074,7 +2061,7 @@ class Retroarch(Emulator):
 
         Callers that only set `platform` (import-spec, most tests) get the
         default profile. `select_core` is where a bad core raises; here an
-        unmapped platform with no core is None, as `_platform_info` was.
+        unmapped platform with no core is None.
 
         Returns:
             The profile, or None when the platform is unset or unmapped.
@@ -2303,6 +2290,15 @@ class Retroarch(Emulator):
         profile = self._profile()
         old_core = identity.get("core") if identity else None
         if profile is None or rom_file is None or not old_core or old_core == profile["core"]:
+            return
+        if not isinstance(old_core, str):
+            # The manifest is archive content: a list or dict here would reach
+            # the alternates lookup as an unhashable key, and this runs after
+            # the working slot was already emptied and restored.
+            log.warning(
+                "retroarch: no .srm carried: the archive's manifest core is a %s, not a core name",
+                type(old_core).__name__,
+            )
             return
         if profile["save_ram"] is False:
             log.info("retroarch: no .srm carried: core %s does not read one", profile["core"])
@@ -3478,6 +3474,10 @@ class Retroarch(Emulator):
         lib = _srm_dir(self.platform, profile)
         if isinstance(lib, imports.ImportRefusal):
             return dataclasses.replace(lib, member=member.name)
+        # The dir the restored archive's manifest recorded for this core, when
+        # there is one, rather than the untested core's guess: the core loads
+        # SRAM from the dir it really writes, and `state_target` uses it too.
+        lib = self.library_name() or lib
         if ctx.rom_file is None:
             return imports.ImportRefusal(
                 "destination_unresolvable",

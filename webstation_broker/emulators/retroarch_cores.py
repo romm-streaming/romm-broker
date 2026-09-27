@@ -569,9 +569,12 @@ def resolve_profile(
         The read-only profile.
 
     Raises:
-        CoreRejectedError: For an unmapped platform with a core, a blocked
-            core without the opt-in, or a core not offered on the platform.
+        CoreRejectedError: For a core that is not a string, an unmapped
+            platform with a core, a blocked core without the opt-in, or a core
+            not offered on the platform.
     """
+    if core is not None and not isinstance(core, str):
+        raise CoreRejectedError(f"core must be a core name, not a {type(core).__name__}")
     entry = platforms.get(platform)
     if entry is None:
         raise CoreRejectedError(
