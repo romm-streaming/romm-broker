@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Keep the bundled libretro core-info catalog in step with upstream (dev only, stdlib only).
+"""Keep the bundled libretro core-info catalog in step with upstream (dev only).
 
 --write   download info.zip and the x86_64 .index, write the bundled zip and its source file
---check   compare the bundle and the platform table with live upstream (Task 13)
---probe   load every default and vetted core and compare library_name (Task 13)
---docs    regenerate the tier table in retroarch-cores.mdx (Task 13)
---tiers   print every catalog core per platform with its tier (Task 13)
+--check   compare the bundle and the platform table with live upstream
+--probe   load every default and vetted core and compare library_name
+--docs    regenerate the tier table in retroarch-cores.mdx
+--tiers   print every catalog core per platform with its tier
 """
 
 import argparse
@@ -15,7 +15,6 @@ import hashlib
 import json
 import sys
 import tempfile
-import urllib.request
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Optional
@@ -37,7 +36,7 @@ DOCS_END = "{/* core-tiers:end */}"
 
 
 def fetch(url: str) -> bytes:
-    """Download `url`.
+    """Download `url` under the same size cap and deadline the broker's refresh uses.
 
     Args:
         url: What to fetch.
@@ -45,8 +44,7 @@ def fetch(url: str) -> bytes:
     Returns:
         The body.
     """
-    with urllib.request.urlopen(url, timeout=60) as resp:  # noqa: S310 - fixed https URLs
-        return resp.read()
+    return rc._http_fetch(url, rc.ZIP_CAP)
 
 
 def write() -> int:

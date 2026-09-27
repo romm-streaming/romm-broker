@@ -28,7 +28,7 @@ from starlette.websockets import WebSocketState
 
 from . import callback, imports, memcard, saves, screenshot, selkies, session, settings
 from .emulators import get_emulator, retroarch, retroarch_cores
-from .emulators.base import STATE_HEAD_BYTES, Emulator, reap_orphan
+from .emulators.base import STATE_HEAD_BYTES, CoreRejectedError, Emulator, reap_orphan
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -550,6 +550,23 @@ async def activate(
         return await _start_session(body, request)
 
 
+def _select_core(emulator: Emulator, route: str) -> None:
+    """Resolve the emulator's requested core, answering 422 when it will not launch.
+
+    Args:
+        emulator: The emulator, with `platform`, `core` and `experimental_cores` set.
+        route: The route name the refusal is logged under.
+
+    Raises:
+        HTTPException: 422 with the player-facing detail when the core is refused.
+    """
+    try:
+        emulator.select_core()
+    except CoreRejectedError as exc:
+        log.warning("%s: %s", route, exc.detail)
+        raise HTTPException(status_code=422, detail=exc.detail)
+
+
 async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     """Do the launch itself, with the session lock already held.
 
@@ -612,13 +629,9 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
         emulator.language = body.rom.language
         emulator.core = body.rom.core
         emulator.experimental_cores = body.rom.experimental_cores
-    try:
-        # Before resolve_rom_file and long before clear_working_slot: a core
-        # that will not launch must leave the working slot as it was.
-        emulator.select_core()
-    except retroarch_cores.CoreRejectedError as exc:
-        log.warning("activate: %s", exc.detail)
-        raise HTTPException(status_code=422, detail=exc.detail)
+    # Before resolve_rom_file and long before clear_working_slot: a core
+    # that will not launch must leave the working slot as it was.
+    _select_core(emulator, "activate")
 
     rom_file = None
     if emulator.requires_rom:
@@ -2021,11 +2034,7 @@ async def get_import_spec(
     inst.platform = platform
     inst.core = core
     inst.experimental_cores = experimental_cores
-    try:
-        inst.select_core()
-    except retroarch_cores.CoreRejectedError as exc:
-        log.warning("import-spec: %s", exc.detail)
-        raise HTTPException(status_code=422, detail=exc.detail)
+    _select_core(inst, "import-spec")
     spec = inst.import_spec()
     return {
         "import_api": 1,
@@ -2041,7 +2050,7 @@ async def get_import_spec(
 
 
 @router.get("/api/retroarch/cores")
-async def get_retroarch_cores(
+def get_retroarch_cores(
     platform: Optional[str] = Query(default=None),
     x_broker_secret: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:

@@ -29,6 +29,8 @@ from typing import Any, Callable, Optional
 import anyio.to_thread
 import httpx
 
+from .base import CoreRejectedError
+
 log = logging.getLogger(__name__)
 
 CORE_NAME_RE = re.compile(r"^[a-z0-9_]+$")
@@ -292,6 +294,25 @@ def build_catalog(zip_bytes: bytes, index_text: str, installed: frozenset[str] =
 
 
 @functools.cache
+def _bundled() -> tuple[bytes, frozenset[str], Mapping[str, CoreInfo]]:
+    """Read, verify and parse the bundled zip once per process.
+
+    Returns:
+        The zip's bytes, the cores its source file lists as built for x86_64,
+        and every core the zip describes.
+
+    Raises:
+        ValueError: When the zip does not match the recorded sha256; a
+            half-updated bundle must stop the broker, not boot a wrong catalog.
+    """
+    data = BUNDLED_ZIP.read_bytes()
+    source = json.loads(BUNDLED_SOURCE.read_text())
+    if hashlib.sha256(data).hexdigest() != source["sha256"]:
+        raise ValueError(f"{BUNDLED_ZIP.name} does not match the sha256 in {BUNDLED_SOURCE.name}")
+    built = parse_index("\n".join(f"{core}{_INDEX_SUFFIX}" for core in source["x86_64_cores"]))
+    return data, built, MappingProxyType(parse_info_zip(data))
+
+
 def load_bundled_catalog(installed: frozenset[str] = frozenset()) -> Catalog:
     """Build the catalog from the bundled zip and the build list in its source file.
 
@@ -302,15 +323,11 @@ def load_bundled_catalog(installed: frozenset[str] = frozenset()) -> Catalog:
         The catalog.
 
     Raises:
-        ValueError: When the zip does not match the recorded sha256; a
-            half-updated bundle must stop the broker, not boot a wrong catalog.
+        ValueError: When the zip does not match the recorded sha256.
     """
-    data = BUNDLED_ZIP.read_bytes()
-    source = json.loads(BUNDLED_SOURCE.read_text())
-    if hashlib.sha256(data).hexdigest() != source["sha256"]:
-        raise ValueError(f"{BUNDLED_ZIP.name} does not match the sha256 in {BUNDLED_SOURCE.name}")
-    index = "\n".join(f"{core}_libretro.so.zip" for core in source["x86_64_cores"])
-    return build_catalog(data, index, installed)
+    data, built, infos = _bundled()
+    keep = built | installed
+    return Catalog(MappingProxyType({name: info for name, info in infos.items() if name in keep}), data)
 
 
 LIBRARY_NAME_FIXES: Mapping[str, str] = MappingProxyType(
@@ -394,19 +411,6 @@ Profile = Mapping[str, Any]
 
 REPORT_URL = "https://github.com/romm-streaming/romm-broker/issues/new?template=core-report.yml"
 """Where players report how a core works (§9)."""
-
-
-class CoreRejectedError(ValueError):
-    """A `core:` the broker will not launch on this platform; `detail` is shown to the player."""
-
-    def __init__(self, detail: str) -> None:
-        """Keep the detail for the 422.
-
-        Args:
-            detail: The message, naming the options.
-        """
-        super().__init__(detail)
-        self.detail = detail
 
 
 def _blocking_entry(tiers: Mapping[str, TierEntry], core: str, platform: str) -> Optional[TierEntry]:

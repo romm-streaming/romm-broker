@@ -26,7 +26,7 @@ from fastapi.testclient import TestClient
 
 from webstation_broker import imports, saves, screenshot, selkies, session, settings
 from webstation_broker.app import create_app
-from webstation_broker.emulators import base, retroarch, xemu
+from webstation_broker.emulators import base, retroarch, retroarch_cores, xemu
 from webstation_broker.emulators.base import Emulator
 
 PREFIX = settings.PREFIX
@@ -331,6 +331,20 @@ def clean_retroarch_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "RETROARCH_EXPERIMENTAL_CORES",
     ):
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def clean_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reset the module-global RetroArch core catalog before and after every test.
+
+    `retroarch_cores._catalog` is module-global state, so a test's `set_catalog`
+    would otherwise leak into the next one.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher, undone (restoring the pre-test
+            value, which this same fixture already reset to None) when the test ends.
+    """
+    monkeypatch.setattr(retroarch_cores, "_catalog", None)
 
 
 @pytest.fixture(autouse=True)

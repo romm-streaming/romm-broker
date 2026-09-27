@@ -20,20 +20,6 @@ from webstation_broker.emulators import retroarch_cores as rc
 from .conftest import PREFIX
 
 
-@pytest.fixture(autouse=True)
-def clean_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Reset the module-global catalog before and after every test in this module.
-
-    `rc._catalog` is module-global state, so a test's `set_catalog` would
-    otherwise leak into the next one.
-
-    Args:
-        monkeypatch: Pytest's attribute patcher, undone (restoring the pre-test
-            value, which this same fixture already reset to None) when the test ends.
-    """
-    monkeypatch.setattr(rc, "_catalog", None)
-
-
 def info_zip(infos: dict[str, dict[str, str]]) -> bytes:
     """Build an info.zip holding one `<core>_libretro.info` per entry.
 
@@ -598,7 +584,7 @@ class TestRefresh:
 
         rc.load_startup_catalog(tmp_path, tmp_path, PLATFORMS)  # must not raise
 
-        assert rc.catalog() is rc.load_bundled_catalog(frozenset())
+        assert rc.catalog() == rc.load_bundled_catalog(frozenset())
 
     def test_load_startup_catalog_is_quiet_about_no_cache(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -607,7 +593,7 @@ class TestRefresh:
         with caplog.at_level(logging.WARNING):
             rc.load_startup_catalog(tmp_path, tmp_path, PLATFORMS)
         assert not caplog.records
-        assert rc.catalog() is rc.load_bundled_catalog(frozenset())
+        assert rc.catalog() == rc.load_bundled_catalog(frozenset())
 
     async def test_refresh_forever_skips_a_fresh_cache(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -17,9 +17,22 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from .. import imports, memcard
-from .retroarch_cores import CoreRejectedError
 
 log = logging.getLogger(__name__)
+
+
+class CoreRejectedError(ValueError):
+    """A `core:` the broker will not launch on this platform; `detail` is shown to the player."""
+
+    def __init__(self, detail: str) -> None:
+        """Keep the detail for the 422.
+
+        Args:
+            detail: The message, naming the options.
+        """
+        super().__init__(detail)
+        self.detail = detail
+
 
 XDG_RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/config/.XDG")
 """The session's runtime directory, from `XDG_RUNTIME_DIR` (default `/config/.XDG`)."""

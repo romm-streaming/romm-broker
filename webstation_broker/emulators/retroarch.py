@@ -754,15 +754,9 @@ def _ensure_core_info(core: str, *, tier: str, has_source: bool) -> None:
             return
         raise RuntimeError(f"no {dest.name} in the core-info catalog")
     CORES_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = CORES_DIR / f".{dest.name}.{secrets.token_hex(8)}.tmp"
     try:
-        tmp.write_bytes(data)
-        os.replace(tmp, dest)
+        retroarch_cores._write_atomic(dest, data)
     except OSError as exc:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError as cleanup_exc:
-            log.warning("retroarch: could not remove the partial info file %s: %s", tmp, cleanup_exc)
         log.error("retroarch: info file %s could not be installed: %s", dest.name, exc)
         raise RuntimeError(f"failed to install {dest.name}: {exc}") from exc
     log.info("retroarch: installed %s", dest.name)
@@ -3445,7 +3439,8 @@ class Retroarch(Emulator):
         """
         # counts_v1 stays False: the archive's other save files belong to other
         # content, and a file at a placed destination is already a conflict.
-        layout = _layout(self.platform, self._profile())
+        profile = self._profile()
+        layout = _layout(self.platform, profile)
         protected: tuple[str, ...] = ()
         if layout == _LAYOUT_WII:
             save = imports.KindSpec("save", (wii_nand.SAVE_SHAPE,))
@@ -3453,12 +3448,11 @@ class Retroarch(Emulator):
         elif layout == _LAYOUT_3DS:
             save = imports.KindSpec("save", _N3DS_SHAPES)
             protected = _N3DS_PROTECTED
-        elif isinstance(_srm_dir(self.platform, self._profile()), str):
+        elif isinstance(_srm_dir(self.platform, profile), str):
             save = imports.KindSpec("save", ("<name>.srm",), max_members=1)
         else:
             save = imports.KindSpec("save", ())
-        mapped = self._profile() is not None
-        channel: imports.StateChannel = "push" if mapped and self.supports_states else "none"
+        channel: imports.StateChannel = "push" if profile is not None and self.supports_states else "none"
         return imports.ImportSpec(kinds=(save,), state_channel=channel, protected=protected)
 
     def identity_source(self) -> Optional[imports.IdentitySource]:
