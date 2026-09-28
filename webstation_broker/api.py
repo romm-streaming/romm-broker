@@ -2733,7 +2733,7 @@ async def context(
         "controllerName": (sess.get("user") or {}).get("display_name") or "Controller",
         "multiplayer": bool(sess.get("multiplayer")),
         "emulator": sess["emulator_obj"].name,
-        # Relative to the page base; the selkies client reads the token from
-        # its query string.
-        "iframeSrc": f"stream/?token={token}",
+        # Relative to the page base; the token rides the fragment, which the
+        # selkies client reads and no request line carries.
+        "iframeSrc": f"stream/#token={token}",
     }
