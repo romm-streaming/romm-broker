@@ -371,19 +371,28 @@ streaming:
       # ...remaining keys as above
 ```
 
-<Callout type="warn" title="host and subfolder both have to be the container's own SUBFOLDER.">
-`host` and `subfolder` are not independent settings. The browser is sent to
-`host`, but the broker answers the claim with a room URL built from its own
-`SUBFOLDER`, and that is an absolute path, so it replaces whatever path `host`
-was carrying. A container mounted at `/streaming-2` while declaring
-`subfolder: /streaming` hands the player a URL the proxy routes to the
-container at `/streaming` instead, mid-session, with nothing written to
-either log.
+<Callout type="warn" title="subfolder and the path in host must both equal the container's own SUBFOLDER.">
+They answer to the same value for different reasons:
 
-RomM refuses such an entry rather than resolve it. It still appears in the fleet
-view, with a warning naming both values, and it cannot be claimed. The usual way
-in is copying an entry for the second container and changing `host` but not
-`subfolder`, which then falls back to its `/streaming` default.
+- **`subfolder`** is where RomM's backend finds the broker API
+  (`broker_host` + `subfolder` + `/api/...`). The container only serves it
+  under its own `SUBFOLDER`, so a wrong value makes every claim fail with a
+  404 from the broker.
+- **The path in `host`** is where the browser starts, but the broker answers
+  a claim with a room URL built from its own `SUBFOLDER`. That is an
+  absolute path, so it replaces whatever path `host` carried.
+
+The trap is copying the first container's setup for the second one. If the
+second container keeps `SUBFOLDER=/streaming` while the proxy and `host`
+say `/streaming-2`, RomM reaches it fine over `broker_host`, but the room URL
+it hands back is `/streaming/...`, and the proxy sends the player to the
+*first* container.
+
+RomM catches the config half of this: an entry whose `host` path differs
+from its `subfolder` is refused, logged with both values, and shown in the
+fleet view as unclaimable. It cannot see the container's own `SUBFOLDER`,
+so keep the compose file, the proxy rule, and the `config.yml` entry in
+step by hand. A `host` that is a bare origin, with no path, is exempt.
 </Callout>
 
 ### How RomM picks one
