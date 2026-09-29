@@ -72,7 +72,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Optional, Union
 
 from .. import imports
-from .base import Emulator, base_launch_env
+from .base import Emulator, base_launch_env, disc_number
 
 log = logging.getLogger(__name__)
 
@@ -111,7 +111,6 @@ _CONTAINER_GLOBS = tuple(
     for type_dir in _CONTAINER_TYPE_DIRS
 )
 _STFS_MAGICS = (b"CON ", b"LIVE", b"PIRS")
-_DISC_RE = re.compile(r"(?:^|[^a-z0-9])(?:disc|disk|cd)[\s._-]*(\d+)", re.IGNORECASE)
 
 # The save tree's own shape, under <storage_root>/content. Anything that is
 # not an <XUID>/<TITLE_ID> pair is not save data: the storage root also holds
@@ -183,27 +182,11 @@ def _pick_rom_file(candidates: list[Path], base: Path) -> Optional[Path]:
         if not real.is_relative_to(ROM_ROOT):
             continue
         ranked.append(
-            (_disc_number(rel), ROM_EXTENSIONS.index(ext), len(rel.parts), p.name.lower(), real)
+            (disc_number(rel), ROM_EXTENSIONS.index(ext), len(rel.parts), p.name.lower(), real)
         )
     if not ranked:
         return None
     return min(ranked)[4]
-
-
-def _disc_number(rel: Path) -> int:
-    """The disc number named in `rel`.
-
-    Args:
-        rel: A candidate's path relative to the folder it was found in.
-
-    Returns:
-        The number the disc marker carries, or 1 when the path names none, so
-        a single-disc dump ranks alongside a disc 1.
-    """
-    match = _DISC_RE.search(str(rel))
-    if match is None:
-        return 1
-    return max(1, int(match.group(1)))
 
 
 def _is_stfs_package(path: Path) -> bool:

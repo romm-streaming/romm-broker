@@ -199,6 +199,7 @@ def test_catalog_is_zip_intersect_index_plus_installed() -> None:
         ("yes", True),
         ("on", True),
         ("0", False),
+        ("false", False),
         ("", False),
         (None, False),
     ],
@@ -206,7 +207,7 @@ def test_catalog_is_zip_intersect_index_plus_installed() -> None:
 def test_truthy_matches_the_brokers_other_boolean_env_vars(
     value: str, expected: bool
 ) -> None:
-    """Same spelling as rpcs3's `_truthy`."""
+    """The spellings every boolean env var in the broker accepts."""
     assert settings.truthy(value) is expected
 
 

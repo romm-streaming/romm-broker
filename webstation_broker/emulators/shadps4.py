@@ -28,6 +28,7 @@ the cache key is taken from the archive itself rather than the throwaway
 scratch extraction.
 """
 
+import functools
 import json
 import logging
 import os
@@ -175,10 +176,6 @@ ROM_EXTENSIONS = (".zar", ".bin", ".pkg") + _ARCHIVE_EXTS
 .pkg, or a .7z/.zip/.rar archive holding one."""
 
 
-def _truthy(value: str) -> bool:
-    return value.strip().lower() in ("1", "true", "yes", "on")
-
-
 PKG_EXTRACTOR_BIN = os.environ.get("SHADPS4_PKG_EXTRACTOR_BIN", "pkg_extractor")
 """The `pkg_extractor` binary (env `SHADPS4_PKG_EXTRACTOR_BIN`, default `pkg_extractor` on PATH)."""
 PKG_EXTRACT_TIMEOUT = float(os.environ.get("SHADPS4_PKG_EXTRACT_TIMEOUT", "1800"))
@@ -206,7 +203,7 @@ of the run even though only the output survives.
 # whether .pkg/archive ROMs are bootable at all, not just whether the
 # extraction is kept. Mirrors rpcs3's identically-named archive cache.
 CACHE_DIR = Path(os.environ.get("SHADPS4_CACHE_DIR", str(DATA_DIR / "extracted")))
-CACHE_ENABLED = _truthy(os.environ.get("SHADPS4_CACHE_ENABLED", "false"))
+CACHE_ENABLED = settings.truthy(os.environ.get("SHADPS4_CACHE_ENABLED", "false"))
 CACHE_MAX_GB = float(os.environ.get("SHADPS4_CACHE_MAX_GB", "30"))
 _LAST_ACCESSED_MARKER = extraction_cache._LAST_ACCESSED_MARKER
 _SCRATCH_DIR_NAME = extraction_cache._SCRATCH_DIR_NAME
@@ -1237,18 +1234,8 @@ def _game_serial(rom_file: Path) -> Optional[str]:
     return _sfo_title_id(sfo)
 
 
-def _refuse(member: imports.ImportMember, reason: str, detail: str) -> imports.ImportRefusal:
-    """Refuse a member with the shadPS4 shape in the message.
-
-    Args:
-        member: The member.
-        reason: The refusal code.
-        detail: What is wrong with this member.
-
-    Returns:
-        The refusal.
-    """
-    return imports.ImportRefusal(reason, member.name, _EXPECTED, detail=detail)
+_refuse = functools.partial(imports.refuse, expected=_EXPECTED)
+"""Refuse a member, naming this emulator's accepted shapes (see `imports.refuse`)."""
 
 
 def _below_wrapper(parts: tuple[str, ...]) -> tuple[str, ...]:

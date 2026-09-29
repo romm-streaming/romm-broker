@@ -37,7 +37,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Optional, Union
 
 from .. import imports
-from .base import Emulator, base_launch_env
+from .base import Emulator, base_launch_env, disc_number
 
 log = logging.getLogger(__name__)
 
@@ -110,22 +110,6 @@ A folder holding several candidates picks by this order so an `.m3u`
 playlist or `.chd` beats the raw `.bin` beside it.
 """
 _ROM_SEARCH_GLOBS = ("*", "*/*")
-_DISC_RE = re.compile(r"(?:^|[^a-z0-9])(?:disc|disk|cd)[\s._-]*(\d+)", re.IGNORECASE)
-
-
-def _disc_number(rel: Path) -> int:
-    """Return the disc number a relative ROM path names, or 1 when it names none.
-
-    Args:
-        rel: Candidate path relative to the ROM folder being searched.
-
-    Returns:
-        The number following a `disc`, `disk` or `cd` marker in the path, never below 1.
-    """
-    match = _DISC_RE.search(str(rel))
-    if match is None:
-        return 1
-    return max(1, int(match.group(1)))
 
 
 def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
@@ -161,7 +145,7 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
         if not real.is_relative_to(ROM_ROOT):
             continue
         ranked.append(
-            (_disc_number(rel), ROM_EXTENSIONS.index(ext), len(rel.parts), p.name.lower(), real)
+            (disc_number(rel), ROM_EXTENSIONS.index(ext), len(rel.parts), p.name.lower(), real)
         )
     if not ranked:
         return None

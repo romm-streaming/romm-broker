@@ -101,20 +101,6 @@ def rom_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return root
 
 
-@pytest.mark.parametrize(
-    ("name", "expected"),
-    [
-        ("Game.iso", 1),
-        ("Game (Disc 2).iso", 2),
-        ("Game.disk3.iso", 3),
-        ("Game_cd-4.iso", 4),
-    ],
-)
-def test_disc_number_is_read_from_the_name(name: str, expected: int) -> None:
-    """The disc number is parsed from the usual markers in a file name."""
-    assert xemu._disc_number(Path(name)) == expected
-
-
 def test_a_disc_set_boots_disc_one(rom_root: Path) -> None:
     """A folder holding several discs resolves to disc one."""
     folder = rom_root / "Game"
@@ -505,15 +491,6 @@ def test_software_gl_reaches_xemu_and_nothing_else(
     env = _spawned_env(emulator, monkeypatch, tmp_path)
     assert env["LIBGL_ALWAYS_SOFTWARE"] == "1"
     assert "LIBGL_ALWAYS_SOFTWARE" not in os.environ
-
-
-@pytest.mark.parametrize("setting,expected", [
-    ("1", True), ("true", True), ("YES", True), (" on ", True),
-    ("0", False), ("false", False), ("", False),
-])
-def test_the_software_gl_switch_reads_the_usual_spellings(setting: str, expected: bool) -> None:
-    """The truthy parser accepts the common spellings of on and off."""
-    assert xemu._truthy(setting) is expected
 
 
 def test_launch_pins_the_display_settings_before_spawning(

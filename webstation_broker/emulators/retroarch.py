@@ -76,7 +76,7 @@ import httpx
 
 from .. import imports, settings
 from . import extraction_cache, retroarch_cores, wii_nand
-from .base import Emulator, _record_pid, base_launch_env, xdg_config_dir
+from .base import Emulator, _record_pid, base_launch_env, disc_number, xdg_config_dir
 from .retroarch_cores import safe_dir_name
 
 log = logging.getLogger(__name__)
@@ -538,12 +538,6 @@ _ADDON_RE = re.compile(
     r"(?:^|[^a-z0-9])(?:update|upd|dlc|patch)(?:[^a-z0-9]|$)", re.IGNORECASE
 )
 """Matches paths that look like an update, DLC or patch rather than the game itself."""
-_DISC_RE = re.compile(r"(?:^|[^a-z0-9])(?:disc|disk|cd)[\s._-]*(\d+)", re.IGNORECASE)
-"""Matches a disc number in a path.
-
-Disc numbering keeps a multi-disc game booting the same disc each session, so
-a save state taken for Disc 1 resumes on Disc 1.
-"""
 
 
 def _platform_info(platform: Optional[str]) -> Optional[dict[str, Any]]:
@@ -1404,22 +1398,6 @@ def _wait_for_state_read(
     return False
 
 
-def _disc_number(rel: Path) -> int:
-    """The disc number a ROM path names, for ranking multi-disc candidates.
-
-    Args:
-        rel: The candidate's path relative to the ROM folder.
-
-    Returns:
-        The number matched by `_DISC_RE`, floored at 1, or 1 when the path
-        names no disc.
-    """
-    match = _DISC_RE.search(str(rel))
-    if match is None:
-        return 1
-    return max(1, int(match.group(1)))
-
-
 def _m3u_entries(playlist: Path) -> list[Path]:
     """Disc paths a .m3u lists, in playlist order, resolved absolute.
 
@@ -1558,7 +1536,7 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path, extensions: tuple[str
         ranked.append(
             (
                 is_addon,
-                _disc_number(rel),
+                disc_number(rel),
                 extensions.index(ext),
                 len(rel.parts),
                 p.name.lower(),

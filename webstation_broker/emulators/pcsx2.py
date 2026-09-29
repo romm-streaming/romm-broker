@@ -11,7 +11,6 @@ rather than exiting.
 import logging
 import os
 import re
-import socket as _socket
 import struct
 import subprocess
 import tempfile
@@ -23,7 +22,8 @@ from threading import Lock, Thread
 from typing import Any, Optional, Union
 
 from .. import imports, memcard
-from .base import Emulator, base_launch_env, xdg_config_dir
+from . import pine
+from .base import XDG_RUNTIME_DIR, Emulator, base_launch_env, disc_number, xdg_config_dir
 
 log = logging.getLogger(__name__)
 
@@ -217,8 +217,6 @@ its resume pick after activate returns, so a slow boot would otherwise leave
 the wait no time at all and the player would start a fresh game.
 """
 
-XDG_RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/config/.XDG")
-"""Runtime directory PCSX2 creates its PINE socket in (env `XDG_RUNTIME_DIR`, default `/config/.XDG`)."""
 PINE_SOCKET = Path(XDG_RUNTIME_DIR) / "pcsx2.sock"
 """Path of the PINE Unix socket pcsx2-qt listens on."""
 
@@ -227,15 +225,6 @@ _PINE_MSG_LOAD_STATE = 0x0A
 _PINE_MSG_GAME_ID = 0x0C
 _PINE_MSG_EMU_STATUS = 0x0F
 
-_PINE_MAX_REPLY_BYTES = 64 * 1024
-"""Largest reply the broker will read off the PINE socket.
-
-The opcodes used here answer in a handful of bytes. The declared size is a
-u32 read straight off the wire, so without a ceiling a bogus one has the
-broker buying 4 GiB of memory on the word of whatever is on the socket.
-"""
-
-
 ROM_EXTENSIONS = (".chd", ".iso", ".cso", ".zso", ".gz", ".mdf", ".dump", ".bin", ".elf")
 """Disc formats pcsx2-qt can boot, best first.
 
@@ -243,22 +232,6 @@ A folder holding several candidates picks by this order so a `.chd` beats the
 raw `.bin` beside it.
 """
 _ROM_SEARCH_GLOBS = ("*", "*/*")
-_DISC_RE = re.compile(r"(?:^|[^a-z0-9])(?:disc|disk|cd)[\s._-]*(\d+)", re.IGNORECASE)
-
-
-def _disc_number(rel: Path) -> int:
-    """Return the disc number a relative ROM path names, or 1 when it names none.
-
-    Args:
-        rel: Candidate path relative to the ROM folder being searched.
-
-    Returns:
-        The number following a `disc`, `disk` or `cd` marker in the path, never below 1.
-    """
-    match = _DISC_RE.search(str(rel))
-    if match is None:
-        return 1
-    return max(1, int(match.group(1)))
 
 
 def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
@@ -294,7 +267,7 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
         if not real.is_relative_to(ROM_ROOT):
             continue
         ranked.append(
-            (_disc_number(rel), ROM_EXTENSIONS.index(ext), len(rel.parts), p.name.lower(), real)
+            (disc_number(rel), ROM_EXTENSIONS.index(ext), len(rel.parts), p.name.lower(), real)
         )
     if not ranked:
         return None
@@ -956,39 +929,8 @@ def newest_state_for_slot(slot: int) -> Optional[Path]:
     return max(candidates)[2]
 
 
-def _pine_recv_exact(sock: _socket.socket, n: int, deadline: float) -> Optional[bytes]:
-    """Read exactly `n` bytes from the PINE socket, on one shared deadline.
-
-    Args:
-        sock: A connected PINE socket.
-        n: Number of bytes to read.
-        deadline: `time.monotonic` value the whole read must finish by. A
-            per-recv timeout alone never expires against a peer that dribbles
-            one byte at a time, so the budget is spent, not restarted.
-
-    Returns:
-        The bytes read, or None if the peer closed the connection or the deadline passed.
-    """
-    buf = b""
-    while len(buf) < n:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            log.warning("PINE read timed out with %d of %d bytes on %s", len(buf), n, PINE_SOCKET)
-            return None
-        sock.settimeout(remaining)
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            return None
-        buf += chunk
-    return buf
-
-
 def _pine_request(opcode: int, payload: bytes = b"", timeout: float = 5.0) -> Optional[bytes]:
-    """Send one PINE request and return the reply body.
-
-    Wire format (little endian): u32 total size, u8 opcode, payload; the reply
-    is u32 size, u8 result (0 = OK), payload. Each request opens its own
-    connection to `PINE_SOCKET`.
+    """Send one PINE request to PCSX2's socket and return the reply body.
 
     Args:
         opcode: The PINE message opcode.
@@ -996,39 +938,9 @@ def _pine_request(opcode: int, payload: bytes = b"", timeout: float = 5.0) -> Op
         timeout: Seconds the whole exchange gets, connect through reply.
 
     Returns:
-        The reply payload (possibly empty), or None when the socket is down, the peer hangs up,
-        the reply declares a size outside `_PINE_MAX_REPLY_BYTES`, or PCSX2 rejects the request
-        with a non-zero result.
+        The reply payload (possibly empty), or None on any failure (see `pine.request`).
     """
-    packet = struct.pack("<IB", 5 + len(payload), opcode) + payload
-    deadline = time.monotonic() + timeout
-    try:
-        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as sock:
-            sock.settimeout(timeout)
-            sock.connect(str(PINE_SOCKET))
-            sock.sendall(packet)
-            header = _pine_recv_exact(sock, 5, deadline)
-            if header is None:
-                return None
-            size, result = struct.unpack("<IB", header)
-            if size < 5 or size > _PINE_MAX_REPLY_BYTES:
-                log.warning(
-                    "PINE opcode 0x%02X declared an unusable reply of %d bytes on %s",
-                    opcode,
-                    size,
-                    PINE_SOCKET,
-                )
-                return None
-            body = b""
-            if size > 5:
-                body = _pine_recv_exact(sock, size - 5, deadline) or b""
-            if result != 0:
-                log.warning("PINE opcode 0x%02X rejected (result %d)", opcode, result)
-                return None
-            return body
-    except OSError as exc:
-        log.warning("PINE request failed on %s (opcode 0x%02X): %s", PINE_SOCKET, opcode, exc)
-        return None
+    return pine.request(PINE_SOCKET, opcode, payload, timeout)
 
 
 def _pine_emu_status() -> Optional[int]:

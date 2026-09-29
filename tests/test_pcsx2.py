@@ -15,7 +15,7 @@ from typing import Any, NoReturn, Optional
 import pytest
 
 from webstation_broker import imports
-from webstation_broker.emulators import pcsx2
+from webstation_broker.emulators import pcsx2, pine
 
 from .conftest import import_zip, preflight_import, restore_import
 
@@ -416,7 +416,7 @@ def test_a_pine_reply_that_declares_a_huge_body_is_refused(
 ) -> None:
     """A reply header claiming gigabytes is dropped instead of accumulated."""
     sock = _FakePineSocket(struct.pack("<IB", 0xFFFFFFFF, 0))
-    monkeypatch.setattr(pcsx2._socket, "socket", lambda family, kind: sock)
+    monkeypatch.setattr(pine._socket, "socket", lambda family, kind: sock)
 
     assert pcsx2._pine_request(pcsx2._PINE_MSG_EMU_STATUS) is None
     # Only the 5-byte header was ever read for.
@@ -428,7 +428,7 @@ def test_a_pine_reply_within_the_ceiling_still_comes_back(
 ) -> None:
     """A well-formed status reply is read and returned."""
     sock = _FakePineSocket(struct.pack("<IB", 9, 0) + struct.pack("<I", 0))
-    monkeypatch.setattr(pcsx2._socket, "socket", lambda family, kind: sock)
+    monkeypatch.setattr(pine._socket, "socket", lambda family, kind: sock)
 
     assert pcsx2._pine_emu_status() == 0
 
@@ -1206,7 +1206,7 @@ def test_the_running_serial_is_read_off_the_pine_reply(monkeypatch: pytest.Monke
     serial = b"SLUS-20946\x00"
     body = struct.pack("<I", len(serial)) + serial
     sock = _FakePineSocket(struct.pack("<IB", 5 + len(body), 0) + body)
-    monkeypatch.setattr(pcsx2._socket, "socket", lambda family, kind: sock)
+    monkeypatch.setattr(pine._socket, "socket", lambda family, kind: sock)
 
     assert pcsx2._pine_game_serial() == "SLUS-20946"
 

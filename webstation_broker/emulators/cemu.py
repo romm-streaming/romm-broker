@@ -21,6 +21,7 @@ folds a CRC16 of the device name into that GUID, so the profile carries one
 controller node per GUID variant; the one that matches binds.
 """
 
+import functools
 import logging
 import os
 import re
@@ -311,18 +312,8 @@ class _Split(NamedTuple):
         return None
 
 
-def _refuse(member: imports.ImportMember, reason: str, detail: str) -> imports.ImportRefusal:
-    """Refuse a member with the Cemu shape in the message.
-
-    Args:
-        member: The member.
-        reason: The refusal code.
-        detail: What is wrong with this member.
-
-    Returns:
-        The refusal.
-    """
-    return imports.ImportRefusal(reason, member.name, _EXPECTED, detail=detail)
+_refuse = functools.partial(imports.refuse, expected=_EXPECTED)
+"""Refuse a member, naming this emulator's accepted shapes (see `imports.refuse`)."""
 
 
 def _user_problem(tail: tuple[str, ...]) -> Optional[str]:

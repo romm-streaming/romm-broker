@@ -31,6 +31,7 @@ How a session moves saves in and out of the image:
   docs/content/docs/api/imports.mdx.
 """
 
+import functools
 import logging
 import os
 import re
@@ -47,7 +48,7 @@ from typing import IO, Any, Optional, Union
 from pyfatx import Fatx
 
 from .. import imports, settings
-from .base import Emulator, _cmdline, base_launch_env
+from .base import Emulator, _cmdline, base_launch_env, disc_number
 
 log = logging.getLogger(__name__)
 
@@ -73,19 +74,7 @@ to `VULKAN` where the driver is known good, or to `KEEP` to leave the file alone
 """
 
 
-def _truthy(value: str) -> bool:
-    """Whether an environment flag reads as enabled.
-
-    Args:
-        value: The raw environment value.
-
-    Returns:
-        True for `1`, `true`, `yes` or `on`, case-insensitive and whitespace-trimmed.
-    """
-    return value.strip().lower() in ("1", "true", "yes", "on")
-
-
-XEMU_SOFTWARE_GL = _truthy(os.environ.get("XEMU_SOFTWARE_GL", ""))
+XEMU_SOFTWARE_GL = settings.truthy(os.environ.get("XEMU_SOFTWARE_GL", ""))
 """Whether xemu renders on the CPU via `LIBGL_ALWAYS_SOFTWARE` (env `XEMU_SOFTWARE_GL`, default off).
 
 Which renderer xemu asks for and whether the driver can answer are separate
@@ -158,8 +147,6 @@ ROM_EXTENSIONS = (".iso",)
 """Bootable disc formats: only XISO, always named `.iso`, including the `.xiso.iso` double extension."""
 _ROM_SEARCH_GLOBS = ("*", "*/*")
 """Glob patterns a ROM folder is searched with, one level of wrapper folder deep."""
-_DISC_RE = re.compile(r"(?:^|[^a-z0-9])(?:disc|disk|cd)[\s._-]*(\d+)", re.IGNORECASE)
-"""Matches a disc number in a file name, for ranking multi-disc dumps."""
 
 
 def _hdd_image_path() -> Path:
@@ -325,21 +312,6 @@ def _pin_display_settings() -> None:
     log.info("pinned xemu display settings in %s", XEMU_TOML)
 
 
-def _disc_number(rel: Path) -> int:
-    """Disc number parsed from a candidate's relative path, for multi-disc ranking.
-
-    Args:
-        rel: The candidate's path relative to the search base.
-
-    Returns:
-        The disc number found in the name, or 1 when there is none.
-    """
-    match = _DISC_RE.search(str(rel))
-    if match is None:
-        return 1
-    return max(1, int(match.group(1)))
-
-
 def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
     """Pick the best bootable disc image among `candidates`.
 
@@ -374,7 +346,7 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
             log.warning("xemu: skipping %s, it resolves outside %s", p, rom_root)
             continue
         ranked.append(
-            (_disc_number(rel), ROM_EXTENSIONS.index(ext), len(rel.parts), p.name.lower(), real)
+            (disc_number(rel), ROM_EXTENSIONS.index(ext), len(rel.parts), p.name.lower(), real)
         )
     if not ranked:
         return None
@@ -728,18 +700,8 @@ def _remove_tree(path: Path) -> None:
         log.warning("could not fully remove %s: %s", path, exc)
 
 
-def _refuse(member: imports.ImportMember, reason: str, detail: str) -> imports.ImportRefusal:
-    """Refuse a member with the xemu shape in the message.
-
-    Args:
-        member: The member.
-        reason: The refusal code.
-        detail: What is wrong with this member.
-
-    Returns:
-        The refusal.
-    """
-    return imports.ImportRefusal(reason, member.name, _EXPECTED, detail=detail)
+_refuse = functools.partial(imports.refuse, expected=_EXPECTED)
+"""Refuse a member, naming this emulator's accepted shapes (see `imports.refuse`)."""
 
 
 def _is_hdd_image(member: imports.ImportMember) -> bool:

@@ -1256,15 +1256,6 @@ def cache_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return cache
 
 
-@pytest.mark.parametrize("setting,expected", [
-    ("1", True), ("true", True), ("YES", True), (" on ", True),
-    ("0", False), ("false", False), ("", False),
-])
-def test_the_cache_enabled_switch_reads_the_usual_spellings(setting: str, expected: bool) -> None:
-    """_truthy recognizes the usual truthy and falsy string spellings."""
-    assert shadps4._truthy(setting) is expected
-
-
 def test_cache_size_bytes_sums_across_every_game_dir(cache_dir: Path) -> None:
     """Cache size bytes sums across every game dir."""
     _touch(cache_dir / "GameA" / "eboot.bin")
@@ -2180,7 +2171,7 @@ def test_stop_keeps_the_pkg_extraction_for_the_next_launch(
 def test_the_cache_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """The cache is disabled by default when SHADPS4_CACHE_ENABLED is unset."""
     monkeypatch.delenv("SHADPS4_CACHE_ENABLED", raising=False)
-    assert shadps4._truthy(os.environ.get("SHADPS4_CACHE_ENABLED", "false")) is False
+    assert settings.truthy(os.environ.get("SHADPS4_CACHE_ENABLED", "false")) is False
 
 
 # -- archive listings must fail closed --
