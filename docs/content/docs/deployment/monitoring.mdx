@@ -35,12 +35,13 @@ variable.
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| `--url` | `$BROKER_URL`, else `http://127.0.0.1:8000` plus the `SUBFOLDER` prefix (`/streaming` when unset) | The broker's base URL, prefix included. |
+| `--url` | `$BROKER_URL`, else `http://` plus `BROKER_HOST` and `BROKER_PORT` (`127.0.0.1:8000` when unset) plus the `SUBFOLDER` prefix (`/streaming` when unset) | The broker's base URL, prefix included. |
 | `--insecure` | off | Skip TLS certificate checks, for the container's self-signed port `3001`. |
 | `--timeout` | `5` | Seconds to wait for each request. |
 | `--max-session-hours` | `12` | Warn when one session has been open longer than this. |
 | `--max-exit-seconds` | `120` | Warn when the last exit took longer than this. |
 | `--max-kept-archives` | `0` | Warn when more save archives than this are waiting on the container. |
+| `--max-last-exit-hours` | `24` | Stop reporting a failed dump, an upload that kept nothing, or a slow exit once the exit is older than this. |
 
 ## Where to run it
 
@@ -50,9 +51,10 @@ checkout of this repo, or from a copy of the single file.
 ### From the Docker host (recommended)
 
 Pipe the script into the container's own Python. It then talks to the broker
-directly on `127.0.0.1:8000`, with no TLS and no reverse proxy in the way, and
-`docker exec` hands it the container's `BROKER_SECRET` and `SUBFOLDER`, so
-there is no second copy of either to keep in sync:
+directly (on `127.0.0.1:8000` unless `BROKER_HOST` or `BROKER_PORT` move it),
+with no TLS and no reverse proxy in the way, and `docker exec` hands it the
+container's `BROKER_SECRET`, `BROKER_PORT` and `SUBFOLDER`, so there is no
+second copy of any of them to keep in sync:
 
 ```bash
 docker exec -i webstation python3 - < scripts/check_broker.py
@@ -159,18 +161,27 @@ On the `exit:` line, `upload` is one of:
 Worst first. When one run finds several problems it prints them all on one
 line, separated by `;`, under the worst state.
 
+Alerts about the last exit clear on their own once they are dealt with. A
+failed upload with a kept archive stays raised until that archive is deleted
+from `BROKER_EXPORT_DIR`. A failed dump, an upload that kept nothing and a
+slow exit leave nothing on disk to track, so they stay raised for
+`--max-last-exit-hours` (24 by default) and then drop; the next exit also
+replaces them. Deal with them inside that window, or raise it if nobody reads
+the alerts that often.
+
 | The check says | What it means | What to do |
 | --- | --- | --- |
 | `CRITICAL: broker health ... unreachable` | Nothing answers on the broker port. | Check the container is running, then read `docker logs webstation` for the startup error. |
 | `CRITICAL: ... emulator ... is not running` | A session is still open but its emulator exited or crashed. Players see a frozen stream. | Exit the session from RomM. The teardown still dumps and uploads whatever saves the emulator wrote before it went down. |
 | `CRITICAL: ... save dump failed` | The last exit could not zip the save tree, so nothing reached RomM. | The saves are still in that emulator's save directory under `/config`; the log line `save dump failed` says why. Copy them out before the next game on that emulator, because a launch clears the working save slot. |
 | `CRITICAL: ... upload failed and the archive could not be kept` | RomM did not take the archive, and writing the fallback copy failed too (a full disk, usually). | Recover the saves from the emulator's save directory as above, then free space under `BROKER_EXPORT_DIR` (default `/config/broker-exports`). |
-| `WARNING: ... upload failed, archive kept at ...` | RomM did not take the archive; the broker kept a copy. | Find out why in the log (`save upload rejected by ...` or `save upload to ... failed`) and fix the RomM side. Then download the archive and delete it, as below. |
+| `WARNING: ... upload failed, archive kept at ...` | RomM did not take the archive; the broker kept a copy. | Find out why in the log (`save upload rejected by ...` or `save upload to ... failed`) and fix the RomM side. Then download the archive and delete it, as below; the alert clears once it is gone. |
 | `WARNING: N save archive(s) kept on disk, not in RomM` | Archives are waiting in `BROKER_EXPORT_DIR`. Outside dev mode each one is a failed upload. | Download and delete them, as below. The warning clears once the directory is empty. In dev mode every exit keeps one, so raise `--max-kept-archives` there. |
 | `WARNING: ... emulator reports a failed boot` | The emulator is running but never reached the game (PCSX2 reports this today). | Read the log around the launch for the emulator's own error, and see [Activate fails](/docs/troubleshooting#activate-fails-or-a-specific-game-wont-launch). |
 | `WARNING: session ... has run 13.0h` | A session has been open longer than `--max-session-hours`. Usually a browser tab closed without exiting. | Check whether someone is really still playing; if not, exit it from RomM. |
 | `WARNING: last exit ... took 300s` | A teardown took longer than `--max-exit-seconds`. | Look for `still running after its exit` in the log: an emulator that ignored its exit request and had to be killed. |
-| `UNKNOWN: broker answered HTTP 403 ...` | The check's `BROKER_SECRET` does not match the broker's. | Use the same secret the container was started with. |
+| `UNKNOWN: broker refused the secret (HTTP 403) ...` | The check's `BROKER_SECRET` does not match the broker's. | Use the same secret the container was started with. |
+| `UNKNOWN: broker answered HTTP 404 ...` (or `500`, `502`) | The status route answered, but not with a status. | A `404` means the `--url` prefix is wrong or a proxy does not forward the route; a `5xx` means the broker or the proxy in front of it failed, so read its log. |
 | `UNKNOWN: could not read broker status` | The broker answered its health route but not the status route. | Usually a proxy that forwards only part of the API; try the check from the Docker host instead. |
 
 ### Recovering a kept archive
@@ -193,6 +204,9 @@ See [Save archives](/docs/api/archives) for the archive layout.
 - **A restart forgets the last exit.** `last_exit` lives in memory. A failed
   upload is still caught after a restart, because its archive stays on disk,
   but a slow exit or a failed dump from before the restart is not.
+- **Old alerts expire.** A failed dump or slow exit older than
+  `--max-last-exit-hours` stops being reported even if nobody acted on it.
+  The `exit:` line in the log keeps the record.
 - **It samples; it does not watch.** An emulator that crashes and is exited
   between two runs never shows as `not running`. The exit's own line in the
   log still records how its saves went.

@@ -33,11 +33,14 @@ class Limits(NamedTuple):
         max_session_hours: A session running longer than this is probably one nobody exited.
         max_exit_seconds: An exit slower than this is a teardown worth looking at.
         max_kept_archives: Save archives on disk above this many never reached RomM.
+        max_last_exit_hours: How long an alert about the last exit stays raised
+            when nothing on disk tracks it.
     """
 
     max_session_hours: float
     max_exit_seconds: float
     max_kept_archives: int
+    max_last_exit_hours: float
 
 
 def evaluate(
@@ -69,13 +72,21 @@ def evaluate(
     last = status.get("last_exit")
     if last:
         what = f"last exit {last.get('session_id')}"
+        # A kept archive is tracked by the exports listing, so its alert clears
+        # once the operator deletes it. The rest leave nothing on disk to watch
+        # and would otherwise stay raised until the next exit, fixed or not.
+        recent = now - last.get("ended_at", now) <= limits.max_last_exit_hours * 3600
+        kept = last.get("archive_path")
+        kept_names = {e.get("name") for e in exports}
         if last.get("dump_error"):
-            problems.append((CRITICAL, f"{what}: save dump failed: {last['dump_error']}"))
-        elif last.get("upload") == "failed" and not last.get("archive_path"):
-            problems.append((CRITICAL, f"{what}: upload failed and the archive could not be kept"))
-        elif last.get("upload") == "failed":
-            problems.append((WARNING, f"{what}: upload failed, archive kept at {last['archive_path']}"))
-        if last.get("duration_s", 0) > limits.max_exit_seconds:
+            if recent:
+                problems.append((CRITICAL, f"{what}: save dump failed: {last['dump_error']}"))
+        elif last.get("upload") == "failed" and not kept:
+            if recent:
+                problems.append((CRITICAL, f"{what}: upload failed and the archive could not be kept"))
+        elif last.get("upload") == "failed" and os.path.basename(kept) in kept_names:
+            problems.append((WARNING, f"{what}: upload failed, archive kept at {kept}"))
+        if recent and last.get("duration_s", 0) > limits.max_exit_seconds:
             problems.append((WARNING, f"{what} took {last['duration_s']}s"))
 
     if len(exports) > limits.max_kept_archives:
@@ -87,16 +98,24 @@ def evaluate(
 def _default_url() -> str:
     """The broker's own address inside the container, under its `SUBFOLDER` prefix.
 
-    Run through `docker exec`, the script inherits the container's `SUBFOLDER`,
-    so the prefix follows it the way the broker's settings do.
+    Run through `docker exec`, the script inherits the container's `BROKER_HOST`,
+    `BROKER_PORT` and `SUBFOLDER`, so it finds the broker the way the broker's
+    settings place it.
 
     Returns:
-        `$BROKER_URL` when set, else `http://127.0.0.1:8000` plus the prefix.
+        `$BROKER_URL` when set, else the broker's bind address plus the prefix,
+        with a wildcard bind address read as loopback.
     """
     if os.environ.get("BROKER_URL"):
         return os.environ["BROKER_URL"]
+    host = os.environ.get("BROKER_HOST", "").strip()
+    if host in ("", "0.0.0.0", "::"):
+        host = "127.0.0.1"
+    elif ":" in host:
+        host = f"[{host}]"
+    port = os.environ.get("BROKER_PORT", "8000").strip()
     prefix = "/" + os.environ.get("SUBFOLDER", "/streaming/").strip().strip("/")
-    return "http://127.0.0.1:8000" + prefix.rstrip("/")
+    return f"http://{host}:{port}" + prefix.rstrip("/")
 
 
 def _get(url: str, secret: Optional[str], timeout: float, context: Optional[ssl.SSLContext]) -> Any:
@@ -133,10 +152,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--max-session-hours", type=float, default=12.0)
     parser.add_argument("--max-exit-seconds", type=float, default=120.0)
     parser.add_argument("--max-kept-archives", type=int, default=0)
+    parser.add_argument("--max-last-exit-hours", type=float, default=24.0)
     args = parser.parse_args(argv)
     base = args.url.rstrip("/") + "/api"
     secret = os.environ.get("BROKER_SECRET") or None
-    limits = Limits(args.max_session_hours, args.max_exit_seconds, args.max_kept_archives)
+    limits = Limits(
+        args.max_session_hours, args.max_exit_seconds, args.max_kept_archives, args.max_last_exit_hours
+    )
     context = None
     if args.insecure:
         context = ssl.create_default_context()
@@ -152,7 +174,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         status = _get(f"{base}/session/status", secret, args.timeout, context)
         exports = _get(f"{base}/session/exports", secret, args.timeout, context)["exports"]
     except urllib.error.HTTPError as exc:
-        print(f"UNKNOWN: broker answered HTTP {exc.code} on a secret route; is BROKER_SECRET set?")
+        if exc.code in (401, 403):
+            print(f"UNKNOWN: broker refused the secret (HTTP {exc.code}) on {exc.url}; is BROKER_SECRET set?")
+        else:
+            print(f"UNKNOWN: broker answered HTTP {exc.code} on {exc.url}")
         return UNKNOWN
     except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
         print(f"UNKNOWN: could not read broker status: {exc}")

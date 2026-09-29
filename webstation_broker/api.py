@@ -929,7 +929,7 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
         sess["id"],
         body.emulator,
         time.monotonic() - started,
-        restore_report["written"] if restore_report else 0,
+        restore_report["written"] + len(restore_report["imported"]) if restore_report else 0,
         tokens_pushed,
     )
 
