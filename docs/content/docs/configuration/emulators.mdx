@@ -69,7 +69,6 @@ DuckStation's data folder isn't configurable here either. Everything
 | `DOLPHIN_STATE_WAIT` | `20.0` | How long a save state has to land on disk after the save hotkey. |
 | `DOLPHIN_RESUME_LOAD_WAIT` | `90.0` | How long a resume load waits for the render window. |
 | `DOLPHIN_RESUME_LOAD_SETTLE` | `5.0` | How long the window has to be up before the load hotkey is sent. |
-| `DOLPHIN_VIDEO_BACKEND` | `OGL` | Video backend pinned at launch; OGL over Vulkan because RADV on the integrated AMD parts has been the less reliable one. |
 | `DOLPHIN_PAD_NAME` | `Xbox 360 Controller` | The selkies virtual pad's name as Dolphin's SDL backend presents it, used in the seeded `GCPadNew.ini` bindings. |
 
 Dolphin's folders aren't configurable here either. Config (`GCPadNew.ini` and
@@ -162,7 +161,7 @@ written) sits at the root of that folder, and saves live under
 | `RETROARCH_STATE_SLOT` | `0` | The slot RetroArch works in; 0 is its default, so the player's own load hotkey reaches the same file. |
 | `RETROARCH_SLOT_STEP_DELAY` | `0.1` | Pause between slot presses while parking the slot. |
 | `RETROARCH_SLOT_HOME_STEPS` | `24` | Slot-down presses to reach the -1 floor from anywhere the player could have cycled to. |
-| `RETROARCH_STATE_CONFIRM_WAIT` | `10.0` | How long a save state has to land on disk after `SAVE_STATE_SLOT`. |
+| `RETROARCH_STATE_CONFIRM_WAIT` | `10.0` | How long a save state has to land on disk after `SAVE_STATE`. |
 | `RETROARCH_LOAD_ACK_WAIT` | `10.0` | How long `LOAD_STATE_SLOT` has to be acknowledged. |
 | `RETROARCH_RESUME_WAIT` | `90.0` | How long a resume load waits for the core to report a running game. |
 | `RETROARCH_RESUME_SETTLE` | `3.0` | How long the game has to be running before the resume load fires. |
@@ -216,7 +215,7 @@ RPCS3's data folder isn't configurable here either. On Linux, everything
 | `PPSSPP_STATE_SLOT` | `1` | The slot PPSSPP works in. |
 | `PPSSPP_STATE_WAIT` | `20.0` | How long a save state has to land on disk after the save hotkey. |
 | `PPSSPP_RESUME_LOAD_WAIT` | `90.0` | How long a resume load waits for the game window. |
-| `PPSSPP_RESUME_LOAD_SETTLE` | `5.0` | How long the window has to be up before the load hotkey is sent. |
+| `PPSSPP_RESUME_LOAD_SETTLE` | `12.0` | How long the window has to be up before the load hotkey is sent. |
 
 PPSSPP's config folder isn't configurable here either. It's
 `/config/.config/ppsspp`. PPSSPP's emulated memory stick lives inside it as

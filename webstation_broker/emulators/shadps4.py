@@ -28,6 +28,7 @@ the cache key is taken from the archive itself rather than the throwaway
 scratch extraction.
 """
 
+import functools
 import json
 import logging
 import os
@@ -1134,18 +1135,8 @@ def _game_serial(rom_file: Path) -> Optional[str]:
     return _sfo_title_id(sfo)
 
 
-def _refuse(member: imports.ImportMember, reason: str, detail: str) -> imports.ImportRefusal:
-    """Refuse a member with the shadPS4 shape in the message.
-
-    Args:
-        member: The member.
-        reason: The refusal code.
-        detail: What is wrong with this member.
-
-    Returns:
-        The refusal.
-    """
-    return imports.ImportRefusal(reason, member.name, _EXPECTED, detail=detail)
+_refuse = functools.partial(imports.refuse, expected=_EXPECTED)
+"""Refuse a member, naming this emulator's accepted shapes (see `imports.refuse`)."""
 
 
 def _below_wrapper(parts: tuple[str, ...]) -> tuple[str, ...]:

@@ -8,6 +8,7 @@ process kill an emulator it never spawned.
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -99,6 +100,29 @@ variant, which never starts in Wayland mode.
 
 STATE_HEAD_BYTES = 64
 """Bytes of a pushed state the push route hands `check_state_bytes`."""
+
+DISC_RE = re.compile(r"(?:^|[^a-z0-9])(?:disc|disk|cd)[\s._-]*(\d+)", re.IGNORECASE)
+"""Matches a disc number in a path.
+
+Disc numbering keeps a multi-disc game booting the same disc each session, so
+a save state taken for Disc 1 resumes on Disc 1.
+"""
+
+
+def disc_number(rel: Path) -> int:
+    """The disc number a ROM path names, for ranking multi-disc candidates.
+
+    Args:
+        rel: The candidate's path relative to the ROM folder being searched.
+
+    Returns:
+        The number following a `disc`, `disk` or `cd` marker in the path,
+        floored at 1, or 1 when the path names no disc.
+    """
+    match = DISC_RE.search(str(rel))
+    if match is None:
+        return 1
+    return max(1, int(match.group(1)))
 
 
 def _xdg_dir(app: str, var: str, fallback: str) -> Path:

@@ -66,7 +66,7 @@ from pathlib import Path, PurePosixPath
 from typing import Optional, Union
 
 from .. import imports
-from .base import Emulator, base_launch_env, xdg_data_dir
+from .base import Emulator, base_launch_env, disc_number, xdg_data_dir
 
 log = logging.getLogger(__name__)
 
@@ -89,7 +89,6 @@ FLYCAST_LOG_PATH = Path(os.environ.get("FLYCAST_LOG_PATH", "/config/flycast.log"
 # flycast's own CLI parser flips bios.UseReios on for it automatically.
 ROM_EXTENSIONS = (".chd", ".gdi", ".cdi", ".cue", ".elf")
 _ROM_SEARCH_GLOBS = ("*", "*/*")
-_DISC_RE = re.compile(r"(?:^|[^a-z0-9])(?:disc|disk|cd)[\s._-]*(\d+)", re.IGNORECASE)
 
 _XDOTOOL = os.environ.get("XDOTOOL_BIN", "xdotool")
 # SDL_CreateWindow("Flycast", ...) at boot; SDL_SetWindowTitle appends
@@ -97,13 +96,6 @@ _XDOTOOL = os.environ.get("XDOTOOL_BIN", "xdotool")
 # class since the AppImage's real argv[0] (and so its default X11 class)
 # isn't something the broker can pin down from source alone.
 _WINDOW_TITLE_RE = "^Flycast"
-
-
-def _disc_number(rel: Path) -> int:
-    match = _DISC_RE.search(str(rel))
-    if match is None:
-        return 1
-    return max(1, int(match.group(1)))
 
 
 def _pick_rom_file(candidates: list[Path], base: Path) -> Optional[Path]:
@@ -125,7 +117,7 @@ def _pick_rom_file(candidates: list[Path], base: Path) -> Optional[Path]:
         if not real.is_relative_to(ROM_ROOT):
             continue
         ranked.append(
-            (_disc_number(rel), ROM_EXTENSIONS.index(ext), len(rel.parts), p.name.lower(), real)
+            (disc_number(rel), ROM_EXTENSIONS.index(ext), len(rel.parts), p.name.lower(), real)
         )
     if not ranked:
         return None

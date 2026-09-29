@@ -190,9 +190,9 @@ the full explanation.
 </Tab>
 </Tabs>
 
-Some emulators (`DOLPHIN_VIDEO_BACKEND`, `XEMU_RENDERER`) are pinned to a
-renderer known to work on the integrated AMD graphics this image is tested
-on. Change these if your driver prefers Vulkan instead. PCSX2 has no such
+xemu is pinned to a renderer (`XEMU_RENDERER`) known to work on the
+integrated AMD graphics this image is tested on. Change it if your driver
+prefers Vulkan instead. PCSX2 has no such
 pin: its renderer setting lives in `PCSX2.ini`, picked by its own setup
 wizard. So a "Failed to initialize GS" startup error on an AMD integrated
 GPU means RADV (AMD's Vulkan driver) failed to start on that hardware.

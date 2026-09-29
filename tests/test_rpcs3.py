@@ -23,7 +23,7 @@ from typing import Callable, NoReturn, Optional
 import pytest
 
 from webstation_broker import imports, saves, settings
-from webstation_broker.emulators import rpcs3
+from webstation_broker.emulators import pine, rpcs3
 
 from .conftest import import_zip, preflight_import, restore_import
 
@@ -1561,7 +1561,7 @@ def test_pine_request_coerces_a_truncated_body_to_empty(pine_socket: Path) -> No
     """A truncated PINE body is coerced to empty bytes, not treated as failure.
 
     The declared size promises 5 payload bytes but the connection closes
-    after 2; _pine_recv_exact's None gets folded into b"" rather than
+    after 2; recv_exact's None gets folded into b"" rather than
     propagated. Both current callers (_pine_status, _pine_title_id) treat an
     empty body the same as None, so this documents the actual coercion
     rather than asserting a failure path that doesn't exist.
@@ -1591,21 +1591,21 @@ def test_pine_recv_exact_accumulates_across_several_recv_calls() -> None:
     """PINE recv exact accumulates across several recv calls."""
     sock = _StubSocket([b"ab", b"cde", b"f"])
 
-    assert rpcs3._pine_recv_exact(sock, 6, time.monotonic() + 5) == b"abcdef"
+    assert pine.recv_exact(sock, 6, time.monotonic() + 5, rpcs3.PINE_SOCKET) == b"abcdef"
 
 
 def test_pine_recv_exact_returns_none_when_the_socket_closes_early() -> None:
     """PINE recv exact returns none when the socket closes early."""
     sock = _StubSocket([b"ab", b""])
 
-    assert rpcs3._pine_recv_exact(sock, 6, time.monotonic() + 5) is None
+    assert pine.recv_exact(sock, 6, time.monotonic() + 5, rpcs3.PINE_SOCKET) is None
 
 
 def test_pine_recv_exact_gives_up_once_the_shared_deadline_passes() -> None:
     """A deadline already in the past stops the read before any recv."""
     sock = _StubSocket([b"ab", b"cd", b"ef"])
 
-    assert rpcs3._pine_recv_exact(sock, 6, time.monotonic() - 1) is None
+    assert pine.recv_exact(sock, 6, time.monotonic() - 1, rpcs3.PINE_SOCKET) is None
     assert sock.timeouts == []
 
 
@@ -1617,7 +1617,7 @@ def test_pine_recv_exact_spends_the_budget_rather_than_restarting_it() -> None:
     """
     sock = _StubSocket([b"a", b"b", b"c"])
 
-    rpcs3._pine_recv_exact(sock, 3, time.monotonic() + 5)
+    pine.recv_exact(sock, 3, time.monotonic() + 5, rpcs3.PINE_SOCKET)
 
     assert sock.timeouts == sorted(sock.timeouts, reverse=True)
     assert all(t <= 5 for t in sock.timeouts)
@@ -1625,7 +1625,7 @@ def test_pine_recv_exact_spends_the_budget_rather_than_restarting_it() -> None:
 
 def test_pine_request_refuses_a_reply_larger_than_the_cap(pine_socket: Path) -> None:
     """A declared reply above the cap is refused instead of accumulated."""
-    reply = struct.pack("<IB", rpcs3._PINE_MAX_REPLY_BYTES + 1, 0)
+    reply = struct.pack("<IB", pine.MAX_REPLY_BYTES + 1, 0)
     thread = _serve_pine_reply(pine_socket, reply)
 
     result = rpcs3._pine_request(rpcs3._PINE_MSG_STATUS, timeout=2.0)

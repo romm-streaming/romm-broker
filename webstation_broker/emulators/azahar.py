@@ -23,6 +23,7 @@ the shapes.
 """
 
 import configparser
+import functools
 import logging
 import os
 import re
@@ -266,18 +267,8 @@ def _patch_config() -> None:
         raise
 
 
-def _refuse(member: imports.ImportMember, reason: str, detail: str) -> imports.ImportRefusal:
-    """Refuse a member with the Azahar shapes in the message.
-
-    Args:
-        member: The member.
-        reason: The refusal code.
-        detail: What is wrong with this member.
-
-    Returns:
-        The refusal.
-    """
-    return imports.ImportRefusal(reason, member.name, _EXPECTED, detail=detail)
+_refuse = functools.partial(imports.refuse, expected=_EXPECTED)
+"""Refuse a member, naming this emulator's accepted shapes (see `imports.refuse`)."""
 
 
 def _hardware_sd_ids(ctx: imports.ImportCtx) -> frozenset[tuple[str, str]]:

@@ -74,23 +74,6 @@ def _touch(path: Path, mtime: Optional[float] = None) -> Path:
     return path
 
 
-@pytest.mark.parametrize(
-    ("name", "expected"),
-    [
-        ("Game.rvz", 1),
-        ("Game (Disc 2).rvz", 2),
-        ("Game.disc3.iso", 3),
-        ("Game_cd-4.iso", 4),
-        # A digit elsewhere in the name is not a disc number.
-        ("Sonic Adventure 2.gcm", 1),
-        ("Game (Disc 0).iso", 1),
-    ],
-)
-def test_disc_number_reads_only_a_disc_marker(name: str, expected: int) -> None:
-    """The disc number comes from an explicit disc marker, not any digit in the name."""
-    assert dolphin._disc_number(Path(name)) == expected
-
-
 def test_rom_pick_prefers_the_compressed_image_beside_the_raw_one(rom_root: Path) -> None:
     """A .rvz beside an .iso of the same game is the one picked."""
     game = rom_root / "game"

@@ -1137,3 +1137,21 @@ def test_an_accepted_member_lands_inside_the_save_tree(
     for placement in result.placements:
         for dest in (placement.dest, *(d for d, _ in placement.sidecars)):
             assert saves.under_subtrees(dest, subtrees), dest
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("Game.rvz", 1),
+        ("Game (Disc 2).rvz", 2),
+        ("Game.disc3.iso", 3),
+        ("Game.disk3.iso", 3),
+        ("Game_cd-4.iso", 4),
+        # A digit elsewhere in the name is not a disc number.
+        ("Sonic Adventure 2.gcm", 1),
+        ("Game (Disc 0).iso", 1),
+    ],
+)
+def test_disc_number_reads_only_a_disc_marker(name: str, expected: int) -> None:
+    """The disc number comes from an explicit disc marker, not any digit in the name."""
+    assert base.disc_number(Path(name)) == expected

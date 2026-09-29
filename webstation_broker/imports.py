@@ -230,6 +230,23 @@ class ImportMember:
             raise MemberReadError("the member's data is corrupt", self.name) from exc
 
 
+def refuse(member: ImportMember, reason: str, detail: str, *, expected: str) -> ImportRefusal:
+    """Refuse one member, naming the shapes the emulator would have taken.
+
+    Emulator modules bind `expected` once with `functools.partial`.
+
+    Args:
+        member: The member.
+        reason: The refusal code.
+        detail: What is wrong with this member.
+        expected: What would have been accepted, in words.
+
+    Returns:
+        The refusal.
+    """
+    return ImportRefusal(reason, member.name, expected, detail=detail)
+
+
 @dataclass(frozen=True)
 class ImportCtx:
     """What preflight knows about the launch, handed to every placement hook.

@@ -48,7 +48,6 @@ import os
 import re
 import shutil
 import signal
-import socket as _socket
 import struct
 import subprocess
 import tempfile
@@ -60,8 +59,8 @@ from threading import Thread
 from typing import Optional, Union
 
 from .. import imports, settings
-from . import extraction_cache
-from .base import Emulator, base_launch_env, xdg_config_dir
+from . import extraction_cache, pine
+from .base import XDG_RUNTIME_DIR, Emulator, base_launch_env, xdg_config_dir
 from .extraction_cache import ExtractionCache
 
 log = logging.getLogger(__name__)
@@ -154,18 +153,12 @@ _IPC_PATCHES: dict[tuple[str, str], str] = {
     ("", "IPC Server enabled"): "true",
 }
 
-XDG_RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/config/.XDG")
 PINE_SOCKET = Path(XDG_RUNTIME_DIR) / "rpcs3.sock"
 
 # RPCS3's generic PINE opcodes (rpcs3/3rdparty/pine/pine_server.h). No
 # save/load-state opcode exists in this set, unlike PCSX2's PINE variant.
 _PINE_MSG_ID = 0x0C
 _PINE_MSG_STATUS = 0x0F
-# The two opcodes used here answer with four bytes and a short title id. A
-# peer declaring more than this is misframed or wedged, and the declared
-# size is what the read loop would otherwise sit and accumulate toward.
-_PINE_MAX_REPLY_BYTES = 64 * 1024
-
 BOOT_WAIT = float(os.environ.get("RPCS3_BOOT_WAIT", "90.0"))
 # A full state write (compressed PS3 RAM + VRAM) is a heavier write than the
 # other cores' states, so this is generous.
@@ -1336,77 +1329,18 @@ def _wait_for_state_write(
     return None
 
 
-def _pine_recv_exact(sock: _socket.socket, n: int, deadline: float) -> Optional[bytes]:
-    """Read exactly `n` bytes, giving the whole read one shared deadline.
-
-    Args:
-        sock: The connected PINE socket.
-        n: Bytes to read.
-        deadline: `time.monotonic()` value the read must complete by. A
-            per-recv timeout alone never expires against a peer that dribbles
-            one byte at a time, so the budget is spent, not restarted.
-
-    Returns:
-        The bytes read, or None if the peer closed or the deadline passed.
-    """
-    buf = b""
-    while len(buf) < n:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            log.warning("PINE read timed out with %d of %d bytes on %s", len(buf), n, PINE_SOCKET)
-            return None
-        sock.settimeout(remaining)
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            return None
-        buf += chunk
-    return buf
-
-
 def _pine_request(opcode: int, payload: bytes = b"", timeout: float = 5.0) -> Optional[bytes]:
-    """Send one PINE request and return its reply payload.
-
-    Wire format (LE): u32 total size, u8 opcode, payload; reply is u32
-    size, u8 result (0 = OK), payload. Same wire format PCSX2's PINE
-    variant uses; RPCS3 just implements a smaller opcode set (no
-    save/load-state) on top of it.
+    """Send one PINE request to RPCS3's socket and return the reply body.
 
     Args:
-        opcode: The PINE opcode to send.
-        payload: Opcode arguments, if any.
+        opcode: The PINE message opcode.
+        payload: Bytes following the opcode.
         timeout: Seconds the whole exchange gets, connect through reply.
 
     Returns:
-        The reply payload, or None if the request failed or the socket is
-        unreachable.
+        The reply payload (possibly empty), or None on any failure (see `pine.request`).
     """
-    packet = struct.pack("<IB", 5 + len(payload), opcode) + payload
-    deadline = time.monotonic() + timeout
-    try:
-        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as sock:
-            sock.settimeout(timeout)
-            sock.connect(str(PINE_SOCKET))
-            sock.sendall(packet)
-            header = _pine_recv_exact(sock, 5, deadline)
-            if header is None:
-                return None
-            size, result = struct.unpack("<IB", header)
-            if size < 5 or size > _PINE_MAX_REPLY_BYTES:
-                log.warning(
-                    "PINE opcode 0x%02X declared an unusable reply of %d bytes on %s",
-                    opcode, size, PINE_SOCKET,
-                )
-                return None
-            body = b""
-            if size > 5:
-                body = _pine_recv_exact(sock, size - 5, deadline) or b""
-            if result != 0:
-                log.warning("PINE opcode 0x%02X rejected (result %d)", opcode, result)
-                return None
-            return body
-    except OSError as exc:
-        log.warning("PINE request failed on %s (opcode 0x%02X): %s", PINE_SOCKET, opcode, exc)
-        return None
+    return pine.request(PINE_SOCKET, opcode, payload, timeout)
 
 
 def _pine_status() -> Optional[int]:

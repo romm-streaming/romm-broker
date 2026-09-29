@@ -199,6 +199,7 @@ def test_catalog_is_zip_intersect_index_plus_installed() -> None:
         ("yes", True),
         ("on", True),
         ("0", False),
+        ("false", False),
         ("", False),
         (None, False),
     ],

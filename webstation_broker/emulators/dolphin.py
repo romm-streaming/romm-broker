@@ -20,7 +20,7 @@ from typing import Any, Optional, Union
 
 from .. import imports, memcard
 from . import wii_nand
-from .base import Emulator, base_launch_env, xdg_config_dir, xdg_data_dir
+from .base import Emulator, base_launch_env, disc_number, xdg_config_dir, xdg_data_dir
 
 log = logging.getLogger(__name__)
 
@@ -112,7 +112,6 @@ A folder holding several candidates picks the compressed image over the raw
 one beside it.
 """
 _ROM_SEARCH_GLOBS = ("*", "*/*")
-_DISC_RE = re.compile(r"(?:^|[^a-z0-9])(?:disc|disk|cd)[\s._-]*(\d+)", re.IGNORECASE)
 
 _STATE_NAME_RE = re.compile(r"(?P<game>[^/]+)\.s\d{2}", re.ASCII)
 """Matches `<game id>.s01`, the name Dolphin builds for a save state."""
@@ -273,21 +272,6 @@ _RENDER_TITLE_MARK = " | "
 """Substring that singles the render window's title out from the main window and dialogs."""
 
 
-def _disc_number(rel: Path) -> int:
-    """Return the disc number a relative ROM path names, or 1 when it names none.
-
-    Args:
-        rel: Candidate path relative to the ROM folder being searched.
-
-    Returns:
-        The number following a `disc`, `disk` or `cd` marker in the path, never below 1.
-    """
-    match = _DISC_RE.search(str(rel))
-    if match is None:
-        return 1
-    return max(1, int(match.group(1)))
-
-
 def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
     """Pick the best bootable disc image out of a set of candidate paths.
 
@@ -321,7 +305,7 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
         if not real.is_relative_to(ROM_ROOT):
             continue
         ranked.append(
-            (_disc_number(rel), ROM_EXTENSIONS.index(ext), len(rel.parts), p.name.lower(), real)
+            (disc_number(rel), ROM_EXTENSIONS.index(ext), len(rel.parts), p.name.lower(), real)
         )
     if not ranked:
         return None

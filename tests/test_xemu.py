@@ -101,20 +101,6 @@ def rom_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return root
 
 
-@pytest.mark.parametrize(
-    ("name", "expected"),
-    [
-        ("Game.iso", 1),
-        ("Game (Disc 2).iso", 2),
-        ("Game.disk3.iso", 3),
-        ("Game_cd-4.iso", 4),
-    ],
-)
-def test_disc_number_is_read_from_the_name(name: str, expected: int) -> None:
-    """The disc number is parsed from the usual markers in a file name."""
-    assert xemu._disc_number(Path(name)) == expected
-
-
 def test_a_disc_set_boots_disc_one(rom_root: Path) -> None:
     """A folder holding several discs resolves to disc one."""
     folder = rom_root / "Game"
