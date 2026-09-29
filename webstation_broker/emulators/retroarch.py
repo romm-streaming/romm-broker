@@ -1452,11 +1452,8 @@ def _archive_member_names(archive: Path) -> Optional[list[str]]:
         Its member paths, or None when it cannot be listed.
     """
     try:
-        if archive.suffix.lower() == ".zip":
-            with zipfile.ZipFile(archive) as zf:
-                return zf.namelist()
-        return extraction_cache._7z_member_paths(archive, ARCHIVE_LIST_TIMEOUT)
-    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        return extraction_cache.list_members(archive, ARCHIVE_LIST_TIMEOUT)
+    except RuntimeError as exc:
         log.warning("retroarch: could not list archive %s: %s", archive.name, exc)
         return None
 
@@ -1484,6 +1481,21 @@ def _untested_core_takes(path: Path, profile: Mapping[str, Any]) -> bool:
             "retroarch: %s is not among core %s's extensions %s", path.name, profile["core"], extensions
         )
         return False
+    return _archive_holds_content(path, profile)
+
+
+def _archive_holds_content(path: Path, profile: Mapping[str, Any]) -> bool:
+    """Whether the profile's core can boot a `.zip` or `.7z` RetroArch extracts.
+
+    Args:
+        path: The archive.
+        profile: The resolved profile.
+
+    Returns:
+        True when the core lets RetroArch extract it and a member carries one
+        of the profile's extensions; a refusal is logged.
+    """
+    extensions = profile["extensions"]
     info = retroarch_cores.catalog().cores.get(profile["core"])
     if info is None or info.block_extract:
         log.warning("retroarch: core %s takes no archive, refusing %s", profile["core"], path.name)
@@ -1502,11 +1514,6 @@ def _untested_core_takes(path: Path, profile: Mapping[str, Any]) -> bool:
 def _pick_rom_file(candidates: Iterable[Path], base: Path, extensions: tuple[str, ...]) -> Optional[Path]:
     """Choose the file to boot out of a ROM folder's candidates.
 
-    Hidden files, unsupported extensions, non-files and anything resolving
-    outside `ROM_ROOT` are dropped. The rest are ranked so that the game beats
-    its add-ons, the lowest disc number wins, then the platform's extension
-    preference, then the shallowest path, then the name.
-
     Args:
         candidates: The paths found under `base`.
         base: The ROM folder the candidates came from.
@@ -1514,6 +1521,27 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path, extensions: tuple[str
 
     Returns:
         The resolved path of the best candidate, or None if nothing qualifies.
+    """
+    ranked = _ranked_rom_files(candidates, base, extensions)
+    return ranked[0] if ranked else None
+
+
+def _ranked_rom_files(candidates: Iterable[Path], base: Path, extensions: tuple[str, ...]) -> list[Path]:
+    """The bootable files among a ROM folder's candidates, best first.
+
+    Hidden files, unsupported extensions, non-files and anything resolving
+    outside `ROM_ROOT` are dropped, as are repeats of one resolved file. The
+    rest are ranked so that the game beats its add-ons, the lowest disc number
+    wins, then the extension preference, then the shallowest path, then the
+    name.
+
+    Args:
+        candidates: The paths found under `base`.
+        base: The ROM folder the candidates came from.
+        extensions: The extensions to keep, in preference order.
+
+    Returns:
+        The resolved paths of the qualifying candidates, best first.
     """
     ranked = []
     for p in candidates:
@@ -1543,9 +1571,44 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path, extensions: tuple[str
                 real,
             )
         )
-    if not ranked:
+    seen: set[Path] = set()
+    ordered = []
+    for entry in sorted(ranked):
+        if entry[5] not in seen:
+            seen.add(entry[5])
+            ordered.append(entry[5])
+    return ordered
+
+
+def _pick_folder_archive(candidates: list[Path], base: Path, profile: Mapping[str, Any]) -> Optional[Path]:
+    """Choose a ROM folder's lone archive when nothing in it has a platform extension.
+
+    Most platforms list neither `.zip` nor `.7z`, yet RetroArch extracts both
+    itself, so a folder holding only an archive still boots. Several archives
+    are refused rather than guessed between.
+
+    Args:
+        candidates: The paths found under `base`.
+        base: The ROM folder the candidates came from.
+        profile: The resolved profile.
+
+    Returns:
+        The resolved path of the one archive whose members the core takes, or
+        None when there is no archive, more than one, or the core can't boot it.
+    """
+    archives = _ranked_rom_files(candidates, base, RA_ARCHIVE_EXTS)
+    if not archives:
         return None
-    return min(ranked)[5]
+    if len(archives) > 1:
+        log.warning(
+            "retroarch: %s holds %d archives and nothing else to boot, refusing to guess: %s",
+            base.name,
+            len(archives),
+            ", ".join(sorted(a.name for a in archives)),
+        )
+        return None
+    archive = archives[0]
+    return archive if _archive_holds_content(archive, profile) else None
 
 
 def _find_reply(buf: bytes, prefixes: tuple[str, ...]) -> Optional[tuple[str, int]]:
@@ -2438,7 +2501,8 @@ class Retroarch(Emulator):
         """File the core should boot for `path`.
 
         A file is taken as is. A folder is searched one level deep and ranked by
-        `_pick_rom_file` against the platform's extensions.
+        `_pick_rom_file` against the platform's extensions; when that finds
+        nothing, a lone archive holding content the core takes is booted.
 
         Args:
             path: The ROM as RomM delivered it, a file or a folder.
@@ -2481,7 +2545,10 @@ class Retroarch(Emulator):
             except OSError as exc:
                 log.debug("retroarch: could not scan rom folder %s for %r: %s", path, pattern, exc)
                 return None
-        return _pick_rom_file(candidates, path, info["extensions"])
+        picked = _pick_rom_file(candidates, path, info["extensions"])
+        if picked is None:
+            picked = _pick_folder_archive(candidates, path, info)
+        return picked
 
     def _spawn_ra(self, cmd: list[str], env: dict[str, str]) -> None:
         """Spawn with a real stdout pipe (stderr to the log).

@@ -928,6 +928,158 @@ class TestPlaylistPreference:
         assert emulator.resolve_rom_file(linked) is None
 
 
+class TestFolderArchive:
+    """A ROM folder holding only an archive boots the archive (#75).
+
+    RetroArch extracts a `.zip` or `.7z` itself, but most platforms list
+    neither among their extensions, so a folder search dropped the archive.
+    """
+
+    def test_a_folder_holding_only_a_7z_boots_it_on_the_default_core(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reported case: snes, default core, a folder with only Game.7z."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        game = tmp_path / "Game"
+        game.mkdir()
+        rom = game / "Game.7z"
+        rom.write_bytes(b"7z")
+        monkeypatch.setattr(retroarch, "_archive_member_names", lambda archive: ["Game.sfc"])
+        assert _on("snes").resolve_rom_file(game) == rom.resolve()
+
+    @staticmethod
+    def _folder(root: Path, *zips: tuple[str, str]) -> Path:
+        """Build a ROM folder of zips, each `(relative path, member name)`."""
+        game = root / "Game"
+        game.mkdir(parents=True)
+        for rel, member in zips:
+            (game / rel).parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(game / rel, "w") as zf:
+                zf.writestr(member, b"x")
+        return game
+
+    def test_a_folder_holding_only_a_zip_boots_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A real zip is listed, not stubbed, and taken for its .sfc member."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        game = self._folder(tmp_path, ("Game.zip", "Game.sfc"))
+        assert _on("snes").resolve_rom_file(game) == (game / "Game.zip").resolve()
+
+    def test_an_archive_one_subfolder_deep_is_found(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The fallback searches the same depth as the platform search."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        game = self._folder(tmp_path, ("rom/Game.zip", "Game.sfc"))
+        assert _on("snes").resolve_rom_file(game) == (game / "rom" / "Game.zip").resolve()
+
+    def test_several_archives_are_refused_and_named(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Game plus its patch as two zips: no guess, a warning listing both."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        game = self._folder(tmp_path, ("Game.zip", "Game.sfc"), ("Game (Patch).7z", "Game.sfc"))
+        with caplog.at_level(logging.WARNING):
+            assert _on("snes").resolve_rom_file(game) is None
+        assert "Game (Patch).7z, Game.zip" in caplog.text
+
+    def test_two_links_to_one_archive_count_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A second path to the same file is not a second archive."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        game = self._folder(tmp_path, ("Game.zip", "Game.sfc"))
+        (game / "Alias.zip").symlink_to(game / "Game.zip")
+        assert _on("snes").resolve_rom_file(game) == (game / "Game.zip").resolve()
+
+    def test_an_archive_for_another_system_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A zipped GBA ROM in a snes folder never reaches snes9x."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        game = self._folder(tmp_path, ("Game.zip", "Game.gba"))
+        with caplog.at_level(logging.WARNING):
+            assert _on("snes").resolve_rom_file(game) is None
+        assert "holds nothing among core snes9x's extensions" in caplog.text
+
+    def test_a_corrupt_archive_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An archive that cannot be listed is not handed to RetroArch."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        game = tmp_path / "Game"
+        game.mkdir()
+        (game / "Game.zip").write_bytes(b"not a zip")
+        assert _on("snes").resolve_rom_file(game) is None
+
+    def test_a_core_that_blocks_extraction_refuses_the_archive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A `block_extract` core would get the archive unopened."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        game = self._folder(tmp_path, ("Game.zip", "Game.sfc"))
+        cat = retroarch_cores.catalog()
+        info = dataclasses.replace(cat.cores["snes9x"], block_extract=True)
+        monkeypatch.setattr(
+            retroarch_cores,
+            "_catalog",
+            dataclasses.replace(cat, cores=MappingProxyType({**cat.cores, "snes9x": info})),
+        )
+        assert _on("snes").resolve_rom_file(game) is None
+
+    def test_hidden_and_escaping_archives_are_ignored(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A dotfile and a link out of the ROM root neither boot nor count as a second archive."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path / "romm")
+        game = self._folder(tmp_path / "romm", ("Game.zip", "Game.sfc"), (".Game.zip", "Game.sfc"))
+        outside = tmp_path / "elsewhere.zip"
+        with zipfile.ZipFile(outside, "w") as zf:
+            zf.writestr("Other.sfc", b"x")
+        (game / "Other.zip").symlink_to(outside)
+        assert _on("snes").resolve_rom_file(game) == (game / "Game.zip").resolve()
+
+    def test_a_platform_file_beside_an_archive_wins_without_listing_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The fallback only runs when the platform search finds nothing."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        game = self._folder(tmp_path, ("Game.zip", "Game.sfc"))
+        (game / "Game.sfc").write_bytes(b"x")
+
+        def fail(archive: Path) -> list[str]:
+            raise AssertionError("archive listed although a .sfc was found")
+
+        monkeypatch.setattr(retroarch, "_archive_member_names", fail)
+        assert _on("snes").resolve_rom_file(game) == (game / "Game.sfc").resolve()
+
+    def test_an_untested_core_checks_members_against_its_own_extensions(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The untested bsnes takes a zipped .sfc, but not a member only the platform lists."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        emu = _with_core("snes", "bsnes")
+        emu.select_core()
+        outside = set(retroarch.PLATFORMS["snes"]["extensions"]) - set(emu.rom_extensions)
+        game = self._folder(tmp_path, ("Game.zip", "Game.sfc"))
+        assert emu.resolve_rom_file(game) == (game / "Game.zip").resolve()
+        assert outside, "bsnes now takes every snes extension; pick another untested core"
+        other = tmp_path / "Other"
+        other.mkdir()
+        with zipfile.ZipFile(other / "Other.zip", "w") as zf:
+            zf.writestr("Other" + sorted(outside)[0], b"x")
+        assert emu.resolve_rom_file(other) is None
+
+    def test_a_platform_listing_zip_still_ranks_it_directly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Arcade zips are the ROM itself and never go through the member check."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        game = self._folder(tmp_path, ("sf2.zip", "sf2.bin"), ("sf2 (Patch).zip", "x.bin"))
+        assert _on("arcade").resolve_rom_file(game) == (game / "sf2.zip").resolve()
+
+
 class TestPlaylistHelpers:
     """Reading a .m3u the way RetroArch does.
 
@@ -4382,7 +4534,7 @@ class TestCoreProfile:
         rom = tmp_path / "Game.7z"
         rom.write_bytes(b"7z")
         monkeypatch.setattr(
-            retroarch.extraction_cache, "_7z_member_paths", lambda archive, timeout: ["dir/Game.SMC"]
+            retroarch.extraction_cache, "list_members", lambda archive, timeout: ["dir/Game.SMC"]
         )
         emu = _with_core("snes", "bsnes")
         emu.select_core()

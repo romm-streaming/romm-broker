@@ -207,7 +207,7 @@ def test_catalog_is_zip_intersect_index_plus_installed() -> None:
 def test_truthy_matches_the_brokers_other_boolean_env_vars(
     value: str, expected: bool
 ) -> None:
-    """The spellings every boolean env var in the broker accepts."""
+    """The spellings every boolean env var in `settings` accepts."""
     assert settings.truthy(value) is expected
 
 

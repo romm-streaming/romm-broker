@@ -161,6 +161,29 @@ against. At the ceiling, a disconnected anonymous seat is reclaimed for the
 new arrival; a named user's seat is never reclaimed.
 """
 
+RPCS3_CACHE_ENABLED = truthy(os.environ.get("RPCS3_CACHE_ENABLED"))
+"""Whether RPCS3 extracts archived ROMs into its cache, from `RPCS3_CACHE_ENABLED` (default off).
+
+Off, an archived PS3 ROM is refused rather than re-extracted on every launch.
+"""
+
+SHADPS4_CACHE_ENABLED = truthy(os.environ.get("SHADPS4_CACHE_ENABLED"))
+"""Whether shadPS4 extracts .pkg and archived ROMs into its cache, from `SHADPS4_CACHE_ENABLED` (default off).
+
+Off, those formats are refused, since a PS4 title only boots once extracted.
+"""
+
+XEMU_SOFTWARE_GL = truthy(os.environ.get("XEMU_SOFTWARE_GL"))
+"""Whether xemu renders on the CPU via `LIBGL_ALWAYS_SOFTWARE`, from `XEMU_SOFTWARE_GL` (default off).
+
+Which renderer xemu asks for and whether the driver can answer are separate
+problems: on the AMD Renoir stack these containers run on, xemu aborts in
+gl_fence on the OpenGL path and in RADV on the Vulkan one. Set
+`XEMU_SOFTWARE_GL` to render xemu on the CPU there, which the container-wide
+`LIBGL_ALWAYS_SOFTWARE` cannot do without dragging every other emulator down
+with it. Slow, so it stays off unless the host needs it.
+"""
+
 RETROARCH_EXPERIMENTAL_CORES = truthy(os.environ.get("RETROARCH_EXPERIMENTAL_CORES"))
 """Whether a blocked RetroArch core may launch, from `RETROARCH_EXPERIMENTAL_CORES` (default off).
 

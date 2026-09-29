@@ -119,8 +119,7 @@ CACHE_DIR = Path(os.environ.get("RPCS3_CACHE_DIR", str(DATA_DIR / "extracted")))
 # Off by default: local disk headroom is limited on a typical host, and an
 # unattended cache would otherwise grow until an operator notices. 30GB
 # comfortably fits one large title's decompressed size for anyone who opts
-# in via RPCS3_CACHE_ENABLED.
-CACHE_ENABLED = settings.truthy(os.environ.get("RPCS3_CACHE_ENABLED", "false"))
+# in via RPCS3_CACHE_ENABLED (`settings.RPCS3_CACHE_ENABLED`).
 CACHE_MAX_GB = float(os.environ.get("RPCS3_CACHE_MAX_GB", "30"))
 # Stands in for a member listing that could not be read. A compressed PS3
 # dump expands several-fold, so budgeting the archive's own size would wave
@@ -219,7 +218,7 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
         ext = p.suffix.lower()
         if ext not in ROM_EXTENSIONS:
             continue
-        if ext in _ARCHIVE_EXTS and not CACHE_ENABLED:
+        if ext in _ARCHIVE_EXTS and not settings.RPCS3_CACHE_ENABLED:
             log.debug(
                 "rpcs3: skipping %s, %s needs the extraction cache "
                 "(set RPCS3_CACHE_ENABLED=true to boot this format)",
@@ -547,49 +546,14 @@ def _run_extractor(cmd: list[str], what: str) -> str:
     return result.stdout
 
 
-def _reject_unsafe_members(dest: Path, members: list[str]) -> None:
-    """Reject any archive member whose path would land outside dest.
-
-    A `../` (or absolute) member path can escape dest on extraction (Zip
-    Slip); this is checked before anything is written.
-    """
-    dest_real = dest.resolve()
-    for member in members:
-        target = (dest / member).resolve()
-        if target != dest_real and dest_real not in target.parents:
-            raise RuntimeError(f"archive member escapes extraction dir: {member}")
-
-
 def _safe_extract_zip(zf: zipfile.ZipFile, dest: Path) -> None:
     """Extract `zf` into dest after rejecting any Zip Slip member.
 
     zf.extractall() writes a member's path verbatim, so a `../` name in
     the archive can escape dest; reject any member that would first.
     """
-    _reject_unsafe_members(dest, zf.namelist())
+    extraction_cache.reject_unsafe_members(dest, zf.namelist())
     zf.extractall(dest)
-
-
-def _rar_member_paths(archive: Path) -> list[str]:
-    """List member paths from an archive.
-
-    Bare paths from `unrar lb`, one per line, no header or column
-    formatting to parse around.
-    """
-    listing = _run_extractor(["unrar", "lb", "-y", str(archive)], f"unrar list ({archive.name})")
-    return [line for line in listing.splitlines() if line]
-
-
-def _7z_member_paths(archive: Path) -> list[str]:
-    """List member paths from an archive.
-
-    Parsed from `7z l -slt`, the only 7z listing mode that gives a full
-    untruncated path per entry. Everything before the `----------`
-    separator describes the archive itself, not its contents.
-    """
-    listing = _run_extractor(["7z", "l", "-slt", str(archive)], f"7z list ({archive.name})")
-    _, _, body = listing.partition("----------\n")
-    return [line[len("Path = ") :] for line in body.splitlines() if line.startswith("Path = ")]
 
 
 def _reject_escaped_tree(dest: Path) -> None:
@@ -636,68 +600,15 @@ def _extract_archive(archive: Path, dest: Path) -> None:
         except (zipfile.BadZipFile, OSError) as exc:
             log.error("rpcs3: zip extraction of %s failed: %s", archive.name, exc)
             raise RuntimeError(f"zip extraction of {archive.name} failed: {exc}") from exc
-    elif ext == ".rar":
-        _reject_unsafe_members(dest, _rar_member_paths(archive))
-        _run_extractor(["unrar", "x", "-y", str(archive), f"{dest}/"], f"unrar ({archive.name})")
     else:
-        # .7z, plus a fallback attempt for any other archive format 7z can
-        # identify (RAR5, tar-in-7z JB dumps, etc).
-        _reject_unsafe_members(dest, _7z_member_paths(archive))
-        _run_extractor(["7z", "x", "-y", str(archive), f"-o{dest}"], f"7z ({archive.name})")
-    if ext != ".zip":
-        _reject_escaped_tree(dest)
-
-
-def _sum_listed_sizes(listing: str, prefix: str) -> Optional[int]:
-    """Total the integers on every `prefix` line of an extractor's listing.
-
-    Args:
-        listing: The extractor's stdout.
-        prefix: Line prefix introducing an uncompressed member size, matched
-            after stripping indentation ("Size =" for 7z, "Size:" for unrar).
-
-    Returns:
-        The total, or None when the listing carried no such line at all.
-    """
-    total = 0
-    found = False
-    for line in listing.splitlines():
-        stripped = line.strip()
-        if not stripped.startswith(prefix):
-            continue
-        value = stripped[len(prefix) :].strip()
-        if value.isdigit():
-            total += int(value)
-            found = True
-    return total if found else None
-
-
-def _listed_extracted_size(archive: Path) -> Optional[int]:
-    """Uncompressed total the archive's own member listing reports.
-
-    Args:
-        archive: The archive to interrogate.
-
-    Returns:
-        The sum of the members' uncompressed sizes, or None when the listing
-        could not be read or carried no sizes.
-    """
-    ext = archive.suffix.lower()
-    try:
-        if ext == ".zip":
-            with zipfile.ZipFile(archive) as zf:
-                return sum(i.file_size for i in zf.infolist()) or None
+        extraction_cache.reject_unsafe_members(dest, extraction_cache.list_members(archive, INSTALL_TIMEOUT))
         if ext == ".rar":
-            listing = _run_extractor(
-                ["unrar", "lt", "-y", str(archive)], f"unrar sizes ({archive.name})"
-            )
-            return _sum_listed_sizes(listing, "Size:")
-        listing = _run_extractor(["7z", "l", "-slt", str(archive)], f"7z sizes ({archive.name})")
-        _, _, body = listing.partition("----------\n")
-        return _sum_listed_sizes(body, "Size =")
-    except (RuntimeError, OSError, zipfile.BadZipFile) as exc:
-        log.warning("rpcs3: could not read the member sizes of %s: %s", archive.name, exc)
-        return None
+            _run_extractor(["unrar", "x", "-y", str(archive), f"{dest}/"], f"unrar ({archive.name})")
+        else:
+            # .7z, plus a fallback attempt for any other archive format 7z can
+            # identify (RAR5, tar-in-7z JB dumps, etc).
+            _run_extractor(["7z", "x", "-y", str(archive), f"-o{dest}"], f"7z ({archive.name})")
+        _reject_escaped_tree(dest)
 
 
 def _extraction_size(archive: Path) -> int:
@@ -715,7 +626,7 @@ def _extraction_size(archive: Path) -> int:
     Returns:
         The size to budget, or 0 when the archive cannot be stat'd at all.
     """
-    listed = _listed_extracted_size(archive)
+    listed = extraction_cache.listed_size(archive, INSTALL_TIMEOUT)
     if listed is not None:
         return listed
     try:
@@ -734,7 +645,7 @@ def _extraction_size(archive: Path) -> int:
 _CACHE = ExtractionCache(
     name="rpcs3",
     cache_dir=lambda: CACHE_DIR,
-    enabled=lambda: CACHE_ENABLED,
+    enabled=lambda: settings.RPCS3_CACHE_ENABLED,
     max_gb=lambda: CACHE_MAX_GB,
     find_boot_target=_archive_boot_target,
     lock_wait=None,
@@ -1778,7 +1689,7 @@ class Rpcs3(Emulator):
         accepted. `.pkg` is unaffected: it installs through `_install_pkgs`
         into GAME_DIR regardless of the cache flag.
         """
-        if CACHE_ENABLED:
+        if settings.RPCS3_CACHE_ENABLED:
             return ROM_EXTENSIONS
         return tuple(e for e in ROM_EXTENSIONS if e not in _ARCHIVE_EXTS)
 
@@ -1991,7 +1902,7 @@ class Rpcs3(Emulator):
         """
         self._pending_rom = None
         if path.is_file():
-            if path.suffix.lower() in _ARCHIVE_EXTS and not CACHE_ENABLED:
+            if path.suffix.lower() in _ARCHIVE_EXTS and not settings.RPCS3_CACHE_ENABLED:
                 log.warning(
                     "rpcs3: refusing %s, %s needs the extraction cache "
                     "(set RPCS3_CACHE_ENABLED=true to boot this format)",

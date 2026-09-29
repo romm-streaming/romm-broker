@@ -5,6 +5,7 @@ import json
 import os
 import struct
 import subprocess
+import sys
 import threading
 import time
 import zipfile
@@ -70,7 +71,7 @@ def test_resolve_refuses_a_pkg_that_symlinks_out_of_the_rom_root(
     With caching enabled the path goes on to pkg_extractor, so containment has
     to be decided before the format is.
     """
-    monkeypatch.setattr(shadps4, "CACHE_ENABLED", True)
+    monkeypatch.setattr(settings, "SHADPS4_CACHE_ENABLED", True)
     outside = tmp_path / "outside"
     outside.mkdir()
     secret = outside / "secret.pkg"
@@ -214,7 +215,7 @@ def test_resolve_rejects_pkg_and_archives_when_the_cache_is_disabled(
     Without the cache, an extraction would just be discarded on every launch,
     so only natively bootable formats should resolve at all.
     """
-    monkeypatch.setattr(shadps4, "CACHE_ENABLED", False)
+    monkeypatch.setattr(settings, "SHADPS4_CACHE_ENABLED", False)
     rom = rom_root / f"game{ext}"
     rom.write_bytes(b"")
 
@@ -226,7 +227,7 @@ def test_resolve_accepts_pkg_and_archives_when_the_cache_is_enabled(
     rom_root: Path, monkeypatch: pytest.MonkeyPatch, ext: str
 ) -> None:
     """A .pkg or archive ROM resolves normally once the extraction cache is enabled."""
-    monkeypatch.setattr(shadps4, "CACHE_ENABLED", True)
+    monkeypatch.setattr(settings, "SHADPS4_CACHE_ENABLED", True)
     rom = rom_root / f"game{ext}"
     rom.write_bytes(b"")
 
@@ -1252,7 +1253,7 @@ def cache_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """Point the pkg extraction cache at an isolated temp directory with caching disabled."""
     cache = tmp_path / "cache"
     monkeypatch.setattr(shadps4, "CACHE_DIR", cache)
-    monkeypatch.setattr(shadps4, "CACHE_ENABLED", False)
+    monkeypatch.setattr(settings, "SHADPS4_CACHE_ENABLED", False)
     return cache
 
 
@@ -1283,7 +1284,7 @@ def test_evict_lru_removes_the_least_recently_used_entry_first(
     cache_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Evict LRU removes the least recently used entry first."""
-    monkeypatch.setattr(shadps4, "CACHE_ENABLED", True)
+    monkeypatch.setattr(settings, "SHADPS4_CACHE_ENABLED", True)
     monkeypatch.setattr(shadps4, "CACHE_MAX_GB", 8 / 1024**3)
     old = cache_dir / "Old"
     new = cache_dir / "New"
@@ -1302,7 +1303,7 @@ def test_evict_lru_never_removes_the_entry_being_extracted(
     cache_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Evict LRU never removes the entry being extracted."""
-    monkeypatch.setattr(shadps4, "CACHE_ENABLED", True)
+    monkeypatch.setattr(settings, "SHADPS4_CACHE_ENABLED", True)
     monkeypatch.setattr(shadps4, "CACHE_MAX_GB", 1 / 1024**3)
     keep = cache_dir / "Incoming"
     _touch(keep / "eboot.bin")
@@ -1317,7 +1318,7 @@ def test_evict_lru_gives_up_and_proceeds_when_nothing_is_left_to_evict(
     cache_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Evict LRU gives up and proceeds when nothing is left to evict."""
-    monkeypatch.setattr(shadps4, "CACHE_ENABLED", True)
+    monkeypatch.setattr(settings, "SHADPS4_CACHE_ENABLED", True)
     monkeypatch.setattr(shadps4, "CACHE_MAX_GB", 1 / 1024**3)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1794,7 +1795,7 @@ def test_extract_and_cache_pkg_serializes_a_second_call_racing_the_same_pkg(
     could interleave writes into the same not-yet-populated game_dir or
     have one call evict the directory the other is about to boot from.
     """
-    monkeypatch.setattr(shadps4, "CACHE_ENABLED", True)
+    monkeypatch.setattr(settings, "SHADPS4_CACHE_ENABLED", True)
     pkg = tmp_path / "Game.pkg"
     pkg.write_bytes(b"pkg")
 
@@ -1869,23 +1870,6 @@ def test_archive_pkg_member_rejects_a_pkg_that_symlinks_outside_root(tmp_path: P
     assert shadps4._archive_pkg_member(root) is None
 
 
-def test_reject_unsafe_members_raises_on_a_zip_slip_path(tmp_path: Path) -> None:
-    """Reject unsafe members raises on a member path that escapes dest."""
-    dest = tmp_path / "dest"
-    dest.mkdir()
-
-    with pytest.raises(RuntimeError, match="escapes extraction dir"):
-        shadps4._reject_unsafe_members(dest, ["../outside.txt"])
-
-
-def test_reject_unsafe_members_allows_a_normal_relative_path(tmp_path: Path) -> None:
-    """Reject unsafe members allows an ordinary relative member path."""
-    dest = tmp_path / "dest"
-    dest.mkdir()
-
-    shadps4._reject_unsafe_members(dest, ["Game/CUSA23079.pkg"])  # must not raise
-
-
 def test_extract_archive_unpacks_a_zip_via_the_stdlib(tmp_path: Path) -> None:
     """Extract archive unpacks a real .zip using the stdlib zipfile module."""
     archive = _make_zip(tmp_path / "Game.zip", {"CUSA23079.pkg": b"pkg data"})
@@ -1929,7 +1913,7 @@ def test_extract_archive_dispatches_7z_through_the_external_tool(
     dest = tmp_path / "dest"
     dest.mkdir()
     calls = []
-    monkeypatch.setattr(shadps4, "_7z_member_paths", lambda a: ["CUSA23079.pkg"])
+    monkeypatch.setattr(shadps4.extraction_cache, "list_members", lambda a, timeout: ["CUSA23079.pkg"])
 
     def fake_run_extractor(cmd: list, what: str) -> str:
         calls.append(cmd)
@@ -1953,7 +1937,7 @@ def test_extract_archive_dispatches_rar_through_the_external_tool(
     dest = tmp_path / "dest"
     dest.mkdir()
     calls = []
-    monkeypatch.setattr(shadps4, "_rar_member_paths", lambda a: ["CUSA23079.pkg"])
+    monkeypatch.setattr(shadps4.extraction_cache, "list_members", lambda a, timeout: ["CUSA23079.pkg"])
 
     def fake_run_extractor(cmd: list, what: str) -> str:
         calls.append(cmd)
@@ -2168,100 +2152,15 @@ def test_stop_keeps_the_pkg_extraction_for_the_next_launch(
     assert game_dir.exists()
 
 
-def test_the_cache_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_cache_is_disabled_by_default() -> None:
     """The cache is disabled by default when SHADPS4_CACHE_ENABLED is unset."""
-    monkeypatch.delenv("SHADPS4_CACHE_ENABLED", raising=False)
-    assert settings.truthy(os.environ.get("SHADPS4_CACHE_ENABLED", "false")) is False
-
-
-# -- archive listings must fail closed --
-
-
-def test_rar_member_paths_raises_when_the_listing_names_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An unrar listing with no members stops the extraction.
-
-    An empty parse used to reach `_reject_unsafe_members` as an empty list,
-    which approves every member in the archive without checking one.
-    """
-    monkeypatch.setattr(shadps4, "_run_extractor", lambda cmd, what: "\n  \n\n")
-
-    with pytest.raises(RuntimeError, match="listed no members"):
-        shadps4._rar_member_paths(tmp_path / "Game.rar")
-
-
-def test_rar_member_paths_returns_the_listed_members(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A normal unrar listing yields one path per member."""
-    monkeypatch.setattr(
-        shadps4, "_run_extractor", lambda cmd, what: "Game/CUSA23079.pkg\nGame/readme.txt\n"
+    env = {k: v for k, v in os.environ.items() if k != "SHADPS4_CACHE_ENABLED"}
+    code = "from webstation_broker import settings; print(settings.SHADPS4_CACHE_ENABLED)"
+    probe = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env, capture_output=True, text=True, check=True,
     )
-
-    assert shadps4._rar_member_paths(tmp_path / "Game.rar") == [
-        "Game/CUSA23079.pkg",
-        "Game/readme.txt",
-    ]
-
-
-def test_7z_member_paths_raises_when_the_listing_has_no_separator(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A 7z listing shaped differently than expected stops the extraction.
-
-    Without the dashed separator there is no member section to parse, so
-    every path in the archive would go unchecked.
-    """
-    monkeypatch.setattr(
-        shadps4, "_run_extractor", lambda cmd, what: "7-Zip 24.09\n\nListing archive: Game.7z\n"
-    )
-
-    with pytest.raises(RuntimeError, match="no member section"):
-        shadps4._7z_member_paths(tmp_path / "Game.7z")
-
-
-def test_7z_member_paths_raises_when_the_member_section_is_empty(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A 7z member section holding no Path line stops the extraction."""
-    listing = "7-Zip 24.09\n----------\nSize = 10\nAttributes = A\n"
-    monkeypatch.setattr(shadps4, "_run_extractor", lambda cmd, what: listing)
-
-    with pytest.raises(RuntimeError, match="listed no members"):
-        shadps4._7z_member_paths(tmp_path / "Game.7z")
-
-
-def test_7z_member_paths_returns_the_listed_members(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A normal 7z -slt listing yields one path per member, header skipped."""
-    listing = (
-        "7-Zip 24.09\n"
-        "Path = Game.7z\n"
-        "----------\n"
-        "Path = Game/CUSA23079.pkg\n"
-        "Size = 4096\n"
-        "\n"
-        "Path = Game/readme.txt\n"
-        "Size = 12\n"
-    )
-    monkeypatch.setattr(shadps4, "_run_extractor", lambda cmd, what: listing)
-
-    assert shadps4._7z_member_paths(tmp_path / "Game.7z") == [
-        "Game/CUSA23079.pkg",
-        "Game/readme.txt",
-    ]
-
-
-def test_reject_unsafe_members_raises_on_a_control_character_name(tmp_path: Path) -> None:
-    """A member name carrying a newline is refused.
-
-    The .rar/.7z member lists are read back out of a line-based listing, so a
-    name holding a newline cannot be checked as the path the archive holds.
-    """
-    with pytest.raises(RuntimeError, match="control character"):
-        shadps4._reject_unsafe_members(tmp_path, ["ok.pkg\n../../etc/evil"])
+    assert probe.stdout.strip() == "False"
 
 
 def test_extract_archive_discards_a_tree_that_escaped_dest(
@@ -2273,7 +2172,7 @@ def test_extract_archive_discards_a_tree_that_escaped_dest(
     archive.write_bytes(b"")
     dest = tmp_path / "dest"
     dest.mkdir()
-    monkeypatch.setattr(shadps4, "_7z_member_paths", lambda a: ["CUSA23079.pkg"])
+    monkeypatch.setattr(shadps4.extraction_cache, "list_members", lambda a, timeout: ["CUSA23079.pkg"])
 
     def fake_run_extractor(cmd: list, what: str) -> str:
         (dest / "CUSA23079.pkg").write_bytes(b"pkg data")

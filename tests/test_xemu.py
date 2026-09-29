@@ -476,7 +476,7 @@ def test_software_gl_is_off_by_default(
 
     CPU rendering is a workaround for broken drivers, not a default.
     """
-    monkeypatch.setattr(xemu, "XEMU_SOFTWARE_GL", False)
+    monkeypatch.setattr(settings, "XEMU_SOFTWARE_GL", False)
     assert "LIBGL_ALWAYS_SOFTWARE" not in _spawned_env(emulator, monkeypatch, tmp_path)
 
 
@@ -487,7 +487,7 @@ def test_software_gl_reaches_xemu_and_nothing_else(
 
     Set on xemu's own launch env, so the rest of the container keeps the GPU.
     """
-    monkeypatch.setattr(xemu, "XEMU_SOFTWARE_GL", True)
+    monkeypatch.setattr(settings, "XEMU_SOFTWARE_GL", True)
     env = _spawned_env(emulator, monkeypatch, tmp_path)
     assert env["LIBGL_ALWAYS_SOFTWARE"] == "1"
     assert "LIBGL_ALWAYS_SOFTWARE" not in os.environ

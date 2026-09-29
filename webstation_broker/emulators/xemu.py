@@ -74,18 +74,6 @@ to `VULKAN` where the driver is known good, or to `KEEP` to leave the file alone
 """
 
 
-XEMU_SOFTWARE_GL = settings.truthy(os.environ.get("XEMU_SOFTWARE_GL", ""))
-"""Whether xemu renders on the CPU via `LIBGL_ALWAYS_SOFTWARE` (env `XEMU_SOFTWARE_GL`, default off).
-
-Which renderer xemu asks for and whether the driver can answer are separate
-problems: on the AMD Renoir stack these containers run on, xemu aborts in
-gl_fence on the OpenGL path and in RADV on the Vulkan one. Set
-`XEMU_SOFTWARE_GL` to render xemu on the CPU there, which the container-wide
-`LIBGL_ALWAYS_SOFTWARE` cannot do without dragging every other emulator down
-with it. Slow, so it stays off unless the host needs it.
-"""
-
-
 def _default_toml_path() -> Path:
     """Where xemu.toml lives when `XEMU_TOML` is not set.
 
@@ -194,7 +182,7 @@ def _launch_env() -> dict[str, str]:
         `XEMU_SOFTWARE_GL` is set.
     """
     env = base_launch_env()
-    if XEMU_SOFTWARE_GL:
+    if settings.XEMU_SOFTWARE_GL:
         env["LIBGL_ALWAYS_SOFTWARE"] = "1"
     return env
 
