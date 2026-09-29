@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.12.0](https://github.com/romm-streaming/romm-broker/compare/v0.11.1...v0.12.0) (2026-09-29)
+
+
+### Features
+
+* **room:** let viewers rename themselves from their own tile ([3c0f5cf](https://github.com/romm-streaming/romm-broker/commit/3c0f5cfb04d43fa0a8316e3f3b4a2b4cf26030d6))
+* **room:** let viewers rename themselves from their own tile ([a4972f0](https://github.com/romm-streaming/romm-broker/commit/a4972f0a74587d4bb1e1a80f14df6d2bb5cacefc))
+
+
+### Bug Fixes
+
+* cut self-inflicted test waits, fail leaked threads, store already-compressed saves ([c54ae7d](https://github.com/romm-streaming/romm-broker/commit/c54ae7da17dafa90ae48560b4bae19555515ee03))
+* **retroarch:** seed DOSBox Pure's mouse to direct ([1e00352](https://github.com/romm-streaming/romm-broker/commit/1e00352f11f799cfdb44fd9e3bb2ff76c27e3d90))
+* **retroarch:** seed DOSBox Pure's mouse to direct ([ca2f8ab](https://github.com/romm-streaming/romm-broker/commit/ca2f8abe61a9e0ba473e4ac0a632023e88c7dead))
+* **room:** drop laggards from the room and keep re-asking for keyframes ([f4b144c](https://github.com/romm-streaming/romm-broker/commit/f4b144cb430ec04fef1ffea5756f0619a880cb70))
+* **room:** drop webcam media by age and keep each video chain decodable ([dbe3074](https://github.com/romm-streaming/romm-broker/commit/dbe3074a8af99c57a18f9dd795d2762b1b55e7ac))
+* **room:** stop one slow viewer from stalling the room's media and chat ([bf7fc57](https://github.com/romm-streaming/romm-broker/commit/bf7fc57b1ef4a1b2396603681e88d6c15fc332fc))
+* **room:** stop one slow viewer from stalling the room's media and chat ([0c44400](https://github.com/romm-streaming/romm-broker/commit/0c44400789201932931845b05be4596df1780b38))
+* **room:** stop waiting on sockets that cannot close ([0765a3f](https://github.com/romm-streaming/romm-broker/commit/0765a3ff7fa16c39fb35fcb82779d75416e03a1d))
+* **saves:** store already-compressed save members instead of deflating them again ([174c381](https://github.com/romm-streaming/romm-broker/commit/174c38124a31d76070980211283448ebe5c7306e))
+* **tests:** stop two tests from waiting out their own timeouts ([814cd85](https://github.com/romm-streaming/romm-broker/commit/814cd858841ffa82d932e62125be2eaa9a2ad5c7))
+* **tests:** wait for the outbox to drain instead of counting loop turns ([f7b0116](https://github.com/romm-streaming/romm-broker/commit/f7b0116981eddb0a72f071eb3b6ea38c9fcca1d4))
+
 ## [0.11.1](https://github.com/romm-streaming/romm-broker/compare/v0.11.0...v0.11.1) (2026-09-29)
 
 
