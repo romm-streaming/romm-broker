@@ -85,6 +85,20 @@ The launch baseline is taken just after the restore, and the dump reaches
 `_BASELINE_MTIME_SLACK` back past it, so a file stamped at the restore
 itself would still ship on the next exit as if the session had written it.
 """
+_DEFLATE_PROBE_MIN_BYTES = 1024 * 1024
+"""Members smaller than this are always deflated; deflating them costs a few milliseconds at most."""
+_DEFLATE_PROBE_SLICES = 8
+"""How many evenly spaced slices of a large member are test-compressed before it is zipped."""
+_DEFLATE_PROBE_SLICE_BYTES = 64 * 1024
+"""Size of each test-compressed slice."""
+_DEFLATE_MIN_SAVING = 0.05
+"""Smallest fraction the slices must shrink by for a large member to be deflated rather than stored.
+
+Save states from PCSX2, RPCS3 and others are compressed by the emulator, and
+deflating one again takes seconds on a large state for no size gain. The dump
+runs under the API's session lock, so those seconds are ones every other
+session route answers 409 for.
+"""
 _ZIP_MIN_DATE = (1980, 1, 1, 0, 0, 0)
 """Earliest timestamp a zip entry can carry: DOS dates start in 1980."""
 _ZIP_MAX_DATE = (2107, 12, 31, 23, 59, 58)
@@ -276,6 +290,33 @@ def _finish_dump(report: dict[str, Any], changed_skipped: list[str]) -> dict[str
     return report
 
 
+def _compress_type(data: bytes) -> int:
+    """Pick deflate or stored for one member, by test-compressing slices of it.
+
+    A member that turns out more compressible than its slices suggested only
+    costs archive size: both methods carry a CRC, so the restore checks it
+    the same way either way.
+
+    Args:
+        data: The member's contents.
+
+    Returns:
+        `zipfile.ZIP_STORED` when the member looks already compressed,
+        otherwise `zipfile.ZIP_DEFLATED`.
+    """
+    if len(data) < _DEFLATE_PROBE_MIN_BYTES:
+        return zipfile.ZIP_DEFLATED
+    step = (len(data) - _DEFLATE_PROBE_SLICE_BYTES) // (_DEFLATE_PROBE_SLICES - 1)
+    raw = packed = 0
+    for i in range(_DEFLATE_PROBE_SLICES):
+        chunk = data[i * step : i * step + _DEFLATE_PROBE_SLICE_BYTES]
+        raw += len(chunk)
+        packed += len(zlib.compress(chunk))
+    if packed > raw * (1 - _DEFLATE_MIN_SAVING):
+        return zipfile.ZIP_STORED
+    return zipfile.ZIP_DEFLATED
+
+
 def build_save_archive(
     root: Path,
     subtrees: tuple[str, ...],
@@ -385,7 +426,7 @@ def build_save_archive(
                 continue
             data, mtime = result
             info = zipfile.ZipInfo(rel, date_time=_zip_date_time(mtime, rel))
-            zf.writestr(info, data, zipfile.ZIP_DEFLATED)
+            zf.writestr(info, data, _compress_type(data))
             report["files"].append({"path": rel, "size": len(data), "mtime": mtime})
             report["total_bytes"] += len(data)
         if report["files"] and identity is not None:

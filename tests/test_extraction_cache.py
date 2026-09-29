@@ -273,6 +273,7 @@ def test_locked_serializes_a_second_call_on_the_same_instance(tmp_path: Path) ->
     cache = _cache(tmp_path)
     entered = _threading.Event()
     release = _threading.Event()
+    second_entered = _threading.Event()
     order: list[str] = []
 
     def first() -> None:
@@ -280,15 +281,23 @@ def test_locked_serializes_a_second_call_on_the_same_instance(tmp_path: Path) ->
             order.append("first-enter")
             entered.set()
             release.wait(timeout=5)
-        order.append("first-exit")
+            order.append("first-exit")
 
-    t = _threading.Thread(target=first)
-    t.start()
+    def second() -> None:
+        with cache._locked("second"):
+            order.append("second-enter")
+            second_entered.set()
+
+    holder = _threading.Thread(target=first)
+    holder.start()
     assert entered.wait(timeout=5)
-    with cache._locked("second"):
-        order.append("second-enter")
+    contender = _threading.Thread(target=second)
+    contender.start()
+    # The contender must still be parked on the lock while the first call holds it.
+    assert not second_entered.wait(timeout=0.1)
     release.set()
-    t.join(timeout=5)
+    holder.join(timeout=5)
+    contender.join(timeout=5)
     assert order == ["first-enter", "first-exit", "second-enter"]
 
 

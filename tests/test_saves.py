@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import os
+import random
 import time
 import tracemalloc
 import zipfile
@@ -123,6 +124,57 @@ def test_build_ships_a_dot_prefixed_save(tmp_path: Path) -> None:
     assert [f["path"] for f in report["files"]] == [
         "sstates/.config.tmp", "sstates/.hidden/inside.bin", "sstates/state.p2s"
     ]
+
+
+_PACKED_STATE = random.Random(0).randbytes(2 * 1024 * 1024)
+"""Stands in for a state the emulator already compressed: large, and nothing deflate can shrink."""
+_SPARSE_CARD = random.Random(1).randbytes(128 * 1024) + b"\xff" * (2 * 1024 * 1024)
+"""Stands in for a mostly empty memory card: large, and mostly one repeated byte."""
+
+
+def _methods(zip_bytes: bytes) -> dict[str, int]:
+    """Map each member of an archive to its compression method.
+
+    Args:
+        zip_bytes: The zip file contents.
+
+    Returns:
+        Member name to `zipfile.ZIP_*` constant.
+    """
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        return {i.filename: i.compress_type for i in zf.infolist()}
+
+
+def test_build_stores_a_large_member_deflate_cannot_shrink(tmp_path: Path) -> None:
+    """An already-compressed state is stored rather than spending seconds deflating it again."""
+    _write(tmp_path / "sstates" / "game.p2s", _PACKED_STATE, mtime=NEW)
+    _write(tmp_path / "sstates" / "card.ps2", _SPARSE_CARD, mtime=NEW)
+    _write(tmp_path / "sstates" / "small.bin", random.Random(2).randbytes(4096), mtime=NEW)
+
+    report = saves.build_save_archive(tmp_path, ("sstates",), baseline=BASELINE, identity={"id": "s"})
+
+    assert _methods(report["zip_bytes"]) == {
+        "sstates/card.ps2": zipfile.ZIP_DEFLATED,
+        "sstates/game.p2s": zipfile.ZIP_STORED,
+        "sstates/small.bin": zipfile.ZIP_DEFLATED,
+        saves.MANIFEST_NAME: zipfile.ZIP_DEFLATED,
+    }
+
+
+def test_a_dump_with_a_stored_member_restores_byte_for_byte(tmp_path: Path) -> None:
+    """A stored member passes the read check and restores exactly like a deflated one."""
+    _write(tmp_path / "dump" / "sstates" / "game.p2s", _PACKED_STATE, mtime=NEW)
+    _write(tmp_path / "dump" / "sstates" / "card.ps2", _SPARSE_CARD, mtime=NEW)
+    report = saves.build_save_archive(tmp_path / "dump", ("sstates",), baseline=BASELINE)
+    body = report["zip_bytes"]
+    names = ("sstates/card.ps2", "sstates/game.p2s")
+
+    assert saves.verify_members(body, names) == ()
+    result = saves.write_save_archive(body, tmp_path / "restore", saves.ArchivePlan(names, 0))
+
+    assert (result["written"], result["failed"]) == (2, 0)
+    assert (tmp_path / "restore" / "sstates" / "game.p2s").read_bytes() == _PACKED_STATE
+    assert (tmp_path / "restore" / "sstates" / "card.ps2").read_bytes() == _SPARSE_CARD
 
 
 @pytest.mark.parametrize(

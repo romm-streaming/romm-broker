@@ -219,6 +219,18 @@ platform table, resolved against the broker's own options file by
 `_resolve_core_options`, as opposed to `core_options`, which is pinned on
 every launch and always wins over a same-named seed.
 
+### DOSBox Pure mouse
+
+DOSBox Pure's default virtual mouse only moves while RetroArch grabs the
+mouse (F11). Under the stream, that grab puts the pointer under a lock that
+drops the absolute mouse positions selkies sends outside Gaming Mode, so the
+DOS cursor never moves. The broker seeds `dosbox_pure_mouse_input` to
+`direct` on `dos`, which follows the cursor position and needs no grab. As a
+seed it only applies to an options file that has never had it: an install
+that already launched a DOS game keeps its saved value, and switching to
+"direct" there is a Quick Menu change. A player who wants the virtual mouse
+back can pick it there too.
+
 ## Choosing a core
 
 Every platform above maps to one libretro core, the one listed in its table.
