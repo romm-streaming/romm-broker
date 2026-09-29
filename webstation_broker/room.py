@@ -27,6 +27,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from . import session, settings
 from .api import _ct_eq
+from .outbox import Outbox
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -167,6 +168,7 @@ async def room_websocket(websocket: WebSocket) -> None:
         "token": token,
         "public_id": session.new_public_id(),
         "has_joined": False,
+        "outbox": Outbox(websocket, username),
     }
     media_id = connection_info["public_id"].encode("ascii")
     if len(media_id) != MEDIA_ID_BYTES:
@@ -443,6 +445,9 @@ async def room_websocket(websocket: WebSocket) -> None:
     except Exception:
         log.exception("unhandled room websocket error for %s", username)
     finally:
+        # Nothing more goes out on this socket; anything still queued for it
+        # is moot now.
+        await connection_info["outbox"].aclose()
         current_username = connection_info.get("username")
         # A socket that was replaced by a newer one on the same token is not
         # the member leaving, so it neither cleans up nor announces a departure.

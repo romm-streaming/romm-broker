@@ -25,6 +25,7 @@ from starlette.websockets import WebSocketState
 from webstation_broker import api, callback, imports, saves, screenshot, selkies, session, settings
 from webstation_broker.app import create_app
 from webstation_broker.emulators import base, dolphin, rpcs3, shadps4
+from webstation_broker.outbox import Outbox
 
 from .conftest import PREFIX, SLEEPER_CMD, FakeEmulator, corrupt_zip_member, mangle_zip_member
 
@@ -1637,8 +1638,10 @@ def _seat_room_sockets() -> tuple[_RoomSocket, _RoomSocket]:
     """
     controller = _RoomSocket()
     guest = _RoomSocket()
-    session.ROOM["controller"] = {"websocket": controller}
-    session.ROOM["viewers"] = {"guest-token": {"websocket": guest}}
+    session.ROOM["controller"] = {"websocket": controller, "outbox": Outbox(controller, "host")}
+    session.ROOM["viewers"] = {
+        "guest-token": {"websocket": guest, "outbox": Outbox(guest, "guest")}
+    }
     return controller, guest
 
 

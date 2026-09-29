@@ -1,14 +1,19 @@
 """Room websocket: oversized-frame rejection, chat rate limiting, and video/audio/cursor state validation."""
 
+import asyncio
 import json
 import logging
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Optional
 
+import anyio
 import pytest
 from fastapi.testclient import TestClient
 from starlette.testclient import WebSocketTestSession
+from starlette.types import Message
 from starlette.websockets import WebSocketDisconnect
 
 from webstation_broker import room, session, settings
@@ -763,3 +768,104 @@ def test_a_chat_message_carries_the_senders_public_id(
 
     assert message["senderPublicId"] == session.find_viewer(viewer)["public_id"]
     assert viewer not in json.dumps(message)
+
+
+_SLOW_DELIVERY_WAIT = 1.0
+"""Seconds a healthy member waits for a frame that a slow member must not hold up."""
+
+
+def _stall_sends(token: str, released: threading.Event) -> None:
+    """Make one member's socket a slow consumer: every send to it parks until `released` is set.
+
+    Stands in for a viewer on a bad link, whose socket write waits on a full
+    TCP buffer. The parked send polls a thread event rather than awaiting an
+    asyncio one, so the test thread can release it.
+
+    Args:
+        token: The seat token of the member to slow down.
+        released: Set by the test to let the parked sends finish.
+    """
+    ws = session.ROOM["viewers"][token]["websocket"]
+
+    async def parked(*_args: object, **_kwargs: object) -> None:
+        """Wait for the test to release the send."""
+        while not released.is_set():
+            await asyncio.sleep(0.01)
+
+    ws.send_bytes = parked
+    ws.send_json = parked
+
+
+def _receive_within(conn: WebSocketTestSession, seconds: float, kind: str) -> Optional[Message]:
+    """Read messages until one carries `kind` ("bytes" or a JSON `type`), or give up after `seconds`.
+
+    `WebSocketTestSession.receive` has no timeout, and a read that never
+    returns would hang the suite, so this reads the session's queue on its own
+    portal under a deadline.
+
+    Args:
+        conn: The client-side session to read from.
+        seconds: How long to wait in total.
+        kind: "bytes" for a media frame, otherwise the JSON message `type` to wait for.
+
+    Returns:
+        The matching message, or None when the deadline passed first.
+    """
+
+    async def read() -> Optional[Message]:
+        """Drain the queue under the deadline until a match turns up."""
+        with anyio.move_on_after(seconds):
+            while True:
+                message = await conn._send_rx.receive()
+                if kind == "bytes" and "bytes" in message:
+                    return message
+                text = message.get("text")
+                if kind != "bytes" and text and json.loads(text).get("type") == kind:
+                    return message
+        return None
+
+    return conn.portal.call(read)
+
+
+def test_a_slow_viewer_does_not_hold_up_the_senders_next_media_frame(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """One viewer on a stalled link must not freeze a sender's video for everyone else."""
+    controller = _activate(client, broker_dirs)
+    healthy = _invite(client, controller)
+    slow = _invite(client, controller)
+    released = threading.Event()
+
+    with _connect(client, controller) as host, _connect(client, healthy) as ok, _connect(client, slow):
+        _stall_sends(slow, released)
+        try:
+            host.send_bytes(b"AAAAAAAA" + bytes([0x01]) + b"frame-1")
+            first = _receive_within(ok, _SLOW_DELIVERY_WAIT, "bytes")
+            host.send_bytes(b"AAAAAAAA" + bytes([0x01]) + b"frame-2")
+            second = _receive_within(ok, _SLOW_DELIVERY_WAIT, "bytes")
+        finally:
+            released.set()
+
+    assert first is not None and first["bytes"].endswith(b"frame-1")
+    assert second is not None and second["bytes"].endswith(b"frame-2")
+
+
+def test_a_slow_viewer_does_not_hold_up_the_senders_chat(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """One viewer on a stalled link must not stall the sender's chat to everyone else."""
+    controller = _activate(client, broker_dirs)
+    healthy = _invite(client, controller)
+    slow = _invite(client, controller)
+    released = threading.Event()
+
+    with _connect(client, controller) as host, _connect(client, healthy) as ok, _connect(client, slow):
+        _stall_sends(slow, released)
+        try:
+            host.send_bytes(b"AAAAAAAA" + bytes([0x01]) + b"frame-1")
+            host.send_json({"action": "send_chat_message", "message": "still here"})
+            chat = _receive_within(ok, _SLOW_DELIVERY_WAIT, "chat_message")
+        finally:
+            released.set()
+
+    assert chat is not None and json.loads(chat["text"])["message"] == "still here"
