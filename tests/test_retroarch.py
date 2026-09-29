@@ -1408,8 +1408,12 @@ class TestSwapDisc:
 
         assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is False
 
+        # End the session the way a stop does; the fixture writes no state file,
+        # so otherwise the resume keeps retrying for the whole RESUME_LOAD_WAIT.
+        emulator._launch_seq += 1
         release_resume.set()
         t.join(timeout=2)
+        assert not t.is_alive()
 
 
 class TestStateSupport:
