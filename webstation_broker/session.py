@@ -12,7 +12,7 @@ import secrets
 import time
 from typing import TYPE_CHECKING, Any, Optional
 
-from starlette.websockets import WebSocket, WebSocketState
+from starlette.websockets import WebSocket
 
 from . import selkies, settings
 
@@ -51,6 +51,12 @@ RomM files the exit state in its library after the teardown has answered, so
 the emulator that captured it has to outlive the session for the read routes
 to find the file. Dropped at the next activate.
 """
+
+SESSION_END_FLUSH_WAIT = 2.0
+"""Seconds the `session_ended` notice gets to reach each member before its socket closes."""
+
+KEYFRAME_REQUEST_GAP = 1.0
+"""Minimum seconds between two keyframe requests to the same member."""
 
 ROOM: dict[str, Any] = {"controller": None, "viewers": {}, "cooldowns": {}}
 """Live websocket connections for the room.
@@ -417,54 +423,65 @@ async def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> 
     return viewer
 
 
-async def broadcast_to_room(payload: dict[str, Any]) -> None:
-    """Send a JSON message to every connected room member.
+def _room_connections() -> list[dict[str, Any]]:
+    """List every live room connection, the controller's first.
 
-    Sends run concurrently; a failure on one socket is logged and does not
-    stop delivery to the others.
+    Returns:
+        The connection-info dicts currently registered in `ROOM`.
+    """
+    connections = []
+    if ROOM.get("controller"):
+        connections.append(ROOM["controller"])
+    connections.extend(ROOM.get("viewers", {}).values())
+    return connections
+
+
+async def broadcast_to_room(payload: dict[str, Any]) -> None:
+    """Queue a JSON message for every connected room member.
+
+    Each member's outbox sends it on its own time, so a member whose
+    connection is backed up delays nobody but itself (see `outbox`).
 
     Args:
         payload: The JSON-serializable message, normally carrying a `type` key.
     """
-    all_ws = []
-    if ROOM.get("controller"):
-        all_ws.append(ROOM["controller"]["websocket"])
-    for conn in ROOM.get("viewers", {}).values():
-        all_ws.append(conn["websocket"])
-    tasks = [
-        ws.send_json(payload)
-        for ws in all_ws
-        if ws.client_state == WebSocketState.CONNECTED
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    for result in results:
-        if isinstance(result, Exception):
-            log.warning("room send failed: %s", result)
+    for conn in _room_connections():
+        conn["outbox"].send_json(payload)
 
 
 async def broadcast_binary_to_room(payload: bytes, sender_ws: WebSocket) -> None:
-    """Relay a binary media frame to every connected room member except its sender.
+    """Queue a binary media frame for every connected room member except its sender.
+
+    Runs inline in the sender's receive loop, so it never waits on a recipient.
 
     Args:
         payload: The raw frame in the room's binary wire format.
         sender_ws: The websocket the frame arrived on; it is skipped.
     """
-    all_ws = []
-    if ROOM.get("controller") and ROOM["controller"]["websocket"] != sender_ws:
-        all_ws.append(ROOM["controller"]["websocket"])
-    for conn in ROOM.get("viewers", {}).values():
-        if conn["websocket"] != sender_ws:
-            all_ws.append(conn["websocket"])
-    tasks = [
-        ws.send_bytes(payload)
-        for ws in all_ws
-        if ws.client_state == WebSocketState.CONNECTED
-    ]
-    if tasks:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for result in results:
-            if isinstance(result, Exception):
-                log.warning("room binary send failed: %s", result)
+    for conn in _room_connections():
+        if conn["websocket"] is not sender_ws:
+            conn["outbox"].send_media(payload)
+
+
+def request_keyframe(media_id: bytes) -> None:
+    """Ask the member streaming under `media_id` to encode its next video frame as a keyframe.
+
+    Called by a recipient's outbox after it dropped one of that member's video
+    frames. Requests to one member are spaced `KEYFRAME_REQUEST_GAP` apart,
+    since keyframes are the largest frames and would add to the congestion.
+
+    Args:
+        media_id: The sender's per-connection media id, as stamped on its frames.
+    """
+    now = time.monotonic()
+    for conn in _room_connections():
+        if conn.get("public_id", "").encode("ascii") != media_id:
+            continue
+        if now - conn.get("keyframe_requested_at", float("-inf")) < KEYFRAME_REQUEST_GAP:
+            return
+        conn["keyframe_requested_at"] = now
+        conn["outbox"].send_json({"type": "keyframe_request"})
+        return
 
 
 async def broadcast_state() -> None:
@@ -657,22 +674,40 @@ async def notify_session_ended() -> None:
     close finds itself already replaced and skips its per-member cleanup: the
     seat, role and token-map releases it would do are moot against a session
     being torn down, and its departure notice would go to a room that has
-    already been told the whole session ended.
+    already been told the whole session ended. Broadcasts only queue, so the
+    notice is given up to `SESSION_END_FLUSH_WAIT` to go out before the
+    sockets close under it.
     """
     await broadcast_to_room({"type": "session_ended"})
-    connections = []
-    if ROOM.get("controller"):
-        connections.append(ROOM["controller"])
-    connections.extend(ROOM.get("viewers", {}).values())
+    connections = _room_connections()
     ROOM["controller"] = None
     ROOM["viewers"] = {}
     ROOM["cooldowns"] = {}
-    for conn in connections:
-        try:
-            await conn["websocket"].close(code=1000)
-        except Exception as exc:
-            log.debug(
-                "session: room socket for %r was already gone at session end: %s",
-                conn.get("username"),
-                exc,
-            )
+    await asyncio.gather(
+        *(conn["outbox"].flush(SESSION_END_FLUSH_WAIT) for conn in connections)
+    )
+    await asyncio.gather(*(_close_at_session_end(conn) for conn in connections))
+
+
+async def _close_at_session_end(conn: dict[str, Any]) -> None:
+    """Close one room socket, giving up after `outbox.CLOSE_WAIT` on one that cannot take it.
+
+    Args:
+        conn: The room connection to close.
+    """
+    from . import outbox
+
+    try:
+        await asyncio.wait_for(conn["websocket"].close(code=1000), outbox.CLOSE_WAIT)
+    except TimeoutError:
+        log.debug(
+            "session: room socket for %r did not close within %gs at session end",
+            conn.get("username"),
+            outbox.CLOSE_WAIT,
+        )
+    except Exception as exc:
+        log.debug(
+            "session: room socket for %r was already gone at session end: %s",
+            conn.get("username"),
+            exc,
+        )

@@ -25,6 +25,7 @@ from starlette.websockets import WebSocketState
 from webstation_broker import api, callback, imports, saves, screenshot, selkies, session, settings
 from webstation_broker.app import create_app
 from webstation_broker.emulators import base, dolphin, rpcs3, shadps4
+from webstation_broker.outbox import Outbox
 
 from .conftest import PREFIX, SLEEPER_CMD, FakeEmulator, corrupt_zip_member, mangle_zip_member
 
@@ -1605,12 +1606,14 @@ class _RoomSocket:
 
     Attributes:
         client_state: What the room fanout checks before sending; always connected.
+        application_state: The server side of the same check; always connected.
         sent: Every payload this seat received, in order.
     """
 
     def __init__(self) -> None:
         """Build a connected socket with nothing sent to it yet."""
         self.client_state = WebSocketState.CONNECTED
+        self.application_state = WebSocketState.CONNECTED
         self.sent: list[dict[str, Any]] = []
 
     async def send_json(self, payload: dict[str, Any]) -> None:
@@ -1637,8 +1640,10 @@ def _seat_room_sockets() -> tuple[_RoomSocket, _RoomSocket]:
     """
     controller = _RoomSocket()
     guest = _RoomSocket()
-    session.ROOM["controller"] = {"websocket": controller}
-    session.ROOM["viewers"] = {"guest-token": {"websocket": guest}}
+    session.ROOM["controller"] = {"websocket": controller, "outbox": Outbox(controller, "host")}
+    session.ROOM["viewers"] = {
+        "guest-token": {"websocket": guest, "outbox": Outbox(guest, "guest")}
+    }
     return controller, guest
 
 

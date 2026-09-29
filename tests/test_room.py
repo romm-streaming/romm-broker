@@ -1,17 +1,22 @@
 """Room websocket: oversized-frame rejection, chat rate limiting, and video/audio/cursor state validation."""
 
+import asyncio
 import json
 import logging
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Optional, cast
 
+import anyio
 import pytest
 from fastapi.testclient import TestClient
 from starlette.testclient import WebSocketTestSession
-from starlette.websockets import WebSocketDisconnect
+from starlette.types import Message
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from webstation_broker import room, session, settings
+from webstation_broker import outbox, room, session, settings
 
 from .conftest import PREFIX, FakeEmulator
 
@@ -763,3 +768,195 @@ def test_a_chat_message_carries_the_senders_public_id(
 
     assert message["senderPublicId"] == session.find_viewer(viewer)["public_id"]
     assert viewer not in json.dumps(message)
+
+
+_SLOW_DELIVERY_WAIT = 1.0
+"""Seconds a healthy member waits for a frame that a slow member must not hold up."""
+
+
+def _stall_sends(token: str, released: threading.Event) -> None:
+    """Make one member's socket a slow consumer: every send to it parks until `released` is set.
+
+    A thread event, polled, so the test thread can release the parked sends.
+
+    Args:
+        token: The seat token of the member to slow down.
+        released: Set by the test to let the parked sends finish.
+    """
+    ws = session.ROOM["viewers"][token]["websocket"]
+
+    async def parked(*_args: object, **_kwargs: object) -> None:
+        """Wait for the test to release the send."""
+        while not released.is_set():
+            await asyncio.sleep(0.01)
+
+    ws.send_bytes = parked
+    ws.send_json = parked
+
+
+def _receive_within(conn: WebSocketTestSession, seconds: float, kind: str) -> Optional[Message]:
+    """Read messages until one carries `kind` ("bytes" or a JSON `type`), or give up after `seconds`.
+
+    `WebSocketTestSession.receive` has no timeout, and a read that never
+    returns would hang the suite, so this reads the session's queue on its own
+    portal under a deadline.
+
+    Args:
+        conn: The client-side session to read from.
+        seconds: How long to wait in total.
+        kind: "bytes" for a media frame, otherwise the JSON message `type` to wait for.
+
+    Returns:
+        The matching message, or None when the deadline passed first.
+    """
+
+    async def read() -> Optional[Message]:
+        """Drain the queue under the deadline until a match turns up."""
+        with anyio.move_on_after(seconds):
+            while True:
+                message = await conn._send_rx.receive()
+                if kind == "bytes" and "bytes" in message:
+                    return message
+                text = message.get("text")
+                if kind != "bytes" and text and json.loads(text).get("type") == kind:
+                    return message
+        return None
+
+    return conn.portal.call(read)
+
+
+def _video_frame(body: bytes) -> bytes:
+    """Build an unstamped video frame as a client sends it.
+
+    Args:
+        body: The encoded payload.
+
+    Returns:
+        The frame in the room's binary wire format.
+    """
+    return b"AAAAAAAA" + bytes([outbox.VIDEO_FRAME]) + body
+
+
+def test_a_slow_viewer_does_not_hold_up_the_senders_next_media_frame(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """One viewer on a stalled link must not freeze a sender's video for everyone else."""
+    controller = _activate(client, broker_dirs)
+    healthy = _invite(client, controller)
+    slow = _invite(client, controller)
+    released = threading.Event()
+
+    with _connect(client, controller) as host, _connect(client, healthy) as ok, _connect(client, slow):
+        _stall_sends(slow, released)
+        try:
+            host.send_bytes(_video_frame(b"frame-1"))
+            first = _receive_within(ok, _SLOW_DELIVERY_WAIT, "bytes")
+            host.send_bytes(_video_frame(b"frame-2"))
+            second = _receive_within(ok, _SLOW_DELIVERY_WAIT, "bytes")
+        finally:
+            released.set()
+
+    assert first is not None and first["bytes"].endswith(b"frame-1")
+    assert second is not None and second["bytes"].endswith(b"frame-2")
+
+
+def test_a_slow_viewer_does_not_hold_up_the_senders_chat(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """One viewer on a stalled link must not stall the sender's chat to everyone else."""
+    controller = _activate(client, broker_dirs)
+    healthy = _invite(client, controller)
+    slow = _invite(client, controller)
+    released = threading.Event()
+
+    with _connect(client, controller) as host, _connect(client, healthy) as ok, _connect(client, slow):
+        _stall_sends(slow, released)
+        try:
+            host.send_bytes(_video_frame(b"frame-1"))
+            host.send_json({"action": "send_chat_message", "message": "still here"})
+            chat = _receive_within(ok, _SLOW_DELIVERY_WAIT, "chat_message")
+        finally:
+            released.set()
+
+    assert chat is not None and json.loads(chat["text"])["message"] == "still here"
+
+
+def test_a_viewer_that_stops_reading_leaves_the_room(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A laggard the outbox gives up on is dropped from the room, not left holding its seat's connection."""
+    monkeypatch.setattr(outbox, "SEND_STALL_LIMIT", 0.1)
+    controller = _activate(client, broker_dirs)
+    slow = _invite(client, controller)
+    released = threading.Event()
+
+    with _connect(client, controller) as host, _connect(client, slow):
+        _stall_sends(slow, released)
+        try:
+            host.send_json({"action": "send_chat_message", "message": "anyone there"})
+            left = _receive_within(host, _SLOW_DELIVERY_WAIT * 3, "user_left")
+            still_seated = slow in session.ROOM["viewers"]
+        finally:
+            released.set()
+
+    assert left is not None
+    assert not still_seated
+
+
+class _SilentSocket:
+    """A room socket whose client never sends anything."""
+
+    async def receive(self) -> Message:
+        """Wait forever."""
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+async def test_the_reader_stops_a_parked_read_once_the_outbox_gives_up() -> None:
+    """A read waiting on a silent client returns None when `abandoned` is set."""
+    abandoned = asyncio.Event()
+    reader = room._RoomReader(cast(WebSocket, _SilentSocket()), abandoned)
+    read = asyncio.ensure_future(asyncio.wait_for(reader.receive(), 1.0))
+    await asyncio.sleep(0)
+    abandoned.set()
+    try:
+        assert await read is None
+    finally:
+        reader.close()
+
+
+async def test_the_reader_lets_an_outside_cancel_through() -> None:
+    """A cancel that did not come from the outbox giving up still cancels the handler."""
+    abandoned = asyncio.Event()
+
+    async def handler() -> None:
+        reader = room._RoomReader(cast(WebSocket, _SilentSocket()), abandoned)
+        try:
+            await reader.receive()
+        finally:
+            reader.close()
+
+    task = asyncio.ensure_future(handler())
+    await asyncio.sleep(0)
+    abandoned.set()
+    await asyncio.sleep(0)
+    assert task.cancelling() == 1
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_the_reader_refuses_a_read_from_another_task() -> None:
+    """Once bound to the task that first read it, the reader will not serve another."""
+    abandoned = asyncio.Event()
+    abandoned.set()
+    reader = room._RoomReader(cast(WebSocket, _SilentSocket()), abandoned)
+    try:
+        assert await reader.receive() is None
+        with pytest.raises(RuntimeError):
+            await asyncio.ensure_future(reader.receive())
+    finally:
+        reader.close()

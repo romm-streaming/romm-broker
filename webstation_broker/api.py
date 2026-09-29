@@ -24,7 +24,6 @@ import anyio
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, field_validator
-from starlette.websockets import WebSocketState
 
 from . import callback, imports, memcard, saves, screenshot, selkies, session, settings
 from .emulators import get_emulator, retroarch, retroarch_cores
@@ -504,13 +503,7 @@ async def _send_to_controller(payload: dict[str, Any]) -> None:
     conn = session.ROOM.get("controller")
     if not conn:
         return
-    ws = conn["websocket"]
-    if ws.client_state != WebSocketState.CONNECTED:
-        return
-    try:
-        await ws.send_json(payload)
-    except Exception as exc:
-        log.warning("controller send failed: %s", exc)
+    conn["outbox"].send_json(payload)
 
 
 @router.get("/api/health")

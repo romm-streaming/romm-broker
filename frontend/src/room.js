@@ -1206,6 +1206,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     let isInitializingMedia = false;
     let isMicOn = false;
     let isWebcamOn = false;
+    // Set by a keyframe_request: a viewer lost one of our video frames and
+    // cannot decode anything after it until the next keyframe.
+    let keyFrameRequested = false;
     let preferredMicId = localStorage.getItem('collab_preferredMicId') || null;
     let preferredCamId = localStorage.getItem('collab_preferredCamId') || null;
     let localAudioAnalyser = null;
@@ -1788,7 +1791,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 if (done || !localStream) return;
                 
                 if (videoEncoder.state === 'configured' && isWebcamOn) {
-                    const needsKeyFrame = (frameCounter % 120 === 0);
+                    const needsKeyFrame = keyFrameRequested || (frameCounter % 120 === 0);
+                    keyFrameRequested = false;
                     let upright = frame;
                     if (!composeFailed) {
                         try {
@@ -2509,6 +2513,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                 switch (data.type) {
                     case 'session_ended':
                         handleControllerDisconnect();
+                        break;
+                    case 'keyframe_request':
+                        keyFrameRequested = true;
                         break;
                     case 'request_resolutions': {
                         const reqIframe = document.getElementById('session-frame');

@@ -5,7 +5,7 @@ Binary wire format:
 ```
 [0..7] 8-byte ASCII publicId of sender
 [8]    0x01 video frame / 0x02 audio frame / 0x03 video config / 0x04 pcm
-[9..]  payload
+[9..]  payload; for a video frame, [9] is 0x01 on a keyframe
 ```
 
 The publicId indirection keeps real tokens out of the media byte stream. It
@@ -16,6 +16,7 @@ that is distinct from a seat's persistent `public_id` in `session.py`, which
 seat's whole life.
 """
 
+import asyncio
 import json
 import logging
 import secrets
@@ -23,10 +24,12 @@ import time
 from typing import Any, Optional
 
 from fastapi import APIRouter
+from starlette.types import Message
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from . import session, settings
 from .api import _ct_eq
+from .outbox import AUDIO_FRAME, Outbox
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -98,6 +101,72 @@ def _positive_pixels(raw: Any) -> Optional[int]:
     return raw if 1 <= raw <= MAX_RESOLUTION_PIXELS else None
 
 
+class _RoomReader:
+    """Reads a room socket until its outbox gives up on the recipient.
+
+    The first `receive()` binds the reader to the task calling it and starts
+    one watcher, which interrupts that task if it is parked in `receive()`
+    when the outbox gives up; otherwise the next read sees it.
+    """
+
+    def __init__(self, websocket: WebSocket, abandoned: asyncio.Event) -> None:
+        """Prepare to read `websocket`.
+
+        Args:
+            websocket: The room socket to read from.
+            abandoned: Set once the connection should no longer be served.
+        """
+        self._websocket = websocket
+        self._abandoned = abandoned
+        self._handler: Optional[asyncio.Task[Any]] = None
+        self._watcher: Optional[asyncio.Task[None]] = None
+        self._reading = False
+        self._interrupted = False
+
+    async def _watch(self, handler: "asyncio.Task[Any]") -> None:
+        """Cancel the handler's pending read once the outbox gives up."""
+        await self._abandoned.wait()
+        if self._reading:
+            self._interrupted = True
+            handler.cancel()
+
+    async def receive(self) -> Optional[Message]:
+        """Receive the next message.
+
+        Returns:
+            The message, or None once the outbox has given up on this socket.
+
+        Raises:
+            RuntimeError: When called from a task other than the first caller's.
+        """
+        handler = asyncio.current_task()
+        if handler is None or self._handler not in (None, handler):
+            raise RuntimeError("a room reader is only read from the task that first read it")
+        if self._watcher is None:
+            self._handler = handler
+            self._watcher = asyncio.get_running_loop().create_task(self._watch(handler))
+        if self._abandoned.is_set():
+            return None
+        self._reading = True
+        try:
+            return await self._websocket.receive()
+        except asyncio.CancelledError:
+            if not self._interrupted:
+                raise
+            self._interrupted = False
+            # Anything left after taking back our own cancel came from outside.
+            if handler.uncancel():
+                raise
+            return None
+        finally:
+            self._reading = False
+
+    def close(self) -> None:
+        """Stop watching."""
+        if self._watcher is not None:
+            self._watcher.cancel()
+
+
 @router.websocket("/ws/room")
 async def room_websocket(websocket: WebSocket) -> None:
     """Join the play session's room and relay its presence, chat, control and media traffic.
@@ -167,6 +236,7 @@ async def room_websocket(websocket: WebSocket) -> None:
         "token": token,
         "public_id": session.new_public_id(),
         "has_joined": False,
+        "outbox": Outbox(websocket, username, on_video_gap=session.request_keyframe),
     }
     media_id = connection_info["public_id"].encode("ascii")
     if len(media_id) != MEDIA_ID_BYTES:
@@ -197,9 +267,14 @@ async def room_websocket(websocket: WebSocket) -> None:
     connection_info["has_joined"] = True
     await session.broadcast_state()
 
+    outbox = connection_info["outbox"]
+    reader = _RoomReader(websocket, outbox.abandoned)
     try:
         while True:
-            message = await websocket.receive()
+            message = await reader.receive()
+            if message is None:
+                log.info("room websocket: %s stopped reading, dropping it from the room", username)
+                break
             if message.get("type") == "websocket.disconnect":
                 break
 
@@ -312,6 +387,7 @@ async def room_websocket(websocket: WebSocket) -> None:
                         viewer_ref["username"] = new_username
                         cooldowns["username"] = now
                         connection_info["username"] = new_username
+                        outbox.label = new_username
                         username = new_username
                         await session.broadcast_to_room(
                             {
@@ -427,7 +503,7 @@ async def room_websocket(websocket: WebSocket) -> None:
                     )
                     continue
                 designated = sess.get("designated_speaker")
-                is_audio = binary_data[MEDIA_ID_BYTES] == 0x02
+                is_audio = binary_data[MEDIA_ID_BYTES] == AUDIO_FRAME
                 if designated and is_audio and token != designated:
                     continue
                 # The leading bytes are the publicId recipients attribute the
@@ -443,6 +519,8 @@ async def room_websocket(websocket: WebSocket) -> None:
     except Exception:
         log.exception("unhandled room websocket error for %s", username)
     finally:
+        reader.close()
+        await outbox.aclose()
         current_username = connection_info.get("username")
         # A socket that was replaced by a newer one on the same token is not
         # the member leaving, so it neither cleans up nor announces a departure.
