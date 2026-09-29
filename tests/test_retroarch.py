@@ -244,6 +244,21 @@ def test_vice_and_hatari_seed_write_protection_instead_of_pinning_it(
     assert option not in info.get("core_options", {})
 
 
+def test_dosbox_pure_seeds_direct_mouse_input() -> None:
+    """DOSBox Pure seeds its mouse to "direct" rather than the grabbed virtual mouse.
+
+    The virtual mouse only moves while RetroArch grabs the pointer, and under
+    the stream's Xwayland that grab becomes a Wayland pointer lock, which drops
+    the absolute moves selkies sends outside Gaming Mode. "direct" follows the
+    cursor position, so no grab is needed. It is a seed, not a pin, so a player
+    who prefers the virtual mouse can switch back.
+    """
+    info = retroarch._platform_info("dos")
+
+    assert info["core_option_seeds"]["dosbox_pure_mouse_input"] == "direct"
+    assert "dosbox_pure_mouse_input" not in info.get("core_options", {})
+
+
 def test_neocd_links_its_shared_backup_ram_into_the_save_archive() -> None:
     """NeoCD's core-wide backup RAM is linked into SAVE_DIR/NeoCD, not left shared under SYSTEM_DIR.
 

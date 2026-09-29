@@ -312,7 +312,8 @@
     "core": "dosbox_pure",
     "library_name": "DOSBox-pure",
     "save_ram": false,
-    "extensions": [".m3u", ".dosz", ".zip", ".iso", ".cue", ".exe", ".com", ".bat", ".conf"]
+    "extensions": [".m3u", ".dosz", ".zip", ".iso", ".cue", ".exe", ".com", ".bat", ".conf"],
+    "core_option_seeds": {"dosbox_pure_mouse_input": "direct"}
   },
   "amiga": {
     "core": "puae",
