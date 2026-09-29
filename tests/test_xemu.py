@@ -490,7 +490,7 @@ def test_software_gl_is_off_by_default(
 
     CPU rendering is a workaround for broken drivers, not a default.
     """
-    monkeypatch.setattr(xemu, "XEMU_SOFTWARE_GL", False)
+    monkeypatch.setattr(settings, "XEMU_SOFTWARE_GL", False)
     assert "LIBGL_ALWAYS_SOFTWARE" not in _spawned_env(emulator, monkeypatch, tmp_path)
 
 
@@ -501,19 +501,10 @@ def test_software_gl_reaches_xemu_and_nothing_else(
 
     Set on xemu's own launch env, so the rest of the container keeps the GPU.
     """
-    monkeypatch.setattr(xemu, "XEMU_SOFTWARE_GL", True)
+    monkeypatch.setattr(settings, "XEMU_SOFTWARE_GL", True)
     env = _spawned_env(emulator, monkeypatch, tmp_path)
     assert env["LIBGL_ALWAYS_SOFTWARE"] == "1"
     assert "LIBGL_ALWAYS_SOFTWARE" not in os.environ
-
-
-@pytest.mark.parametrize("setting,expected", [
-    ("1", True), ("true", True), ("YES", True), (" on ", True),
-    ("0", False), ("false", False), ("", False),
-])
-def test_the_software_gl_switch_reads_the_usual_spellings(setting: str, expected: bool) -> None:
-    """The truthy parser accepts the common spellings of on and off."""
-    assert xemu._truthy(setting) is expected
 
 
 def test_launch_pins_the_display_settings_before_spawning(

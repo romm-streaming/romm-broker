@@ -406,14 +406,132 @@ def test_reject_unsafe_members_rejects_a_traversal_path(tmp_path: Path) -> None:
     dest = tmp_path / "dest"
     dest.mkdir()
     with pytest.raises(RuntimeError, match="escapes"):
-        extraction_cache._reject_unsafe_members(dest, ["../outside.txt"])
+        extraction_cache.reject_unsafe_members(dest, ["../outside.txt"])
 
 
 def test_reject_unsafe_members_allows_normal_paths(tmp_path: Path) -> None:
     """Ordinary relative member paths are accepted."""
     dest = tmp_path / "dest"
     dest.mkdir()
-    extraction_cache._reject_unsafe_members(dest, ["a/b/c.txt", "top.txt"])
+    extraction_cache.reject_unsafe_members(dest, ["a/b/c.txt", "top.txt"])
+
+
+def test_reject_unsafe_members_raises_on_a_control_character_name(tmp_path: Path) -> None:
+    """A member name carrying a newline is refused.
+
+    The .rar/.7z member lists are read back out of a line-based listing, so a
+    name holding a newline cannot be checked as the path the archive holds.
+    """
+    with pytest.raises(RuntimeError, match="control character"):
+        extraction_cache.reject_unsafe_members(tmp_path, ["ok.pkg\n../../etc/evil"])
+
+
+def _fake_listing(monkeypatch: pytest.MonkeyPatch, listing: str) -> list[list[str]]:
+    """Make every extractor run return `listing`, recording each command."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        extraction_cache, "_run_extractor", lambda cmd, what, timeout: calls.append(cmd) or listing
+    )
+    return calls
+
+
+def test_list_members_reads_a_zip_in_process(tmp_path: Path) -> None:
+    """A .zip is listed with the stdlib, no external tool."""
+    archive = _make_zip(tmp_path / "Game.zip", {"dir/Game.sfc": b"x", "readme.txt": b"y"})
+    assert extraction_cache.list_members(archive, 30.0) == ["dir/Game.sfc", "readme.txt"]
+
+
+def test_list_members_raises_on_a_corrupt_zip(tmp_path: Path) -> None:
+    """A corrupt .zip surfaces as the same RuntimeError an external listing raises."""
+    archive = tmp_path / "Game.zip"
+    archive.write_bytes(b"not a zip")
+    with pytest.raises(RuntimeError, match="could not list zip"):
+        extraction_cache.list_members(archive, 30.0)
+
+
+def test_list_members_returns_the_rar_listing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A normal `unrar lb` listing yields one path per member."""
+    calls = _fake_listing(monkeypatch, "Game/CUSA23079.pkg\nGame/readme.txt\n")
+    archive = tmp_path / "Game.rar"
+    assert extraction_cache.list_members(archive, 30.0) == ["Game/CUSA23079.pkg", "Game/readme.txt"]
+    assert calls == [["unrar", "lb", "-y", str(archive)]]
+
+
+def test_list_members_raises_when_the_rar_listing_names_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unrar listing with no members stops the extraction.
+
+    An empty parse would reach `reject_unsafe_members` as an empty list,
+    which approves every member in the archive without checking one.
+    """
+    _fake_listing(monkeypatch, "\n  \n\n")
+    with pytest.raises(RuntimeError, match="listed no members"):
+        extraction_cache.list_members(tmp_path / "Game.rar", 30.0)
+
+
+def test_list_members_parses_a_7z_listing_and_skips_the_archive_header(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A normal `7z l -slt` listing yields one path per member, header skipped."""
+    calls = _fake_listing(
+        monkeypatch,
+        "7-Zip 24.09\nPath = Game.7z\nType = 7z\n\n----------\n"
+        "Path = sub\nSize = 0\n\nPath = sub/file.txt\nSize = 3\n",
+    )
+    archive = tmp_path / "Game.7z"
+    assert extraction_cache.list_members(archive, 30.0) == ["sub", "sub/file.txt"]
+    assert calls == [["7z", "l", "-slt", str(archive)]]
+
+
+def test_list_members_sends_an_unknown_extension_to_7z(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any other extension is listed by 7z, which identifies more formats than its own."""
+    calls = _fake_listing(monkeypatch, "----------\nPath = Game/EBOOT.BIN\n")
+    assert extraction_cache.list_members(tmp_path / "Game.tar", 30.0) == ["Game/EBOOT.BIN"]
+    assert calls[0][:3] == ["7z", "l", "-slt"]
+
+
+def test_list_members_raises_when_the_7z_listing_has_no_separator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 7z listing shaped differently than expected stops the extraction.
+
+    Without the dashed separator there is no member section to parse, so
+    every path in the archive would go unchecked.
+    """
+    _fake_listing(monkeypatch, "7-Zip 24.09\n\nListing archive: Game.7z\n")
+    with pytest.raises(RuntimeError, match="no member section"):
+        extraction_cache.list_members(tmp_path / "Game.7z", 30.0)
+
+
+def test_list_members_raises_when_the_7z_member_section_is_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 7z member section holding no Path line stops the extraction."""
+    _fake_listing(monkeypatch, "7-Zip 24.09\n----------\nSize = 10\nAttributes = A\n")
+    with pytest.raises(RuntimeError, match="listed no members"):
+        extraction_cache.list_members(tmp_path / "Game.7z", 30.0)
+
+
+def test_listed_size_sums_the_7z_member_sizes_past_the_header(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The archive header's own size line is not counted as a member."""
+    _fake_listing(
+        monkeypatch,
+        "Path = Game.7z\nPhysical Size = 999\n----------\nPath = a\nSize = 10\n\nPath = b\nSize = 5\n",
+    )
+    assert extraction_cache.listed_size(tmp_path / "Game.7z", 30.0) == 15
+
+
+def test_listed_size_is_none_when_the_7z_listing_has_no_separator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unparseable 7z listing falls back to the caller's estimate instead of raising."""
+    _fake_listing(monkeypatch, "Size = 10\n")
+    assert extraction_cache.listed_size(tmp_path / "Game.7z", 30.0) is None
 
 
 def test_safe_extract_zip_extracts_normal_members(tmp_path: Path) -> None:

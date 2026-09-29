@@ -19,7 +19,7 @@ shadPS4 has no PKG installer of its own; a `.pkg` ROM, or a `.7z`/`.zip`/
 `.rar` archive holding one, is unpacked with the standalone `pkg_extractor`
 tool into CACHE_DIR, mirroring rpcs3's archive cache
 (`webstation_broker/emulators/rpcs3.py`): extracted once and reused on every
-later launch. Those formats are only bootable at all with `CACHE_ENABLED`,
+later launch. Those formats are only bootable at all with `SHADPS4_CACHE_ENABLED`,
 since a multi-GB extraction thrown away on every launch buys nothing; with
 the cache off `resolve_rom_file` refuses them and only natively bootable
 formats work. An archive is unpacked to a scratch dir first to locate the
@@ -175,10 +175,6 @@ ROM_EXTENSIONS = (".zar", ".bin", ".pkg") + _ARCHIVE_EXTS
 .pkg, or a .7z/.zip/.rar archive holding one."""
 
 
-def _truthy(value: str) -> bool:
-    return value.strip().lower() in ("1", "true", "yes", "on")
-
-
 PKG_EXTRACTOR_BIN = os.environ.get("SHADPS4_PKG_EXTRACTOR_BIN", "pkg_extractor")
 """The `pkg_extractor` binary (env `SHADPS4_PKG_EXTRACTOR_BIN`, default `pkg_extractor` on PATH)."""
 PKG_EXTRACT_TIMEOUT = float(os.environ.get("SHADPS4_PKG_EXTRACT_TIMEOUT", "1800"))
@@ -202,11 +198,10 @@ of the run even though only the output survives.
 """
 
 # PS4 titles run several GB decrypted, so a .pkg is extracted once into
-# CACHE_DIR and reused on every later launch. CACHE_ENABLED therefore gates
+# CACHE_DIR and reused on every later launch. SHADPS4_CACHE_ENABLED therefore gates
 # whether .pkg/archive ROMs are bootable at all, not just whether the
 # extraction is kept. Mirrors rpcs3's identically-named archive cache.
 CACHE_DIR = Path(os.environ.get("SHADPS4_CACHE_DIR", str(DATA_DIR / "extracted")))
-CACHE_ENABLED = _truthy(os.environ.get("SHADPS4_CACHE_ENABLED", "false"))
 CACHE_MAX_GB = float(os.environ.get("SHADPS4_CACHE_MAX_GB", "30"))
 _LAST_ACCESSED_MARKER = extraction_cache._LAST_ACCESSED_MARKER
 _SCRATCH_DIR_NAME = extraction_cache._SCRATCH_DIR_NAME
@@ -421,112 +416,14 @@ def _run_extractor(cmd: list[str], what: str) -> str:
     return result.stdout
 
 
-_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
-"""Matches a control character in an archive member name."""
-_7Z_SEPARATOR_RE = re.compile(r"^-{5,}\s*$")
-"""Matches the dashed line `7z l -slt` puts between the archive header and its members."""
-_7Z_PATH_PREFIX = "Path = "
-"""Prefix of the `7z l -slt` line carrying one member's full path."""
-
-
-def _reject_unsafe_members(dest: Path, members: list[str]) -> None:
-    """Reject any archive member whose path would land outside dest.
-
-    A `../` (or absolute) member path can escape dest on extraction (Zip
-    Slip); this is checked before anything is written. A name carrying a
-    control character is refused as well: the .rar/.7z member lists are read
-    back out of a line-based text listing, so a name holding a newline (or
-    anything else that does not survive that round trip) cannot be checked as
-    the path the archive really holds.
-
-    Args:
-        dest: The directory the extraction must stay under.
-        members: Member paths as the archive names them.
-
-    Raises:
-        RuntimeError: On the first member that escapes dest or carries a
-            control character.
-    """
-    dest_real = dest.resolve()
-    for member in members:
-        if _CONTROL_CHAR_RE.search(member):
-            log.error("shadps4: archive member name holds a control character: %r", member)
-            raise RuntimeError(f"archive member name holds a control character: {member!r}")
-        target = (dest / member).resolve()
-        if target != dest_real and dest_real not in target.parents:
-            raise RuntimeError(f"archive member escapes extraction dir: {member}")
-
-
 def _safe_extract_zip(zf: zipfile.ZipFile, dest: Path) -> None:
     """Extract `zf` into dest after rejecting any Zip Slip member.
 
     zf.extractall() writes a member's path verbatim, so a `../` name in
     the archive can escape dest; reject any member that would first.
     """
-    _reject_unsafe_members(dest, zf.namelist())
+    extraction_cache.reject_unsafe_members(dest, zf.namelist())
     zf.extractall(dest)
-
-
-def _rar_member_paths(archive: Path) -> list[str]:
-    """List member paths from an archive.
-
-    Bare paths from `unrar lb`, one per line, no header or column
-    formatting to parse around.
-
-    Args:
-        archive: The .rar to list.
-
-    Returns:
-        One path per member.
-
-    Raises:
-        RuntimeError: When the listing names no member. `_reject_unsafe_members`
-            checks exactly this list, so an empty parse would wave the whole
-            archive through unchecked and has to stop the extraction instead.
-    """
-    listing = _run_extractor(["unrar", "lb", "-y", str(archive)], f"unrar list ({archive.name})")
-    members = [line for line in listing.splitlines() if line.strip()]
-    if not members:
-        log.error("shadps4: unrar listed no members in %s", archive.name)
-        raise RuntimeError(f"unrar listed no members in {archive.name}")
-    return members
-
-
-def _7z_member_paths(archive: Path) -> list[str]:
-    """List member paths from an archive.
-
-    Parsed from `7z l -slt`, the only 7z listing mode that gives a full
-    untruncated path per entry. Everything before the dashed separator line
-    describes the archive itself, not its contents.
-
-    Args:
-        archive: The .7z, or any other archive 7z can identify, to list.
-
-    Returns:
-        One path per member.
-
-    Raises:
-        RuntimeError: When the listing carries no separator line or names no
-            member. `_reject_unsafe_members` checks exactly this list, so a
-            listing shaped differently than expected (another 7z build, a
-            localized one) has to stop the extraction rather than wave every
-            member through unchecked.
-    """
-    listing = _run_extractor(["7z", "l", "-slt", str(archive)], f"7z list ({archive.name})")
-    lines = listing.splitlines()
-    body: Optional[list[str]] = None
-    for i, line in enumerate(lines):
-        if _7Z_SEPARATOR_RE.match(line):
-            body = lines[i + 1:]
-            break
-    if body is None:
-        log.error("shadps4: 7z listing of %s has no member section", archive.name)
-        raise RuntimeError(f"7z listing of {archive.name} has no member section")
-    members = [line[len(_7Z_PATH_PREFIX):] for line in body if line.startswith(_7Z_PATH_PREFIX)]
-    if not members:
-        log.error("shadps4: 7z listed no members in %s", archive.name)
-        raise RuntimeError(f"7z listed no members in {archive.name}")
-    return members
 
 
 def _reject_escaped_tree(dest: Path) -> None:
@@ -600,15 +497,15 @@ def _extract_archive(archive: Path, dest: Path) -> None:
         except (zipfile.BadZipFile, OSError) as exc:
             log.error("shadps4: zip extraction of %s failed: %s", archive.name, exc)
             raise RuntimeError(f"zip extraction of {archive.name} failed: {exc}") from exc
-    elif ext == ".rar":
-        _reject_unsafe_members(dest, _rar_member_paths(archive))
-        _run_extractor(["unrar", "x", "-y", str(archive), f"{dest}/"], f"unrar ({archive.name})")
     else:
-        # .7z, plus a fallback attempt for any other archive format 7z can
-        # identify.
-        _reject_unsafe_members(dest, _7z_member_paths(archive))
-        _run_extractor(["7z", "x", "-y", str(archive), f"-o{dest}"], f"7z ({archive.name})")
-    if ext != ".zip":
+        members = extraction_cache.list_members(archive, PKG_EXTRACT_TIMEOUT)
+        extraction_cache.reject_unsafe_members(dest, members)
+        if ext == ".rar":
+            _run_extractor(["unrar", "x", "-y", str(archive), f"{dest}/"], f"unrar ({archive.name})")
+        else:
+            # .7z, plus a fallback attempt for any other archive format 7z can
+            # identify.
+            _run_extractor(["7z", "x", "-y", str(archive), f"-o{dest}"], f"7z ({archive.name})")
         try:
             _reject_escaped_tree(dest)
         except RuntimeError:
@@ -713,7 +610,7 @@ def _phase_for(rom: Path) -> str:
 _CACHE = ExtractionCache(
     name="shadps4",
     cache_dir=lambda: CACHE_DIR,
-    enabled=lambda: CACHE_ENABLED,
+    enabled=lambda: settings.SHADPS4_CACHE_ENABLED,
     max_gb=lambda: CACHE_MAX_GB,
     find_boot_target=_extracted_boot_target,
     lock_wait=lambda: _CACHE_LOCK_WAIT,
@@ -1423,7 +1320,7 @@ class Shadps4(Emulator):
         CACHE_DIR, so with the cache off they are not bootable and must not
         be advertised as accepted.
         """
-        if CACHE_ENABLED:
+        if settings.SHADPS4_CACHE_ENABLED:
             return ROM_EXTENSIONS
         return tuple(e for e in ROM_EXTENSIONS if e != ".pkg" and e not in _ARCHIVE_EXTS)
 
@@ -1509,7 +1406,7 @@ class Shadps4(Emulator):
             except OSError as exc:
                 log.warning("shadps4: could not resolve %s (%s)", path, exc)
                 return None
-            if not CACHE_ENABLED and path.suffix.lower() in (".pkg",) + _ARCHIVE_EXTS:
+            if not settings.SHADPS4_CACHE_ENABLED and path.suffix.lower() in (".pkg",) + _ARCHIVE_EXTS:
                 log.warning(
                     "shadps4: refusing %s, %s needs the extraction cache "
                     "(set SHADPS4_CACHE_ENABLED=true to boot this format)",

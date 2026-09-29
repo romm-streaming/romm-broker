@@ -1474,11 +1474,8 @@ def _archive_member_names(archive: Path) -> Optional[list[str]]:
         Its member paths, or None when it cannot be listed.
     """
     try:
-        if archive.suffix.lower() == ".zip":
-            with zipfile.ZipFile(archive) as zf:
-                return zf.namelist()
-        return extraction_cache._7z_member_paths(archive, ARCHIVE_LIST_TIMEOUT)
-    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        return extraction_cache.list_members(archive, ARCHIVE_LIST_TIMEOUT)
+    except RuntimeError as exc:
         log.warning("retroarch: could not list archive %s: %s", archive.name, exc)
         return None
 
