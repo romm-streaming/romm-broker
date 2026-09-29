@@ -171,8 +171,9 @@ class Outbox:
         """Stop the drain task and discard anything still queued.
 
         Called once the connection is over. It does not close the socket
-        itself, but waits out a laggard close already under way. Logs how
-        many frames this recipient lost, if any.
+        itself, and abandons a laggard close still under way, since the
+        handler returning drops the connection anyway. Logs how many frames
+        this recipient lost, if any.
         """
         if self.dropped_video or self.dropped_audio:
             log.info(
@@ -183,16 +184,14 @@ class Outbox:
             )
         self._closed = True
         self._clear()
-        task, self._task = self._task, None
-        if task is not None and task is not asyncio.current_task():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        closer, self._closer = self._closer, None
-        if closer is not None:
-            await closer
+        for task in (self._task, self._closer):
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._task = self._closer = None
 
     def _clear(self) -> None:
         """Drop everything queued and mark the outbox idle."""
@@ -223,6 +222,8 @@ class Outbox:
         """Close the socket with `LAGGARD_CLOSE_CODE`, giving up after `CLOSE_WAIT`."""
         try:
             await asyncio.wait_for(self._websocket.close(code=LAGGARD_CLOSE_CODE), CLOSE_WAIT)
+        except TimeoutError:
+            log.debug("room outbox: closing %s timed out after %gs", self.label, CLOSE_WAIT)
         except Exception as exc:
             log.debug("room outbox: closing %s failed: %s", self.label, exc)
 

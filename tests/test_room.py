@@ -7,14 +7,14 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Optional, cast
 
 import anyio
 import pytest
 from fastapi.testclient import TestClient
 from starlette.testclient import WebSocketTestSession
 from starlette.types import Message
-from starlette.websockets import WebSocketDisconnect
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from webstation_broker import outbox, room, session, settings
 
@@ -904,3 +904,59 @@ def test_a_viewer_that_stops_reading_leaves_the_room(
 
     assert left is not None
     assert not still_seated
+
+
+class _SilentSocket:
+    """A room socket whose client never sends anything."""
+
+    async def receive(self) -> Message:
+        """Wait forever."""
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+async def test_the_reader_stops_a_parked_read_once_the_outbox_gives_up() -> None:
+    """A read waiting on a silent client returns None when `abandoned` is set."""
+    abandoned = asyncio.Event()
+    reader = room._RoomReader(cast(WebSocket, _SilentSocket()), abandoned)
+    read = asyncio.ensure_future(asyncio.wait_for(reader.receive(), 1.0))
+    await asyncio.sleep(0)
+    abandoned.set()
+    try:
+        assert await read is None
+    finally:
+        reader.close()
+
+
+async def test_the_reader_lets_an_outside_cancel_through() -> None:
+    """A cancel that did not come from the outbox giving up still cancels the handler."""
+    abandoned = asyncio.Event()
+
+    async def handler() -> None:
+        reader = room._RoomReader(cast(WebSocket, _SilentSocket()), abandoned)
+        try:
+            await reader.receive()
+        finally:
+            reader.close()
+
+    task = asyncio.ensure_future(handler())
+    await asyncio.sleep(0)
+    abandoned.set()
+    await asyncio.sleep(0)
+    assert task.cancelling() == 1
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_the_reader_refuses_a_read_from_another_task() -> None:
+    """Once bound to the task that first read it, the reader will not serve another."""
+    abandoned = asyncio.Event()
+    abandoned.set()
+    reader = room._RoomReader(cast(WebSocket, _SilentSocket()), abandoned)
+    try:
+        assert await reader.receive() is None
+        with pytest.raises(RuntimeError):
+            await asyncio.ensure_future(reader.receive())
+    finally:
+        reader.close()

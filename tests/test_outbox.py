@@ -187,8 +187,8 @@ async def test_stale_video_is_skipped_until_its_senders_next_keyframe(
 ) -> None:
     """After a dropped frame the sender's deltas are undecodable, so they wait on a keyframe.
 
-    The other sender's chain is untouched, and the gap is reported once so the
-    sender can be asked for a keyframe.
+    The other sender's chain is untouched, and every skipped frame reports the
+    gap so the sender keeps being asked for a keyframe.
     """
     monkeypatch.setattr(outbox, "MAX_MEDIA_AGE", 0.05)
     gaps: list[bytes] = []
@@ -394,25 +394,50 @@ async def test_a_json_backlog_past_its_cap_closes_the_recipient(
     await box.aclose()
 
 
-async def test_aclose_waits_for_a_laggard_close_already_under_way(
+async def test_aclose_abandons_a_laggard_close_that_cannot_get_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The close started on giving up is finished, not left running past `aclose`."""
+    """A close stuck behind the stalled socket does not hold up the departure."""
     monkeypatch.setattr(outbox, "MAX_JSON_BACKLOG", 1)
     sock, box = _outbox(held=True)
-    real_close = sock.close
+    close_cancelled = asyncio.Event()
 
-    async def slow_close(code: int = 1000) -> None:
-        await asyncio.sleep(0.05)
-        await real_close(code)
+    async def stuck_close(code: int = 1000) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            close_cancelled.set()
+            raise
 
-    sock.close = slow_close  # type: ignore[method-assign]
+    sock.close = stuck_close  # type: ignore[method-assign]
     box.send_json({"n": 0})
     box.send_json({"n": 1})
+    await _settle()
 
+    await asyncio.wait_for(box.aclose(), outbox.CLOSE_WAIT / 4)
+
+    assert close_cancelled.is_set()
+
+
+async def test_a_laggard_close_that_times_out_says_so(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The give-up log names the timeout rather than printing an empty error."""
+    monkeypatch.setattr(outbox, "MAX_JSON_BACKLOG", 1)
+    monkeypatch.setattr(outbox, "CLOSE_WAIT", 0.01)
+    sock, box = _outbox(held=True)
+
+    async def stuck_close(code: int = 1000) -> None:
+        await asyncio.Event().wait()
+
+    sock.close = stuck_close  # type: ignore[method-assign]
+    with caplog.at_level(logging.DEBUG, logger="webstation_broker.outbox"):
+        box.send_json({"n": 0})
+        box.send_json({"n": 1})
+        await asyncio.sleep(0.05)
+
+    assert "room outbox: closing viewer timed out after 0.01s" in [r.getMessage() for r in caplog.records]
     await box.aclose()
-
-    assert sock.events == [("close", outbox.LAGGARD_CLOSE_CODE)]
 
 
 async def test_a_failed_send_is_logged_and_the_next_message_still_goes_out() -> None:
@@ -495,4 +520,25 @@ async def test_session_end_delivers_its_notice_before_closing_each_socket() -> N
     for sock in (host, guest):
         assert sock.events == [("json", {"type": "session_ended"}), ("close", 1000)]
     for box in boxes:
+        await box.aclose()
+
+
+async def test_session_end_does_not_wait_on_a_socket_that_will_not_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stuck close is given up after `CLOSE_WAIT` and does not hold up the others."""
+    monkeypatch.setattr(outbox, "CLOSE_WAIT", 0.05)
+    (stuck, stuck_box), (guest, guest_box) = _outbox("stuck"), _outbox("guest")
+
+    async def stuck_close(code: int = 1000) -> None:
+        await asyncio.Event().wait()
+
+    stuck.close = stuck_close  # type: ignore[method-assign]
+    session.ROOM["controller"] = {"websocket": stuck, "outbox": stuck_box}
+    session.ROOM["viewers"] = {"g": {"websocket": guest, "outbox": guest_box}}
+
+    await asyncio.wait_for(session.notify_session_ended(), 1.0)
+
+    assert guest.events == [("json", {"type": "session_ended"}), ("close", 1000)]
+    for box in (stuck_box, guest_box):
         await box.aclose()

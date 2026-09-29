@@ -686,12 +686,28 @@ async def notify_session_ended() -> None:
     await asyncio.gather(
         *(conn["outbox"].flush(SESSION_END_FLUSH_WAIT) for conn in connections)
     )
-    for conn in connections:
-        try:
-            await conn["websocket"].close(code=1000)
-        except Exception as exc:
-            log.debug(
-                "session: room socket for %r was already gone at session end: %s",
-                conn.get("username"),
-                exc,
-            )
+    await asyncio.gather(*(_close_at_session_end(conn) for conn in connections))
+
+
+async def _close_at_session_end(conn: dict[str, Any]) -> None:
+    """Close one room socket, giving up after `outbox.CLOSE_WAIT` on one that cannot take it.
+
+    Args:
+        conn: The room connection to close.
+    """
+    from . import outbox
+
+    try:
+        await asyncio.wait_for(conn["websocket"].close(code=1000), outbox.CLOSE_WAIT)
+    except TimeoutError:
+        log.debug(
+            "session: room socket for %r did not close within %gs at session end",
+            conn.get("username"),
+            outbox.CLOSE_WAIT,
+        )
+    except Exception as exc:
+        log.debug(
+            "session: room socket for %r was already gone at session end: %s",
+            conn.get("username"),
+            exc,
+        )

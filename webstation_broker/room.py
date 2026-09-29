@@ -101,26 +101,70 @@ def _positive_pixels(raw: Any) -> Optional[int]:
     return raw if 1 <= raw <= MAX_RESOLUTION_PIXELS else None
 
 
-async def _receive_unless(websocket: WebSocket, stop: "asyncio.Future[Any]") -> Optional[Message]:
-    """Receive the next message, unless `stop` completes first.
+class _RoomReader:
+    """Reads a room socket until its outbox gives up on the recipient.
 
-    Args:
-        websocket: The room socket to read from.
-        stop: Completes when the connection should no longer be served.
-
-    Returns:
-        The message, or None once `stop` has completed.
+    The first `receive()` binds the reader to the task calling it and starts
+    one watcher, which interrupts that task if it is parked in `receive()`
+    when the outbox gives up; otherwise the next read sees it.
     """
-    receive = asyncio.ensure_future(websocket.receive())
-    try:
-        await asyncio.wait({receive, stop}, return_when=asyncio.FIRST_COMPLETED)
-    except BaseException:
-        receive.cancel()
-        raise
-    if receive.done():
-        return receive.result()
-    receive.cancel()
-    return None
+
+    def __init__(self, websocket: WebSocket, abandoned: asyncio.Event) -> None:
+        """Prepare to read `websocket`.
+
+        Args:
+            websocket: The room socket to read from.
+            abandoned: Set once the connection should no longer be served.
+        """
+        self._websocket = websocket
+        self._abandoned = abandoned
+        self._handler: Optional[asyncio.Task[Any]] = None
+        self._watcher: Optional[asyncio.Task[None]] = None
+        self._reading = False
+        self._interrupted = False
+
+    async def _watch(self, handler: "asyncio.Task[Any]") -> None:
+        """Cancel the handler's pending read once the outbox gives up."""
+        await self._abandoned.wait()
+        if self._reading:
+            self._interrupted = True
+            handler.cancel()
+
+    async def receive(self) -> Optional[Message]:
+        """Receive the next message.
+
+        Returns:
+            The message, or None once the outbox has given up on this socket.
+
+        Raises:
+            RuntimeError: When called from a task other than the first caller's.
+        """
+        handler = asyncio.current_task()
+        if handler is None or self._handler not in (None, handler):
+            raise RuntimeError("a room reader is only read from the task that first read it")
+        if self._watcher is None:
+            self._handler = handler
+            self._watcher = asyncio.get_running_loop().create_task(self._watch(handler))
+        if self._abandoned.is_set():
+            return None
+        self._reading = True
+        try:
+            return await self._websocket.receive()
+        except asyncio.CancelledError:
+            if not self._interrupted:
+                raise
+            self._interrupted = False
+            # Anything left after taking back our own cancel came from outside.
+            if handler.uncancel():
+                raise
+            return None
+        finally:
+            self._reading = False
+
+    def close(self) -> None:
+        """Stop watching."""
+        if self._watcher is not None:
+            self._watcher.cancel()
 
 
 @router.websocket("/ws/room")
@@ -224,10 +268,10 @@ async def room_websocket(websocket: WebSocket) -> None:
     await session.broadcast_state()
 
     outbox = connection_info["outbox"]
-    abandoned = asyncio.ensure_future(outbox.abandoned.wait())
+    reader = _RoomReader(websocket, outbox.abandoned)
     try:
         while True:
-            message = await _receive_unless(websocket, abandoned)
+            message = await reader.receive()
             if message is None:
                 log.info("room websocket: %s stopped reading, dropping it from the room", username)
                 break
@@ -475,7 +519,7 @@ async def room_websocket(websocket: WebSocket) -> None:
     except Exception:
         log.exception("unhandled room websocket error for %s", username)
     finally:
-        abandoned.cancel()
+        reader.close()
         await outbox.aclose()
         current_username = connection_info.get("username")
         # A socket that was replaced by a newer one on the same token is not
