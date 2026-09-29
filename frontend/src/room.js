@@ -1373,6 +1373,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const settingsModalOverlay = document.getElementById('settings-modal-overlay');
     const settingsModalCloseBtn = document.getElementById('settings-modal-close');
     const usernameModalOverlay = document.getElementById('username-modal-overlay');
+    const renameModalOverlay = document.getElementById('rename-modal-overlay');
     const audioInputSelect = document.getElementById('audio-input-select');
     const videoInputSelect = document.getElementById('video-input-select');
     const reloadStreamBtn = document.getElementById('reload-stream-btn');
@@ -2599,6 +2600,15 @@ document.addEventListener('DOMContentLoaded', async () => {
                             }
                         }
 
+                        // The broker holds the seat's name, so a rename (or
+                        // one refused for its cooldown) settles here.
+                        if (self && self.username && self.username !== username) {
+                            username = self.username;
+                            localStorage.setItem('collab_username', username);
+                            const selfNameEl = localContainer.querySelector('.video-overlay .username');
+                            if (selfNameEl) selfNameEl.textContent = username;
+                        }
+
                         const participantsToShow = data.viewers.filter(u =>
                             u.permission !== 'readonly' &&
                             u.online &&
@@ -2743,6 +2753,27 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     };
 
+    const showRenamePrompt = () => {
+        const renameInput = document.getElementById('rename-input');
+        renameInput.value = username || '';
+        renameModalOverlay.classList.remove('hidden');
+        renameInput.focus();
+        renameInput.select();
+    };
+
+    const closeRenamePrompt = () => renameModalOverlay.classList.add('hidden');
+
+    // Only asks: the broker can refuse (cooldown, length), so the local name
+    // follows the next state_update rather than what was typed here.
+    const handleRenameSubmit = (e) => {
+        e.preventDefault();
+        const newUsername = document.getElementById('rename-input').value.trim();
+        if (newUsername && newUsername !== username && ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ action: 'set_username', username: newUsername }));
+        }
+        closeRenamePrompt();
+    };
+
     const showUsernamePrompt = () => {
         const usernameInput = document.getElementById('username-input');
         if (username) {
@@ -2769,9 +2800,16 @@ document.addEventListener('DOMContentLoaded', async () => {
                 <button class="remote-control-btn designate-speaker" data-public-id="${COLLAB_DATA.userPublicId}" title="${t('tooltips.designateSpeaker')}"><i class="fas fa-star"></i></button>
             `;
         }
+        // Only a viewer's name is theirs to change; the controller's comes
+        // from their RomM account and the broker has no rename path for it.
+        const renameBtn = isController ? '' : `
+                <button class="rename-btn" title="${t('tooltips.renameSelf')}"><i class="fas fa-pen"></i></button>`;
         localContainer.querySelector('.video-overlay').innerHTML = `
-            <span class="username">${escapeHTML(isController ? (COLLAB_DATA.controllerName || t('localUsername')) : (username || t('localUsername')))}</span>
+            <span class="name-group">
+                <span class="username">${escapeHTML(isController ? (COLLAB_DATA.controllerName || t('localUsername')) : (username || t('localUsername')))}</span>${renameBtn}
+            </span>
             <div class="remote-controls">${localControls}</div>`;
+        localContainer.querySelector('.rename-btn')?.addEventListener('click', showRenamePrompt);
 
         if (isController || isParticipant) {
             initGamepadControls();
@@ -2912,6 +2950,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
         chatScroll.addEventListener('click', handleChatAreaClick);
         document.getElementById('username-form').addEventListener('submit', handleUsernameSubmit);
+        document.getElementById('rename-form').addEventListener('submit', handleRenameSubmit);
+        renameModalOverlay.addEventListener('click', (e) => {
+            if (e.target === renameModalOverlay) closeRenamePrompt();
+        });
+        document.getElementById('rename-input').addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeRenamePrompt();
+        });
 
         initInviteControls();
 
