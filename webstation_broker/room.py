@@ -168,7 +168,7 @@ async def room_websocket(websocket: WebSocket) -> None:
         "token": token,
         "public_id": session.new_public_id(),
         "has_joined": False,
-        "outbox": Outbox(websocket, username),
+        "outbox": Outbox(websocket, username, on_video_gap=session.request_keyframe),
     }
     media_id = connection_info["public_id"].encode("ascii")
     if len(media_id) != MEDIA_ID_BYTES:

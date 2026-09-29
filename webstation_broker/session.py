@@ -55,6 +55,9 @@ to find the file. Dropped at the next activate.
 SESSION_END_FLUSH_WAIT = 2.0
 """Seconds the `session_ended` notice gets to reach each member before its socket closes."""
 
+KEYFRAME_REQUEST_GAP = 1.0
+"""Minimum seconds between two keyframe requests to the same member."""
+
 ROOM: dict[str, Any] = {"controller": None, "viewers": {}, "cooldowns": {}}
 """Live websocket connections for the room.
 
@@ -460,6 +463,32 @@ async def broadcast_binary_to_room(payload: bytes, sender_ws: WebSocket) -> None
     for conn in _room_connections():
         if conn["websocket"] is not sender_ws:
             conn["outbox"].send_media(payload)
+
+
+def request_keyframe(media_id: bytes) -> None:
+    """Ask the member streaming under `media_id` to encode its next video frame as a keyframe.
+
+    Called by a recipient's outbox once it has had to drop one of that
+    member's video frames: every delta after the gap is undecodable, so
+    without this the recipient would wait out the sender's keyframe interval
+    (seconds) on a broken tile. Requests to one member are spaced at least
+    `KEYFRAME_REQUEST_GAP` apart, since keyframes are the biggest frames there
+    are and a room full of lagging recipients asking at once would only add
+    to the congestion that caused the drop. The request names nobody, so it
+    tells the sender nothing about who is behind.
+
+    Args:
+        media_id: The sender's per-connection media id, as stamped on its frames.
+    """
+    now = time.monotonic()
+    for conn in _room_connections():
+        if conn.get("public_id", "").encode("ascii") != media_id:
+            continue
+        if now - conn.get("keyframe_requested_at", float("-inf")) < KEYFRAME_REQUEST_GAP:
+            return
+        conn["keyframe_requested_at"] = now
+        conn["outbox"].send_json({"type": "keyframe_request"})
+        return
 
 
 async def broadcast_state() -> None:

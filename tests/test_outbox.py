@@ -1,6 +1,7 @@
 """Tests for the per-connection room outbox."""
 
 import asyncio
+import logging
 from typing import Any, Union
 
 import pytest
@@ -63,13 +64,70 @@ async def _settle() -> None:
         await asyncio.sleep(0)
 
 
-async def test_json_goes_out_before_queued_media_and_each_kind_keeps_its_order() -> None:
-    """Chat and control never wait behind a media backlog, and neither kind is reordered."""
+def _video(sender: bytes, body: bytes, key: bool = False) -> bytes:
+    """Build a stamped video frame.
+
+    Args:
+        sender: The 8-byte media id of the member it came from.
+        body: The encoded payload.
+        key: Whether it is a keyframe.
+
+    Returns:
+        The frame in the room's binary wire format.
+    """
+    return sender + bytes([outbox.VIDEO_FRAME, outbox.KEYFRAME_FLAG if key else 0]) + body
+
+
+def _audio(sender: bytes, body: bytes) -> bytes:
+    """Build a stamped audio frame.
+
+    Args:
+        sender: The 8-byte media id of the member it came from.
+        body: The encoded payload.
+
+    Returns:
+        The frame in the room's binary wire format.
+    """
+    return sender + bytes([0x02, 0]) + body
+
+
+def _config(sender: bytes) -> bytes:
+    """Build a stamped video config message.
+
+    Args:
+        sender: The 8-byte media id of the member it came from.
+
+    Returns:
+        The message in the room's binary wire format.
+    """
+    return sender + bytes([outbox.VIDEO_CONFIG]) + b"cfg"
+
+
+_A = b"AAAAAAAA"
+_B = b"BBBBBBBB"
+
+
+def _sent_frames(sock: _Socket) -> list[bytes]:
+    """List the media frames a socket was sent, in order.
+
+    Args:
+        sock: The recording socket.
+
+    Returns:
+        Every binary payload it received.
+    """
+    return [value for kind, value in sock.events if kind == "bytes"]  # type: ignore[misc]
+
+
+async def test_json_then_audio_then_video_and_each_lane_keeps_its_order() -> None:
+    """Chat and control never wait behind media, audio never waits behind video."""
     sock = _Socket()
     box = Outbox(sock, "viewer")  # type: ignore[arg-type]
 
-    box.send_media(b"f1")
-    box.send_media(b"f2")
+    box.send_media(_video(_A, b"v1", key=True))
+    box.send_media(_audio(_A, b"a1"))
+    box.send_media(_video(_A, b"v2"))
+    box.send_media(_audio(_A, b"a2"))
     box.send_json({"n": 1})
     box.send_json({"n": 2})
     assert await box.flush(1.0)
@@ -77,32 +135,188 @@ async def test_json_goes_out_before_queued_media_and_each_kind_keeps_its_order()
     assert sock.events == [
         ("json", {"n": 1}),
         ("json", {"n": 2}),
-        ("bytes", b"f1"),
-        ("bytes", b"f2"),
+        ("bytes", _audio(_A, b"a1")),
+        ("bytes", _audio(_A, b"a2")),
+        ("bytes", _video(_A, b"v1", key=True)),
+        ("bytes", _video(_A, b"v2")),
     ]
     await box.aclose()
 
 
-async def test_a_recipient_that_falls_behind_loses_its_oldest_frames_but_no_json() -> None:
-    """Past the media backlog the oldest frame goes; every JSON message still arrives."""
+async def test_a_brief_hiccup_drops_nothing_however_much_queued_up() -> None:
+    """Frames younger than `MAX_MEDIA_AGE` all go out once the recipient catches up."""
     sock = _Socket()
     sock.gate.clear()
     box = Outbox(sock, "viewer")  # type: ignore[arg-type]
-    box.send_media(b"in-flight")
-    await _settle()
-
-    frames = [f"f{i}".encode() for i in range(outbox.MAX_MEDIA_BACKLOG + 5)]
+    frames = [_video(_A, b"k", key=True)] + [_video(_A, f"d{i}".encode()) for i in range(300)]
     for frame in frames:
         box.send_media(frame)
-    box.send_json({"type": "chat_message"})
+    await _settle()
+
     sock.gate.set()
     assert await box.flush(1.0)
 
-    sent_frames = [value for kind, value in sock.events if kind == "bytes"]
-    assert sent_frames == [b"in-flight", *frames[5:]]
-    assert box.dropped_frames == 5
-    assert ("json", {"type": "chat_message"}) in sock.events
+    assert _sent_frames(sock) == frames
+    assert box.dropped_video == 0
     await box.aclose()
+
+
+async def test_stale_video_is_skipped_until_its_senders_next_keyframe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a dropped frame the sender's deltas are undecodable, so they wait on a keyframe.
+
+    The other sender's chain is untouched, and the gap is reported once so the
+    sender can be asked for a keyframe.
+    """
+    monkeypatch.setattr(outbox, "MAX_MEDIA_AGE", 0.05)
+    gaps: list[bytes] = []
+    sock = _Socket()
+    sock.gate.clear()
+    box = Outbox(sock, "viewer", on_video_gap=gaps.append)  # type: ignore[arg-type]
+    box.send_media(_video(_A, b"in-flight", key=True))
+    await _settle()
+    box.send_media(_video(_A, b"stale"))
+    await asyncio.sleep(0.1)
+
+    box.send_media(_video(_A, b"after-gap"))
+    box.send_media(_video(_B, b"b-fresh"))
+    box.send_media(_video(_A, b"still-broken"))
+    box.send_media(_video(_A, b"fresh-key", key=True))
+    box.send_media(_video(_A, b"decodable"))
+    sock.gate.set()
+    assert await box.flush(1.0)
+
+    assert _sent_frames(sock) == [
+        _video(_A, b"in-flight", key=True),
+        _video(_B, b"b-fresh"),
+        _video(_A, b"fresh-key", key=True),
+        _video(_A, b"decodable"),
+    ]
+    assert gaps == [_A]
+    assert box.dropped_video == 3
+    await box.aclose()
+
+
+async def test_audio_keeps_flowing_while_video_absorbs_the_lag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale backlog loses its video; fresh audio queued behind it still goes out first."""
+    monkeypatch.setattr(outbox, "MAX_MEDIA_AGE", 0.05)
+    sock = _Socket()
+    sock.gate.clear()
+    box = Outbox(sock, "viewer")  # type: ignore[arg-type]
+    box.send_media(_audio(_A, b"in-flight"))
+    await _settle()
+    box.send_media(_video(_A, b"old", key=True))
+    box.send_media(_audio(_A, b"old"))
+    await asyncio.sleep(0.1)
+
+    box.send_media(_audio(_A, b"fresh"))
+    sock.gate.set()
+    assert await box.flush(1.0)
+
+    assert _sent_frames(sock) == [_audio(_A, b"in-flight"), _audio(_A, b"fresh")]
+    assert (box.dropped_audio, box.dropped_video) == (1, 1)
+    await box.aclose()
+
+
+async def test_a_video_config_is_never_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A decoder config goes out however stale, even mid-gap: without it nothing decodes."""
+    monkeypatch.setattr(outbox, "MAX_MEDIA_AGE", 0.05)
+    sock = _Socket()
+    sock.gate.clear()
+    box = Outbox(sock, "viewer")  # type: ignore[arg-type]
+    box.send_media(_audio(_A, b"in-flight"))
+    await _settle()
+    box.send_media(_video(_A, b"stale"))
+    box.send_media(_config(_A))
+    await asyncio.sleep(0.1)
+
+    sock.gate.set()
+    assert await box.flush(1.0)
+
+    assert _sent_frames(sock) == [_audio(_A, b"in-flight"), _config(_A)]
+    await box.aclose()
+
+
+async def test_the_byte_backstop_evicts_video_before_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recipient blocked outright is capped in memory, losing video first."""
+    frame_bytes = len(_video(_A, b"x" * 90))
+    monkeypatch.setattr(outbox, "MAX_MEDIA_BACKLOG_BYTES", frame_bytes * 3)
+    gaps: list[bytes] = []
+    sock = _Socket()
+    sock.gate.clear()
+    box = Outbox(sock, "viewer", on_video_gap=gaps.append)  # type: ignore[arg-type]
+    box.send_media(_audio(_A, b"in-flight"))
+    await _settle()
+
+    box.send_media(_video(_A, b"x" * 90, key=True))
+    box.send_media(_audio(_A, b"y" * 90))
+    box.send_media(_audio(_A, b"z" * 90))
+    box.send_media(_audio(_A, b"w" * 90))
+    sock.gate.set()
+    assert await box.flush(1.0)
+
+    assert _sent_frames(sock) == [
+        _audio(_A, b"in-flight"),
+        _audio(_A, b"y" * 90),
+        _audio(_A, b"z" * 90),
+        _audio(_A, b"w" * 90),
+    ]
+    assert gaps == [_A]
+    await box.aclose()
+
+
+async def test_leaving_logs_how_many_frames_the_recipient_missed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The drop count is reported when the connection closes, and only if it lost any."""
+    monkeypatch.setattr(outbox, "MAX_MEDIA_AGE", 0.05)
+    sock = _Socket()
+    sock.gate.clear()
+    box = Outbox(sock, "viewer")  # type: ignore[arg-type]
+    box.send_media(_audio(_A, b"in-flight"))
+    await _settle()
+    box.send_media(_audio(_A, b"stale"))
+    await asyncio.sleep(0.1)
+    sock.gate.set()
+    assert await box.flush(1.0)
+
+    with caplog.at_level(logging.INFO, logger="webstation_broker.outbox"):
+        await box.aclose()
+        await Outbox(_Socket(), "healthy").aclose()  # type: ignore[arg-type]
+
+    assert [r.getMessage() for r in caplog.records] == [
+        "room outbox: viewer missed 0 video and 1 audio frame(s) while connected"
+    ]
+
+
+async def test_keyframe_requests_reach_only_the_sender_and_are_spaced_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The member streaming under the media id is asked, at most once per gap window."""
+    host, guest = _Socket(), _Socket()
+    boxes = [Outbox(host, "host"), Outbox(guest, "guest")]  # type: ignore[arg-type]
+    session.ROOM["controller"] = {"websocket": host, "public_id": "AAAAAAAA", "outbox": boxes[0]}
+    session.ROOM["viewers"] = {"g": {"websocket": guest, "public_id": "BBBBBBBB", "outbox": boxes[1]}}
+
+    session.request_keyframe(_B)
+    session.request_keyframe(_B)
+    session.request_keyframe(b"ZZZZZZZZ")
+    for box in boxes:
+        assert await box.flush(1.0)
+    assert guest.events == [("json", {"type": "keyframe_request"})]
+    assert host.events == []
+
+    monkeypatch.setattr(session, "KEYFRAME_REQUEST_GAP", 0.0)
+    session.request_keyframe(_B)
+    assert await boxes[1].flush(1.0)
+    assert len(guest.events) == 2
+    for box in boxes:
+        await box.aclose()
 
 
 async def test_a_send_that_outlasts_the_stall_limit_closes_the_recipient(
@@ -175,7 +389,7 @@ async def test_nothing_is_sent_to_a_socket_that_is_no_longer_connected() -> None
     box = Outbox(sock, "viewer")  # type: ignore[arg-type]
 
     box.send_json({"n": 1})
-    box.send_media(b"f")
+    box.send_media(_video(_A, b"f"))
     assert await box.flush(1.0)
 
     assert sock.events == []
@@ -204,7 +418,7 @@ async def test_aclose_stops_the_drain_and_drops_what_was_queued() -> None:
     sock.gate.clear()
     box = Outbox(sock, "viewer")  # type: ignore[arg-type]
     box.send_json({"n": 1})
-    box.send_media(b"f")
+    box.send_media(_video(_A, b"f"))
     await _settle()
 
     await box.aclose()
