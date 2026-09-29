@@ -31,12 +31,18 @@ const en = {
         lockResolution: 'Lock/Unlock Resolution',
         resizeClient: 'Resize to Client',
         invite: 'Invite someone to this session',
+        renameSelf: 'Change your name',
     },
     usernamePrompt: {
         title: 'Welcome!',
         description: 'Please choose a username to join the session.',
         placeholder: 'Your Name',
         joinButton: 'Join',
+    },
+    renamePrompt: {
+        title: 'Change your name',
+        description: 'This is the name everyone in the room sees.',
+        saveButton: 'Save',
     },
     chat: {
         inputPlaceholder: 'Type a message...',
@@ -95,12 +101,18 @@ const es = {
         lockResolution: 'Bloquear/Desbloquear resolución',
         resizeClient: 'Redimensionar al cliente',
         invite: 'Invitar a alguien a esta sesión',
+        renameSelf: 'Cambiar tu nombre',
     },
     usernamePrompt: {
         title: '¡Bienvenido!',
         description: 'Por favor, elige un nombre de usuario para unirte a la sesión.',
         placeholder: 'Tu nombre',
         joinButton: 'Unirse',
+    },
+    renamePrompt: {
+        title: 'Cambiar tu nombre',
+        description: 'Este es el nombre que ven todos en la sala.',
+        saveButton: 'Guardar',
     },
     chat: {
         inputPlaceholder: 'Escribe un mensaje...',
@@ -158,12 +170,18 @@ const zh = {
         lockResolution: '锁定/解锁分辨率',
         resizeClient: '调整为客户端大小',
         invite: '邀请他人加入此会话',
+        renameSelf: '更改你的名字',
     },
     usernamePrompt: {
         title: '欢迎！',
         description: '请选择一个用户名以加入会话。',
         placeholder: '您的名字',
         joinButton: '加入',
+    },
+    renamePrompt: {
+        title: '更改你的名字',
+        description: '这是房间里所有人看到的名字。',
+        saveButton: '保存',
     },
     chat: {
         inputPlaceholder: '输入消息...',
@@ -221,12 +239,18 @@ const hi = {
         lockResolution: 'रिज़ॉल्यूशन लॉक/अनलॉक करें',
         resizeClient: 'क्लाइंट के आकार में बदलें',
         invite: 'किसी को इस सत्र में आमंत्रित करें',
+        renameSelf: 'अपना नाम बदलें',
     },
     usernamePrompt: {
         title: 'स्वागत है!',
         description: 'सत्र में शामिल होने के लिए कृपया एक उपयोगकर्ता नाम चुनें।',
         placeholder: 'आपका नाम',
         joinButton: 'शामिल हों',
+    },
+    renamePrompt: {
+        title: 'अपना नाम बदलें',
+        description: 'यह वह नाम है जो कमरे में सभी को दिखता है।',
+        saveButton: 'सहेजें',
     },
     chat: {
         inputPlaceholder: 'एक संदेश लिखें...',
@@ -284,12 +308,18 @@ const pt = {
         lockResolution: 'Bloquear/Desbloquear Resolução',
         resizeClient: 'Redimensionar para o Cliente',
         invite: 'Convidar alguém para esta sessão',
+        renameSelf: 'Alterar seu nome',
     },
     usernamePrompt: {
         title: 'Bem-vindo(a)!',
         description: 'Por favor, escolha um nome de usuário para entrar na sessão.',
         placeholder: 'Seu nome',
         joinButton: 'Entrar',
+    },
+    renamePrompt: {
+        title: 'Alterar seu nome',
+        description: 'Este é o nome que todos na sala veem.',
+        saveButton: 'Salvar',
     },
     chat: {
         inputPlaceholder: 'Digite uma mensagem...',
@@ -347,12 +377,18 @@ const fr = {
         lockResolution: 'Verrouiller/Déverrouiller la résolution',
         resizeClient: 'Redimensionner au client',
         invite: 'Inviter quelqu\'un à cette session',
+        renameSelf: 'Changer votre nom',
     },
     usernamePrompt: {
         title: 'Bienvenue !',
         description: 'Veuillez choisir un nom d\'utilisateur pour rejoindre la session.',
         placeholder: 'Votre nom',
         joinButton: 'Rejoindre',
+    },
+    renamePrompt: {
+        title: 'Changer votre nom',
+        description: 'C\'est le nom que tout le monde voit dans la salle.',
+        saveButton: 'Enregistrer',
     },
     chat: {
         inputPlaceholder: 'Saisissez un message...',
@@ -410,12 +446,18 @@ const ru = {
         lockResolution: 'Заблокировать/Разблокировать разрешение',
         resizeClient: 'Изменить размер под клиента',
         invite: 'Пригласить кого-то в этот сеанс',
+        renameSelf: 'Изменить имя',
     },
     usernamePrompt: {
         title: 'Добро пожаловать!',
         description: 'Пожалуйста, выберите имя пользователя, чтобы присоединиться к сеансу.',
         placeholder: 'Ваше имя',
         joinButton: 'Присоединиться',
+    },
+    renamePrompt: {
+        title: 'Изменить имя',
+        description: 'Это имя видят все в комнате.',
+        saveButton: 'Сохранить',
     },
     chat: {
         inputPlaceholder: 'Введите сообщение...',
@@ -473,12 +515,18 @@ const de = {
         lockResolution: 'Auflösung sperren/entsperren',
         resizeClient: 'Größe an Client anpassen',
         invite: 'Jemanden zu dieser Sitzung einladen',
+        renameSelf: 'Namen ändern',
     },
     usernamePrompt: {
         title: 'Willkommen!',
         description: 'Bitte wählen Sie einen Benutzernamen, um der Sitzung beizutreten.',
         placeholder: 'Ihr Name',
         joinButton: 'Beitreten',
+    },
+    renamePrompt: {
+        title: 'Namen ändern',
+        description: 'Diesen Namen sehen alle im Raum.',
+        saveButton: 'Speichern',
     },
     chat: {
         inputPlaceholder: 'Nachricht eingeben...',
@@ -536,12 +584,18 @@ const tr = {
         lockResolution: 'Çözünürlüğü Kilitle/Kilidini Aç',
         resizeClient: 'İstemciye Göre Yeniden Boyutlandır',
         invite: 'Birini bu oturuma davet et',
+        renameSelf: 'Adını değiştir',
     },
     usernamePrompt: {
         title: 'Hoş geldiniz!',
         description: 'Oturuma katılmak için lütfen bir kullanıcı adı seçin.',
         placeholder: 'Adınız',
         joinButton: 'Katıl',
+    },
+    renamePrompt: {
+        title: 'Adını değiştir',
+        description: 'Odadaki herkes bu adı görür.',
+        saveButton: 'Kaydet',
     },
     chat: {
         inputPlaceholder: 'Bir mesaj yazın...',
@@ -599,12 +653,18 @@ const it = {
         lockResolution: 'Blocca/Sblocca risoluzione',
         resizeClient: 'Ridimensiona al client',
         invite: 'Invita qualcuno a questa sessione',
+        renameSelf: 'Cambia il tuo nome',
     },
     usernamePrompt: {
         title: 'Benvenuto!',
         description: 'Scegli un nome utente per partecipare alla sessione.',
         placeholder: 'Il tuo nome',
         joinButton: 'Partecipa',
+    },
+    renamePrompt: {
+        title: 'Cambia il tuo nome',
+        description: 'Questo è il nome che tutti nella stanza vedono.',
+        saveButton: 'Salva',
     },
     chat: {
         inputPlaceholder: 'Scrivi un messaggio...',
@@ -662,12 +722,18 @@ const nl = {
         lockResolution: 'Resolutie vergrendelen/ontgrendelen',
         resizeClient: 'Formaat aanpassen aan client',
         invite: 'Nodig iemand uit voor deze sessie',
+        renameSelf: 'Je naam wijzigen',
     },
     usernamePrompt: {
         title: 'Welkom!',
         description: 'Kies een gebruikersnaam om deel te nemen aan de sessie.',
         placeholder: 'Jouw naam',
         joinButton: 'Deelnemen',
+    },
+    renamePrompt: {
+        title: 'Je naam wijzigen',
+        description: 'Dit is de naam die iedereen in de ruimte ziet.',
+        saveButton: 'Opslaan',
     },
     chat: {
         inputPlaceholder: 'Typ een bericht...',
@@ -725,12 +791,18 @@ const ar = {
         lockResolution: 'قفل/إلغاء قفل الدقة',
         resizeClient: 'تغيير الحجم ليناسب العميل',
         invite: 'دعوة شخص ما إلى هذه الجلسة',
+        renameSelf: 'تغيير اسمك',
     },
     usernamePrompt: {
         title: 'أهلاً بك!',
         description: 'الرجاء اختيار اسم مستخدم للانضمام إلى الجلسة.',
         placeholder: 'اسمك',
         joinButton: 'انضمام',
+    },
+    renamePrompt: {
+        title: 'تغيير اسمك',
+        description: 'هذا هو الاسم الذي يراه الجميع في الغرفة.',
+        saveButton: 'حفظ',
     },
     chat: {
         inputPlaceholder: 'اكتب رسالة...',
@@ -788,12 +860,18 @@ const ko = {
         lockResolution: '해상도 잠금/잠금 해제',
         resizeClient: '클라이언트에 맞게 크기 조정',
         invite: '이 세션에 누군가를 초대',
+        renameSelf: '이름 변경',
     },
     usernamePrompt: {
         title: '환영합니다!',
         description: '세션에 참여하려면 사용자 이름을 선택하세요.',
         placeholder: '이름',
         joinButton: '참여',
+    },
+    renamePrompt: {
+        title: '이름 변경',
+        description: '방에 있는 모든 사람이 보는 이름입니다.',
+        saveButton: '저장',
     },
     chat: {
         inputPlaceholder: '메시지를 입력하세요...',
@@ -851,12 +929,18 @@ const ja = {
         lockResolution: '解像度をロック/ロック解除',
         resizeClient: 'クライアントに合わせてサイズ変更',
         invite: 'このセッションに誰かを招待',
+        renameSelf: '名前を変更',
     },
     usernamePrompt: {
         title: 'ようこそ！',
         description: 'セッションに参加するためのユーザー名を選択してください。',
         placeholder: 'あなたの名前',
         joinButton: '参加',
+    },
+    renamePrompt: {
+        title: '名前を変更',
+        description: 'ルームの全員に表示される名前です。',
+        saveButton: '保存',
     },
     chat: {
         inputPlaceholder: 'メッセージを入力...',
@@ -914,12 +998,18 @@ const vi = {
         lockResolution: 'Khóa/Mở khóa độ phân giải',
         resizeClient: 'Thay đổi kích thước theo máy khách',
         invite: 'Mời ai đó vào phiên này',
+        renameSelf: 'Đổi tên của bạn',
     },
     usernamePrompt: {
         title: 'Chào mừng!',
         description: 'Vui lòng chọn tên người dùng để tham gia phiên.',
         placeholder: 'Tên của bạn',
         joinButton: 'Tham gia',
+    },
+    renamePrompt: {
+        title: 'Đổi tên của bạn',
+        description: 'Đây là tên mọi người trong phòng nhìn thấy.',
+        saveButton: 'Lưu',
     },
     chat: {
         inputPlaceholder: 'Nhập tin nhắn...',
@@ -977,12 +1067,18 @@ const th = {
         lockResolution: 'ล็อก/ปลดล็อกความละเอียด',
         resizeClient: 'ปรับขนาดตามไคลเอนต์',
         invite: 'เชิญใครสักคนเข้าร่วมเซสชันนี้',
+        renameSelf: 'เปลี่ยนชื่อของคุณ',
     },
     usernamePrompt: {
         title: 'ยินดีต้อนรับ!',
         description: 'โปรดเลือกชื่อผู้ใช้เพื่อเข้าร่วมเซสชัน',
         placeholder: 'ชื่อของคุณ',
         joinButton: 'เข้าร่วม',
+    },
+    renamePrompt: {
+        title: 'เปลี่ยนชื่อของคุณ',
+        description: 'นี่คือชื่อที่ทุกคนในห้องจะเห็น',
+        saveButton: 'บันทึก',
     },
     chat: {
         inputPlaceholder: 'พิมพ์ข้อความ...',
@@ -1040,12 +1136,18 @@ const fil = {
         lockResolution: 'I-lock/I-unlock ang Resolusyon',
         resizeClient: 'I-resize sa Client',
         invite: 'Mag-imbita ng isang tao sa session na ito',
+        renameSelf: 'Palitan ang iyong pangalan',
     },
     usernamePrompt: {
         title: 'Maligayang pagdating!',
         description: 'Mangyaring pumili ng username para sumali sa session.',
         placeholder: 'Iyong Pangalan',
         joinButton: 'Sumali',
+    },
+    renamePrompt: {
+        title: 'Palitan ang iyong pangalan',
+        description: 'Ito ang pangalang nakikita ng lahat sa kuwarto.',
+        saveButton: 'I-save',
     },
     chat: {
         inputPlaceholder: 'Mag-type ng mensahe...',
@@ -1103,12 +1205,18 @@ const da = {
         lockResolution: 'Lås/Lås op for opløsning',
         resizeClient: 'Tilpas størrelse til klient',
         invite: 'Inviter nogen til denne session',
+        renameSelf: 'Skift dit navn',
     },
     usernamePrompt: {
         title: 'Velkommen!',
         description: 'Vælg venligst et brugernavn for at deltage i sessionen.',
         placeholder: 'Dit navn',
         joinButton: 'Deltag',
+    },
+    renamePrompt: {
+        title: 'Skift dit navn',
+        description: 'Det er navnet, alle i rummet ser.',
+        saveButton: 'Gem',
     },
     chat: {
         inputPlaceholder: 'Skriv en besked...',

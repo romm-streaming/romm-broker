@@ -97,6 +97,17 @@
         </div>
     </div>
 
+    <div id="rename-modal-overlay" class="modal-overlay hidden">
+        <div class="modal-content username-prompt">
+            <h3 data-i18n="renamePrompt.title"></h3>
+            <p data-i18n="renamePrompt.description"></p>
+            <form id="rename-form">
+                <input type="text" id="rename-input" data-i18n-placeholder="usernamePrompt.placeholder" maxlength="25" autocomplete="off" required>
+                <button type="submit" data-i18n="renamePrompt.saveButton"></button>
+            </form>
+        </div>
+    </div>
+
     <div id="settings-modal-overlay" class="modal-overlay hidden">
         <div class="modal-content">
             <div class="modal-header">

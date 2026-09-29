@@ -1365,6 +1365,46 @@ iframe {
   pointer-events: auto;
 }
 
+/* The rename pencil beside a viewer's own name follows the same reveal as
+   the self controls above: hover, keyboard focus, or a tap on touch. */
+.name-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.name-group .username {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rename-btn {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  padding: 0 2px;
+  color: white;
+  font-size: 0.7rem;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease-in-out;
+}
+
+#local-user-container:hover .rename-btn,
+#local-user-container:focus-within .rename-btn,
+#local-user-container.controls-shown .rename-btn {
+  opacity: 0.8;
+  pointer-events: auto;
+}
+
+.rename-btn:hover,
+.rename-btn:focus-visible {
+  opacity: 1 !important;
+}
+
 /* ── Invite ──────────────────────────────────────────────────────────────── */
 /* A blank "user" at the end of the tile row: a dashed tile with a plus in the
    middle that swaps to the two invite-link buttons in place when opened. */
