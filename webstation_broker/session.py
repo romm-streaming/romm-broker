@@ -52,6 +52,17 @@ the emulator that captured it has to outlive the session for the read routes
 to find the file. Dropped at the next activate.
 """
 
+LAST_OUTCOME: Optional[dict[str, Any]] = None
+"""How the last exit of this broker process ended.
+
+`{"session_id", "ended_at", "duration_s", "state_saved", "dump_error",
+"upload", "archive_path"}`, where `upload` is the exit report's upload mode.
+
+Unlike `LAST_EXIT` it survives the next activate, so a save archive that never
+reached RomM stays visible on the status route until another exit replaces it.
+None until the first exit of this broker process.
+"""
+
 SESSION_END_FLUSH_WAIT = 2.0
 """Seconds the `session_ended` notice gets to reach each member before its socket closes."""
 

@@ -104,7 +104,7 @@ def test_health_answers_without_a_secret(client: TestClient) -> None:
 
 def test_status_is_inactive_before_anything_runs(client: TestClient) -> None:
     """Status reports inactive before anything runs."""
-    assert client.get(f"{API}/session/status").json() == {"active": False}
+    assert client.get(f"{API}/session/status").json() == {"active": False, "last_exit": None}
 
 
 def test_status_requires_the_broker_secret_when_one_is_set(
@@ -116,7 +116,7 @@ def test_status_requires_the_broker_secret_when_one_is_set(
     assert response.status_code == 403
 
     secret_client.headers["X-Broker-Secret"] = "s3cret"
-    assert secret_client.get(f"{API}/session/status").json() == {"active": False}
+    assert secret_client.get(f"{API}/session/status").json() == {"active": False, "last_exit": None}
 
 
 def test_a_wrong_secret_is_refused(secret_client: TestClient, broker_dirs: dict[str, Path]) -> None:
@@ -821,6 +821,87 @@ def test_exit_dumps_the_save_delta_and_retires_the_session(
     assert body["upload"]["mode"] == "report-only"
     assert fake_emulator[0].running is False
     assert session.SESSION is None
+
+
+def test_activate_logs_how_long_the_launch_took(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A successful activate logs one line naming the session, the emulator and the launch time."""
+    with caplog.at_level(logging.INFO, logger="webstation_broker.api"):
+        session_id = _activate(client, broker_dirs).json()["session_id"]
+
+    launched = [r.getMessage() for r in caplog.records if r.getMessage().startswith("activate: session")]
+    assert len(launched) == 1
+    assert session_id in launched[0]
+    assert " launched " in launched[0]
+
+
+def test_exit_outcome_survives_the_next_activate_on_the_status_route(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Status reports how the last exit ended, before and after the next activate.
+
+    A failed upload has to stay visible until another exit replaces it, so a
+    check polling status between games still sees it.
+    """
+    monkeypatch.setattr(settings, "DEV_MODE", True)
+    _activate(client, broker_dirs)
+    exited = client.post(f"{API}/session/exit").json()
+
+    idle = client.get(f"{API}/session/status").json()
+    _activate(client, broker_dirs)
+    playing = client.get(f"{API}/session/status").json()
+
+    assert idle["last_exit"]["session_id"] == exited["session_id"]
+    assert idle["last_exit"]["upload"] == "report-only"
+    assert idle["last_exit"]["dump_error"] is None
+    assert idle["last_exit"]["duration_s"] >= 0
+    assert playing["last_exit"] == idle["last_exit"]
+
+
+def test_a_failed_upload_logs_the_exit_line_as_a_warning(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An exit whose archive never reached the parent logs `upload=failed` at WARNING."""
+    _activate(client, broker_dirs)
+    _write_save_after_launch(fake_emulator[0].save_root / "saves" / "card.bin", b"played")
+
+    async def _refuse_upload(
+        cb: Optional[dict[str, Any]], zip_bytes: bytes, filename: str, sess: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Report an upload the parent would not take.
+
+        Args:
+            cb: The session's callback block.
+            zip_bytes: The archive body.
+            filename: The archive name.
+            sess: The session the archive belongs to.
+
+        Returns:
+            A failed upload report.
+        """
+        return {"mode": "failed", "ok": False, "error": "connection refused"}
+
+    monkeypatch.setattr(callback, "push_save_archive", _refuse_upload)
+
+    with caplog.at_level(logging.INFO, logger="webstation_broker.api"):
+        client.post(f"{API}/session/exit")
+
+    done = [r for r in caplog.records if r.getMessage().startswith("exit: session")]
+    assert [r.levelname for r in done] == ["WARNING"]
+    assert "upload=failed" in done[0].getMessage()
+    assert session.LAST_OUTCOME is not None
+    assert session.LAST_OUTCOME["archive_path"] in done[0].getMessage()
 
 
 def test_exit_reports_files_skipped_during_the_dump(
