@@ -5,6 +5,7 @@ state are module globals.
 """
 
 import asyncio
+import hmac
 import logging
 import re
 import secrets
@@ -265,8 +266,12 @@ def find_invite(token: str) -> Optional[str]:
     """
     if SESSION is None:
         return None
+    # Bytes, not str: compare_digest raises on a non-ASCII str, which would
+    # turn a junk invite into a 500. Same comparison as `api._ct_eq`, which
+    # this module can't import without a cycle.
+    presented = token.encode("utf-8", "replace")
     for permission, minted in SESSION.get("invites", {}).items():
-        if secrets.compare_digest(minted, token):
+        if hmac.compare_digest(minted.encode("utf-8"), presented):
             return permission
     return None
 

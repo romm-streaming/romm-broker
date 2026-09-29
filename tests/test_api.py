@@ -1342,6 +1342,24 @@ def test_a_disconnected_arrival_is_reclaimed_at_the_room_cap(
     assert len(session.SESSION["viewers"]) == 1
 
 
+def test_a_non_ascii_invite_is_refused_not_crashed(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+) -> None:
+    """A non-ASCII invite gets a 401 rather than a 500 from the token comparison."""
+    _activate(client, broker_dirs)
+    client.post(
+        f"{API}/session/invite",
+        params={"token": session.SESSION["controller_token"]},
+        json={"permission": "readonly"},
+    )
+
+    response = client.get(f"{API}/session/context", params={"invite": "é"})
+
+    assert response.status_code == 401
+
+
 def test_an_arrival_past_the_room_cap_gets_a_429_when_nothing_is_reclaimable(
     client: TestClient,
     broker_dirs: dict[str, Path],
