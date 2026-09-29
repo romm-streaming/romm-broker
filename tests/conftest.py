@@ -14,6 +14,7 @@ import signal
 import struct
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import zipfile
@@ -248,6 +249,42 @@ def restore_import(emulator: Emulator, body: bytes, result: imports.PreflightRes
             emulator.link_roots,
         ),
     )
+
+
+POOLED_THREAD_NAMES = frozenset({"AnyIO worker thread"})
+"""Names of pool workers that idle between tests by design and are never a leak."""
+
+THREAD_LEAK_GRACE = 1.0
+"""Seconds a thread a test started gets to finish after the test before it counts as leaked."""
+
+_real_monotonic = time.monotonic
+"""The clock the leak check reads, bound at import so a test's own patch of it never reaches the check."""
+
+
+@pytest.fixture(autouse=True)
+def no_leaked_threads() -> Iterator[None]:
+    """Fail a test that leaves a thread it started still running.
+
+    A leaked thread keeps acting on module-global state while later tests run,
+    so it can make those tests pass or fail for reasons of its own. This once
+    hid a resume thread retrying for its whole 90 s budget behind a test that
+    looked like it passed.
+
+    Yields:
+        Nothing; the test runs between the snapshot and the check.
+    """
+    before = set(threading.enumerate())
+    yield
+    deadline = _real_monotonic() + THREAD_LEAK_GRACE
+    leaked = []
+    for thread in threading.enumerate():
+        if thread in before or thread.name in POOLED_THREAD_NAMES:
+            continue
+        thread.join(timeout=max(0.0, deadline - _real_monotonic()))
+        if thread.is_alive():
+            leaked.append(thread.name)
+    if leaked:
+        pytest.fail(f"test left {len(leaked)} thread(s) running: {', '.join(leaked)}")
 
 
 @pytest.fixture(autouse=True)
