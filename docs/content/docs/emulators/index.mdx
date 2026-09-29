@@ -105,6 +105,12 @@ Azahar's SD card and NAND folders on `3ds`. `ngc` still refuses a save: its
 GCI shape has not been verified, so import through `dolphin` instead. See
 [RetroArch cores](/docs/emulators/retroarch-cores#saves-states-and-imports).
 
+Cores that read the mouse as relative movement, such as DOSBox Pure's
+default virtual mouse, need RetroArch to grab the mouse (F11 by default).
+The grab puts the pointer under the same lock described for
+[ScummVM](#scummvm), and the same selkies patch keeps the mouse moving
+through it.
+
 The full list matching each platform to its core lives in
 `retroarch_platforms.json`, next to the launcher's code. To pin exactly where
 one specific core downloads from, without editing that file, set
@@ -544,10 +550,11 @@ labwc, drops the *absolute* mouse-position updates the browser sends while a
 lock is active. It still forwards relative movement, though, so the result
 is an in-game cursor that freezes in place while clicks still land where you
 click. To work around this, the container image patches selkies' own input
-handler (`input_handler.py`) so that every absolute mouse move is sent as a
-relative movement followed by the absolute position, and so that it reads
-the actual pointer position back afterward (using the `python-xlib` library)
-to correct for any warp the game just issued. Without that patch, the mouse
+handler (`input_handler.py`) so that every absolute mouse move is also sent
+as a relative movement: the distance from the previous absolute position,
+injected just before the absolute position itself. With no lock active, the
+two land on the same spot; with a lock active, the absolute move is dropped
+and the relative one is what reaches the game. Without that patch, the mouse
 pointer would be unusable even in windowed mode, no matter what this
 launcher pins.
 
