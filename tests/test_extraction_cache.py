@@ -439,7 +439,7 @@ def _fake_listing(monkeypatch: pytest.MonkeyPatch, listing: str) -> list[list[st
     """Make every extractor run return `listing`, recording each command."""
     calls: list[list[str]] = []
     monkeypatch.setattr(
-        extraction_cache, "_run_extractor", lambda cmd, what, timeout: calls.append(cmd) or listing
+        extraction_cache, "run_extractor", lambda cmd, what, timeout: calls.append(cmd) or listing
     )
     return calls
 
@@ -549,7 +549,7 @@ def test_safe_extract_zip_extracts_normal_members(tmp_path: Path) -> None:
     dest = tmp_path / "Game"
     dest.mkdir()
     with zipfile.ZipFile(archive) as zf:
-        extraction_cache._safe_extract_zip(zf, dest)
+        extraction_cache.safe_extract_zip(zf, dest)
     assert (dest / "PS_GAME" / "EBOOT.BIN").read_bytes() == b"boot"
 
 
@@ -560,7 +560,7 @@ def test_safe_extract_zip_rejects_a_member_that_escapes_the_dest(tmp_path: Path)
     dest.mkdir()
     with zipfile.ZipFile(archive) as zf:
         with pytest.raises(RuntimeError, match="escapes"):
-            extraction_cache._safe_extract_zip(zf, dest)
+            extraction_cache.safe_extract_zip(zf, dest)
 
 
 def test_reject_escaped_tree_allows_a_normal_extraction(tmp_path: Path) -> None:
@@ -568,7 +568,7 @@ def test_reject_escaped_tree_allows_a_normal_extraction(tmp_path: Path) -> None:
     dest = tmp_path / "dest"
     (dest / "sub").mkdir(parents=True)
     (dest / "sub" / "file.txt").write_bytes(b"x")
-    extraction_cache._reject_escaped_tree(dest)
+    extraction_cache.reject_escaped_tree(dest)
 
 
 def test_reject_escaped_tree_rejects_a_symlink_that_resolves_outside_dest(tmp_path: Path) -> None:
@@ -579,7 +579,71 @@ def test_reject_escaped_tree_rejects_a_symlink_that_resolves_outside_dest(tmp_pa
     dest.mkdir()
     (dest / "escape").symlink_to(outside, target_is_directory=True)
     with pytest.raises(RuntimeError, match="escapes cache dir"):
-        extraction_cache._reject_escaped_tree(dest)
+        extraction_cache.reject_escaped_tree(dest)
+
+
+def test_reject_escaped_tree_logs_every_offender(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Each escaping entry is named in the log, not just the first one raised on."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "one").symlink_to(outside, target_is_directory=True)
+    (dest / "two").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="escapes cache dir"):
+        extraction_cache.reject_escaped_tree(dest)
+    logged = caplog.text
+    assert str(dest / "one") in logged and str(dest / "two") in logged
+
+
+def test_extract_archive_hands_an_escaped_tree_to_on_escape_then_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """on_escape sees the dest and archive name before the escape error propagates."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    archive = tmp_path / "Game.7z"
+    archive.write_bytes(b"")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    monkeypatch.setattr(extraction_cache, "list_members", lambda a, timeout: ["EBOOT.BIN"])
+
+    def fake_run(cmd: list[str], what: str, timeout: float) -> str:
+        (dest / "escape").symlink_to(outside, target_is_directory=True)
+        return ""
+
+    monkeypatch.setattr(extraction_cache, "run_extractor", fake_run)
+    seen: list[tuple[Path, str]] = []
+
+    with pytest.raises(RuntimeError, match="escapes cache dir"):
+        extraction_cache.extract_archive(
+            archive, dest, 30.0, on_escape=lambda d, name: seen.append((d, name))
+        )
+
+    assert seen == [(dest, "Game.7z")]
+
+
+def test_extract_archive_leaves_on_escape_alone_for_a_contained_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """on_escape is only for escapes: a clean extraction never calls it."""
+    archive = tmp_path / "Game.rar"
+    archive.write_bytes(b"")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    monkeypatch.setattr(extraction_cache, "list_members", lambda a, timeout: ["EBOOT.BIN"])
+
+    def fake_run(cmd: list[str], what: str, timeout: float) -> str:
+        (dest / "EBOOT.BIN").write_bytes(b"boot")
+        return ""
+
+    monkeypatch.setattr(extraction_cache, "run_extractor", fake_run)
+    seen: list[tuple[Path, str]] = []
+
+    extraction_cache.extract_archive(archive, dest, 30.0, on_escape=lambda d, name: seen.append((d, name)))
+
+    assert seen == []
+    assert (dest / "EBOOT.BIN").read_bytes() == b"boot"
 
 
 def test_run_extractor_raises_on_a_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -589,7 +653,7 @@ def test_run_extractor_raises_on_a_nonzero_exit(monkeypatch: pytest.MonkeyPatch)
         lambda *a, **k: type("R", (), {"returncode": 2, "stderr": "boom"})(),
     )
     with pytest.raises(RuntimeError, match="exited 2"):
-        extraction_cache._run_extractor(["7z", "x"], "7z (Game.7z)", 30.0)
+        extraction_cache.run_extractor(["7z", "x"], "7z (Game.7z)", 30.0)
 
 
 def test_run_extractor_raises_when_the_binary_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -599,7 +663,7 @@ def test_run_extractor_raises_when_the_binary_is_missing(monkeypatch: pytest.Mon
         raise OSError("not found")
     monkeypatch.setattr(extraction_cache.subprocess, "run", raise_oserror)
     with pytest.raises(RuntimeError, match="failed to run"):
-        extraction_cache._run_extractor(["unrar", "x"], "unrar (Game.rar)", 30.0)
+        extraction_cache.run_extractor(["unrar", "x"], "unrar (Game.rar)", 30.0)
 
 
 def test_default_stage_extracts_a_zip_directly_into_staged(tmp_path: Path) -> None:
@@ -669,7 +733,7 @@ def test_extract_sets_and_clears_the_extraction_phase(tmp_path: Path) -> None:
 
     def spying_stage(rom: Path, staged: Path, scratch: Path, emulator: Emulator, kept: int) -> None:
         seen.append(emulator.extraction_phase)
-        extraction_cache._extract_archive(rom, staged, 30.0)
+        extraction_cache.extract_archive(rom, staged, 30.0)
 
     cache._stage = spying_stage
     emulator = _FakeEmulator()
@@ -703,7 +767,7 @@ def test_extract_cleans_up_and_raises_when_nothing_bootable_was_extracted(tmp_pa
     archive = _make_zip(tmp_path / "Game.zip", {"readme.txt": b"nope"})
 
     def empty_stage(rom: Path, staged: Path, scratch: Path, emulator: Emulator, kept: int) -> None:
-        extraction_cache._extract_archive(rom, staged, 30.0)
+        extraction_cache.extract_archive(rom, staged, 30.0)
 
     cache._stage = empty_stage
     with pytest.raises(RuntimeError, match="held no EBOOT.BIN"):
@@ -781,7 +845,7 @@ def test_extract_still_raises_if_stage_succeeds_but_leaves_no_boot_target(tmp_pa
 
     def stage_that_appears_ok(rom: Path, staged: Path, scratch: Path, emulator: Emulator, kept: int) -> None:
         # Extract the archive (readme.txt), but no EBOOT.BIN will be found
-        extraction_cache._extract_archive(rom, staged, 30.0)
+        extraction_cache.extract_archive(rom, staged, 30.0)
         # Stage could set internal flags saying "I found boot!" but that's ignored
         # The post-stage check still calls find_boot_target(staged) and finds nothing
 

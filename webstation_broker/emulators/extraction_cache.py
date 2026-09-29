@@ -114,7 +114,17 @@ def _touch_last_accessed(game_dir: Path) -> None:
         log.warning("extraction cache: could not update last-accessed marker for %s: %s", game_dir, exc)
 
 
-def _run_extractor(cmd: list[str], what: str, timeout: float) -> str:
+def run_extractor(cmd: list[str], what: str, timeout: float) -> str:
+    """Run an archive tool and return its stdout.
+
+    Args:
+        cmd: The command line to run.
+        what: What the run is for, named in errors.
+        timeout: Seconds the tool gets before it is considered hung.
+
+    Raises:
+        RuntimeError: When the tool cannot start, times out, or exits non-zero.
+    """
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -161,7 +171,7 @@ def reject_unsafe_members(dest: Path, members: list[str]) -> None:
             raise RuntimeError(f"archive member escapes extraction dir: {member}")
 
 
-def _safe_extract_zip(zf: zipfile.ZipFile, dest: Path) -> None:
+def safe_extract_zip(zf: zipfile.ZipFile, dest: Path) -> None:
     """Extract `zf` into dest after rejecting any Zip Slip member."""
     reject_unsafe_members(dest, zf.namelist())
     zf.extractall(dest)
@@ -184,7 +194,7 @@ def _7z_listing_body(archive: Path, what: str, timeout: float) -> list[str]:
     Raises:
         RuntimeError: When 7z fails or the listing carries no separator line.
     """
-    listing = _run_extractor(["7z", "l", "-slt", str(archive)], f"{what} ({archive.name})", timeout)
+    listing = run_extractor(["7z", "l", "-slt", str(archive)], f"{what} ({archive.name})", timeout)
     lines = listing.splitlines()
     for i, line in enumerate(lines):
         if _7Z_SEPARATOR_RE.match(line):
@@ -221,7 +231,7 @@ def list_members(archive: Path, timeout: float) -> list[str]:
         except (zipfile.BadZipFile, OSError) as exc:
             raise RuntimeError(f"could not list zip {archive.name}: {exc}") from exc
     if ext == ".rar":
-        listing = _run_extractor(["unrar", "lb", "-y", str(archive)], f"unrar list ({archive.name})", timeout)
+        listing = run_extractor(["unrar", "lb", "-y", str(archive)], f"unrar list ({archive.name})", timeout)
         members = [line for line in listing.splitlines() if line.strip()]
         tool = "unrar"
     else:
@@ -233,7 +243,7 @@ def list_members(archive: Path, timeout: float) -> list[str]:
     return members
 
 
-def _reject_escaped_tree(dest: Path) -> None:
+def reject_escaped_tree(dest: Path) -> None:
     """Post-extraction safety net: any real symlink or entry resolving outside dest is fatal.
 
     unrar/7z extraction is trusted to confine writes under dest, but the
@@ -241,8 +251,22 @@ def _reject_escaped_tree(dest: Path) -> None:
     and a name holding a raw control character can render differently there
     than in the archive's real central directory. This walks the real
     result instead of trusting the listing as a proxy for it.
+
+    Every offender is logged with the host path it points at, because that is
+    where the extractor may have written and it is the one thing the caller
+    cannot clean up on its own judgement.
+
+    Args:
+        dest: The directory the extraction was confined to.
+
+    Raises:
+        RuntimeError: If any entry resolves outside dest or cannot be resolved.
     """
     dest_real = dest.resolve()
+    escaped: list[Path] = []
+    # followlinks=False means os.walk never descends through a symlinked
+    # directory, but it still lists one in dirnames for its parent's
+    # iteration -- exactly where this loop catches it.
     for dirpath, dirnames, filenames in os.walk(dest, followlinks=False):
         base = Path(dirpath)
         for name in dirnames + filenames:
@@ -256,26 +280,62 @@ def _reject_escaped_tree(dest: Path) -> None:
                 )
                 raise RuntimeError(f"could not resolve extracted member {p}: {exc}") from exc
             if target_real != dest_real and dest_real not in target_real.parents:
-                raise RuntimeError(f"extracted member escapes cache dir: {p}")
+                log.error(
+                    "extraction cache: extracted member %s points outside %s, at %s", p, dest, target_real
+                )
+                escaped.append(p)
+    if escaped:
+        raise RuntimeError(f"extracted member escapes cache dir: {escaped[0]}")
 
 
-def _extract_archive(archive: Path, dest: Path, timeout: float) -> None:
+def extract_archive(
+    archive: Path,
+    dest: Path,
+    timeout: float,
+    on_escape: Optional[Callable[[Path, str], None]] = None,
+) -> None:
+    """Extract a .zip, .rar or .7z into dest, refusing anything that would land outside it.
+
+    A .zip is extracted in process; anything else goes through unrar or 7z,
+    the latter also covering any other format 7z can identify (RAR5,
+    tar-in-7z dumps). Member names are checked before a byte is written, and
+    the external tools' result is walked again afterwards.
+
+    Args:
+        archive: The archive to extract.
+        dest: The directory the extraction must stay under.
+        timeout: Seconds `unrar` or `7z` gets, per run, before it is
+            considered hung.
+        on_escape: Called with (dest, archive name) when the post-extraction
+            walk finds an escaped entry, before the error propagates. The
+            tool has already written by then, so this is the caller's chance
+            to discard what it left.
+
+    Raises:
+        RuntimeError: When the archive is unreadable, a member would escape
+            dest, or the extractor fails.
+    """
     ext = archive.suffix.lower()
     log.info("extraction cache: extracting %s (%s)", archive.name, ext)
     if ext == ".zip":
         try:
             with zipfile.ZipFile(archive) as zf:
-                _safe_extract_zip(zf, dest)
+                safe_extract_zip(zf, dest)
         except (zipfile.BadZipFile, OSError) as exc:
             log.error("extraction cache: zip extraction of %s failed: %s", archive.name, exc)
             raise RuntimeError(f"zip extraction of {archive.name} failed: {exc}") from exc
+        return
+    reject_unsafe_members(dest, list_members(archive, timeout))
+    if ext == ".rar":
+        run_extractor(["unrar", "x", "-y", str(archive), f"{dest}/"], f"unrar ({archive.name})", timeout)
     else:
-        reject_unsafe_members(dest, list_members(archive, timeout))
-        if ext == ".rar":
-            _run_extractor(["unrar", "x", "-y", str(archive), f"{dest}/"], f"unrar ({archive.name})", timeout)
-        else:
-            _run_extractor(["7z", "x", "-y", str(archive), f"-o{dest}"], f"7z ({archive.name})", timeout)
-        _reject_escaped_tree(dest)
+        run_extractor(["7z", "x", "-y", str(archive), f"-o{dest}"], f"7z ({archive.name})", timeout)
+    try:
+        reject_escaped_tree(dest)
+    except RuntimeError:
+        if on_escape is not None:
+            on_escape(dest, archive.name)
+        raise
 
 
 def _sum_listed_sizes(lines: Iterable[str], prefix: str) -> Optional[int]:
@@ -310,7 +370,7 @@ def listed_size(archive: Path, timeout: float) -> Optional[int]:
             with zipfile.ZipFile(archive) as zf:
                 return sum(i.file_size for i in zf.infolist()) or None
         if ext == ".rar":
-            listing = _run_extractor(
+            listing = run_extractor(
                 ["unrar", "lt", "-y", str(archive)], f"unrar sizes ({archive.name})", timeout,
             )
             return _sum_listed_sizes(listing.splitlines(), "Size:")
@@ -539,7 +599,7 @@ class ExtractionCache:
         self, archive: Path, staged: Path, scratch: Path, emulator: Emulator, kept_bytes: int
     ) -> None:
         """The default `stage`: extract `archive` directly into `staged`."""
-        _extract_archive(archive, staged, self._extract_timeout())
+        extract_archive(archive, staged, self._extract_timeout())
 
     def _default_budget(self, rom: Path) -> tuple[int, int]:
         """The default `budget`: the archive's own listed size, or a compressed-size fallback."""

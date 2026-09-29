@@ -2091,29 +2091,6 @@ def _make_zip(path: Path, members: dict[str, bytes]) -> Path:
     return path
 
 
-def test_safe_extract_zip_extracts_normal_members(cache_dir: Path, tmp_path: Path) -> None:
-    """Safe extract zip extracts normal members."""
-    archive = _make_zip(tmp_path / "Game.zip", {"PS3_GAME/USRDIR/EBOOT.BIN": b"boot"})
-    dest = cache_dir / "Game"
-    dest.mkdir(parents=True)
-
-    with zipfile.ZipFile(archive) as zf:
-        rpcs3._safe_extract_zip(zf, dest)
-
-    assert (dest / "PS3_GAME" / "USRDIR" / "EBOOT.BIN").read_bytes() == b"boot"
-
-
-def test_safe_extract_zip_rejects_a_member_that_escapes_the_dest(cache_dir: Path, tmp_path: Path) -> None:
-    """Safe extract zip rejects a member that escapes the dest."""
-    archive = _make_zip(tmp_path / "Evil.zip", {"../../etc/passwd": b"pwned"})
-    dest = cache_dir / "Evil"
-    dest.mkdir(parents=True)
-
-    with zipfile.ZipFile(archive) as zf:
-        with pytest.raises(RuntimeError, match="escapes"):
-            rpcs3._safe_extract_zip(zf, dest)
-
-
 def test_extract_archive_zip_raises_on_a_corrupt_file(cache_dir: Path, tmp_path: Path) -> None:
     """Extract archive zip raises on a corrupt file."""
     archive = tmp_path / "Corrupt.zip"
@@ -2130,11 +2107,15 @@ def test_extract_archive_dispatches_rar_to_unrar(
 ) -> None:
     """Extract archive dispatches rar to unrar."""
     calls = []
-    monkeypatch.setattr(rpcs3, "_run_extractor", lambda cmd, what: calls.append(cmd) or "")
-    monkeypatch.setattr(
-        rpcs3.extraction_cache, "_run_extractor",
-        lambda cmd, what, timeout: calls.append(cmd) or "PS3_GAME/USRDIR/EBOOT.BIN\n",
-    )
+    timeouts = []
+    monkeypatch.setattr(rpcs3, "INSTALL_TIMEOUT", 42.0)
+
+    def fake_run(cmd: list[str], what: str, timeout: float) -> str:
+        calls.append(cmd)
+        timeouts.append(timeout)
+        return "PS3_GAME/USRDIR/EBOOT.BIN\n"
+
+    monkeypatch.setattr(rpcs3.extraction_cache, "run_extractor", fake_run)
     archive = tmp_path / "Game.rar"
     archive.write_bytes(b"rar")
 
@@ -2143,6 +2124,7 @@ def test_extract_archive_dispatches_rar_to_unrar(
     assert calls[0] == ["unrar", "lb", "-y", str(archive)]
     assert calls[1][0] == "unrar" and calls[1][1] == "x"
     assert str(archive) in calls[1]
+    assert timeouts == [42.0, 42.0]
 
 
 def test_extract_archive_dispatches_7z_and_unknown_exts_to_7z(
@@ -2151,9 +2133,8 @@ def test_extract_archive_dispatches_7z_and_unknown_exts_to_7z(
     """Extract archive dispatches .7z and unknown extensions to the 7z tool."""
     calls = []
     slt_output = "Path = Game.7z\n\n----------\nPath = PS3_GAME/USRDIR/EBOOT.BIN\nSize = 4\n"
-    monkeypatch.setattr(rpcs3, "_run_extractor", lambda cmd, what: calls.append(cmd) or "")
     monkeypatch.setattr(
-        rpcs3.extraction_cache, "_run_extractor", lambda cmd, what, timeout: calls.append(cmd) or slt_output
+        rpcs3.extraction_cache, "run_extractor", lambda cmd, what, timeout: calls.append(cmd) or slt_output
     )
     archive = tmp_path / "Game.7z"
     archive.write_bytes(b"7z")
@@ -2174,8 +2155,7 @@ def test_extract_archive_rar_rejects_a_member_that_escapes_the_dest(
         calls.append(cmd)
         return "../../etc/passwd\n" if cmd[1] == "lb" else ""
 
-    monkeypatch.setattr(rpcs3, "_run_extractor", fake_run)
-    monkeypatch.setattr(rpcs3.extraction_cache, "_run_extractor", fake_run)
+    monkeypatch.setattr(rpcs3.extraction_cache, "run_extractor", fake_run)
     archive = tmp_path / "Evil.rar"
     archive.write_bytes(b"rar")
 
@@ -2196,8 +2176,7 @@ def test_extract_archive_7z_rejects_a_member_that_escapes_the_dest(
         calls.append(cmd)
         return slt_output if cmd[1] == "l" else ""
 
-    monkeypatch.setattr(rpcs3, "_run_extractor", fake_run)
-    monkeypatch.setattr(rpcs3.extraction_cache, "_run_extractor", fake_run)
+    monkeypatch.setattr(rpcs3.extraction_cache, "run_extractor", fake_run)
     archive = tmp_path / "Evil.7z"
     archive.write_bytes(b"7z")
 
@@ -2205,34 +2184,6 @@ def test_extract_archive_7z_rejects_a_member_that_escapes_the_dest(
         rpcs3._extract_archive(archive, cache_dir / "Evil")
 
     assert calls == [["7z", "l", "-slt", str(archive)]]
-
-
-def test_reject_escaped_tree_allows_a_normal_extraction(tmp_path: Path) -> None:
-    """Reject escaped tree allows a normal extraction."""
-    dest = tmp_path / "dest"
-    (dest / "sub").mkdir(parents=True)
-    (dest / "sub" / "file.txt").write_bytes(b"x")
-
-    rpcs3._reject_escaped_tree(dest)
-
-
-def test_reject_escaped_tree_rejects_a_symlink_that_resolves_outside_dest(tmp_path: Path) -> None:
-    """A symlink resolving outside dest must be caught, not just literal paths.
-
-    The pre-extraction listing check can be fooled by a control character
-    that renders differently in unrar/7z's text listing than in the
-    archive's real central directory, so this walks what actually landed on
-    disk -- a symlink is exactly the kind of real filesystem object that
-    check could never catch before extraction ran.
-    """
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    dest = tmp_path / "dest"
-    dest.mkdir()
-    (dest / "escape").symlink_to(outside, target_is_directory=True)
-
-    with pytest.raises(RuntimeError, match="escapes cache dir"):
-        rpcs3._reject_escaped_tree(dest)
 
 
 def test_extract_and_cache_serializes_a_second_call_racing_the_same_archive(
@@ -2280,29 +2231,6 @@ def test_extract_and_cache_serializes_a_second_call_racing_the_same_archive(
     release.set()
     first.join(timeout=5)
     second.join(timeout=5)
-
-
-def test_run_extractor_raises_on_a_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Run extractor raises on a nonzero exit."""
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda *a, **k: type("R", (), {"returncode": 2, "stderr": "boom"})(),
-    )
-
-    with pytest.raises(RuntimeError, match="exited 2"):
-        rpcs3._run_extractor(["7z", "x"], "7z (Game.7z)")
-
-
-def test_run_extractor_raises_when_the_binary_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Run extractor raises when the binary is missing."""
-    def raise_oserror(*a: object, **k: object) -> NoReturn:
-        raise OSError("not found")
-
-    monkeypatch.setattr(subprocess, "run", raise_oserror)
-
-    with pytest.raises(RuntimeError, match="failed to run"):
-        rpcs3._run_extractor(["unrar", "x"], "unrar (Game.rar)")
 
 
 def test_extract_and_cache_does_not_reuse_a_stale_entry_from_a_replaced_archive(

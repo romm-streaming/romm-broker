@@ -52,7 +52,6 @@ import struct
 import subprocess
 import tempfile
 import time
-import zipfile
 from collections.abc import Iterable
 from pathlib import Path
 from threading import Thread
@@ -535,80 +534,9 @@ def _archive_boot_target(root: Path) -> Optional[Path]:
     return None
 
 
-def _run_extractor(cmd: list[str], what: str) -> str:
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=INSTALL_TIMEOUT)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        log.error("rpcs3: %s failed to run: %s", what, exc)
-        raise RuntimeError(f"{what} failed to run: {exc}") from exc
-    if result.returncode != 0:
-        raise RuntimeError(f"{what} exited {result.returncode}: {result.stderr.strip()}")
-    return result.stdout
-
-
-def _safe_extract_zip(zf: zipfile.ZipFile, dest: Path) -> None:
-    """Extract `zf` into dest after rejecting any Zip Slip member.
-
-    zf.extractall() writes a member's path verbatim, so a `../` name in
-    the archive can escape dest; reject any member that would first.
-    """
-    extraction_cache.reject_unsafe_members(dest, zf.namelist())
-    zf.extractall(dest)
-
-
-def _reject_escaped_tree(dest: Path) -> None:
-    """Post-extraction safety net for the .rar/.7z paths.
-
-    unrar/7z extraction is trusted to confine writes under dest -- 7z's own
-    extractor collapses `..` path components against the destination root --
-    but the pre-extraction member-name check above parses each tool's own
-    *text listing* to decide what's "safe" before anything is written, and a
-    member name holding a raw control character can render differently (or
-    get silently merged with the next line) in that listing than in the
-    archive's real central directory. Rather than trust the listing as a
-    proxy for what actually landed on disk, walk the real result: any
-    symlink whose target resolves outside dest is a real filesystem object
-    the listing-based check could never catch (no such thing exists until
-    after extraction), and any entry that isn't contained under dest at all
-    means the extractor's own traversal protection didn't hold -- both are
-    treated as fatal for the whole archive rather than silently dropped.
-    """
-    dest_real = dest.resolve()
-    # followlinks=False means os.walk never descends through a symlinked
-    # directory, but it still lists one in dirnames for its parent's
-    # iteration -- exactly where this loop catches it.
-    for dirpath, dirnames, filenames in os.walk(dest, followlinks=False):
-        base = Path(dirpath)
-        for name in dirnames + filenames:
-            p = base / name
-            try:
-                target_real = p.resolve()
-            except OSError as exc:
-                log.error("rpcs3: could not resolve extracted member %s under %s: %s", p, dest, exc)
-                raise RuntimeError(f"could not resolve extracted member {p}: {exc}") from exc
-            if target_real != dest_real and dest_real not in target_real.parents:
-                raise RuntimeError(f"extracted member escapes cache dir: {p}")
-
-
 def _extract_archive(archive: Path, dest: Path) -> None:
-    ext = archive.suffix.lower()
-    log.info("rpcs3: extracting %s (%s)", archive.name, ext)
-    if ext == ".zip":
-        try:
-            with zipfile.ZipFile(archive) as zf:
-                _safe_extract_zip(zf, dest)
-        except (zipfile.BadZipFile, OSError) as exc:
-            log.error("rpcs3: zip extraction of %s failed: %s", archive.name, exc)
-            raise RuntimeError(f"zip extraction of {archive.name} failed: {exc}") from exc
-    else:
-        extraction_cache.reject_unsafe_members(dest, extraction_cache.list_members(archive, INSTALL_TIMEOUT))
-        if ext == ".rar":
-            _run_extractor(["unrar", "x", "-y", str(archive), f"{dest}/"], f"unrar ({archive.name})")
-        else:
-            # .7z, plus a fallback attempt for any other archive format 7z can
-            # identify (RAR5, tar-in-7z JB dumps, etc).
-            _run_extractor(["7z", "x", "-y", str(archive), f"-o{dest}"], f"7z ({archive.name})")
-        _reject_escaped_tree(dest)
+    """Extract a PS3 dump archive into dest, bounded by INSTALL_TIMEOUT per tool run."""
+    extraction_cache.extract_archive(archive, dest, INSTALL_TIMEOUT)
 
 
 def _extraction_size(archive: Path) -> int:
