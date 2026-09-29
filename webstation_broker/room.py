@@ -5,7 +5,7 @@ Binary wire format:
 ```
 [0..7] 8-byte ASCII publicId of sender
 [8]    0x01 video frame / 0x02 audio frame / 0x03 video config / 0x04 pcm
-[9..]  payload
+[9..]  payload; for a video frame, [9] is 0x01 on a keyframe
 ```
 
 The publicId indirection keeps real tokens out of the media byte stream. It
@@ -27,7 +27,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from . import session, settings
 from .api import _ct_eq
-from .outbox import Outbox
+from .outbox import AUDIO_FRAME, Outbox
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -429,7 +429,7 @@ async def room_websocket(websocket: WebSocket) -> None:
                     )
                     continue
                 designated = sess.get("designated_speaker")
-                is_audio = binary_data[MEDIA_ID_BYTES] == 0x02
+                is_audio = binary_data[MEDIA_ID_BYTES] == AUDIO_FRAME
                 if designated and is_audio and token != designated:
                     continue
                 # The leading bytes are the publicId recipients attribute the
@@ -445,8 +445,6 @@ async def room_websocket(websocket: WebSocket) -> None:
     except Exception:
         log.exception("unhandled room websocket error for %s", username)
     finally:
-        # Nothing more goes out on this socket; anything still queued for it
-        # is moot now.
         await connection_info["outbox"].aclose()
         current_username = connection_info.get("username")
         # A socket that was replaced by a newer one on the same token is not

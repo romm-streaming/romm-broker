@@ -1,34 +1,22 @@
 """Per-connection outbound queue for room sockets.
 
-A room broadcast used to await every recipient's send before returning, and
-the media relay awaits the broadcast inline in the sender's receive loop. A
-single viewer whose connection backed up (a slow uplink, a suspended tab)
-therefore stalled the sender, and with it every other member's frames, chat
-and control messages. Each room connection now owns an `Outbox`: a broadcast
-only queues the message and returns, and one drain task per connection does
-the actual sends, so a slow recipient only ever delays itself.
+A broadcast only queues its message and returns; one drain task per
+connection does the sends, so a slow recipient delays nobody but itself.
 
-Traffic goes out in three lanes, each in the order it was queued: JSON
-(chat, presence, control) first, then audio, then video. JSON is never
-dropped. Media is live, so a recipient that falls behind skips frames rather
-than building up delay, and the lanes decide what it skips: audio is small
-and what keeps a room talking, so it goes ahead of video and video absorbs
-the lag.
+Traffic goes out in three lanes, each in queue order: JSON (chat, presence,
+control) first, then audio, then video. JSON is never dropped. Media is
+live, so a recipient that falls behind skips frames instead of building up
+delay, and video absorbs the lag before audio does.
 
-A frame is only dropped once it has waited `MAX_MEDIA_AGE`, so a brief
-hiccup costs nothing however many members are streaming. Webcam video is a
-keyframe followed by deltas that each depend on the frame before, so losing
-one video frame would leave the recipient decoding garbage until the next
-keyframe. Once one of a sender's video frames is dropped for a recipient,
-that sender's later deltas are skipped for it too, until a keyframe restores
-a clean picture, and `on_video_gap` is told so the sender can be asked for
-that keyframe now instead of at its next scheduled one. A sender's video
-config message is never dropped.
+A frame is dropped only once it has waited `MAX_MEDIA_AGE`. Webcam deltas
+each depend on the frame before, so after one of a sender's video frames is
+dropped for a recipient, that sender's later deltas are skipped for it too
+until a keyframe, and `on_video_gap` asks the sender for one. A sender's
+video config is never dropped.
 
-A recipient that stops draining altogether, one send outlasting
-`SEND_STALL_LIMIT` or more JSON backed up than `MAX_JSON_BACKLOG`, is
-closed: its handler then runs the normal departure cleanup, and the client
-can reconnect on the same seat.
+A recipient that stops draining (one send outlasting `SEND_STALL_LIMIT`, or
+more than `MAX_JSON_BACKLOG` JSON messages queued) is closed; the client
+reconnects on the same seat.
 """
 
 import asyncio
@@ -44,27 +32,17 @@ from .session import PUBLIC_ID_HEX_CHARS
 log = logging.getLogger(__name__)
 
 MAX_MEDIA_AGE = 0.5
-"""Seconds a media frame may wait for its recipient before it is dropped.
-
-Long enough that a brief network hiccup drops nothing; short enough that a
-recipient that is really behind catches up instead of drifting further.
-"""
+"""Seconds a media frame may wait for its recipient before it is dropped."""
 
 MAX_MEDIA_BACKLOG_BYTES = 4 * 1024 * 1024
 """Bytes of media queued per recipient before the oldest frames are dropped.
 
-Only a memory backstop for a recipient whose send is blocked outright (so
-nothing gets dequeued to be aged out); several seconds of every webcam in a
-full room fit under it.
+A memory backstop for a recipient whose send is blocked outright, so nothing
+is dequeued to be aged out.
 """
 
 MAX_JSON_BACKLOG = 512
-"""JSON messages allowed to queue for one recipient before it is closed.
-
-JSON is never dropped, so this is only a backstop against a recipient that
-has stopped reading while the room keeps talking; normal traffic never comes
-close to it.
-"""
+"""JSON messages allowed to queue for one recipient before it is closed."""
 
 SEND_STALL_LIMIT = 10.0
 """Seconds one send may take before the recipient is treated as gone and closed."""
@@ -77,6 +55,9 @@ LAGGARD_CLOSE_CODE = 1013
 
 VIDEO_FRAME = 0x01
 """Frame-type byte of an encoded webcam video frame."""
+
+AUDIO_FRAME = 0x02
+"""Frame-type byte of an encoded mic audio frame."""
 
 VIDEO_CONFIG = 0x03
 """Frame-type byte of a sender's video decoder config, which is never dropped."""
@@ -186,8 +167,7 @@ class Outbox:
         """Stop the drain task and discard anything still queued.
 
         Called once the connection is over; it does not close the socket.
-        Logs how many frames this recipient lost, if any, since that is the
-        one number that says whether its connection kept up.
+        Logs how many frames this recipient lost, if any.
         """
         if self.dropped_video or self.dropped_audio:
             log.info(

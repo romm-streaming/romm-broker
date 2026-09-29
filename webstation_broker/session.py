@@ -452,9 +452,7 @@ async def broadcast_to_room(payload: dict[str, Any]) -> None:
 async def broadcast_binary_to_room(payload: bytes, sender_ws: WebSocket) -> None:
     """Queue a binary media frame for every connected room member except its sender.
 
-    This runs inline in the sender's receive loop, so it must never wait on a
-    recipient: a member that falls behind loses its oldest queued frames
-    instead (see `outbox`).
+    Runs inline in the sender's receive loop, so it never waits on a recipient.
 
     Args:
         payload: The raw frame in the room's binary wire format.
@@ -468,14 +466,9 @@ async def broadcast_binary_to_room(payload: bytes, sender_ws: WebSocket) -> None
 def request_keyframe(media_id: bytes) -> None:
     """Ask the member streaming under `media_id` to encode its next video frame as a keyframe.
 
-    Called by a recipient's outbox once it has had to drop one of that
-    member's video frames: every delta after the gap is undecodable, so
-    without this the recipient would wait out the sender's keyframe interval
-    (seconds) on a broken tile. Requests to one member are spaced at least
-    `KEYFRAME_REQUEST_GAP` apart, since keyframes are the biggest frames there
-    are and a room full of lagging recipients asking at once would only add
-    to the congestion that caused the drop. The request names nobody, so it
-    tells the sender nothing about who is behind.
+    Called by a recipient's outbox after it dropped one of that member's video
+    frames. Requests to one member are spaced `KEYFRAME_REQUEST_GAP` apart,
+    since keyframes are the largest frames and would add to the congestion.
 
     Args:
         media_id: The sender's per-connection media id, as stamped on its frames.

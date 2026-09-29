@@ -2,10 +2,10 @@
 
 import asyncio
 import logging
-from typing import Any, Union
+from typing import Any, Callable, Optional, Union, cast
 
 import pytest
-from starlette.websockets import WebSocketState
+from starlette.websockets import WebSocket, WebSocketState
 
 from webstation_broker import outbox, session
 from webstation_broker.outbox import Outbox
@@ -54,6 +54,27 @@ class _Socket:
         self.events.append(("close", code))
 
 
+def _outbox(
+    label: str = "viewer",
+    held: bool = False,
+    on_video_gap: Optional[Callable[[bytes], None]] = None,
+) -> tuple[_Socket, Outbox]:
+    """Build an outbox over a recording socket.
+
+    Args:
+        label: The member name the outbox logs under.
+        held: Park every send until the socket's gate is set.
+        on_video_gap: Passed through to the outbox.
+
+    Returns:
+        The socket and the outbox wrapping it.
+    """
+    sock = _Socket()
+    if held:
+        sock.gate.clear()
+    return sock, Outbox(cast(WebSocket, sock), label, on_video_gap=on_video_gap)
+
+
 async def _settle() -> None:
     """Give the drain task a few loop turns, for checks that nothing (more) went out.
 
@@ -88,7 +109,7 @@ def _audio(sender: bytes, body: bytes) -> bytes:
     Returns:
         The frame in the room's binary wire format.
     """
-    return sender + bytes([0x02, 0]) + body
+    return sender + bytes([outbox.AUDIO_FRAME, 0]) + body
 
 
 def _config(sender: bytes) -> bytes:
@@ -116,13 +137,12 @@ def _sent_frames(sock: _Socket) -> list[bytes]:
     Returns:
         Every binary payload it received.
     """
-    return [value for kind, value in sock.events if kind == "bytes"]  # type: ignore[misc]
+    return [value for _, value in sock.events if isinstance(value, bytes)]
 
 
 async def test_json_then_audio_then_video_and_each_lane_keeps_its_order() -> None:
     """Chat and control never wait behind media, audio never waits behind video."""
-    sock = _Socket()
-    box = Outbox(sock, "viewer")  # type: ignore[arg-type]
+    sock, box = _outbox()
 
     box.send_media(_video(_A, b"v1", key=True))
     box.send_media(_audio(_A, b"a1"))
@@ -145,9 +165,7 @@ async def test_json_then_audio_then_video_and_each_lane_keeps_its_order() -> Non
 
 async def test_a_brief_hiccup_drops_nothing_however_much_queued_up() -> None:
     """Frames younger than `MAX_MEDIA_AGE` all go out once the recipient catches up."""
-    sock = _Socket()
-    sock.gate.clear()
-    box = Outbox(sock, "viewer")  # type: ignore[arg-type]
+    sock, box = _outbox(held=True)
     frames = [_video(_A, b"k", key=True)] + [_video(_A, f"d{i}".encode()) for i in range(300)]
     for frame in frames:
         box.send_media(frame)
@@ -171,9 +189,7 @@ async def test_stale_video_is_skipped_until_its_senders_next_keyframe(
     """
     monkeypatch.setattr(outbox, "MAX_MEDIA_AGE", 0.05)
     gaps: list[bytes] = []
-    sock = _Socket()
-    sock.gate.clear()
-    box = Outbox(sock, "viewer", on_video_gap=gaps.append)  # type: ignore[arg-type]
+    sock, box = _outbox(held=True, on_video_gap=gaps.append)
     box.send_media(_video(_A, b"in-flight", key=True))
     await _settle()
     box.send_media(_video(_A, b"stale"))
@@ -203,9 +219,7 @@ async def test_audio_keeps_flowing_while_video_absorbs_the_lag(
 ) -> None:
     """A stale backlog loses its video; fresh audio queued behind it still goes out first."""
     monkeypatch.setattr(outbox, "MAX_MEDIA_AGE", 0.05)
-    sock = _Socket()
-    sock.gate.clear()
-    box = Outbox(sock, "viewer")  # type: ignore[arg-type]
+    sock, box = _outbox(held=True)
     box.send_media(_audio(_A, b"in-flight"))
     await _settle()
     box.send_media(_video(_A, b"old", key=True))
@@ -224,9 +238,7 @@ async def test_audio_keeps_flowing_while_video_absorbs_the_lag(
 async def test_a_video_config_is_never_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
     """A decoder config goes out however stale, even mid-gap: without it nothing decodes."""
     monkeypatch.setattr(outbox, "MAX_MEDIA_AGE", 0.05)
-    sock = _Socket()
-    sock.gate.clear()
-    box = Outbox(sock, "viewer")  # type: ignore[arg-type]
+    sock, box = _outbox(held=True)
     box.send_media(_audio(_A, b"in-flight"))
     await _settle()
     box.send_media(_video(_A, b"stale"))
@@ -247,9 +259,7 @@ async def test_the_byte_backstop_evicts_video_before_audio(
     frame_bytes = len(_video(_A, b"x" * 90))
     monkeypatch.setattr(outbox, "MAX_MEDIA_BACKLOG_BYTES", frame_bytes * 3)
     gaps: list[bytes] = []
-    sock = _Socket()
-    sock.gate.clear()
-    box = Outbox(sock, "viewer", on_video_gap=gaps.append)  # type: ignore[arg-type]
+    sock, box = _outbox(held=True, on_video_gap=gaps.append)
     box.send_media(_audio(_A, b"in-flight"))
     await _settle()
 
@@ -275,9 +285,7 @@ async def test_leaving_logs_how_many_frames_the_recipient_missed(
 ) -> None:
     """The drop count is reported when the connection closes, and only if it lost any."""
     monkeypatch.setattr(outbox, "MAX_MEDIA_AGE", 0.05)
-    sock = _Socket()
-    sock.gate.clear()
-    box = Outbox(sock, "viewer")  # type: ignore[arg-type]
+    sock, box = _outbox(held=True)
     box.send_media(_audio(_A, b"in-flight"))
     await _settle()
     box.send_media(_audio(_A, b"stale"))
@@ -287,7 +295,7 @@ async def test_leaving_logs_how_many_frames_the_recipient_missed(
 
     with caplog.at_level(logging.INFO, logger="webstation_broker.outbox"):
         await box.aclose()
-        await Outbox(_Socket(), "healthy").aclose()  # type: ignore[arg-type]
+        await _outbox("healthy")[1].aclose()
 
     assert [r.getMessage() for r in caplog.records] == [
         "room outbox: viewer missed 0 video and 1 audio frame(s) while connected"
@@ -298,10 +306,10 @@ async def test_keyframe_requests_reach_only_the_sender_and_are_spaced_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The member streaming under the media id is asked, at most once per gap window."""
-    host, guest = _Socket(), _Socket()
-    boxes = [Outbox(host, "host"), Outbox(guest, "guest")]  # type: ignore[arg-type]
-    session.ROOM["controller"] = {"websocket": host, "public_id": "AAAAAAAA", "outbox": boxes[0]}
-    session.ROOM["viewers"] = {"g": {"websocket": guest, "public_id": "BBBBBBBB", "outbox": boxes[1]}}
+    (host, host_box), (guest, guest_box) = _outbox("host"), _outbox("guest")
+    boxes = [host_box, guest_box]
+    session.ROOM["controller"] = {"websocket": host, "public_id": _A.decode(), "outbox": boxes[0]}
+    session.ROOM["viewers"] = {"g": {"websocket": guest, "public_id": _B.decode(), "outbox": boxes[1]}}
 
     session.request_keyframe(_B)
     session.request_keyframe(_B)
@@ -324,9 +332,7 @@ async def test_a_send_that_outlasts_the_stall_limit_closes_the_recipient(
 ) -> None:
     """A recipient that stops reading is closed with 1013 rather than queued for forever."""
     monkeypatch.setattr(outbox, "SEND_STALL_LIMIT", 0.05)
-    sock = _Socket()
-    sock.gate.clear()
-    box = Outbox(sock, "viewer")  # type: ignore[arg-type]
+    sock, box = _outbox(held=True)
 
     box.send_json({"n": 1})
     await asyncio.sleep(0.2)
@@ -344,9 +350,7 @@ async def test_a_json_backlog_past_its_cap_closes_the_recipient(
 ) -> None:
     """JSON is never dropped, so a recipient that lets it pile up past the cap is closed instead."""
     monkeypatch.setattr(outbox, "MAX_JSON_BACKLOG", 3)
-    sock = _Socket()
-    sock.gate.clear()
-    box = Outbox(sock, "viewer")  # type: ignore[arg-type]
+    sock, box = _outbox(held=True)
     box.send_json({"n": 0})
     await _settle()
 
@@ -360,7 +364,7 @@ async def test_a_json_backlog_past_its_cap_closes_the_recipient(
 
 async def test_a_failed_send_is_logged_and_the_next_message_still_goes_out() -> None:
     """One send raising does not stop the drain."""
-    sock = _Socket()
+    sock, box = _outbox()
     calls = 0
     real_send = sock.send_json
 
@@ -372,7 +376,6 @@ async def test_a_failed_send_is_logged_and_the_next_message_still_goes_out() -> 
         await real_send(payload)
 
     sock.send_json = flaky  # type: ignore[method-assign]
-    box = Outbox(sock, "viewer")  # type: ignore[arg-type]
 
     box.send_json({"n": 1})
     box.send_json({"n": 2})
@@ -384,9 +387,8 @@ async def test_a_failed_send_is_logged_and_the_next_message_still_goes_out() -> 
 
 async def test_nothing_is_sent_to_a_socket_that_is_no_longer_connected() -> None:
     """A queued message for a socket that has since disconnected is skipped, not sent."""
-    sock = _Socket()
+    sock, box = _outbox()
     sock.client_state = WebSocketState.DISCONNECTED
-    box = Outbox(sock, "viewer")  # type: ignore[arg-type]
 
     box.send_json({"n": 1})
     box.send_media(_video(_A, b"f"))
@@ -398,8 +400,7 @@ async def test_nothing_is_sent_to_a_socket_that_is_no_longer_connected() -> None
 
 async def test_flush_waits_for_the_queue_and_times_out_on_a_stuck_one() -> None:
     """`flush` reports whether everything queued so far went out in time."""
-    sock = _Socket()
-    box = Outbox(sock, "viewer")  # type: ignore[arg-type]
+    sock, box = _outbox()
     assert await box.flush(0.1)
 
     box.send_json({"n": 1})
@@ -414,9 +415,7 @@ async def test_flush_waits_for_the_queue_and_times_out_on_a_stuck_one() -> None:
 
 async def test_aclose_stops_the_drain_and_drops_what_was_queued() -> None:
     """After `aclose` nothing more goes out and later sends are ignored."""
-    sock = _Socket()
-    sock.gate.clear()
-    box = Outbox(sock, "viewer")  # type: ignore[arg-type]
+    sock, box = _outbox(held=True)
     box.send_json({"n": 1})
     box.send_media(_video(_A, b"f"))
     await _settle()
@@ -432,8 +431,8 @@ async def test_aclose_stops_the_drain_and_drops_what_was_queued() -> None:
 
 async def test_session_end_delivers_its_notice_before_closing_each_socket() -> None:
     """`session_ended` reaches every member before their socket closes under it."""
-    host, guest = _Socket(), _Socket()
-    boxes = [Outbox(host, "host"), Outbox(guest, "guest")]  # type: ignore[arg-type]
+    (host, host_box), (guest, guest_box) = _outbox("host"), _outbox("guest")
+    boxes = [host_box, guest_box]
     session.ROOM["controller"] = {"websocket": host, "outbox": boxes[0]}
     session.ROOM["viewers"] = {"g": {"websocket": guest, "outbox": boxes[1]}}
 

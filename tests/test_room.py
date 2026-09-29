@@ -16,7 +16,7 @@ from starlette.testclient import WebSocketTestSession
 from starlette.types import Message
 from starlette.websockets import WebSocketDisconnect
 
-from webstation_broker import room, session, settings
+from webstation_broker import outbox, room, session, settings
 
 from .conftest import PREFIX, FakeEmulator
 
@@ -777,9 +777,7 @@ _SLOW_DELIVERY_WAIT = 1.0
 def _stall_sends(token: str, released: threading.Event) -> None:
     """Make one member's socket a slow consumer: every send to it parks until `released` is set.
 
-    Stands in for a viewer on a bad link, whose socket write waits on a full
-    TCP buffer. The parked send polls a thread event rather than awaiting an
-    asyncio one, so the test thread can release it.
+    A thread event, polled, so the test thread can release the parked sends.
 
     Args:
         token: The seat token of the member to slow down.
@@ -827,6 +825,18 @@ def _receive_within(conn: WebSocketTestSession, seconds: float, kind: str) -> Op
     return conn.portal.call(read)
 
 
+def _video_frame(body: bytes) -> bytes:
+    """Build an unstamped video frame as a client sends it.
+
+    Args:
+        body: The encoded payload.
+
+    Returns:
+        The frame in the room's binary wire format.
+    """
+    return b"AAAAAAAA" + bytes([outbox.VIDEO_FRAME]) + body
+
+
 def test_a_slow_viewer_does_not_hold_up_the_senders_next_media_frame(
     client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
 ) -> None:
@@ -839,9 +849,9 @@ def test_a_slow_viewer_does_not_hold_up_the_senders_next_media_frame(
     with _connect(client, controller) as host, _connect(client, healthy) as ok, _connect(client, slow):
         _stall_sends(slow, released)
         try:
-            host.send_bytes(b"AAAAAAAA" + bytes([0x01]) + b"frame-1")
+            host.send_bytes(_video_frame(b"frame-1"))
             first = _receive_within(ok, _SLOW_DELIVERY_WAIT, "bytes")
-            host.send_bytes(b"AAAAAAAA" + bytes([0x01]) + b"frame-2")
+            host.send_bytes(_video_frame(b"frame-2"))
             second = _receive_within(ok, _SLOW_DELIVERY_WAIT, "bytes")
         finally:
             released.set()
@@ -862,7 +872,7 @@ def test_a_slow_viewer_does_not_hold_up_the_senders_chat(
     with _connect(client, controller) as host, _connect(client, healthy) as ok, _connect(client, slow):
         _stall_sends(slow, released)
         try:
-            host.send_bytes(b"AAAAAAAA" + bytes([0x01]) + b"frame-1")
+            host.send_bytes(_video_frame(b"frame-1"))
             host.send_json({"action": "send_chat_message", "message": "still here"})
             chat = _receive_within(ok, _SLOW_DELIVERY_WAIT, "chat_message")
         finally:
