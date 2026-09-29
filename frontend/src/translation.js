@@ -9,6 +9,7 @@ const en = {
         title: 'Settings',
         microphoneLabel: 'Microphone',
         webcamLabel: 'Webcam',
+        touchOpacityLabel: 'Touch controls opacity',
     },
     alerts: {
         mediaAccessError: 'Could not access your camera or microphone: {message}',
@@ -79,6 +80,7 @@ const es = {
         title: 'Ajustes',
         microphoneLabel: 'Micrófono',
         webcamLabel: 'Cámara web',
+        touchOpacityLabel: 'Opacidad de los controles táctiles',
     },
     alerts: {
         mediaAccessError: 'No se pudo acceder a tu cámara o micrófono: {message}',
@@ -148,6 +150,7 @@ const zh = {
         title: '设置',
         microphoneLabel: '麦克风',
         webcamLabel: '网络摄像头',
+        touchOpacityLabel: '触控按键不透明度',
     },
     alerts: {
         mediaAccessError: '无法访问您的摄像头或麦克风：{message}',
@@ -217,6 +220,7 @@ const hi = {
         title: 'सेटिंग्स',
         microphoneLabel: 'माइक्रोफ़ोन',
         webcamLabel: 'वेबकैम',
+        touchOpacityLabel: 'टच कंट्रोल की अपारदर्शिता',
     },
     alerts: {
         mediaAccessError: 'आपके कैमरे या माइक्रोफ़ोन तक नहीं पहुँच सका: {message}',
@@ -286,6 +290,7 @@ const pt = {
         title: 'Configurações',
         microphoneLabel: 'Microfone',
         webcamLabel: 'Webcam',
+        touchOpacityLabel: 'Opacidade dos controles de toque',
     },
     alerts: {
         mediaAccessError: 'Não foi possível acessar sua câmera ou microfone: {message}',
@@ -355,6 +360,7 @@ const fr = {
         title: 'Paramètres',
         microphoneLabel: 'Microphone',
         webcamLabel: 'Webcam',
+        touchOpacityLabel: 'Opacité des commandes tactiles',
     },
     alerts: {
         mediaAccessError: 'Impossible d\'accéder à votre caméra ou à votre microphone : {message}',
@@ -424,6 +430,7 @@ const ru = {
         title: 'Настройки',
         microphoneLabel: 'Микрофон',
         webcamLabel: 'Веб-камера',
+        touchOpacityLabel: 'Непрозрачность сенсорного управления',
     },
     alerts: {
         mediaAccessError: 'Не удалось получить доступ к вашей камере или микрофону: {message}',
@@ -493,6 +500,7 @@ const de = {
         title: 'Einstellungen',
         microphoneLabel: 'Mikrofon',
         webcamLabel: 'Webcam',
+        touchOpacityLabel: 'Deckkraft der Touch-Steuerung',
     },
     alerts: {
         mediaAccessError: 'Zugriff auf Ihre Kamera oder Ihr Mikrofon fehlgeschlagen: {message}',
@@ -562,6 +570,7 @@ const tr = {
         title: 'Ayarlar',
         microphoneLabel: 'Mikrofon',
         webcamLabel: 'Web Kamerası',
+        touchOpacityLabel: 'Dokunmatik kontrollerin opaklığı',
     },
     alerts: {
         mediaAccessError: 'Kameranıza veya mikrofonunuza erişilemedi: {message}',
@@ -631,6 +640,7 @@ const it = {
         title: 'Impostazioni',
         microphoneLabel: 'Microfono',
         webcamLabel: 'Webcam',
+        touchOpacityLabel: 'Opacità dei controlli touch',
     },
     alerts: {
         mediaAccessError: 'Impossibile accedere alla tua fotocamera o al tuo microfono: {message}',
@@ -700,6 +710,7 @@ const nl = {
         title: 'Instellingen',
         microphoneLabel: 'Microfoon',
         webcamLabel: 'Webcam',
+        touchOpacityLabel: 'Dekking van aanraakbediening',
     },
     alerts: {
         mediaAccessError: 'Kon geen toegang krijgen tot uw camera of microfoon: {message}',
@@ -769,6 +780,7 @@ const ar = {
         title: 'الإعدادات',
         microphoneLabel: 'الميكروفون',
         webcamLabel: 'كاميرا الويب',
+        touchOpacityLabel: 'عتامة أزرار اللمس',
     },
     alerts: {
         mediaAccessError: 'تعذر الوصول إلى الكاميرا أو الميكروفون: {message}',
@@ -838,6 +850,7 @@ const ko = {
         title: '설정',
         microphoneLabel: '마이크',
         webcamLabel: '웹캠',
+        touchOpacityLabel: '터치 컨트롤 불투명도',
     },
     alerts: {
         mediaAccessError: '카메라 또는 마이크에 액세스할 수 없습니다: {message}',
@@ -907,6 +920,7 @@ const ja = {
         title: '設定',
         microphoneLabel: 'マイク',
         webcamLabel: 'ウェブカメラ',
+        touchOpacityLabel: 'タッチ操作ボタンの不透明度',
     },
     alerts: {
         mediaAccessError: 'カメラまたはマイクにアクセスできませんでした：{message}',
@@ -976,6 +990,7 @@ const vi = {
         title: 'Cài đặt',
         microphoneLabel: 'Micrô',
         webcamLabel: 'Webcam',
+        touchOpacityLabel: 'Độ đục của nút cảm ứng',
     },
     alerts: {
         mediaAccessError: 'Không thể truy cập máy ảnh hoặc micrô của bạn: {message}',
@@ -1045,6 +1060,7 @@ const th = {
         title: 'การตั้งค่า',
         microphoneLabel: 'ไมโครโฟน',
         webcamLabel: 'เว็บแคม',
+        touchOpacityLabel: 'ความทึบของปุ่มสัมผัส',
     },
     alerts: {
         mediaAccessError: 'ไม่สามารถเข้าถึงกล้องหรือไมโครโฟนของคุณได้: {message}',
@@ -1114,6 +1130,7 @@ const fil = {
         title: 'Mga Setting',
         microphoneLabel: 'Mikropono',
         webcamLabel: 'Webcam',
+        touchOpacityLabel: 'Opacity ng touch controls',
     },
     alerts: {
         mediaAccessError: 'Hindi ma-access ang iyong camera o mikropono: {message}',
@@ -1183,6 +1200,7 @@ const da = {
         title: 'Indstillinger',
         microphoneLabel: 'Mikrofon',
         webcamLabel: 'Webcam',
+        touchOpacityLabel: 'Uigennemsigtighed for touch-knapper',
     },
     alerts: {
         mediaAccessError: 'Kunne ikke få adgang til dit kamera eller din mikrofon: {message}',
