@@ -191,8 +191,11 @@ class Outbox:
                     else self._websocket.send_json(item)
                 )
                 try:
-                    await asyncio.wait_for(send, SEND_STALL_LIMIT)
-                except asyncio.TimeoutError:
+                    # timeout() runs the send in this task; wait_for() would
+                    # wrap it in a new task per frame on Python 3.11.
+                    async with asyncio.timeout(SEND_STALL_LIMIT):
+                        await send
+                except TimeoutError:
                     log.warning(
                         "room outbox: a send to %s took over %.0fs, closing it",
                         self._label,

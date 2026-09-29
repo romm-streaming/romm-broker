@@ -54,7 +54,11 @@ class _Socket:
 
 
 async def _settle() -> None:
-    """Let the drain task run everything it can without a real wait."""
+    """Give the drain task a few loop turns, for checks that nothing (more) went out.
+
+    Anything expected to be sent is waited for with `Outbox.flush` instead: how
+    many turns one send takes differs between Python versions.
+    """
     for _ in range(20):
         await asyncio.sleep(0)
 
@@ -68,7 +72,7 @@ async def test_json_goes_out_before_queued_media_and_each_kind_keeps_its_order()
     box.send_media(b"f2")
     box.send_json({"n": 1})
     box.send_json({"n": 2})
-    await _settle()
+    assert await box.flush(1.0)
 
     assert sock.events == [
         ("json", {"n": 1}),
@@ -92,7 +96,7 @@ async def test_a_recipient_that_falls_behind_loses_its_oldest_frames_but_no_json
         box.send_media(frame)
     box.send_json({"type": "chat_message"})
     sock.gate.set()
-    await _settle()
+    assert await box.flush(1.0)
 
     sent_frames = [value for kind, value in sock.events if kind == "bytes"]
     assert sent_frames == [b"in-flight", *frames[5:]]
@@ -158,7 +162,7 @@ async def test_a_failed_send_is_logged_and_the_next_message_still_goes_out() -> 
 
     box.send_json({"n": 1})
     box.send_json({"n": 2})
-    await _settle()
+    assert await box.flush(1.0)
 
     assert sock.events == [("json", {"n": 2})]
     await box.aclose()
@@ -172,7 +176,7 @@ async def test_nothing_is_sent_to_a_socket_that_is_no_longer_connected() -> None
 
     box.send_json({"n": 1})
     box.send_media(b"f")
-    await _settle()
+    assert await box.flush(1.0)
 
     assert sock.events == []
     await box.aclose()
