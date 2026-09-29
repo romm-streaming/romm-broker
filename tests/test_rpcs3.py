@@ -12,6 +12,7 @@ import signal
 import socket
 import struct
 import subprocess
+import sys
 import threading
 import time
 import zipfile
@@ -1936,21 +1937,12 @@ def test_game_window_prefers_the_launch_pid_over_a_window_with_no_pid(
 # -- archive extraction / extraction cache --
 
 
-@pytest.mark.parametrize("setting,expected", [
-    ("1", True), ("true", True), ("YES", True), (" on ", True),
-    ("0", False), ("false", False), ("", False),
-])
-def test_the_cache_enabled_switch_reads_the_usual_spellings(setting: str, expected: bool) -> None:
-    """_truthy recognizes the usual truthy and falsy string spellings."""
-    assert rpcs3._truthy(setting) is expected
-
-
 @pytest.fixture
 def cache_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """Point the archive extraction cache at an isolated temp directory with caching disabled."""
     cache = tmp_path / "cache"
     monkeypatch.setattr(rpcs3, "CACHE_DIR", cache)
-    monkeypatch.setattr(rpcs3, "CACHE_ENABLED", False)
+    monkeypatch.setattr(settings, "RPCS3_CACHE_ENABLED", False)
     return cache
 
 
@@ -1981,7 +1973,7 @@ def test_evict_lru_removes_the_least_recently_used_entry_first(
     cache_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Evict LRU removes the least recently used entry first."""
-    monkeypatch.setattr(rpcs3, "CACHE_ENABLED", True)
+    monkeypatch.setattr(settings, "RPCS3_CACHE_ENABLED", True)
     monkeypatch.setattr(rpcs3, "CACHE_MAX_GB", 8 / 1024**3)
     old = cache_dir / "Old"
     new = cache_dir / "New"
@@ -2000,7 +1992,7 @@ def test_evict_lru_never_removes_the_entry_being_extracted(
     cache_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Evict LRU never removes the entry being extracted."""
-    monkeypatch.setattr(rpcs3, "CACHE_ENABLED", True)
+    monkeypatch.setattr(settings, "RPCS3_CACHE_ENABLED", True)
     monkeypatch.setattr(rpcs3, "CACHE_MAX_GB", 1 / 1024**3)
     keep = cache_dir / "Incoming"
     _touch(keep / "EBOOT.BIN")
@@ -2015,7 +2007,7 @@ def test_evict_lru_gives_up_and_proceeds_when_nothing_is_left_to_evict(
     cache_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Evict LRU gives up and proceeds when nothing is left to evict."""
-    monkeypatch.setattr(rpcs3, "CACHE_ENABLED", True)
+    monkeypatch.setattr(settings, "RPCS3_CACHE_ENABLED", True)
     monkeypatch.setattr(rpcs3, "CACHE_MAX_GB", 1 / 1024**3)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2139,6 +2131,10 @@ def test_extract_archive_dispatches_rar_to_unrar(
     """Extract archive dispatches rar to unrar."""
     calls = []
     monkeypatch.setattr(rpcs3, "_run_extractor", lambda cmd, what: calls.append(cmd) or "")
+    monkeypatch.setattr(
+        rpcs3.extraction_cache, "_run_extractor",
+        lambda cmd, what, timeout: calls.append(cmd) or "PS3_GAME/USRDIR/EBOOT.BIN\n",
+    )
     archive = tmp_path / "Game.rar"
     archive.write_bytes(b"rar")
 
@@ -2154,7 +2150,11 @@ def test_extract_archive_dispatches_7z_and_unknown_exts_to_7z(
 ) -> None:
     """Extract archive dispatches .7z and unknown extensions to the 7z tool."""
     calls = []
+    slt_output = "Path = Game.7z\n\n----------\nPath = PS3_GAME/USRDIR/EBOOT.BIN\nSize = 4\n"
     monkeypatch.setattr(rpcs3, "_run_extractor", lambda cmd, what: calls.append(cmd) or "")
+    monkeypatch.setattr(
+        rpcs3.extraction_cache, "_run_extractor", lambda cmd, what, timeout: calls.append(cmd) or slt_output
+    )
     archive = tmp_path / "Game.7z"
     archive.write_bytes(b"7z")
 
@@ -2170,11 +2170,12 @@ def test_extract_archive_rar_rejects_a_member_that_escapes_the_dest(
     """Extract archive rar rejects a member that escapes the dest."""
     calls = []
 
-    def fake_run(cmd: list[str], what: str) -> str:
+    def fake_run(cmd: list[str], what: str, timeout: float = 0.0) -> str:
         calls.append(cmd)
         return "../../etc/passwd\n" if cmd[1] == "lb" else ""
 
     monkeypatch.setattr(rpcs3, "_run_extractor", fake_run)
+    monkeypatch.setattr(rpcs3.extraction_cache, "_run_extractor", fake_run)
     archive = tmp_path / "Evil.rar"
     archive.write_bytes(b"rar")
 
@@ -2191,11 +2192,12 @@ def test_extract_archive_7z_rejects_a_member_that_escapes_the_dest(
     calls = []
     slt_output = "Path = Evil.7z\n\n----------\nPath = ../../etc/passwd\nSize = 4\n"
 
-    def fake_run(cmd: list[str], what: str) -> str:
+    def fake_run(cmd: list[str], what: str, timeout: float = 0.0) -> str:
         calls.append(cmd)
         return slt_output if cmd[1] == "l" else ""
 
     monkeypatch.setattr(rpcs3, "_run_extractor", fake_run)
+    monkeypatch.setattr(rpcs3.extraction_cache, "_run_extractor", fake_run)
     archive = tmp_path / "Evil.7z"
     archive.write_bytes(b"7z")
 
@@ -2203,23 +2205,6 @@ def test_extract_archive_7z_rejects_a_member_that_escapes_the_dest(
         rpcs3._extract_archive(archive, cache_dir / "Evil")
 
     assert calls == [["7z", "l", "-slt", str(archive)]]
-
-
-def test_reject_unsafe_members_rejects_a_traversal_path(tmp_path: Path) -> None:
-    """Reject unsafe members rejects a traversal path."""
-    dest = tmp_path / "dest"
-    dest.mkdir()
-
-    with pytest.raises(RuntimeError, match="escapes"):
-        rpcs3._reject_unsafe_members(dest, ["../outside.txt"])
-
-
-def test_reject_unsafe_members_allows_normal_paths(tmp_path: Path) -> None:
-    """Reject unsafe members allows normal paths."""
-    dest = tmp_path / "dest"
-    dest.mkdir()
-
-    rpcs3._reject_unsafe_members(dest, ["a/b/c.txt", "top.txt"])
 
 
 def test_reject_escaped_tree_allows_a_normal_extraction(tmp_path: Path) -> None:
@@ -2260,7 +2245,7 @@ def test_extract_and_cache_serializes_a_second_call_racing_the_same_archive(
     could interleave writes into the same not-yet-populated game_dir or
     have one call evict the directory the other is about to boot from.
     """
-    monkeypatch.setattr(rpcs3, "CACHE_ENABLED", True)
+    monkeypatch.setattr(settings, "RPCS3_CACHE_ENABLED", True)
     archive = tmp_path / "Game.zip"
     archive.write_bytes(b"zip")
 
@@ -2295,28 +2280,6 @@ def test_extract_and_cache_serializes_a_second_call_racing_the_same_archive(
     release.set()
     first.join(timeout=5)
     second.join(timeout=5)
-
-
-def test_rar_member_paths_parses_bare_listing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """_rar_member_paths parses a bare listing with no archive header."""
-    monkeypatch.setattr(rpcs3, "_run_extractor", lambda cmd, what: "sub\nsub/file.txt\ntop.txt\n")
-
-    assert rpcs3._rar_member_paths(tmp_path / "Game.rar") == ["sub", "sub/file.txt", "top.txt"]
-
-
-def test_7z_member_paths_parses_slt_listing_and_skips_the_archive_header(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """_7z_member_paths parses an slt listing and skips the archive header line."""
-    slt_output = (
-        "Path = Game.7z\nType = 7z\n\n"
-        "----------\n"
-        "Path = sub\nSize = 0\n\n"
-        "Path = sub/file.txt\nSize = 3\n"
-    )
-    monkeypatch.setattr(rpcs3, "_run_extractor", lambda cmd, what: slt_output)
-
-    assert rpcs3._7z_member_paths(tmp_path / "Game.7z") == ["sub", "sub/file.txt"]
 
 
 def test_run_extractor_raises_on_a_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2697,13 +2660,18 @@ def test_stop_keeps_the_extraction_for_the_next_launch(
     assert game_dir.exists()
 
 
-def test_the_cache_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_cache_is_disabled_by_default() -> None:
     """The cache is disabled by default when RPCS3_CACHE_ENABLED is unset."""
-    monkeypatch.delenv("RPCS3_CACHE_ENABLED", raising=False)
-    assert rpcs3._truthy(os.environ.get("RPCS3_CACHE_ENABLED", "false")) is False
+    env = {k: v for k, v in os.environ.items() if k != "RPCS3_CACHE_ENABLED"}
+    code = "from webstation_broker import settings; print(settings.RPCS3_CACHE_ENABLED)"
+    probe = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env, capture_output=True, text=True, check=True,
+    )
+    assert probe.stdout.strip() == "False"
 
 
-# -- CACHE_ENABLED gating of archive ROMs --
+# -- RPCS3_CACHE_ENABLED gating of archive ROMs --
 
 
 @pytest.mark.parametrize("ext", [".7z", ".zip", ".rar"])
@@ -2715,7 +2683,7 @@ def test_resolve_rejects_an_archive_file_when_the_cache_is_disabled(
     Without the cache, an extraction would just be discarded on every
     launch, so only natively bootable formats should resolve at all.
     """
-    monkeypatch.setattr(rpcs3, "CACHE_ENABLED", False)
+    monkeypatch.setattr(settings, "RPCS3_CACHE_ENABLED", False)
     rom = tmp_path / f"game{ext}"
     rom.write_bytes(b"")
 
@@ -2727,7 +2695,7 @@ def test_resolve_accepts_an_archive_file_when_the_cache_is_enabled(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ext: str
 ) -> None:
     """An archive ROM resolves normally once the extraction cache is enabled."""
-    monkeypatch.setattr(rpcs3, "CACHE_ENABLED", True)
+    monkeypatch.setattr(settings, "RPCS3_CACHE_ENABLED", True)
     rom = tmp_path / f"game{ext}"
     rom.write_bytes(b"")
 
@@ -2743,7 +2711,7 @@ def test_resolve_accepts_a_pkg_file_regardless_of_the_cache_setting(
     .pkg installs through _install_pkgs into GAME_DIR, a separate always-on
     path unrelated to the archive extraction cache.
     """
-    monkeypatch.setattr(rpcs3, "CACHE_ENABLED", cache_enabled)
+    monkeypatch.setattr(settings, "RPCS3_CACHE_ENABLED", cache_enabled)
     rom = tmp_path / "game.pkg"
     rom.write_bytes(b"")
 
@@ -2754,7 +2722,7 @@ def test_pick_rom_file_skips_an_archive_candidate_when_the_cache_is_disabled(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A folder holding only an archive yields nothing when the cache is disabled."""
-    monkeypatch.setattr(rpcs3, "CACHE_ENABLED", False)
+    monkeypatch.setattr(settings, "RPCS3_CACHE_ENABLED", False)
     monkeypatch.setattr(rpcs3, "ROM_ROOT", tmp_path)
     folder = tmp_path / "MyGame"
     archive = folder / "game.zip"
@@ -2768,7 +2736,7 @@ def test_pick_rom_file_accepts_an_archive_candidate_when_the_cache_is_enabled(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A folder holding an archive yields it once the cache is enabled."""
-    monkeypatch.setattr(rpcs3, "CACHE_ENABLED", True)
+    monkeypatch.setattr(settings, "RPCS3_CACHE_ENABLED", True)
     monkeypatch.setattr(rpcs3, "ROM_ROOT", tmp_path)
     folder = tmp_path / "MyGame"
     archive = folder / "game.zip"

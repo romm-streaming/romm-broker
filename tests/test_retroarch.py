@@ -4534,7 +4534,7 @@ class TestCoreProfile:
         rom = tmp_path / "Game.7z"
         rom.write_bytes(b"7z")
         monkeypatch.setattr(
-            retroarch.extraction_cache, "_7z_member_paths", lambda archive, timeout: ["dir/Game.SMC"]
+            retroarch.extraction_cache, "list_members", lambda archive, timeout: ["dir/Game.SMC"]
         )
         emu = _with_core("snes", "bsnes")
         emu.select_core()
