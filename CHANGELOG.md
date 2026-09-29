@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.11.1](https://github.com/romm-streaming/romm-broker/compare/v0.11.0...v0.11.1) (2026-09-29)
+
+
+### Bug Fixes
+
+* **retroarch:** boot a ROM folder's lone .zip/.7z archive ([c062c68](https://github.com/romm-streaming/romm-broker/commit/c062c6833e02dcfc4aab950b56e72aa1f2b45c4e))
+* **retroarch:** boot a ROM folder's lone .zip/.7z archive ([1f4bb1d](https://github.com/romm-streaming/romm-broker/commit/1f4bb1d98a5608a31a1db214322dea30758375fa))
+* **session:** compare invite tokens as bytes so non-ASCII input returns 401 ([1641564](https://github.com/romm-streaming/romm-broker/commit/16415643525dc8b3e140d5ee317191b678f89514))
+* **session:** compare invite tokens as bytes so non-ASCII input returns 401 ([fd23c94](https://github.com/romm-streaming/romm-broker/commit/fd23c94660fa6d58369d2e4b50c6dcf330f46ad2))
+
+
+### Documentation
+
+* fix stale env vars and module lists ([5616554](https://github.com/romm-streaming/romm-broker/commit/56165544bb48e049eeaea96ae58a2b8868f941f8))
+
 ## [0.11.0](https://github.com/romm-streaming/romm-broker/compare/v0.10.0...v0.11.0) (2026-09-28)
 
 
