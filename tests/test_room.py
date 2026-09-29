@@ -879,3 +879,28 @@ def test_a_slow_viewer_does_not_hold_up_the_senders_chat(
             released.set()
 
     assert chat is not None and json.loads(chat["text"])["message"] == "still here"
+
+
+def test_a_viewer_that_stops_reading_leaves_the_room(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A laggard the outbox gives up on is dropped from the room, not left holding its seat's connection."""
+    monkeypatch.setattr(outbox, "SEND_STALL_LIMIT", 0.1)
+    controller = _activate(client, broker_dirs)
+    slow = _invite(client, controller)
+    released = threading.Event()
+
+    with _connect(client, controller) as host, _connect(client, slow):
+        _stall_sends(slow, released)
+        try:
+            host.send_json({"action": "send_chat_message", "message": "anyone there"})
+            left = _receive_within(host, _SLOW_DELIVERY_WAIT * 3, "user_left")
+            still_seated = slow in session.ROOM["viewers"]
+        finally:
+            released.set()
+
+    assert left is not None
+    assert not still_seated

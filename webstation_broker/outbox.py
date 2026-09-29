@@ -11,12 +11,13 @@ delay, and video absorbs the lag before audio does.
 A frame is dropped only once it has waited `MAX_MEDIA_AGE`. Webcam deltas
 each depend on the frame before, so after one of a sender's video frames is
 dropped for a recipient, that sender's later deltas are skipped for it too
-until a keyframe, and `on_video_gap` asks the sender for one. A sender's
-video config is never dropped.
+until a keyframe, and `on_video_gap` asks the sender for one with every
+frame skipped meanwhile. A sender's video config is never dropped.
 
 A recipient that stops draining (one send outlasting `SEND_STALL_LIMIT`, or
-more than `MAX_JSON_BACKLOG` JSON messages queued) is closed; the client
-reconnects on the same seat.
+more than `MAX_JSON_BACKLOG` JSON messages queued) is closed and `abandoned`
+is set, so its handler stops waiting on it; the client reconnects on the
+same seat.
 """
 
 import asyncio
@@ -78,6 +79,8 @@ class Outbox:
     built before the event loop that serves the connection is known.
 
     Attributes:
+        label: The member's display name, for log lines only.
+        abandoned: Set once the recipient is given up on as stuck.
         dropped_video: Video frames discarded for this recipient.
         dropped_audio: Audio frames discarded for this recipient.
     """
@@ -93,11 +96,11 @@ class Outbox:
         Args:
             websocket: The accepted room socket the messages go out on.
             label: The member's display name, for log lines only.
-            on_video_gap: Called with a sender's media id when this recipient
-                has lost one of its video frames and now waits for a keyframe.
+            on_video_gap: Called with a sender's media id each time this
+                recipient drops one of its video frames, until a keyframe gets through.
         """
         self._websocket = websocket
-        self._label = label
+        self.label = label
         self._on_video_gap = on_video_gap
         self._json: collections.deque[dict[str, Any]] = collections.deque()
         self._audio: collections.deque[_Queued] = collections.deque()
@@ -110,6 +113,7 @@ class Outbox:
         self._task: Optional[asyncio.Task[None]] = None
         self._closer: Optional[asyncio.Task[None]] = None
         self._closed = False
+        self.abandoned = asyncio.Event()
         self.dropped_video = 0
         self.dropped_audio = 0
 
@@ -124,7 +128,7 @@ class Outbox:
         if len(self._json) >= MAX_JSON_BACKLOG:
             log.warning(
                 "room outbox: %s has %d unsent messages, closing it",
-                self._label,
+                self.label,
                 len(self._json),
             )
             self._shut()
@@ -166,13 +170,14 @@ class Outbox:
     async def aclose(self) -> None:
         """Stop the drain task and discard anything still queued.
 
-        Called once the connection is over; it does not close the socket.
-        Logs how many frames this recipient lost, if any.
+        Called once the connection is over. It does not close the socket
+        itself, but waits out a laggard close already under way. Logs how
+        many frames this recipient lost, if any.
         """
         if self.dropped_video or self.dropped_audio:
             log.info(
                 "room outbox: %s missed %d video and %d audio frame(s) while connected",
-                self._label,
+                self.label,
                 self.dropped_video,
                 self.dropped_audio,
             )
@@ -185,6 +190,9 @@ class Outbox:
                 await task
             except asyncio.CancelledError:
                 pass
+        closer, self._closer = self._closer, None
+        if closer is not None:
+            await closer
 
     def _clear(self) -> None:
         """Drop everything queued and mark the outbox idle."""
@@ -202,9 +210,13 @@ class Outbox:
             self._task = asyncio.get_running_loop().create_task(self._drain())
 
     def _shut(self) -> None:
-        """Give up on a stuck recipient: drop its queue and close it in the background."""
+        """Give up on a stuck recipient: drop its queue, stop its drain, and close it in the background."""
         self._closed = True
         self._clear()
+        self.abandoned.set()
+        task, self._task = self._task, None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
         self._closer = asyncio.get_running_loop().create_task(self._close_socket())
 
     async def _close_socket(self) -> None:
@@ -212,10 +224,13 @@ class Outbox:
         try:
             await asyncio.wait_for(self._websocket.close(code=LAGGARD_CLOSE_CODE), CLOSE_WAIT)
         except Exception as exc:
-            log.debug("room outbox: closing %s failed: %s", self._label, exc)
+            log.debug("room outbox: closing %s failed: %s", self.label, exc)
 
     def _drop_video(self, frame: bytes) -> None:
-        """Count a dropped video frame and start waiting for its sender's next keyframe.
+        """Count a dropped video frame and wait for its sender's next keyframe.
+
+        Asks for that keyframe on every drop, not just the first: the request
+        is rate-limited upstream, and a keyframe that arrives stale is lost too.
 
         Args:
             frame: The video frame being dropped.
@@ -225,9 +240,9 @@ class Outbox:
         if sender not in self._gaps:
             self._gaps.add(sender)
             if self.dropped_video == 1:
-                log.info("room outbox: %s is behind, skipping video until a keyframe", self._label)
-            if self._on_video_gap is not None:
-                self._on_video_gap(sender)
+                log.info("room outbox: %s is behind, skipping video until a keyframe", self.label)
+        if self._on_video_gap is not None:
+            self._on_video_gap(sender)
 
     def _evict_oldest(self) -> bool:
         """Drop the oldest droppable frame to get back under the byte backstop.
@@ -275,7 +290,7 @@ class Outbox:
                 if _is_keyframe(frame) and now - queued_at <= MAX_MEDIA_AGE:
                     self._gaps.discard(sender)
                     return frame
-                self.dropped_video += 1
+                self._drop_video(frame)
                 continue
             if now - queued_at > MAX_MEDIA_AGE:
                 self._drop_video(frame)
@@ -293,7 +308,11 @@ class Outbox:
                 item = self._json.popleft() if self._json else self._next_media()
                 if item is None:
                     break
-                if self._websocket.client_state != WebSocketState.CONNECTED:
+                # A server-side close() only moves application_state.
+                if (
+                    self._websocket.client_state != WebSocketState.CONNECTED
+                    or self._websocket.application_state != WebSocketState.CONNECTED
+                ):
                     continue
                 send = (
                     self._websocket.send_bytes(item)
@@ -308,13 +327,13 @@ class Outbox:
                 except TimeoutError:
                     log.warning(
                         "room outbox: a send to %s took over %.0fs, closing it",
-                        self._label,
+                        self.label,
                         SEND_STALL_LIMIT,
                     )
                     self._shut()
                     return
                 except Exception as exc:
-                    log.warning("room send to %s failed: %s", self._label, exc)
+                    log.warning("room send to %s failed: %s", self.label, exc)
             if not self._closed:
                 self._idle.set()
 

@@ -15,7 +15,8 @@ class _Socket:
     """A room socket stand-in that records sends and can be held mid-send.
 
     Attributes:
-        client_state: What the outbox checks before each send.
+        client_state: The client's side of the connection, flipped by a test to disconnect it.
+        application_state: The server's side, which `close` moves as starlette's does.
         events: Every send and close, in order, as `(kind, value)` pairs.
         gate: Cleared to park every send until it is set again.
     """
@@ -23,6 +24,7 @@ class _Socket:
     def __init__(self) -> None:
         """Build a connected socket that sends straight away."""
         self.client_state = WebSocketState.CONNECTED
+        self.application_state = WebSocketState.CONNECTED
         self.events: list[tuple[str, Union[dict[str, Any], bytes, int]]] = []
         self.gate = asyncio.Event()
         self.gate.set()
@@ -51,6 +53,7 @@ class _Socket:
         Args:
             code: The close code the outbox used.
         """
+        self.application_state = WebSocketState.DISCONNECTED
         self.events.append(("close", code))
 
 
@@ -209,8 +212,29 @@ async def test_stale_video_is_skipped_until_its_senders_next_keyframe(
         _video(_A, b"fresh-key", key=True),
         _video(_A, b"decodable"),
     ]
-    assert gaps == [_A]
+    assert gaps == [_A, _A, _A]
     assert box.dropped_video == 3
+    await box.aclose()
+
+
+async def test_a_keyframe_that_arrives_stale_mid_gap_asks_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Losing the requested keyframe too must not leave the tile frozen until the scheduled one."""
+    monkeypatch.setattr(outbox, "MAX_MEDIA_AGE", 0.05)
+    gaps: list[bytes] = []
+    sock, box = _outbox(held=True, on_video_gap=gaps.append)
+    box.send_media(_video(_A, b"in-flight", key=True))
+    await _settle()
+    box.send_media(_video(_A, b"stale"))
+    box.send_media(_video(_A, b"stale-key", key=True))
+    await asyncio.sleep(0.1)
+
+    sock.gate.set()
+    assert await box.flush(1.0)
+
+    assert _sent_frames(sock) == [_video(_A, b"in-flight", key=True)]
+    assert gaps == [_A, _A]
     await box.aclose()
 
 
@@ -348,18 +372,47 @@ async def test_a_send_that_outlasts_the_stall_limit_closes_the_recipient(
 async def test_a_json_backlog_past_its_cap_closes_the_recipient(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """JSON is never dropped, so a recipient that lets it pile up past the cap is closed instead."""
+    """JSON is never dropped, so a recipient that lets it pile up past the cap is closed instead.
+
+    The send already in flight is abandoned with it, so it neither completes
+    nor times out into a second close.
+    """
     monkeypatch.setattr(outbox, "MAX_JSON_BACKLOG", 3)
+    monkeypatch.setattr(outbox, "SEND_STALL_LIMIT", 0.05)
     sock, box = _outbox(held=True)
     box.send_json({"n": 0})
     await _settle()
 
     for n in range(1, 5):
         box.send_json({"n": n})
+    await asyncio.sleep(0.1)
+    sock.gate.set()
     await _settle()
 
     assert sock.events == [("close", outbox.LAGGARD_CLOSE_CODE)]
+    assert box.abandoned.is_set()
     await box.aclose()
+
+
+async def test_aclose_waits_for_a_laggard_close_already_under_way(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The close started on giving up is finished, not left running past `aclose`."""
+    monkeypatch.setattr(outbox, "MAX_JSON_BACKLOG", 1)
+    sock, box = _outbox(held=True)
+    real_close = sock.close
+
+    async def slow_close(code: int = 1000) -> None:
+        await asyncio.sleep(0.05)
+        await real_close(code)
+
+    sock.close = slow_close  # type: ignore[method-assign]
+    box.send_json({"n": 0})
+    box.send_json({"n": 1})
+
+    await box.aclose()
+
+    assert sock.events == [("close", outbox.LAGGARD_CLOSE_CODE)]
 
 
 async def test_a_failed_send_is_logged_and_the_next_message_still_goes_out() -> None:
@@ -385,10 +438,11 @@ async def test_a_failed_send_is_logged_and_the_next_message_still_goes_out() -> 
     await box.aclose()
 
 
-async def test_nothing_is_sent_to_a_socket_that_is_no_longer_connected() -> None:
-    """A queued message for a socket that has since disconnected is skipped, not sent."""
+@pytest.mark.parametrize("side", ["client_state", "application_state"])
+async def test_nothing_is_sent_to_a_socket_that_is_no_longer_connected(side: str) -> None:
+    """A queued message for a socket either end has since closed is skipped, not sent."""
     sock, box = _outbox()
-    sock.client_state = WebSocketState.DISCONNECTED
+    setattr(sock, side, WebSocketState.DISCONNECTED)
 
     box.send_json({"n": 1})
     box.send_media(_video(_A, b"f"))

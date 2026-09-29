@@ -1606,12 +1606,14 @@ class _RoomSocket:
 
     Attributes:
         client_state: What the room fanout checks before sending; always connected.
+        application_state: The server side of the same check; always connected.
         sent: Every payload this seat received, in order.
     """
 
     def __init__(self) -> None:
         """Build a connected socket with nothing sent to it yet."""
         self.client_state = WebSocketState.CONNECTED
+        self.application_state = WebSocketState.CONNECTED
         self.sent: list[dict[str, Any]] = []
 
     async def send_json(self, payload: dict[str, Any]) -> None:

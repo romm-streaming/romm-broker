@@ -16,6 +16,7 @@ that is distinct from a seat's persistent `public_id` in `session.py`, which
 seat's whole life.
 """
 
+import asyncio
 import json
 import logging
 import secrets
@@ -23,6 +24,7 @@ import time
 from typing import Any, Optional
 
 from fastapi import APIRouter
+from starlette.types import Message
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from . import session, settings
@@ -97,6 +99,28 @@ def _positive_pixels(raw: Any) -> Optional[int]:
     if isinstance(raw, bool) or not isinstance(raw, int):
         return None
     return raw if 1 <= raw <= MAX_RESOLUTION_PIXELS else None
+
+
+async def _receive_unless(websocket: WebSocket, stop: "asyncio.Future[Any]") -> Optional[Message]:
+    """Receive the next message, unless `stop` completes first.
+
+    Args:
+        websocket: The room socket to read from.
+        stop: Completes when the connection should no longer be served.
+
+    Returns:
+        The message, or None once `stop` has completed.
+    """
+    receive = asyncio.ensure_future(websocket.receive())
+    try:
+        await asyncio.wait({receive, stop}, return_when=asyncio.FIRST_COMPLETED)
+    except BaseException:
+        receive.cancel()
+        raise
+    if receive.done():
+        return receive.result()
+    receive.cancel()
+    return None
 
 
 @router.websocket("/ws/room")
@@ -199,9 +223,14 @@ async def room_websocket(websocket: WebSocket) -> None:
     connection_info["has_joined"] = True
     await session.broadcast_state()
 
+    outbox = connection_info["outbox"]
+    abandoned = asyncio.ensure_future(outbox.abandoned.wait())
     try:
         while True:
-            message = await websocket.receive()
+            message = await _receive_unless(websocket, abandoned)
+            if message is None:
+                log.info("room websocket: %s stopped reading, dropping it from the room", username)
+                break
             if message.get("type") == "websocket.disconnect":
                 break
 
@@ -314,6 +343,7 @@ async def room_websocket(websocket: WebSocket) -> None:
                         viewer_ref["username"] = new_username
                         cooldowns["username"] = now
                         connection_info["username"] = new_username
+                        outbox.label = new_username
                         username = new_username
                         await session.broadcast_to_room(
                             {
@@ -445,7 +475,8 @@ async def room_websocket(websocket: WebSocket) -> None:
     except Exception:
         log.exception("unhandled room websocket error for %s", username)
     finally:
-        await connection_info["outbox"].aclose()
+        abandoned.cancel()
+        await outbox.aclose()
         current_username = connection_info.get("username")
         # A socket that was replaced by a newer one on the same token is not
         # the member leaving, so it neither cleans up nor announces a departure.
