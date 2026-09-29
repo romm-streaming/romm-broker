@@ -1913,9 +1913,11 @@ def test_extract_archive_dispatches_7z_through_the_external_tool(
     dest = tmp_path / "dest"
     dest.mkdir()
     calls = []
-    monkeypatch.setattr(shadps4.extraction_cache, "list_members", lambda a, timeout: ["CUSA23079.pkg"])
+    monkeypatch.setattr(
+        shadps4.extraction_cache, "list_members", lambda a, timeout, owner="": ["CUSA23079.pkg"]
+    )
 
-    def fake_run_extractor(cmd: list, what: str, timeout: float) -> str:
+    def fake_run_extractor(cmd: list, what: str, timeout: float, owner: str = "") -> str:
         calls.append(cmd)
         (dest / "CUSA23079.pkg").write_bytes(b"pkg data")
         return ""
@@ -1928,6 +1930,28 @@ def test_extract_archive_dispatches_7z_through_the_external_tool(
     assert (dest / "CUSA23079.pkg").exists()
 
 
+def test_extract_archive_runs_the_tools_under_pkg_extract_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every unrar/7z run the wrapper makes is bounded by PKG_EXTRACT_TIMEOUT and named as shadps4's."""
+    archive = tmp_path / "Game.rar"
+    archive.write_bytes(b"")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    runs: list[tuple[float, str]] = []
+    monkeypatch.setattr(shadps4, "PKG_EXTRACT_TIMEOUT", 42.0)
+
+    def fake_run_extractor(cmd: list, what: str, timeout: float, owner: str = "") -> str:
+        runs.append((timeout, owner))
+        return "CUSA23079.pkg\n" if cmd[1] == "lb" else ""
+
+    monkeypatch.setattr(shadps4.extraction_cache, "run_extractor", fake_run_extractor)
+
+    shadps4._extract_archive(archive, dest)
+
+    assert runs == [(42.0, "shadps4"), (42.0, "shadps4")]
+
+
 def test_extract_archive_dispatches_rar_through_the_external_tool(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1937,9 +1961,11 @@ def test_extract_archive_dispatches_rar_through_the_external_tool(
     dest = tmp_path / "dest"
     dest.mkdir()
     calls = []
-    monkeypatch.setattr(shadps4.extraction_cache, "list_members", lambda a, timeout: ["CUSA23079.pkg"])
+    monkeypatch.setattr(
+        shadps4.extraction_cache, "list_members", lambda a, timeout, owner="": ["CUSA23079.pkg"]
+    )
 
-    def fake_run_extractor(cmd: list, what: str, timeout: float) -> str:
+    def fake_run_extractor(cmd: list, what: str, timeout: float, owner: str = "") -> str:
         calls.append(cmd)
         (dest / "CUSA23079.pkg").write_bytes(b"pkg data")
         return ""
@@ -2130,9 +2156,11 @@ def test_extract_archive_discards_a_tree_that_escaped_dest(
     archive.write_bytes(b"")
     dest = tmp_path / "dest"
     dest.mkdir()
-    monkeypatch.setattr(shadps4.extraction_cache, "list_members", lambda a, timeout: ["CUSA23079.pkg"])
+    monkeypatch.setattr(
+        shadps4.extraction_cache, "list_members", lambda a, timeout, owner="": ["CUSA23079.pkg"]
+    )
 
-    def fake_run_extractor(cmd: list, what: str, timeout: float) -> str:
+    def fake_run_extractor(cmd: list, what: str, timeout: float, owner: str = "") -> str:
         (dest / "CUSA23079.pkg").write_bytes(b"pkg data")
         (dest / "escaped.pkg").symlink_to(outside)
         return ""

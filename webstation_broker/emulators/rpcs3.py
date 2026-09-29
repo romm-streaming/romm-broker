@@ -536,7 +536,7 @@ def _archive_boot_target(root: Path) -> Optional[Path]:
 
 def _extract_archive(archive: Path, dest: Path) -> None:
     """Extract a PS3 dump archive into dest, bounded by INSTALL_TIMEOUT per tool run."""
-    extraction_cache.extract_archive(archive, dest, INSTALL_TIMEOUT)
+    extraction_cache.extract_archive(archive, dest, INSTALL_TIMEOUT, owner="rpcs3")
 
 
 def _extraction_size(archive: Path) -> int:
@@ -554,7 +554,7 @@ def _extraction_size(archive: Path) -> int:
     Returns:
         The size to budget, or 0 when the archive cannot be stat'd at all.
     """
-    listed = extraction_cache.listed_size(archive, INSTALL_TIMEOUT)
+    listed = extraction_cache.listed_size(archive, INSTALL_TIMEOUT, "rpcs3")
     if listed is not None:
         return listed
     try:

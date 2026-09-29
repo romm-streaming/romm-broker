@@ -5,7 +5,7 @@ import os
 import shutil
 import zipfile
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, NoReturn, Optional
 
 import pytest
 
@@ -439,7 +439,7 @@ def _fake_listing(monkeypatch: pytest.MonkeyPatch, listing: str) -> list[list[st
     """Make every extractor run return `listing`, recording each command."""
     calls: list[list[str]] = []
     monkeypatch.setattr(
-        extraction_cache, "run_extractor", lambda cmd, what, timeout: calls.append(cmd) or listing
+        extraction_cache, "run_extractor", lambda cmd, what, timeout, owner="": calls.append(cmd) or listing
     )
     return calls
 
@@ -596,6 +596,42 @@ def test_reject_escaped_tree_logs_every_offender(tmp_path: Path, caplog: pytest.
     assert str(dest / "one") in logged and str(dest / "two") in logged
 
 
+def test_extract_archive_names_its_owner_in_the_log(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failure logged on an emulator's behalf says which emulator, as ExtractionCache's own lines do."""
+    archive = tmp_path / "Corrupt.zip"
+    archive.write_bytes(b"not a zip")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    with pytest.raises(RuntimeError, match="zip extraction"):
+        extraction_cache.extract_archive(archive, dest, 30.0, owner="rpcs3")
+    assert "rpcs3 extraction cache: zip extraction of Corrupt.zip failed" in caplog.text
+
+
+def test_extract_archive_hands_an_unresolvable_tree_to_on_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An entry that cannot be resolved rejects the tree too, so on_escape runs for it."""
+    archive = tmp_path / "Game.7z"
+    archive.write_bytes(b"")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    monkeypatch.setattr(extraction_cache, "list_members", lambda a, timeout, owner="": ["EBOOT.BIN"])
+    monkeypatch.setattr(extraction_cache, "run_extractor", lambda cmd, what, timeout, owner="": "")
+
+    def unresolvable(dest: Path, owner: str = "") -> NoReturn:
+        raise RuntimeError(f"could not resolve extracted member {dest / 'EBOOT.BIN'}: denied")
+
+    monkeypatch.setattr(extraction_cache, "reject_escaped_tree", unresolvable)
+    seen: list[str] = []
+
+    with pytest.raises(RuntimeError, match="could not resolve"):
+        extraction_cache.extract_archive(archive, dest, 30.0, on_escape=lambda d, name: seen.append(name))
+
+    assert seen == ["Game.7z"]
+
+
 def test_extract_archive_hands_an_escaped_tree_to_on_escape_then_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -606,9 +642,9 @@ def test_extract_archive_hands_an_escaped_tree_to_on_escape_then_raises(
     archive.write_bytes(b"")
     dest = tmp_path / "dest"
     dest.mkdir()
-    monkeypatch.setattr(extraction_cache, "list_members", lambda a, timeout: ["EBOOT.BIN"])
+    monkeypatch.setattr(extraction_cache, "list_members", lambda a, timeout, owner="": ["EBOOT.BIN"])
 
-    def fake_run(cmd: list[str], what: str, timeout: float) -> str:
+    def fake_run(cmd: list[str], what: str, timeout: float, owner: str = "") -> str:
         (dest / "escape").symlink_to(outside, target_is_directory=True)
         return ""
 
@@ -631,9 +667,9 @@ def test_extract_archive_leaves_on_escape_alone_for_a_contained_tree(
     archive.write_bytes(b"")
     dest = tmp_path / "dest"
     dest.mkdir()
-    monkeypatch.setattr(extraction_cache, "list_members", lambda a, timeout: ["EBOOT.BIN"])
+    monkeypatch.setattr(extraction_cache, "list_members", lambda a, timeout, owner="": ["EBOOT.BIN"])
 
-    def fake_run(cmd: list[str], what: str, timeout: float) -> str:
+    def fake_run(cmd: list[str], what: str, timeout: float, owner: str = "") -> str:
         (dest / "EBOOT.BIN").write_bytes(b"boot")
         return ""
 
@@ -658,7 +694,6 @@ def test_run_extractor_raises_on_a_nonzero_exit(monkeypatch: pytest.MonkeyPatch)
 
 def test_run_extractor_raises_when_the_binary_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     """A missing extractor binary raises rather than propagating an OSError."""
-    from typing import NoReturn
     def raise_oserror(*a: object, **k: object) -> NoReturn:
         raise OSError("not found")
     monkeypatch.setattr(extraction_cache.subprocess, "run", raise_oserror)

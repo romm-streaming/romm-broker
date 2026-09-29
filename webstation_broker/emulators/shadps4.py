@@ -431,7 +431,9 @@ def _extract_archive(archive: Path, dest: Path) -> None:
     unrar/7z have already written by the time an escaped entry is found, so
     what they left is purged rather than staying for a later launch to boot.
     """
-    extraction_cache.extract_archive(archive, dest, PKG_EXTRACT_TIMEOUT, on_escape=_purge_extraction)
+    extraction_cache.extract_archive(
+        archive, dest, PKG_EXTRACT_TIMEOUT, on_escape=_purge_extraction, owner="shadps4"
+    )
 
 
 def _run_pkg_extractor(pkg: Path, dest: Path) -> None:

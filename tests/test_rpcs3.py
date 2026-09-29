@@ -2110,9 +2110,9 @@ def test_extract_archive_dispatches_rar_to_unrar(
     timeouts = []
     monkeypatch.setattr(rpcs3, "INSTALL_TIMEOUT", 42.0)
 
-    def fake_run(cmd: list[str], what: str, timeout: float) -> str:
+    def fake_run(cmd: list[str], what: str, timeout: float, owner: str = "") -> str:
         calls.append(cmd)
-        timeouts.append(timeout)
+        timeouts.append((timeout, owner))
         return "PS3_GAME/USRDIR/EBOOT.BIN\n"
 
     monkeypatch.setattr(rpcs3.extraction_cache, "run_extractor", fake_run)
@@ -2124,7 +2124,7 @@ def test_extract_archive_dispatches_rar_to_unrar(
     assert calls[0] == ["unrar", "lb", "-y", str(archive)]
     assert calls[1][0] == "unrar" and calls[1][1] == "x"
     assert str(archive) in calls[1]
-    assert timeouts == [42.0, 42.0]
+    assert timeouts == [(42.0, "rpcs3"), (42.0, "rpcs3")]
 
 
 def test_extract_archive_dispatches_7z_and_unknown_exts_to_7z(
@@ -2134,7 +2134,8 @@ def test_extract_archive_dispatches_7z_and_unknown_exts_to_7z(
     calls = []
     slt_output = "Path = Game.7z\n\n----------\nPath = PS3_GAME/USRDIR/EBOOT.BIN\nSize = 4\n"
     monkeypatch.setattr(
-        rpcs3.extraction_cache, "run_extractor", lambda cmd, what, timeout: calls.append(cmd) or slt_output
+        rpcs3.extraction_cache, "run_extractor",
+        lambda cmd, what, timeout, owner="": calls.append(cmd) or slt_output,
     )
     archive = tmp_path / "Game.7z"
     archive.write_bytes(b"7z")
@@ -2151,7 +2152,7 @@ def test_extract_archive_rar_rejects_a_member_that_escapes_the_dest(
     """Extract archive rar rejects a member that escapes the dest."""
     calls = []
 
-    def fake_run(cmd: list[str], what: str, timeout: float = 0.0) -> str:
+    def fake_run(cmd: list[str], what: str, timeout: float = 0.0, owner: str = "") -> str:
         calls.append(cmd)
         return "../../etc/passwd\n" if cmd[1] == "lb" else ""
 
@@ -2172,7 +2173,7 @@ def test_extract_archive_7z_rejects_a_member_that_escapes_the_dest(
     calls = []
     slt_output = "Path = Evil.7z\n\n----------\nPath = ../../etc/passwd\nSize = 4\n"
 
-    def fake_run(cmd: list[str], what: str, timeout: float = 0.0) -> str:
+    def fake_run(cmd: list[str], what: str, timeout: float = 0.0, owner: str = "") -> str:
         calls.append(cmd)
         return slt_output if cmd[1] == "l" else ""
 
