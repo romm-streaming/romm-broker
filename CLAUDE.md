@@ -11,7 +11,7 @@ Session broker and collaboration interface for the RomM webstation container. It
 | `webstation_broker/` | Python 3.11+ (FastAPI) | pip-installable, console script `webstation-broker`       |
 | `frontend/`          | Vanilla JS (Vite)      | room UI, served under the `SUBFOLDER` prefix              |
 | `tests/`             | pytest                 | one test module per emulator/subsystem                    |
-| `docs/`              | Markdown               | standalone-emulator and integration notes                 |
+| `docs/`              | Fumadocs (Next.js)     | documentation site, deployed to GitHub Pages              |
 
 See [README.md](README.md) for the full request flow and save-archive layout.
 
@@ -46,7 +46,7 @@ them by path, or activate the venv first.
 uv venv && uv pip install -e . pytest pytest-asyncio "ruff==0.16.1"   # first time only
 
 .venv/bin/ruff check webstation_broker tests          # lint
-.venv/bin/pytest -q                                   # run tests (3442, ~45s)
+.venv/bin/pytest -q                                   # run tests (3760, ~50s)
 .venv/bin/pytest tests/test_flycast.py                # run a subset
 .venv/bin/webstation-broker                           # run the app (console script)
 

@@ -175,9 +175,8 @@ player would use, through xdotool, a tool that lets the broker simulate key
 presses inside the container: Shift+F`n` saves slot `n`, and F`n` loads it.
 The broker waits for Dolphin's game window to appear before sending these,
 and confirms a save actually happened by watching the `StateSaves/` folder
-for the new file. The video backend is locked to OpenGL when Dolphin
-launches
-([`DOLPHIN_VIDEO_BACKEND`](/docs/configuration/emulators#dolphin)). For
+for the new file. The video backend is left to Dolphin's own config, so
+a backend picked in Dolphin's settings survives the next launch. For
 GameCube, memory card Slot A is set
 to a folder-based card device, so the card is a normal directory the save
 archive can carry along.
