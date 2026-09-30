@@ -5,7 +5,10 @@ naming contract, and finding the game window among PPSSPP's windows.
 """
 
 import os
+import subprocess
+import sys
 import time
+import zipfile
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional
@@ -1153,3 +1156,306 @@ def test_a_push_after_an_import_must_match_the_imported_state(psp_root: Path) ->
     assert emu.state_target("ULUS10041_1.01_4.ppst") is None
     assert emu.state_target("HOMEBREW_1.00_4.ppst") is None
     assert emu.state_target("ULES00151_1.00_4.ppst") is None
+
+
+# -- Archived ROMs --
+
+
+@pytest.fixture
+def cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config_inis: tuple[Path, Path]) -> Path:
+    """Turn the extraction cache on and point it under tmp_path.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        tmp_path: The per-test temporary directory.
+        config_inis: Redirects the inis a launch patches.
+
+    Returns:
+        The cache directory, not created yet.
+    """
+    d = tmp_path / "extracted"
+    monkeypatch.setattr(ppsspp, "CACHE_DIR", d)
+    monkeypatch.setattr(ppsspp.settings, "PPSSPP_CACHE_ENABLED", True)
+    return d
+
+
+def _zip(path: Path, members: dict[str, bytes]) -> Path:
+    """Write a zip, creating parents.
+
+    Args:
+        path: The archive to write.
+        members: Member path to its contents.
+
+    Returns:
+        The archive.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as zf:
+        for member, data in members.items():
+            zf.writestr(member, data)
+    return path
+
+
+def _launched(emu: ppsspp.Ppsspp, rom: Path) -> list[str]:
+    """Launch `rom` with the spawn stubbed out, and return the argv it would have run.
+
+    Args:
+        emu: The launcher.
+        rom: What `resolve_rom_file` handed back.
+
+    Returns:
+        The argv.
+    """
+    spawned: dict[str, list[str]] = {}
+    emu.stop = lambda: None
+    emu._spawn = lambda cmd, env: spawned.update(cmd=cmd)
+    emu.launch(rom, None)
+    return spawned["cmd"]
+
+
+def test_a_zipped_image_resolves_to_the_archive(rom_root: Path, cache: Path) -> None:
+    """An archive holding a PSP image is accepted for `launch` to extract."""
+    archive = _zip(rom_root / "Game.zip", {"Game.iso": b"iso"})
+
+    assert ppsspp.Ppsspp().resolve_rom_file(archive) == archive
+
+
+def test_an_archive_holding_no_psp_image_is_refused(rom_root: Path, cache: Path) -> None:
+    """Refused at resolve, from the member list, rather than after an extraction."""
+    archive = _zip(rom_root / "Game.zip", {"readme.txt": b"hi"})
+
+    assert ppsspp.Ppsspp().resolve_rom_file(archive) is None
+
+
+def test_a_corrupt_archive_is_refused(rom_root: Path, cache: Path) -> None:
+    """A file that only claims to be a zip is a clean refusal."""
+    archive = _touch(rom_root / "Game.zip")
+
+    assert ppsspp.Ppsspp().resolve_rom_file(archive) is None
+
+
+def test_an_archive_is_refused_with_the_cache_off(
+    rom_root: Path, cache: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With nowhere to extract it, an archive cannot boot and is not advertised."""
+    monkeypatch.setattr(ppsspp.settings, "PPSSPP_CACHE_ENABLED", False)
+    archive = _zip(rom_root / "Game.zip", {"Game.iso": b"iso"})
+    emu = ppsspp.Ppsspp()
+
+    assert emu.resolve_rom_file(archive) is None
+    assert ".zip" not in emu.rom_extensions
+
+
+def test_a_folder_holding_only_an_archive_resolves_to_it(rom_root: Path, cache: Path) -> None:
+    """A ROM folder with no image of its own falls back to its one archive."""
+    archive = _zip(rom_root / "game" / "Game.zip", {"Game.cso": b"cso"})
+
+    assert ppsspp.Ppsspp().resolve_rom_file(rom_root / "game") == archive.resolve()
+
+
+def test_an_image_beside_an_archive_wins(rom_root: Path, cache: Path) -> None:
+    """The archive is only a fallback, never picked over a bootable image."""
+    _zip(rom_root / "game" / "Game.zip", {"Game.iso": b"iso"})
+    _touch(rom_root / "game" / "Game.iso")
+
+    assert ppsspp.Ppsspp().resolve_rom_file(rom_root / "game").name == "Game.iso"
+
+
+def test_a_folder_of_several_archives_is_refused(rom_root: Path, cache: Path) -> None:
+    """Two archives and no image is ambiguous, so neither is guessed at."""
+    _zip(rom_root / "game" / "Disc A.zip", {"A.iso": b"iso"})
+    _zip(rom_root / "game" / "Disc B.zip", {"B.iso": b"iso"})
+
+    assert ppsspp.Ppsspp().resolve_rom_file(rom_root / "game") is None
+
+
+def test_an_archive_in_a_subfolder_never_makes_the_games_own_ambiguous(
+    rom_root: Path, cache: Path
+) -> None:
+    """An extras bundle one folder down is not a second candidate for the game."""
+    archive = _zip(rom_root / "game" / "Game.zip", {"Game.cso": b"cso"})
+    _zip(rom_root / "game" / "extras" / "Manual.zip", {"Manual.iso": b"iso"})
+
+    assert ppsspp.Ppsspp().resolve_rom_file(rom_root / "game") == archive.resolve()
+
+
+def test_an_extracted_archive_is_not_listed_again(
+    rom_root: Path, cache: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its extraction already showed a PSP image, so a later activate skips the listing."""
+    archive = _zip(rom_root / "Game.zip", {"Game.iso": b"iso"})
+    emu = ppsspp.Ppsspp()
+    _launched(emu, emu.resolve_rom_file(archive))
+
+    def never_lists(archive: Path, timeout: float) -> list[str]:
+        """Fail the test if the archive is listed.
+
+        Args:
+            archive: The archive.
+            timeout: The lister timeout.
+
+        Raises:
+            AssertionError: Always.
+        """
+        raise AssertionError(f"listed {archive.name} again")
+
+    monkeypatch.setattr(ppsspp.extraction_cache, "list_members", never_lists)
+
+    assert ppsspp.Ppsspp().resolve_rom_file(archive) == archive
+
+
+def test_a_startup_sweep_it_cannot_read_never_stops_the_broker(
+    cache: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable cache dir skips the sweep instead of failing startup."""
+
+    def unreadable() -> None:
+        """Fail the way an unreadable scratch dir would.
+
+        Raises:
+            PermissionError: Always.
+        """
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(ppsspp._CACHE, "_clear_scratch", unreadable)
+
+    ppsspp.sweep_stale_extractions()
+
+
+def test_an_archived_rom_boots_its_extracted_image(rom_root: Path, cache: Path) -> None:
+    """The image inside the archive, wrapper folder and all, is what PPSSPP is handed."""
+    archive = _zip(rom_root / "Game.zip", {"Game (USA)/Game (USA).iso": b"iso"})
+    emu = ppsspp.Ppsspp()
+
+    cmd = _launched(emu, emu.resolve_rom_file(archive))
+
+    booted = Path(cmd[-1])
+    assert cmd[-2] == "--"
+    assert booted.name == "Game (USA).iso"
+    assert booted.is_relative_to(cache.resolve())
+    assert booted.read_bytes() == b"iso"
+    assert emu.extraction_phase is None
+
+
+def test_a_second_launch_reuses_the_extraction(
+    rom_root: Path, cache: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The archive is extracted once, then booted from the cache."""
+    archive = _zip(rom_root / "Game.zip", {"Game.iso": b"iso"})
+    extractions: list[Path] = []
+    real_extract = ppsspp.extraction_cache.extract_archive
+
+    def counting(rom: Path, dest: Path, timeout: float, **kwargs: Any) -> None:
+        """Record an extraction and run it.
+
+        Args:
+            rom: The archive.
+            dest: Where it goes.
+            timeout: The extractor timeout.
+            **kwargs: The escape hook and owner, passed on or ignored.
+        """
+        extractions.append(rom)
+        real_extract(rom, dest, timeout, **kwargs)
+
+    monkeypatch.setattr(ppsspp.extraction_cache, "extract_archive", counting)
+    emu = ppsspp.Ppsspp()
+
+    first = _launched(emu, emu.resolve_rom_file(archive))
+    second = _launched(emu, emu.resolve_rom_file(archive))
+
+    assert first == second
+    assert len(extractions) == 1
+
+
+def test_an_archive_escaping_the_cache_never_launches(rom_root: Path, cache: Path) -> None:
+    """A Zip Slip member fails the launch before anything is written or spawned."""
+    archive = _zip(rom_root / "Game.zip", {"../../escaped.iso": b"x", "Game.iso": b"iso"})
+    emu = ppsspp.Ppsspp()
+    emu.stop = lambda: None
+    emu._spawn = lambda cmd, env: pytest.fail("ppsspp spawned from a Zip Slip archive")
+
+    with pytest.raises(RuntimeError, match="escapes"):
+        emu.launch(emu.resolve_rom_file(archive), None)
+
+    assert not (cache.parent / "escaped.iso").exists()
+
+
+def test_an_extraction_cut_short_leaves_nothing_to_boot_from(
+    rom_root: Path, cache: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure mid-extraction leaves no half-written image for the next launch to trust."""
+    archive = _zip(rom_root / "Game.zip", {"Game.iso": b"iso"})
+
+    def dies(rom: Path, dest: Path, timeout: float, **kwargs: Any) -> None:
+        """Write part of the image, then fail the way a full disk would.
+
+        Args:
+            rom: The archive.
+            dest: Where it goes.
+            timeout: The extractor timeout.
+            **kwargs: The escape hook and owner, passed on or ignored.
+
+        Raises:
+            RuntimeError: Always.
+        """
+        (dest / "Game.iso").write_bytes(b"i")
+        raise RuntimeError("no space left on device")
+
+    monkeypatch.setattr(ppsspp.extraction_cache, "extract_archive", dies)
+    emu = ppsspp.Ppsspp()
+    emu.stop = lambda: None
+    emu._spawn = lambda cmd, env: pytest.fail("ppsspp spawned from a failed extraction")
+
+    with pytest.raises(RuntimeError, match="no space"):
+        emu.launch(emu.resolve_rom_file(archive), None)
+
+    assert [p.name for p in cache.iterdir() if p.name != ".scratch"] == []
+    assert not any((cache / ".scratch").iterdir())
+
+
+def test_an_image_nested_deeper_than_the_search_is_refused_at_activate(rom_root: Path, cache: Path) -> None:
+    """An image the extraction search would never find is refused before anything is extracted."""
+    archive = _zip(rom_root / "Game.zip", {"a/b/Game.iso": b"iso"})
+
+    assert ppsspp.Ppsspp().resolve_rom_file(archive) is None
+
+
+def test_an_image_one_folder_down_is_accepted(rom_root: Path, cache: Path) -> None:
+    """The usual wrapper folder is within the search's reach."""
+    archive = _zip(rom_root / "Game.zip", {"Game/Game.iso": b"iso"})
+
+    assert ppsspp.Ppsspp().resolve_rom_file(archive) == archive
+
+
+def test_a_hidden_image_does_not_make_an_archive_bootable(rom_root: Path, cache: Path) -> None:
+    """A Mac fork named like an image is not one."""
+    archive = _zip(rom_root / "Game.zip", {"__MACOSX/._Game.iso": b"fork"})
+
+    assert ppsspp.Ppsspp().resolve_rom_file(archive) is None
+
+
+def test_archives_resolve_under_a_symlinked_rom_root(
+    tmp_path: Path, cache: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `/romm` that is itself a symlink, as bind and NFS layouts make it, still boots archives."""
+    real = tmp_path / "real-romm"
+    link = tmp_path / "romm-link"
+    real.mkdir()
+    link.symlink_to(real)
+    monkeypatch.setattr(ppsspp, "ROM_ROOT", link)
+    folder = link / "psp" / "Game"
+    archive = _zip(folder / "Game.zip", {"Game.iso": b"iso"})
+
+    assert ppsspp.Ppsspp().resolve_rom_file(folder) == archive.resolve()
+    assert ppsspp.Ppsspp().resolve_rom_file(archive) == archive
+
+
+def test_the_cache_is_disabled_by_default() -> None:
+    """The cache is disabled by default when PPSSPP_CACHE_ENABLED is unset."""
+    env = {k: v for k, v in os.environ.items() if k != "PPSSPP_CACHE_ENABLED"}
+    code = "from webstation_broker import settings; print(settings.PPSSPP_CACHE_ENABLED)"
+    probe = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env, capture_output=True, text=True, check=True,
+    )
+    assert probe.stdout.strip() == "False"

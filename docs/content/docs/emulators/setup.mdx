@@ -242,6 +242,11 @@ handling (see [Supported emulators](/docs/emulators#ppsspp)). Set up the
 standalone version anyway if you want it available too; it needs no extra
 files either way.
 
+Archived PSP ROMs (`.7z`, `.zip`, `.rar`) boot once `PPSSPP_CACHE_ENABLED=true`
+is set: the broker extracts one on its first launch and keeps it, capped by
+`PPSSPP_CACHE_MAX_GB` (default 20GB). The RetroArch core reads zips on its
+own and doesn't use this cache.
+
 Set your graphics options and test a real game before moving on.
 
 ## RetroArch
@@ -374,6 +379,11 @@ firmware, or keys. The games themselves are the setup. A ScummVM game is a
 *folder* of data files rather than a single image, so the entries in your
 RomM library for this platform have to be folders, one per game, and the
 platform's `fs_path` has to resolve to the same files inside the container.
+
+A game zipped into a single `.7z`, `.zip`, or `.rar` archive works too. The
+broker extracts it on the first launch and keeps the result, capped by
+`SCUMMVM_CACHE_MAX_GB` (default 10GB). See
+[Configuration](/docs/configuration/emulators#scummvm).
 
 There's no controller step either. These are mouse-and-keyboard games, played
 with the stream's own pointer and keyboard.

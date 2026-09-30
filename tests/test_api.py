@@ -24,7 +24,7 @@ from starlette.websockets import WebSocketState
 
 from webstation_broker import api, callback, imports, room, saves, screenshot, selkies, session, settings
 from webstation_broker.app import create_app
-from webstation_broker.emulators import base, dolphin, rpcs3, shadps4
+from webstation_broker.emulators import base, dolphin, extraction_cache, ppsspp, rpcs3, scummvm, shadps4
 from webstation_broker.outbox import Outbox
 
 from .conftest import PREFIX, SLEEPER_CMD, FakeEmulator, corrupt_zip_member, mangle_zip_member
@@ -1069,7 +1069,7 @@ def test_starting_the_app_reaps_an_emulator_an_earlier_broker_left(
 
 
 @pytest.mark.parametrize("prefix", [PREFIX, ""])
-def test_starting_the_app_sweeps_the_scratch_dirs_both_caching_emulators_leave(
+def test_starting_the_app_sweeps_the_scratch_dirs_every_caching_emulator_leaves(
     prefix: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Startup reclaims orphaned extraction scratch for every emulator that extracts.
@@ -1080,10 +1080,10 @@ def test_starting_the_app_sweeps_the_scratch_dirs_both_caching_emulators_leave(
     monkeypatch.setattr(settings, "PREFIX", prefix)
     monkeypatch.setattr(settings, "BROKER_SECRET", "s3cret")
     orphans = []
-    for module, name in ((shadps4, "shadps4"), (rpcs3, "rpcs3")):
-        cache = tmp_path / name
+    for module in (shadps4, rpcs3, scummvm, ppsspp):
+        cache = tmp_path / module.__name__.rsplit(".", 1)[-1]
         monkeypatch.setattr(module, "CACHE_DIR", cache)
-        scratch = cache / module._SCRATCH_DIR_NAME / "dead-run"
+        scratch = cache / extraction_cache._SCRATCH_DIR_NAME / "dead-run"
         scratch.mkdir(parents=True)
         (scratch / "leftover").write_bytes(b"x")
         orphans.append(scratch)
@@ -1091,7 +1091,7 @@ def test_starting_the_app_sweeps_the_scratch_dirs_both_caching_emulators_leave(
     with TestClient(create_app()):
         pass
 
-    assert [o.exists() for o in orphans] == [False, False]
+    assert [o.exists() for o in orphans] == [False, False, False, False]
 
 
 def test_exiting_nothing_is_a_conflict(client: TestClient) -> None:

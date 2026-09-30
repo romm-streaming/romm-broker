@@ -209,6 +209,17 @@ screenshot, which needs `resume_slot`. The RetroArch `ppsspp` core takes no
 imported PSP save: RetroArch refuses one and names `ppsspp` in the refusal's
 `suggest_emulator`.
 
+With `PPSSPP_CACHE_ENABLED=true`, a PSP image stored as a `.7z`, `.zip`, or
+`.rar` archive boots too. PPSSPP can't read one directly, so the first launch extracts it into the
+[extraction cache](/docs/configuration/emulators#ppsspp) and later launches
+reuse that copy. `rom.path` can name the archive itself, or a folder that
+holds exactly one archive and no loose image; an archive in a subfolder
+beside it, such as extras, doesn't count. A folder with several archives
+side by side is refused, since there's no telling which one is the game, and
+so is an archive whose image sits more than one folder down. Save data is
+keyed by the game's serial, not its file path, so zipping a game you already
+have saves for keeps them.
+
 ## Cemu
 
 Cemu has no save states; `mlc01/usr/save/` is where its save data lives.
@@ -422,6 +433,19 @@ success even when it added nothing, so its exit code alone can't tell you
 whether it worked. If `rom.path` points at a single file instead, a
 `.scummvm` marker file, for example, ScummVM registers the folder that file
 sits in.
+
+A game can also be stored as a single `.7z`, `.zip`, or `.rar` archive,
+either named directly by `rom.path` or sitting alone in the game's folder.
+ScummVM can't detect a game inside an archive, so the first launch extracts
+it into the [extraction cache](/docs/configuration/emulators#scummvm) and
+registers the extracted folder instead. A single wrapper folder inside the
+archive (`Monkey Island/`, say) is walked into, and macOS `__MACOSX` clutter
+is ignored. Later launches reuse the same extraction and the same target, so
+saves keep their names. Replacing the archive with a different file extracts
+it again, under the same target. A second archive of the same game is
+refused, the same way a second folder copy is, so two copies never share
+one set of saves. An archive with no game files in it is refused before
+anything is extracted.
 
 A folder holding a game in multiple languages registers one target per
 language ScummVM detects (`gob1-cd-fr`, `gob1-cd-de`), and it's the target,
