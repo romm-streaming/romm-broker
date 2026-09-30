@@ -2220,7 +2220,7 @@ async def put_memory_card(
     return {"status": "ok", "written": result.written, "unread": list(result.unread), "slot": 1}
 
 
-def check_emulator_alive(reported: Optional[str]) -> Optional[str]:
+def check_emulator_alive(reported: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     """Log once when the open session's emulator has exited on its own.
 
     Exit code 0 is a clean quit, usually the player leaving from the emulator's
@@ -2234,14 +2234,16 @@ def check_emulator_alive(reported: Optional[str]) -> Optional[str]:
     the state routes stop or restart the emulator on purpose.
 
     Args:
-        reported: The id of the session already logged, so one crash is one line.
+        reported: The session record already logged, so one crash is one line.
+            Matched by identity, not by id: RomM supplies the id and may reuse
+            it, while every activate builds a new record.
 
     Returns:
-        The id of the session logged so far: `reported`, or the current
-        session's id when this call logged it.
+        The session record logged so far: `reported`, or the current session
+        when this call logged it.
     """
     sess = session.SESSION
-    if sess is None or not sess.get("active") or sess["id"] == reported or _SESSION_LOCK.locked():
+    if sess is None or not sess.get("active") or sess is reported or _SESSION_LOCK.locked():
         return reported
     emulator = sess["emulator_obj"]
     if emulator.alive():
@@ -2256,7 +2258,7 @@ def check_emulator_alive(reported: Optional[str]) -> Optional[str]:
         emulator.exit_code,
         rom.get("name") or sess.get("rom_file") or "-",
     )
-    return sess["id"]
+    return sess
 
 
 async def watch_emulator_forever(interval: float) -> None:
@@ -2268,7 +2270,7 @@ async def watch_emulator_forever(interval: float) -> None:
     Args:
         interval: Seconds between checks.
     """
-    reported: Optional[str] = None
+    reported: Optional[dict[str, Any]] = None
     failing = False
     while True:
         await anyio.sleep(interval)

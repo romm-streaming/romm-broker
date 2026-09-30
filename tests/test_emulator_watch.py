@@ -66,7 +66,7 @@ def test_a_dead_emulator_is_logged_once_per_session(caplog: pytest.LogCaptureFix
     reported = api.check_emulator_alive(None)
     reported = api.check_emulator_alive(reported)
 
-    assert reported == "sess-1"
+    assert reported is session.SESSION
     [line] = _logged(caplog)
     assert "session sess-1: fake exited" in line
     assert "rom Game" in line
@@ -92,7 +92,18 @@ def test_the_next_session_is_watched_afresh(caplog: pytest.LogCaptureFixture) ->
     reported = api.check_emulator_alive(None)
     _activate("sess-2").running = False
 
-    assert api.check_emulator_alive(reported) == "sess-2"
+    assert api.check_emulator_alive(reported) is session.SESSION
+    assert len(_logged(caplog)) == 2
+
+
+def test_a_reused_session_id_is_still_watched(caplog: pytest.LogCaptureFixture) -> None:
+    """RomM may send the same session id again; a new activate is a new session to report."""
+    _activate("sess-1").running = False
+    reported = api.check_emulator_alive(None)
+    _activate("sess-1").running = False
+
+    api.check_emulator_alive(reported)
+
     assert len(_logged(caplog)) == 2
 
 
@@ -142,9 +153,9 @@ async def test_a_failing_check_is_logged_once_until_it_recovers(
         caplog: The pytest log capture fixture.
     """
     outcomes: list[Any] = [RuntimeError("boom"), RuntimeError("boom"), None, _StopWatch()]
-    calls: list[Optional[str]] = []
+    calls: list[Optional[dict[str, Any]]] = []
 
-    def scripted(reported: Optional[str]) -> Optional[str]:
+    def scripted(reported: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
         calls.append(reported)
         outcome = outcomes.pop(0)
         if outcome is not None:
