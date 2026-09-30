@@ -436,7 +436,8 @@ def test_another_live_copy_of_the_same_game_is_left_alone(
     write_ini(dirs["ini"], f"[monkey-en]\ngameid=monkey\npath={other}")
     monkeypatch.setattr(scummvm.subprocess, "run", AddRuns(folder))
 
-    scummvm.register_target(folder)
+    with pytest.raises(scummvm.RegisteredElsewhere, match=str(other)):
+        scummvm.register_target(folder)
 
     assert "monkey-en" in scummvm._ini_domains()
 
@@ -2531,10 +2532,29 @@ def test_a_live_library_copy_never_gives_way_to_an_extraction(
     emu.launch(emu.resolve_rom_file(loose), None)
     archive = zipped_game(dirs["roms"], {"MONKEY.000": b"data"})
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(scummvm.RegisteredElsewhere, match=f"already registered from {loose}"):
         emu.launch(emu.resolve_rom_file(archive), None)
 
     assert scummvm.target_for_path(loose) == "monkey"
+
+
+def test_a_second_copy_names_the_first_in_the_import_refusal(
+    dirs: dict[str, Path], spawned: Spawned, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The preflight says which folder holds the game, not that there is no game."""
+    loose = dirs["roms"] / "Monkey Loose"
+    loose.mkdir()
+    (loose / "MONKEY.000").write_bytes(b"data")
+    monkeypatch.setattr(scummvm.subprocess, "run", AddsWhatItScans())
+    emu = Scummvm()
+    emu.launch(emu.resolve_rom_file(loose), None)
+    rom = emu.resolve_rom_file(zipped_game(dirs["roms"], {"MONKEY.000": b"data"}))
+    ctx = imports.ImportCtx(rom_file=rom, rom=None, memory_card_synced=False, excluded=(), resume_slot=None)
+
+    target, names, why = scummvm._session_game(emu, ctx)
+
+    assert (target, names) == (None, [])
+    assert why is not None and str(loose) in why
 
 
 def test_macos_metadata_does_not_hide_the_wrapper_folder(

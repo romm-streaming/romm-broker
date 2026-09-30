@@ -657,6 +657,10 @@ def _run_add(rom_dir: Path) -> Optional[subprocess.CompletedProcess]:
     return result
 
 
+class RegisteredElsewhere(RuntimeError):
+    """ScummVM refused a folder because another live copy of the same game holds its target."""
+
+
 def register_target(rom_dir: Path, language: Optional[str] = None) -> Optional[str]:
     """Register `rom_dir` with `scummvm --add` and read its target back.
 
@@ -676,6 +680,10 @@ def register_target(rom_dir: Path, language: Optional[str] = None) -> Optional[s
 
     Returns:
         The target ScummVM registered, or None when it detected no game there.
+
+    Raises:
+        RegisteredElsewhere: When the game is still registered from another
+            folder that exists, so this copy would share its target and saves.
     """
     result = _run_add(rom_dir)
     if result is None:
@@ -696,6 +704,15 @@ def register_target(rom_dir: Path, language: Optional[str] = None) -> Optional[s
                 if retry is not None:
                     result = retry
                     target = target_for_path(rom_dir, language)
+            if target is None:
+                held = sorted(
+                    keys["path"] for keys in _game_domains().values() if keys.get("gameid") == gameid
+                )
+                if held:
+                    raise RegisteredElsewhere(
+                        f"scummvm: {gameid} is already registered from {', '.join(held)}; "
+                        f"a second copy at {rom_dir} would share its saves"
+                    )
 
     if target is None and "Game Added" in result.stdout:
         # Detection worked and the config flush did not, which is only ever a
@@ -1187,7 +1204,10 @@ def _session_game(
         target = target_for_path(rom_dir, language)
         if target is None:
             patch_ini(normalize_language(emu.gui_language))
-            target = register_target(rom_dir, language)
+            try:
+                target = register_target(rom_dir, language)
+            except RegisteredElsewhere as exc:
+                why = str(exc)
         if target is not None:
             names = _folder_names(rom_dir)
     game = (target, names, why)
@@ -1687,6 +1707,7 @@ class Scummvm(Emulator):
         Raises:
             RuntimeError: When no ROM folder was resolved, an archive could
                 not be extracted, or ScummVM detects no game in it.
+            RegisteredElsewhere: When another copy of the game holds its target.
         """
         self.stop()
         rom_dir = rom_path or self._rom_dir
