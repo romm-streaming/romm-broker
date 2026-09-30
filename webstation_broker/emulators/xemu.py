@@ -48,7 +48,7 @@ from typing import IO, Any, Optional, Union
 from pyfatx import Fatx
 
 from .. import imports, settings
-from .base import Emulator, _cmdline, base_launch_env, disc_number
+from .base import Emulator, _cmdline, base_launch_env, disc_number, scrubbed_env
 
 log = logging.getLogger(__name__)
 
@@ -377,7 +377,7 @@ def _ensure_raw_image(image: Path) -> bool:
     try:
         subprocess.run(
             ["qemu-img", "convert", "-f", "qcow2", "-O", "raw", str(image), str(tmp)],
-            check=True, capture_output=True, text=True,
+            check=True, capture_output=True, text=True, env=scrubbed_env(),
         )
     except FileNotFoundError:
         log.error("qemu-img not found; cannot convert %s", image)
