@@ -3597,3 +3597,70 @@ def test_every_route_is_behind_the_secret_or_deliberately_open() -> None:
     assert {f"/api{path}" for _, path in _SECRET_GATED} >= {
         path.replace("{name}", "a.zip") for path in gated
     }
+
+
+@pytest.fixture
+def page_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> TestClient:
+    """Serve a stub room page through the real frontend mount, which dev mode leaves out.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher, undone when the test ends.
+        tmp_path: The per-test temporary directory.
+
+    Returns:
+        A client for an app built with a secret and dev mode off. No lifespan
+        runs; the page and health routes don't need one.
+    """
+    (tmp_path / "index.html").write_text("<!doctype html><title>room</title>")
+    monkeypatch.setattr(settings, "BROKER_SECRET", "s3cret")
+    monkeypatch.setattr(settings, "DEV_MODE", False)
+    monkeypatch.setattr(settings, "FRONTEND_DIST", tmp_path)
+    return TestClient(create_app())
+
+
+def test_room_page_csp_is_report_only_by_default(page_client: TestClient) -> None:
+    """Off by default the policy only reports, and nothing restricts who may frame the room."""
+    response = page_client.get(f"{PREFIX}/")
+
+    assert response.status_code == 200
+    assert "script-src 'self' blob:" in response.headers["Content-Security-Policy-Report-Only"]
+    assert "Content-Security-Policy" not in response.headers
+
+
+def test_frame_ancestors_is_enforced_even_while_the_policy_only_reports(
+    page_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Browsers ignore frame-ancestors in a report-only policy, so it rides its own enforced header."""
+    monkeypatch.setattr(settings, "FRAME_ANCESTORS", "https://romm.example")
+
+    headers = page_client.get(f"{PREFIX}/").headers
+
+    assert headers["Content-Security-Policy"] == "frame-ancestors https://romm.example"
+    assert "frame-ancestors" not in headers["Content-Security-Policy-Report-Only"]
+
+
+@pytest.mark.parametrize("ancestors", ["", "'self'"])
+def test_enforced_room_page_csp_carries_frame_ancestors_when_set(
+    page_client: TestClient, monkeypatch: pytest.MonkeyPatch, ancestors: str
+) -> None:
+    """Enforcing folds frame-ancestors into the one policy and drops the report-only header."""
+    monkeypatch.setattr(settings, "CSP_ENFORCE", True)
+    monkeypatch.setattr(settings, "FRAME_ANCESTORS", ancestors)
+
+    headers = page_client.get(f"{PREFIX}/").headers
+    policy = headers["Content-Security-Policy"]
+
+    assert policy.startswith("default-src 'self'")
+    assert policy.endswith("frame-ancestors 'self'") == bool(ancestors)
+    assert "Content-Security-Policy-Report-Only" not in headers
+
+
+def test_json_answers_carry_no_csp(page_client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The policy is for the page; a JSON answer has nothing for it to govern."""
+    monkeypatch.setattr(settings, "CSP_ENFORCE", True)
+    monkeypatch.setattr(settings, "FRAME_ANCESTORS", "'self'")
+
+    headers = page_client.get(f"{PREFIX}/api/health").headers
+
+    assert "Content-Security-Policy" not in headers
+    assert "Content-Security-Policy-Report-Only" not in headers

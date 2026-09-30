@@ -120,6 +120,49 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         tg.cancel_scope.cancel()
 
 
+ROOM_CSP = "; ".join(
+    (
+        "default-src 'self'",
+        # The media and socket workers and the audio worklets are built from
+        # blob: URLs (room.js); nothing else runs that the page did not ship.
+        "script-src 'self' blob:",
+        "worker-src 'self' blob:",
+        "connect-src 'self'",
+        "img-src 'self' data: blob:",
+        "media-src 'self' blob:",
+        "font-src 'self' data:",
+        # Inline style= attributes in markup room.js builds; no inline <style>.
+        "style-src 'self'",
+        "style-src-attr 'unsafe-inline'",
+        # The selkies stream, served under the same prefix.
+        "frame-src 'self'",
+        "object-src 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+    )
+)
+"""The room page's Content-Security-Policy, minus `frame-ancestors` (see `_page_csp_headers`)."""
+
+
+def _page_csp_headers() -> dict[str, str]:
+    """Build the CSP headers for an HTML page.
+
+    `frame-ancestors` is always enforced when configured: browsers ignore it
+    in a report-only policy, so it cannot wait for `BROKER_CSP_ENFORCE`.
+
+    Returns:
+        The header names and values to set; empty of `frame-ancestors` when
+        `BROKER_FRAME_ANCESTORS` is unset.
+    """
+    ancestors = f"frame-ancestors {settings.FRAME_ANCESTORS}" if settings.FRAME_ANCESTORS else ""
+    if settings.CSP_ENFORCE:
+        return {"Content-Security-Policy": "; ".join(filter(None, (ROOM_CSP, ancestors)))}
+    headers = {"Content-Security-Policy-Report-Only": ROOM_CSP}
+    if ancestors:
+        headers["Content-Security-Policy"] = ancestors
+    return headers
+
+
 def create_app() -> FastAPI:
     """Build the broker application, mounted under the configured prefix.
 
@@ -159,6 +202,9 @@ def create_app() -> FastAPI:
         # sit under a URL that carries one too; keep both out of any cache.
         if request.url.path.startswith(f"{settings.PREFIX}/api/"):
             response.headers.setdefault("Cache-Control", "no-store")
+        if response.headers.get("content-type", "").startswith("text/html"):
+            for name, value in _page_csp_headers().items():
+                response.headers[name] = value
         return response
 
     if not settings.DEV_MODE:
