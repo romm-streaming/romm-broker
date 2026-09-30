@@ -26,7 +26,7 @@ import os
 import re
 import subprocess
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from pathlib import Path, PurePosixPath
 from threading import Thread
 from typing import Any, Optional, Union
@@ -209,6 +209,37 @@ or a second key the player mapped to Save State keeps working.
 """
 
 
+def _qualifying(
+    candidates: Iterable[Path], base: Path, exts: tuple[str, ...], root: Path
+) -> Iterator[tuple[str, int, Path, Path]]:
+    """The candidates that are real, visible files with one of `exts`, inside `root`.
+
+    Args:
+        candidates: Paths found under the ROM folder.
+        base: The ROM folder the candidates are relative to.
+        exts: The lower-cased suffixes that count.
+        root: The tree every candidate must resolve inside.
+
+    Yields:
+        Each qualifying candidate's suffix, its depth under `base`, the path
+        as found, and its resolved path.
+    """
+    for p in candidates:
+        ext = p.suffix.lower()
+        if p.name.startswith(".") or ext not in exts:
+            continue
+        try:
+            if not p.is_file():
+                continue
+            real = p.resolve()
+            depth = len(p.relative_to(base).parts)
+        except (OSError, ValueError) as exc:
+            log.debug("ppsspp: skipping candidate %s: %s", p, exc)
+            continue
+        if real.is_relative_to(root):
+            yield ext, depth, p, real
+
+
 def _pick_rom_file(candidates: Iterable[Path], base: Path, root: Optional[Path] = None) -> Optional[Path]:
     """Pick the best bootable ROM out of a set of candidate paths.
 
@@ -224,25 +255,10 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path, root: Optional[Path] 
     Returns:
         The resolved path of the winning ROM, or None when nothing qualifies.
     """
-    ranked = []
-    root = root or ROM_ROOT.resolve()
-    for p in candidates:
-        if p.name.startswith("."):
-            continue
-        ext = p.suffix.lower()
-        if ext not in ROM_EXTENSIONS:
-            continue
-        try:
-            if not p.is_file():
-                continue
-            real = p.resolve()
-            rel = p.relative_to(base)
-        except (OSError, ValueError) as exc:
-            log.debug("ppsspp: skipping rom candidate %s: %s", p, exc)
-            continue
-        if not real.is_relative_to(root):
-            continue
-        ranked.append((ROM_EXTENSIONS.index(ext), len(rel.parts), p.name.lower(), real))
+    ranked = [
+        (ROM_EXTENSIONS.index(ext), depth, p.name.lower(), real)
+        for ext, depth, p, real in _qualifying(candidates, base, ROM_EXTENSIONS, root or ROM_ROOT.resolve())
+    ]
     if not ranked:
         return None
     return min(ranked)[-1]
@@ -316,23 +332,6 @@ def _archive_holds_rom(archive: Path) -> bool:
         ", ".join(ROM_EXTENSIONS),
     )
     return False
-
-
-def _already_extracted(archive: Path) -> bool:
-    """Whether the cache holds an extraction of this exact archive.
-
-    One that does already showed a PSP image, so it needs no second listing.
-
-    Args:
-        archive: The archive.
-
-    Returns:
-        True when its extraction is on disk.
-    """
-    try:
-        return (CACHE_DIR / extraction_cache._cache_key(archive)).is_dir()
-    except (RuntimeError, OSError):
-        return False
 
 
 _CACHE = ExtractionCache(
@@ -946,7 +945,8 @@ class Ppsspp(Emulator):
                 archive.name,
             )
             return False
-        return _already_extracted(archive) or _archive_holds_rom(archive)
+        # Already extracted means it held a PSP image, so only a new archive is listed.
+        return _CACHE.entry_dir(archive) is not None or _archive_holds_rom(archive)
 
     def _folder_archive(self, candidates: list[Path], base: Path) -> Optional[Path]:
         """A ROM folder's lone archive, for a folder holding no PSP image of its own.
@@ -963,21 +963,10 @@ class Ppsspp(Emulator):
             The resolved archive, or None when there is none, more than one
             at the shallowest depth, or it cannot be booted.
         """
-        root = ROM_ROOT.resolve()
-        found: list[tuple[int, Path]] = []
-        for p in candidates:
-            if p.name.startswith(".") or p.suffix.lower() not in _ARCHIVE_EXTS:
-                continue
-            try:
-                if not p.is_file():
-                    continue
-                real = p.resolve()
-                depth = len(p.relative_to(base).parts)
-            except (OSError, ValueError) as exc:
-                log.debug("ppsspp: skipping archive candidate %s: %s", p, exc)
-                continue
-            if real.is_relative_to(root):
-                found.append((depth, real))
+        found = [
+            (depth, real)
+            for _, depth, _, real in _qualifying(candidates, base, _ARCHIVE_EXTS, ROM_ROOT.resolve())
+        ]
         if not found:
             return None
         shallowest = min(depth for depth, _ in found)

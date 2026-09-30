@@ -744,6 +744,7 @@ def _drop_dead_domains(gameid: str, keep: Optional[Path] = None) -> int:
         How many domains were dropped.
     """
     source = _extraction_source(keep) if keep is not None else None
+    kept = keep.resolve() if source is not None else None
     doomed = set()
     for name, keys in _game_domains().items():
         if keys.get("gameid") != gameid:
@@ -759,7 +760,7 @@ def _drop_dead_domains(gameid: str, keep: Optional[Path] = None) -> int:
             if not Path(recorded).exists():
                 log.info("scummvm: domain %s was extracted from %s, which is gone", name, recorded)
                 doomed.add(name)
-            elif source is not None and recorded == source and path.resolve() != keep.resolve():
+            elif source is not None and recorded == source and path.resolve() != kept:
                 doomed.add(name)
         except (OSError, ValueError) as exc:
             log.warning(
@@ -846,6 +847,11 @@ def _extraction_source(path: Path) -> Optional[str]:
         return None
 
 
+def _is_junk(name: str) -> bool:
+    """Whether a file or folder name is hidden or the `__MACOSX` fork a Mac-made zip carries."""
+    return name.startswith(".") or name == "__MACOSX"
+
+
 def _visible_entries(folder: Path) -> list[Path]:
     """`folder`'s entries, minus hidden ones and the `__MACOSX` fork a Mac-made zip carries.
 
@@ -858,7 +864,7 @@ def _visible_entries(folder: Path) -> list[Path]:
     Raises:
         OSError: When the folder cannot be listed.
     """
-    return [e for e in folder.iterdir() if not e.name.startswith(".") and e.name != "__MACOSX"]
+    return [e for e in folder.iterdir() if not _is_junk(e.name)]
 
 
 def _extracted_game_dir(root: Path) -> Optional[Path]:
@@ -914,7 +920,7 @@ def _archive_holds_files(archive: Path) -> bool:
         parts = PurePosixPath(member.replace("\\", "/")).parts
         if member.endswith("/") or not parts:
             continue
-        if not any(part.startswith(".") or part == "__MACOSX" for part in parts):
+        if not any(_is_junk(part) for part in parts):
             return True
     log.warning("scummvm: %s holds no game files", archive.name)
     return False
@@ -989,7 +995,7 @@ def _game_dir(rom: Path, emu: Emulator) -> Path:
     # back. Without it a re-upload's old extraction is indistinguishable from
     # another copy, and blocks the new one.
     try:
-        root = _extraction_root(game)
+        root = _CACHE.entry_dir(rom)
         if root is not None:
             (root / _SOURCE_FILE).write_text(str(rom.resolve()))
     except OSError as exc:
@@ -1009,11 +1015,8 @@ def _cached_game_dir(rom: Path) -> Optional[Path]:
     """
     if not _is_archive(rom):
         return rom
-    try:
-        extracted = CACHE_DIR / extraction_cache._cache_key(rom)
-    except RuntimeError:
-        return None
-    return _extracted_game_dir(extracted) if extracted.is_dir() else None
+    extracted = _CACHE.entry_dir(rom)
+    return _extracted_game_dir(extracted) if extracted is not None else None
 
 
 def sweep_stale_extractions() -> None:
@@ -1154,11 +1157,9 @@ def _match_name(stem: str, names: list[str]) -> Optional[str]:
     return next((name for name in names if name.casefold() == folded), None)
 
 
-_NO_GAME_KEY = ("scummvm", "no_game")
-"""Memo key for why `_session_game` found no game, when that is not a detection miss."""
-
-
-def _session_game(emu: Emulator, ctx: imports.ImportCtx) -> tuple[Optional[str], list[str]]:
+def _session_game(
+    emu: Emulator, ctx: imports.ImportCtx
+) -> tuple[Optional[str], list[str], Optional[str]]:
     """Work out the target the session boots, and every name a save may carry.
 
     This is what `launch` will do, in the same order: extract an archived
@@ -1173,8 +1174,9 @@ def _session_game(emu: Emulator, ctx: imports.ImportCtx) -> tuple[Optional[str],
         ctx: The launch context; its `memo` keeps the answer.
 
     Returns:
-        The target and the names, or None and an empty list when there is no
-        game folder or ScummVM detects no game in it.
+        The target, the names, and why there are none when an archived game
+        would not extract. With no game folder, or none ScummVM detects, the
+        target is None and the names are empty.
     """
     key = ("scummvm", "game")
     cached = ctx.memo.get(key)
@@ -1182,13 +1184,14 @@ def _session_game(emu: Emulator, ctx: imports.ImportCtx) -> tuple[Optional[str],
         return cached
     target: Optional[str] = None
     names: list[str] = []
+    why: Optional[str] = None
     rom_dir = ctx.rom_file
     if rom_dir is not None:
         try:
             rom_dir = _game_dir(rom_dir, emu)
         except (RuntimeError, OSError) as exc:
             log.warning("scummvm: import preflight could not extract %s: %s", rom_dir, exc)
-            ctx.memo[_NO_GAME_KEY] = f"the archived game could not be extracted: {exc}"
+            why = f"the archived game could not be extracted: {exc}"
             rom_dir = None
     if rom_dir is not None:
         language = _wanted_language(emu)
@@ -1198,7 +1201,7 @@ def _session_game(emu: Emulator, ctx: imports.ImportCtx) -> tuple[Optional[str],
             target = register_target(rom_dir, language)
         if target is not None:
             names = _folder_names(rom_dir)
-    game = (target, names)
+    game = (target, names, why)
     ctx.memo[key] = game
     return game
 
@@ -1227,7 +1230,7 @@ def _split_name(
 
 
 def _game_name(
-    member: imports.ImportMember, stem: str, expected: str, names: list[str], ctx: imports.ImportCtx
+    member: imports.ImportMember, stem: str, expected: str, names: list[str], why: Optional[str]
 ) -> Union[str, imports.ImportRefusal]:
     """Hold a member's stem to the game the session runs.
 
@@ -1236,8 +1239,8 @@ def _game_name(
         stem: Its stem.
         expected: The accepted shape, in words.
         names: The session's names, from `_session_game`.
-        ctx: The launch context, whose memo says why there is no game when
-            an archived one would not extract.
+        why: Why there is no game, from `_session_game`, when an archived
+            one would not extract.
 
     Returns:
         The name to file it under, as the ini spells it, or `identity_unknown`
@@ -1248,7 +1251,7 @@ def _game_name(
             "identity_unknown",
             member.name,
             expected,
-            detail=ctx.memo.get(_NO_GAME_KEY) or "ScummVM detects no game in this rom folder",
+            detail=why or "ScummVM detects no game in this rom folder",
         )
     matched = _match_name(stem, names)
     if matched is None:
@@ -1284,8 +1287,8 @@ def _place_save(
     split = _split_name(member, _SAVE_EXPECTED)
     if isinstance(split, imports.ImportRefusal):
         return split
-    target, names = _session_game(emu, ctx)
-    named = _game_name(member, split[0], _SAVE_EXPECTED, names, ctx)
+    target, names, why = _session_game(emu, ctx)
+    named = _game_name(member, split[0], _SAVE_EXPECTED, names, why)
     if isinstance(named, imports.ImportRefusal):
         return named
     dest = imports.build_dest("saves", (), (f"{named}.{split[1]}",), member=member, expected=_SAVE_EXPECTED)
@@ -1322,8 +1325,8 @@ def _place_state(
     split = _split_name(member, _STATE_EXPECTED)
     if isinstance(split, imports.ImportRefusal):
         return split
-    target, names = _session_game(emu, ctx)
-    named = _game_name(member, split[0], _STATE_EXPECTED, names, ctx)
+    target, names, why = _session_game(emu, ctx)
+    named = _game_name(member, split[0], _STATE_EXPECTED, names, why)
     if isinstance(named, imports.ImportRefusal):
         return named
     slot_ext = f"s{STATE_SLOT:02d}" if split[1].startswith("s") else f"{STATE_SLOT:03d}"
@@ -2079,7 +2082,7 @@ class Scummvm(Emulator):
         states = [p for p in plan if p.member.kind == "state"]
         if len(states) != 1:
             return []
-        target, _ = _session_game(self, ctx)
+        target, _, _ = _session_game(self, ctx)
         if target is None:
             return []
         state = states[0]

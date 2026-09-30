@@ -2287,7 +2287,7 @@ def test_preflight_picks_the_target_launch_boots(
     rom = emu.resolve_rom_file(folder)
     ctx = imports.ImportCtx(rom_file=rom, rom=None, memory_card_synced=False, excluded=(), resume_slot=None)
 
-    target, _ = scummvm._session_game(emu, ctx)
+    target, _, _ = scummvm._session_game(emu, ctx)
     emu.launch(rom, None)
 
     assert target == expected == emu._target
