@@ -144,6 +144,10 @@ same endpoint. If you want that distinction, enforce it upstream:
       host is reachable from this container's network segment
 - [ ] The container runs rootless, without `--privileged`, without the
       container runtime's socket mounted in
+- [ ] `BROKER_FRAME_ANCESTORS` names only RomM's origin (or `'self'`), and
+      the room still loads inside RomM with it set
+- [ ] The browser console shows no `[Report Only]` CSP messages during a
+      session, and `BROKER_CSP_ENFORCE=true` is set
 - [ ] Whoever can reach `emulator: "desktop"` is someone you would hand a
       terminal on this host to directly
 
