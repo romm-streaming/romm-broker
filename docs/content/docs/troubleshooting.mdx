@@ -121,6 +121,12 @@ invite links falling back to a manual copy box, or a broker-secret 403. All
 of these already have a full writeup. See [Reverse proxy
 troubleshooting](/docs/deployment/troubleshooting).
 
+## Save uploads failing without anyone noticing
+
+The broker keeps a save archive RomM did not take, so nothing is lost, but it
+tells nobody. [Monitoring](/docs/deployment/monitoring) sets up a check that
+does, and explains every alert it raises.
+
 ## Where to look next
 
 The broker's own container logs are the best source of truth for anything
