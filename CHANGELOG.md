@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.13.0](https://github.com/romm-streaming/romm-broker/compare/v0.12.0...v0.13.0) (2026-09-30)
+
+
+### Features
+
+* **emulators:** boot zipped ScummVM and PPSSPP games ([77240b7](https://github.com/romm-streaming/romm-broker/commit/77240b77da91713671f28803970c4f344292c289))
+* **emulators:** boot zipped ScummVM and PPSSPP games ([a05bf99](https://github.com/romm-streaming/romm-broker/commit/a05bf9947e6b69cd821650f33c23a3c65d80bf56)), closes [#52](https://github.com/romm-streaming/romm-broker/issues/52)
+* **observability:** log activate/exit outcomes, expose last_exit, add check script ([14e84ac](https://github.com/romm-streaming/romm-broker/commit/14e84ac4433748ab43a10b6153549b294dbfc490))
+* **observability:** log activate/exit outcomes, expose last_exit, add check script ([5ad8ba0](https://github.com/romm-streaming/romm-broker/commit/5ad8ba0d85f9cb8c803398b23c663314fc2a78ec))
+* **observability:** log when a session's emulator exits on its own ([29c6eea](https://github.com/romm-streaming/romm-broker/commit/29c6eea01e86dbb9005b75276676e5470c9a928c))
+* **observability:** log when a session's emulator exits on its own ([393ff64](https://github.com/romm-streaming/romm-broker/commit/393ff6408dc56e3c1910a666f2dbafe40380d9ba))
+* **room:** add touch controls opacity slider ([0583dbd](https://github.com/romm-streaming/romm-broker/commit/0583dbd763c3daeb4a6228ae38529721e9329bba))
+* **room:** add touch controls opacity slider ([3ea2d28](https://github.com/romm-streaming/romm-broker/commit/3ea2d28e1c6745b8570ff9e06c93f51542472548)), closes [#51](https://github.com/romm-streaming/romm-broker/issues/51)
+* **security:** room page Content-Security-Policy, report-only by default ([b3a04c3](https://github.com/romm-streaming/romm-broker/commit/b3a04c3a19cf2026f32c1f2bcc3a4ce1be02b745))
+* **security:** room page Content-Security-Policy, report-only by default ([48230de](https://github.com/romm-streaming/romm-broker/commit/48230deafc11e21d82821390f2247bc72d815880))
+
+
+### Bug Fixes
+
+* **emulators:** follow master's extraction_cache API in ScummVM and PPSSPP ([436cd0c](https://github.com/romm-streaming/romm-broker/commit/436cd0c0d7dfa151873ad07de792f5ab372a017e))
+* **emulators:** harden archive extraction after code review ([c8d98be](https://github.com/romm-streaming/romm-broker/commit/c8d98be6259abe21df37ce52f1a8d7f3217d8806))
+* **emulators:** name the owning emulator in shared extraction logs ([8b05119](https://github.com/romm-streaming/romm-broker/commit/8b051190d0c71b742f173a94f9aad60595d89020))
+* **observability:** let check alerts clear, honour BROKER_HOST/PORT, report HTTP errors as-is ([85c0bdc](https://github.com/romm-streaming/romm-broker/commit/85c0bdcfc9bc3877bda83255b1d5fc8c2eada93e))
+* **observability:** match the reported session by record, not RomM's id ([ac3b27c](https://github.com/romm-streaming/romm-broker/commit/ac3b27cd4595d1163b158c4e96247875c1835445))
+* **observability:** stop calling the check a healthcheck, tidy its tests ([872c077](https://github.com/romm-streaming/romm-broker/commit/872c0773fb6dbfc7a90385087651195e433baf08))
+* **observability:** warn on a clean emulator quit, log a failing watch once ([0755fe6](https://github.com/romm-streaming/romm-broker/commit/0755fe67f5c57bc88f52b42b8011090afdda8da9))
+* **ppsspp:** leave the archive extraction cache off by default ([5d01cd1](https://github.com/romm-streaming/romm-broker/commit/5d01cd1649580311be9aa4831888415898b9a4e2))
+* **retroarch:** name retroarch in shared archive-listing logs ([175266e](https://github.com/romm-streaming/romm-broker/commit/175266e96a4e60d0c06b05562a99cf3de96c6029))
+* **room:** apply code-review fixes to touch opacity ([ad95120](https://github.com/romm-streaming/romm-broker/commit/ad951205177e85246fcad4956ce4ec90ed459c75))
+* **room:** move touch opacity slider to the stream controls ([94434ab](https://github.com/romm-streaming/romm-broker/commit/94434ab4830f1f1940df9367e1eeab5dbf14c44e))
+* **room:** move touch opacity slider to the stream controls ([7d408f9](https://github.com/romm-streaming/romm-broker/commit/7d408f9d95d92d900251ab9c782b31ceb147b232))
+* **room:** scope touch opacity to the live overlay and harden storage ([71f2e33](https://github.com/romm-streaming/romm-broker/commit/71f2e334e99cc1ff3f36c92c31b4c9800032c513))
+* **scummvm:** name the registered copy when a second copy of a game is refused ([d95da38](https://github.com/romm-streaming/romm-broker/commit/d95da38f3a4d42764bf75fa05199a4c81503d6e2))
+* **security:** scrub secrets from helper subprocesses and redact callback credentials ([bbe924b](https://github.com/romm-streaming/romm-broker/commit/bbe924b7b8959d36ac256634d31429630743dd60))
+* **security:** scrub secrets from helper subprocesses and redact callback credentials ([c10ee22](https://github.com/romm-streaming/romm-broker/commit/c10ee22df8ecda7bbf129c4fde6287207da9cbb3))
+
+
+### Documentation
+
+* **contributing:** link a PR to an issue only when one already exists ([9989c07](https://github.com/romm-streaming/romm-broker/commit/9989c077d5522289cd4c40e36b927cd76128d73e))
+* **monitoring:** point at the emulator watch log line ([7b7c292](https://github.com/romm-streaming/romm-broker/commit/7b7c29268065b93e329a1068f03520a2396ed926))
+* **monitoring:** point at the emulator watch log line ([fef212f](https://github.com/romm-streaming/romm-broker/commit/fef212f89c6e08124f09f68e4bf7691e6b51865a))
+* **observability:** say most check alerts need a person, not all ([9390344](https://github.com/romm-streaming/romm-broker/commit/9390344066ca848aa215c7948b63ed9dc0c28817))
+* **room:** trim touch opacity comments in review polish ([6f11681](https://github.com/romm-streaming/romm-broker/commit/6f1168185503b61c9990fd6ef677f68e2913f36a))
+* **security:** pair callback.token with base_url and state the env trust boundary ([73984c9](https://github.com/romm-streaming/romm-broker/commit/73984c98e0323c1c6546c93201d17f18eb4ba3e7))
+* **security:** pair callback.token with base_url and state the env trust boundary ([a464b82](https://github.com/romm-streaming/romm-broker/commit/a464b82de25f48caa0262bc730b393addd42f166))
+
 ## [0.12.0](https://github.com/romm-streaming/romm-broker/compare/v0.11.1...v0.12.0) (2026-09-29)
 
 
