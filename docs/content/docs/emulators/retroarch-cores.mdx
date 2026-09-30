@@ -40,7 +40,8 @@ that platform," not as settled fact.
 | Game Boy / Color | `gambatte` | Optional | A real boot ROM only changes splash timing; every game plays identically without one. |
 | Game Boy Advance | `mgba` | Optional | `gba_bios.bin` fixes a handful of titles that rely on exact BIOS timing; HLE covers the rest. |
 | Virtual Boy | `mednafen_vb` | None | |
-| Nintendo DS | `melondsds` | Optional | Real firmware plus `bios7.bin`/`bios9.bin` is recommended; the core falls back to a built-in HLE BIOS. The original `melonds` core is unmaintained and crashes on launch on current buildbot builds - don't switch back to it. |
+| Nintendo DS | `melondsds` | Optional | Real firmware plus `bios7.bin`/`bios9.bin` is recommended; the core falls back to a built-in HLE BIOS. The original `melonds` core is unmaintained and crashes on launch on current buildbot builds, so don't switch back to it. |
+| Nintendo DSi | `melondsds` | Required | DSi mode has no built-in fallback BIOS, so it needs `dsi_bios7.bin`, `dsi_bios9.bin`, `dsi_firmware.bin` and `dsi_nand.bin`. The core's firmware list marks them optional only because plain DS games run without them. |
 
 ## Nintendo, disc and 3D
 
@@ -58,6 +59,7 @@ that platform," not as settled fact.
 | 32X | `picodrive` | None | Boot code lives on the cartridge itself. |
 | Dreamcast | `flycast` | Required | `dc_boot.bin` and `dc_flash.bin`, matching the standalone Flycast module's requirement (see [Flycast setup](/docs/emulators/setup#flycast)). |
 | Saturn | `yabasanshiro` | Required | Region Saturn BIOS. |
+| Model 3 | `supermodel` | None | No separate BIOS file. Gun games such as L.A. Machineguns need calibrating in the game's Test Menu first. |
 
 ## Sony
 
@@ -73,6 +75,7 @@ that platform," not as settled fact.
 | PC Engine / TurboGrafx-16 | `mednafen_pce` | None | Cart dumps boot with nothing extra. |
 | TurboGrafx-CD / PCE-CD | `mednafen_pce` | Required | System Card BIOS (e.g. `syscard3.pce`). Same core as the row above; only the CD add-on needs it. |
 | SuperGrafx | `mednafen_supergrafx` | Optional | Most cart dumps run without it; a real SuperGrafx BIOS exists but is not a hard requirement. |
+| PC-FX | `mednafen_pcfx` | Required | `pcfx.rom`. |
 
 ## SNK and arcade
 
@@ -93,17 +96,23 @@ that platform," not as settled fact.
 | Lynx | `handy` | Optional | `lynxboot.img`, only a handful of titles need it. |
 | Jaguar | `virtualjaguar` | None | The only platform in this table with savestates disabled entirely (`savestate: false` in the platform config). |
 | Atari ST | `hatari` | Required | TOS ROM (e.g. `tos.img`). |
+| Atari 8-bit | `atari800` | Optional | Real OS and BASIC ROMs (`ATARIXL.ROM`, `ATARIOSA.ROM`, `ATARIOSB.ROM`, `ATARIBAS.ROM`) are all optional in the core's own firmware list. |
 
 ## Other handhelds and consoles
 
 | Platform | Core | Setup | Details |
 | --- | --- | --- | --- |
-| WonderSwan / Color | `mednafen_wswan` | None | Fully HLE'd. |
+| WonderSwan / Color, Benesse Pocket Challenge V2 | `mednafen_wswan` | None | Fully HLE'd. |
 | 3DO | `opera` | Required | System boot ROM (e.g. `panafz10.bin`). This system has no HLE fallback, so you need a real boot ROM to play anything. |
 | ColecoVision | `gearcoleco` | Required | `coleco.rom`. |
 | Intellivision | `freeintv` | Required | `exec.bin` plus `grom.bin`. |
 | Vectrex | `vecx` | Optional | The built-in minimal BIOS works; a real `bios.bin` improves a few titles. |
 | Odyssey2 / Videopac | `o2em` | Required | `o2rom.bin`, or `c52.bin` for Videopac+ titles. |
+| Pokémon Mini | `pokemini` | Optional | `bios.min`. |
+| Watara Supervision | `potator` | None | |
+| Arcadia 2001 | `amiarcadia` | None | |
+| Fairchild Channel F | `freechaf` | Required | `sl31253.bin`, `sl31254.bin` and `sl90025.bin`. |
+| Epoch Super Cassette Vision | `emuscv` | Required | `upd7801g.s01`. A cartridge dumped in several parts loads from its `.0` file, with `.1`, `.2` and `.3` beside it. A `.cart` file showing up in the save directory after a launch is the converted cartridge, and is expected. |
 
 ## Home computers
 
@@ -111,9 +120,14 @@ that platform," not as settled fact.
 | --- | --- | --- | --- |
 | DOS | `dosbox_pure` | None | DOSBox provides its own virtual BIOS. |
 | Amiga | `puae` | Required | Kickstart ROM matching the emulated model (e.g. `kick13.rom`/`kick31.rom`). |
+| Amiga CD32 | `puae` | Required | `kick40060.CD32` and `kick40060.CD32.ext`. |
 | Commodore 64 | `vice_x64` | None | VICE ships open-licensed replacement ROMs by default; real Kernal/Basic ROMs are optional. |
 | MSX / MSX2 | `bluemsx` | Required | Machine-specific system ROMs (e.g. `MSX.ROM`, `MSX2.ROM`, `MSX2EXT.ROM`, `DISK.ROM`). Which ones you need varies by region. |
 | ZX Spectrum | `fuse` | None | ROM ships bundled with the core. |
+| Apple II | `applewin` | None | |
+| NEC PC-8801 | `quasi88` | Required | `quasi88/n88.rom` and `quasi88/n88_0.rom` in the system dir; the other files in that folder (`n88_1.rom` to `n88_3.rom`, `n88n.rom`, `disk.rom`, the kanji ROMs) are optional. |
+| NEC PC-9801 | `np2kai` | Optional | `bios.rom`, `FONT.ROM`, `itf.rom`, `sound.rom` and the `2608_*.WAV` drum samples, in `np2kai/` under the system dir. Every one is optional in the core's firmware list. |
+| Sharp X68000 | `px68k` | Required | `keropi/iplrom.dat` and `keropi/cgrom.dat` in the system dir; `keropi/iplrom30.dat` is optional. |
 
 ## Saves, states and imports
 
@@ -146,8 +160,7 @@ platforms take one:
 
 On `nds`, the `.srm` is the melondsds core's NDS cart SRAM, exposed through
 the standard `RETRO_MEMORY_SAVE_RAM` libretro call. The older, unmaintained
-`melonds` core did not expose this — it managed its own `.sav` file instead,
-which is why this platform used to refuse a `.srm` import.
+`melonds` core doesn't expose this; it manages its own `.sav` file instead.
 
 On `psx`, the `.srm` is the SwanStation core's first memory card. The core
 loads it only while its `swanstation_MemoryCards_Card1Type` option stays at
@@ -174,7 +187,7 @@ The other platforms refuse a `.srm`:
 
 | Core (platforms) | Where the save is |
 | --- | --- |
-| `flycast` (dc) | VMU files in the system folder, `dc/vmu_save_<port>.bin`, per game — the broker pins `flycast_per_content_vmus` to `All VMUs`; its shared-by-default setting would leak saves between games |
+| `flycast` (dc) | VMU files in the system folder, `dc/vmu_save_<port>.bin`, per game. The broker pins `flycast_per_content_vmus` to `All VMUs`; its shared-by-default setting would leak saves between games |
 | `fbneo` (arcade, cps1, cps2, cps3, neogeoaes, neogeomvs) | `fbneo/<driver>.fs` or `.nv`, named for the driver |
 | `mednafen_ngp` (neo-geo-pocket, neo-geo-pocket-color) | `<game>.flash` |
 | `handy` (lynx) | `<game>.eeprom` |
@@ -185,7 +198,7 @@ The other platforms refuse a `.srm`:
 | `yabasanshiro` (saturn) | `yabasanshiro/backup.bin`, shared by every game |
 | `genesis_plus_gx` (segacd) | `scd_<region>.brm`, shared by every game of that region |
 | `mesen` (fds) | `<game>.ips`, a patch against the disk |
-| `puae` (amiga) | written to a substitute disk under `saves/`, not the mounted image — the broker pins `puae_floppy_write_redirect` to `enabled` |
+| `puae` (amiga) | written to a substitute disk under `saves/`, not the mounted image. The broker pins `puae_floppy_write_redirect` to `enabled` |
 | `vice_x64`, `hatari` (c64, atari-st) | written into the disk image by default; see the write-protection note below |
 | `a5200`, `prosystem`, `freeintv`, `vecx`, `o2em`, `fuse` | no battery save |
 
@@ -279,7 +292,9 @@ platform to plain `retroarch`.
 ### Finding your options
 
 - `GET /api/retroarch/cores?platform=<slug>` lists every core offered on a
-  platform, its tier, and whether it's verified.
+  platform, its tier, and whether it's verified; leave `platform` off to get
+  every platform at once. It needs the `X-Broker-Secret` header, and a
+  platform RetroArch has no core for answers `404`.
 - `scripts/sync_core_info.py --tiers [--platform <slug>]` prints the same
   list from the command line, for every platform or just one.
 

@@ -886,7 +886,7 @@ def test_extract_still_raises_if_stage_succeeds_but_leaves_no_boot_target(tmp_pa
     """Stage returning normally does NOT bypass the generic post-stage boot check.
 
     Even if stage() completes without raising, if find_boot_target(staged)
-    finds nothing, extract() raises missing_target_error — stage's internal
+    finds nothing, extract() raises missing_target_error: stage's internal
     bookkeeping does not override the generic validation.
     """
     cache = _cache(tmp_path, max_gb=10.0)

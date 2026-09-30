@@ -19,15 +19,15 @@ dev mode it does start with `BROKER_SECRET` unset, but then every
 session-lifecycle endpoint is left unauthenticated, so a dev-mode broker
 should never be exposed beyond local development.
 
-Endpoints fall into three groups:
+Endpoints fall into five groups:
 
 | Group | Caller | Auth |
 | --- | --- | --- |
 | Lifecycle: activate, join, swap-disc | RomM's backend | `X-Broker-Secret` |
-| State and archive transfer: save-state, load-state, state-file, state-screenshot, imports, exports, memory card | RomM's backend | `X-Broker-Secret` |
+| State and archive transfer: save-state, load-state, state-file, state-screenshot, imports, import-spec, exports, memory card, RetroArch core list | RomM's backend | `X-Broker-Secret` |
 | Host actions: invite, exit | the room UI (invite), RomM (exit) | the controller token as `?token=`; exit also accepts the secret |
 | Room: context, the collab websocket | the room UI | a personal token, or an invite token, in the URL |
-| Status and health | anyone | none |
+| Status and health | RomM's backend (status), anyone (health) | `X-Broker-Secret` for status; none for health |
 
 The room UI never holds the secret. Its invite tile carries the controller
 token instead; exit accepts either so RomM and the controller token both
@@ -48,8 +48,10 @@ work.
 | `GET` | `/api/session/state-screenshot` | [Save states](/docs/api/state#fetch-the-frame-a-state-was-taken-at) |
 | `POST` | `/api/session/exit` | [Exit](/docs/api/exit) |
 | `PUT` | `/api/session/imports/{name}.zip` | [Save archives](/docs/api/archives) |
+| `GET` | `/api/session/import-spec` | [Declared imports](/docs/api/imports#asking-what-an-emulator-takes) |
 | `GET` / `DELETE` | `/api/session/exports[/{name}.zip]` | [Save archives](/docs/api/archives) |
 | `GET` / `PUT` | `/api/session/memory-card` | [Save archives](/docs/api/archives#memory-cards) |
+| `GET` | `/api/retroarch/cores` | [RetroArch core manifest](/docs/emulators/retroarch-cores#finding-your-options) |
 | `GET` | `/api/session/status` | [Status](/docs/api/status) |
 | `GET` | `/api/health` | [Status](/docs/api/status) |
 

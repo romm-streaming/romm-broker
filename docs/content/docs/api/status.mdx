@@ -19,8 +19,8 @@ names players and ROMs. If no session is running, it answers
 | `session_id`, `emulator`, `rom`, `rom_file` | Which session, emulator, and ROM were activated, and the exact file the broker chose to boot. |
 | `multiplayer` | Whether multiplayer is on. This is set once, when the session is activated, and doesn't change after that. |
 | `emulator_alive` | Whether the emulator process is still running. |
-| `boot_failed` | True when an emulator can tell its own process is alive but never actually reached a running game — for example, it's stuck on a boot-error dialog. This is a passive signal: the broker only reports it and doesn't act on it. |
-| `extraction_phase` | `null`, `"extracting_archive"`, or `"extracting_pkg"`. Set while shadPS4 or RPCS3 is unpacking a slow `.pkg`/archive ROM, and cleared back to `null` once unpacking ends. At that point the emulator still hasn't started yet, so `null` here doesn't mean the game is running; check `emulator_alive` for that. Like `boot_failed`, this is a passive signal: poll it to show a plain loading spinner while it isn't `null`. There's no percentage to show. |
+| `boot_failed` | True when an emulator can tell its own process is alive but never actually reached a running game, for example because it's stuck on a boot-error dialog. This is a passive signal: the broker only reports it and doesn't act on it. |
+| `extraction_phase` | `null`, `"extracting_archive"`, or `"extracting_pkg"`. Set while shadPS4, RPCS3, PPSSPP or ScummVM is unpacking an archived ROM (`extracting_archive`), or shadPS4 a `.pkg` (`extracting_pkg`), and cleared back to `null` once unpacking ends. At that point the emulator still hasn't started yet, so `null` here doesn't mean the game is running; check `emulator_alive` for that. Like `boot_failed`, this is a passive signal: poll it to show a plain loading spinner while it isn't `null`. There's no percentage to show. |
 | `supports_states` | Whether save and load states work at all for this emulator, so the parent (usually RomM) doesn't need to keep its own list of which emulators support them. |
 | `state_slot` | The one slot this emulator uses. Every save and load echoes this same number back. |
 | `started_at` | Unix time (seconds since January 1, 1970) marking when the session was created. |
@@ -53,7 +53,9 @@ This is what the room UI reads when it loads: who the token belongs to, what
 that person is allowed to do, and the session's rom and emulator. It doesn't
 say who else is in the room; that roster arrives separately, over the room's
 websocket `state_update` broadcast. It answers `409` when there's no session,
-and `401` for a token that isn't part of it. It's documented here because
+and `401` for a token that isn't part of it. Opened with `?invite=...`
+instead, it seats the arrival first, so it can also answer `429` when the
+room is full, or `409` when another session operation is already running. It's documented here because
 it's useful when you're troubleshooting a room that shows "Session Ended",
 but it isn't part of the parent-facing API (the endpoints meant for the
 parent, usually RomM, to call).

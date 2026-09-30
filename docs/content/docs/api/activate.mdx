@@ -32,7 +32,7 @@ The payload fields:
 | Field | Required | Purpose |
 | --- | --- | --- |
 | `emulator` | yes | The emulator's name, from the [Supported emulators](/docs/emulators) list. |
-| `rom` | unless the emulator is `desktop` | `path` is the container path (the file's location inside the container, not on your host machine). `id`, `name` and `platform` come back in the exit upload, and for `retroarch`, `platform` picks the core (the plugin that lets RetroArch emulate that particular system). The optional `language` is the rom's own language, for an emulator whose games ship several of them in one folder: ScummVM sets up one entry, called a target, per language it detects, and that target is what actually boots. Without `language`, a multilingual game starts in whichever language happens to sort first. A code the broker doesn't recognise is ignored rather than failing the launch. The optional `title_id`, `save_target` and `save_target_layout` help an emulator place a [declared import](/docs/api/imports#what-romm-can-tell-the-broker). |
+| `rom` | unless the emulator is `desktop` | `path` is the container path (the file's location inside the container, not on your host machine). `id`, `name` and `platform` come back in the exit upload, and for `retroarch`, `platform` picks the core (the plugin that lets RetroArch emulate that particular system). The optional `language` is the rom's own language, for an emulator whose games ship several of them in one folder: ScummVM sets up one entry, called a target, per language it detects, and that target is what actually boots. Without `language`, a multilingual game starts in whichever language happens to sort first. A code the broker doesn't recognise is ignored rather than failing the launch. The optional `title_id`, `save_target` and `save_target_layout` help an emulator place a [declared import](/docs/api/imports#what-romm-can-tell-the-broker). The optional `core` (RetroArch only) boots that libretro core instead of the platform's default, and must match `^[a-z0-9_]+$` or the launch fails with a 422. `experimental_cores: true` allows a core the broker lists as blocked. See [Choosing a core](/docs/emulators/retroarch-cores#choosing-a-core). |
 | `gui_language` | no | The player's own interface language, not the rom's. If an emulator has a translated interface, it follows this setting (ScummVM writes it into `scummvm.ini`, which is also where the broker reads the keyboard shortcuts it uses to drive ScummVM's in-game menu automatically). A multilingual game folder falls back to `gui_language` when `rom.language` is missing: RomM rarely knows a game's language, so the player's own setting is the only clue left. This is sent for the `desktop` session too, even though it has no rom at all. An unrecognised code is ignored. |
 | `user` | no | `id`, `username` and `display_name` for the controller (the person launching the game, who gets full control by default). If they join or rejoin, the broker matches them by `id` first, then by `username`. |
 | `session_id` | no | An id you supply, cleaned up so it's safe to use in a filename. The broker generates one itself if you leave this out. |
@@ -118,8 +118,8 @@ curl -k -X POST https://localhost:3001/streaming/api/session/swap-disc \
 
 `path` is checked against `ROM_ROOT` the same way activate checks its rom
 path. Returns `{"status": "ok", "path": "<path to the disc>"}`. You get `400` if the running
-emulator has no disc tray to swap into, and `409` if there's no active
-session. Disc swaps can't happen at the same time as each other, or at the
+emulator has no disc tray to swap into, `404` if the disc path doesn't exist,
+`409` if there's no active session, and `502` if the emulator refused the swap. Disc swaps can't happen at the same time as each other, or at the
 same time as a deferred resume load that's already running. A swap only
 counts as finished once the core confirms it's running a game again.
 
@@ -130,7 +130,9 @@ counts as finished once the core confirms it's running a game again.
 Checks the shared secret and makes sure no session is already active
 (answers `409` if one is), looks up the emulator by name (answers `422` if
 it's not recognised), and works out which file under `ROM_ROOT` should
-actually boot.
+actually boot. A rom path that doesn't exist answers `404`. A folder with
+nothing bootable in it, or a missing `rom` for an emulator that needs one,
+answers `422`.
 </Step>
 <Step>
 Shuts down any emulator left running by an earlier broker process, using the
@@ -150,6 +152,10 @@ one with imports lists the file as `unrecognised_layout`, `unsafe_path` or
 `unreadable_member`. A corrupt file refuses the restore even when a newer
 copy on disk means it would not have been written. Only a synced memory
 card sitting in an older archive gets skipped.
+
+A `save.archive` path that doesn't exist answers `404`. If checking the
+imports against the emulator crashes outright, activate answers `500` with
+`{"error": "import_preflight_failed"}` instead of launching.
 </Step>
 <Step>
 Launches the emulator in its own process group, with its output captured to

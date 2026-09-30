@@ -11,6 +11,7 @@ webstation_broker/       FastAPI app (pip installable, console script webstation
   room.py                collab websocket (chat, webcam fanout, resolution, input passing)
   session.py             single-session state, room broadcast, gamepad/MK assignment
   selkies.py             token pushes to the selkies control plane
+  outbox.py              per-connection outbound queue, so a slow room socket delays only itself
   saves.py               save archive restore on activate, delta dump on exit
   memcard.py             whole memory card capture and hydrate
   imports.py             declared save/state/card imports, placed or refused per emulator in preflight
@@ -21,6 +22,7 @@ webstation_broker/       FastAPI app (pip installable, console script webstation
   app.py                 application factory, SUBFOLDER mount, orphan reaping on start
   emulators/             one launcher per emulator, all subclassing emulators.base.Emulator
 frontend/                vite vanilla-JS room interface
+scripts/                 check_broker.py (monitoring check), sync_core_info.py (core catalog upkeep, dev only)
 tests/                   pytest suite; launchers are stubbed, nothing needs a display
 docs/                    this site (Fumadocs, static export to GitHub Pages)
 ```
@@ -37,9 +39,10 @@ uv pip install -e . pytest pytest-asyncio "ruff==0.16.1"
 .venv/bin/ruff check webstation_broker tests
 ```
 
-CI runs the same lint, builds the app factory to catch import errors, and runs
-the tests. Dependencies are deliberately few: FastAPI, uvicorn, httpx and
-pyfatx (for xemu's FATX images).
+CI runs the same lint, builds the app factory to catch import errors, runs
+the tests, and runs the frontend's `npm test`. Dependencies are deliberately
+few: FastAPI, uvicorn, httpx, Pillow (for save-state screenshots) and pyfatx
+(for xemu's FATX images).
 
 ## Conventions
 

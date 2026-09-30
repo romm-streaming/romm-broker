@@ -18,10 +18,11 @@ problem:
 
 - **The broker refuses to start unless `BROKER_SECRET` is set**, unless you
   explicitly set `BROKER_DEV_MODE=true`
-  ([main.py](webstation_broker/main.py)). Once `BROKER_SECRET` is set, every
-  session-lifecycle endpoint (`activate`, `join`, save/load state, swap-disc,
-  state-file, memory-card, exports, imports, status) requires a matching
-  `X-Broker-Secret` header on every request.
+  ([app.py](webstation_broker/app.py), `enforce_auth_config`). Once
+  `BROKER_SECRET` is set, every session-lifecycle endpoint (`activate`,
+  `join`, save/load state, swap-disc, state-file, state-screenshot,
+  memory-card, exports, imports, import-spec, the RetroArch core list,
+  status) requires a matching `X-Broker-Secret` header on every request.
 - **`BROKER_DEV_MODE=true` turns that check off on purpose**, for local
   development where you have the source code mounted in. The broker logs a
   warning every time it starts this way. Never set it on anything reachable
