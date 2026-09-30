@@ -919,7 +919,7 @@ def _archive_holds_files(archive: Path) -> bool:
         True when a member could be a game file; a refusal is logged.
     """
     try:
-        members = extraction_cache.list_members(archive, ARCHIVE_LIST_TIMEOUT)
+        members = extraction_cache.list_members(archive, ARCHIVE_LIST_TIMEOUT, "scummvm")
     except RuntimeError as exc:
         log.warning("scummvm: could not list %s: %s", archive.name, exc)
         return False

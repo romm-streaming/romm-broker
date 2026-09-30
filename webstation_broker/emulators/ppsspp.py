@@ -317,7 +317,7 @@ def _archive_holds_rom(archive: Path) -> bool:
         True when a member carries one of `ROM_EXTENSIONS`; a refusal is logged.
     """
     try:
-        members = extraction_cache.list_members(archive, ARCHIVE_LIST_TIMEOUT)
+        members = extraction_cache.list_members(archive, ARCHIVE_LIST_TIMEOUT, "ppsspp")
     except RuntimeError as exc:
         log.warning("ppsspp: could not list %s: %s", archive.name, exc)
         return False

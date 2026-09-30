@@ -2435,20 +2435,21 @@ def _count_extractions(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
         The archives extracted, appended to as they are.
     """
     extractions: list[Path] = []
-    real_extract = scummvm.extraction_cache._extract_archive
+    real_extract = scummvm.extraction_cache.extract_archive
 
-    def counting(rom: Path, dest: Path, timeout: float) -> None:
+    def counting(rom: Path, dest: Path, timeout: float, **kwargs: Any) -> None:
         """Record an extraction and run it.
 
         Args:
             rom: The archive.
             dest: Where it goes.
             timeout: The extractor timeout.
+            **kwargs: The escape hook and owner, passed on or ignored.
         """
         extractions.append(rom)
-        real_extract(rom, dest, timeout)
+        real_extract(rom, dest, timeout, **kwargs)
 
-    monkeypatch.setattr(scummvm.extraction_cache, "_extract_archive", counting)
+    monkeypatch.setattr(scummvm.extraction_cache, "extract_archive", counting)
     return extractions
 
 
@@ -2634,13 +2635,14 @@ def test_an_extraction_cut_short_leaves_nothing_to_boot_from(
     """A failure mid-extraction leaves no half-written game for the next launch to trust."""
     archive = zipped_game(dirs["roms"], {"MONKEY.000": b"data"})
 
-    def dies(rom: Path, dest: Path, timeout: float) -> None:
+    def dies(rom: Path, dest: Path, timeout: float, **kwargs: Any) -> None:
         """Write part of the game, then fail the way a full disk would.
 
         Args:
             rom: The archive.
             dest: Where it goes.
             timeout: The extractor timeout.
+            **kwargs: The escape hook and owner, passed on or ignored.
 
         Raises:
             RuntimeError: Always.
@@ -2648,7 +2650,7 @@ def test_an_extraction_cut_short_leaves_nothing_to_boot_from(
         (dest / "MONKEY.000").write_bytes(b"da")
         raise RuntimeError("no space left on device")
 
-    monkeypatch.setattr(scummvm.extraction_cache, "_extract_archive", dies)
+    monkeypatch.setattr(scummvm.extraction_cache, "extract_archive", dies)
     emu = Scummvm()
 
     with pytest.raises(RuntimeError, match="no space"):
@@ -2752,20 +2754,21 @@ def test_a_preflight_whose_archive_will_not_extract_says_so(
     archive = zipped_game(dirs["roms"], {"MONKEY.000": b"data"})
     monkeypatch.setattr(scummvm.subprocess, "run", _never_runs)
 
-    def fails(rom: Path, dest: Path, timeout: float) -> None:
+    def fails(rom: Path, dest: Path, timeout: float, **kwargs: Any) -> None:
         """Fail the way a full disk would.
 
         Args:
             rom: The archive.
             dest: Where it goes.
             timeout: The extractor timeout.
+            **kwargs: The escape hook and owner, passed on or ignored.
 
         Raises:
             RuntimeError: Always.
         """
         raise RuntimeError("No space left on device")
 
-    monkeypatch.setattr(scummvm.extraction_cache, "_extract_archive", fails)
+    monkeypatch.setattr(scummvm.extraction_cache, "extract_archive", fails)
 
     result = _preflight(Scummvm(), archive, {".import/save/monkey.003": b"one"})
 
