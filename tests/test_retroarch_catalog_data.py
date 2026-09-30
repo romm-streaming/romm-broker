@@ -231,3 +231,13 @@ def test_table_extensions_are_a_subset_of_the_cores_plus_extra() -> None:
         for core, alt in info.get("alternates", {}).items():
             allowed = set(catalog.cores[core].extensions) | set(alt.get("extra_extensions", ()))
             assert set(info["extensions"]) & allowed, (slug, core)
+
+
+def test_the_docs_table_marks_an_untested_platform_s_default() -> None:
+    """The tier table tags a flagged platform's default core `(untested)` and leaves the rest plain."""
+    table = _sync_module().render_tier_table(retroarch.PLATFORMS, rc.load_bundled_catalog(), rc.TIERS)
+    rows = {line.split("|")[1].strip(" `"): line for line in table.splitlines()[2:]}
+
+    assert "`same_cdi` (untested)" in rows["philips-cd-i"]
+    assert "`numero` (untested)" in rows["ti-83"]
+    assert "(untested)" not in rows["snes"]

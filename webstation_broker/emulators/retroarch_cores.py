@@ -503,7 +503,7 @@ def cores_for_platform(
             "tier": tier,
             "reason": tier_entry.reason if tier_entry and tier == "blocked" else None,
             "reports": list(tier_entry.reports) if tier_entry else [],
-            "verified": tier in ("default", "vetted"),
+            "verified": tier == "vetted" or (tier == "default" and not entry.get("untested")),
             "report_url": f"{REPORT_URL}&core={core}&platform={platform}",
         })
     rows.sort(key=lambda r: (_TIER_ORDER[r["tier"]], r["core"]))

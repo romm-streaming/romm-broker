@@ -149,6 +149,45 @@ def test_a_cd_i_folder_with_a_cue_and_its_track_boots_the_cue(
     assert picked == (tmp_path / "Game.cue").resolve()
 
 
+@pytest.mark.parametrize("slug", ["philips-cd-i", "ti-83"])
+def test_a_platform_nobody_has_booted_yet_ships_flagged_untested(slug: str) -> None:
+    """CD-i and TI-83 launch, but carry the `untested` flag until a tester confirms them (#61).
+
+    Args:
+        slug: The RomM platform slug.
+    """
+    assert retroarch._platform_info(slug)["untested"] is True
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_a_platform_with_a_non_boolean_untested_fails_the_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: Any
+) -> None:
+    """An `untested` spelled as anything but a bool stops the table loading.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher.
+        tmp_path: The per-test temporary directory.
+        value: The `untested` value.
+    """
+    table = tmp_path / "platforms.json"
+    info = {"core": "snes9x", "library_name": "Snes9x", "save_ram": True, "extensions": [".sfc"]}
+    info["untested"] = value
+    table.write_text(json.dumps({"snes": info}))
+    monkeypatch.setattr(retroarch, "_PLATFORMS_FILE", table)
+
+    with pytest.raises(ValueError, match="platforms.json: snes needs a true or false untested"):
+        retroarch._load_platforms()
+
+
+def test_an_alternate_may_not_claim_the_platform_untested() -> None:
+    """`untested` describes the platform's default core, so an alternate carrying it is rejected."""
+    with pytest.raises(ValueError, match="unknown key"):
+        retroarch._validate_entry(
+            "snes/bsnes", {"library_name": "bsnes", "save_ram": True, "untested": True}, alternate=True
+        )
+
+
 @pytest.mark.parametrize("slug", ["mac", "fm-towns"])
 def test_a_platform_whose_core_is_unsafe_or_unbootable_stays_unmapped(slug: str) -> None:
     """Mac and FM Towns stay out of the table until their cores can run safely (#61).
@@ -851,6 +890,30 @@ class TestResumeGate:
         emu.platform = "snes"
         emu.launch(tmp_path / "game.sfc", resume_slot)
         return emu
+
+    def test_launching_an_untested_platform_warns_it_is_untested(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A launch on a platform flagged `untested` says so in the log, and still launches."""
+        emu = retroarch.Retroarch()
+        emu.platform = "ti-83"
+
+        with caplog.at_level(logging.WARNING):
+            emu.launch(tmp_path / "game.8xp", None)
+
+        assert "ti-83 is untested" in caplog.text
+
+    def test_launching_a_tested_platform_does_not_warn(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A platform without the flag launches with no untested warning."""
+        emu = retroarch.Retroarch()
+        emu.platform = "snes"
+
+        with caplog.at_level(logging.WARNING):
+            emu.launch(tmp_path / "game.sfc", None)
+
+        assert "untested" not in caplog.text
 
     def test_slot_zero_still_defers_a_load(self, tmp_path: Path, _stub_launch: list[tuple[Any, ...]]) -> None:
         """A resume request for slot 0 schedules a deferred load of slot 0."""

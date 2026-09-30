@@ -82,7 +82,8 @@ def render_tier_table(
         tiers: The tiers table.
 
     Returns:
-        A Markdown table: platform, default, vetted, blocked, count of untested.
+        A Markdown table: platform, default (tagged `(untested)` on a flagged
+        platform), vetted, blocked, count of untested.
     """
     lines = ["| Platform | Default (best tested) | Vetted | Blocked | Untested |", "|---|---|---|---|---|"]
     for slug in sorted(platforms):
@@ -91,8 +92,9 @@ def render_tier_table(
             t: [r["core"] for r in rows if r["tier"] == t]
             for t in ("default", "vetted", "blocked", "untested")
         }
+        default = f"`{by['default'][0]}`" + (" (untested)" if platforms[slug].get("untested") else "")
         lines.append(
-            f"| `{slug}` | `{by['default'][0]}` | {', '.join(f'`{c}`' for c in by['vetted']) or '-'} "
+            f"| `{slug}` | {default} | {', '.join(f'`{c}`' for c in by['vetted']) or '-'} "
             f"| {', '.join(f'`{c}`' for c in by['blocked']) or '-'} | {len(by['untested'])} |"
         )
     return "\n".join(lines)

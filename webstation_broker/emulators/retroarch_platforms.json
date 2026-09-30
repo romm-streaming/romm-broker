@@ -387,7 +387,8 @@
     "library_name": "SAME_CDI",
     "save_ram": false,
     "extensions": [".chd", ".cue", ".iso"],
-    "savestate": false
+    "savestate": false,
+    "untested": true
   },
   "pc-fx": {
     "core": "mednafen_pcfx",
@@ -463,7 +464,8 @@
     "core": "numero",
     "library_name": "Numero",
     "save_ram": false,
-    "extensions": [".8xp", ".8xk", ".8xg"]
+    "extensions": [".8xp", ".8xk", ".8xg"],
+    "untested": true
   },
   "epoch-super-cassette-vision": {
     "core": "emuscv",
