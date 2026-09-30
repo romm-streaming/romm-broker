@@ -22,7 +22,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketState
 
-from webstation_broker import api, callback, imports, saves, screenshot, selkies, session, settings
+from webstation_broker import api, callback, imports, room, saves, screenshot, selkies, session, settings
 from webstation_broker.app import create_app
 from webstation_broker.emulators import base, dolphin, extraction_cache, ppsspp, rpcs3, scummvm, shadps4
 from webstation_broker.outbox import Outbox
@@ -104,7 +104,7 @@ def test_health_answers_without_a_secret(client: TestClient) -> None:
 
 def test_status_is_inactive_before_anything_runs(client: TestClient) -> None:
     """Status reports inactive before anything runs."""
-    assert client.get(f"{API}/session/status").json() == {"active": False}
+    assert client.get(f"{API}/session/status").json() == {"active": False, "last_exit": None}
 
 
 def test_status_requires_the_broker_secret_when_one_is_set(
@@ -116,7 +116,7 @@ def test_status_requires_the_broker_secret_when_one_is_set(
     assert response.status_code == 403
 
     secret_client.headers["X-Broker-Secret"] = "s3cret"
-    assert secret_client.get(f"{API}/session/status").json() == {"active": False}
+    assert secret_client.get(f"{API}/session/status").json() == {"active": False, "last_exit": None}
 
 
 def test_a_wrong_secret_is_refused(secret_client: TestClient, broker_dirs: dict[str, Path]) -> None:
@@ -821,6 +821,87 @@ def test_exit_dumps_the_save_delta_and_retires_the_session(
     assert body["upload"]["mode"] == "report-only"
     assert fake_emulator[0].running is False
     assert session.SESSION is None
+
+
+def test_activate_logs_how_long_the_launch_took(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A successful activate logs one line naming the session, the emulator and the launch time."""
+    with caplog.at_level(logging.INFO, logger="webstation_broker.api"):
+        session_id = _activate(client, broker_dirs).json()["session_id"]
+
+    launched = [r.getMessage() for r in caplog.records if r.getMessage().startswith("activate: session")]
+    assert len(launched) == 1
+    assert session_id in launched[0]
+    assert " launched " in launched[0]
+
+
+def test_exit_outcome_survives_the_next_activate_on_the_status_route(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Status reports how the last exit ended, before and after the next activate.
+
+    A failed upload has to stay visible until another exit replaces it, so a
+    check polling status between games still sees it.
+    """
+    monkeypatch.setattr(settings, "DEV_MODE", True)
+    _activate(client, broker_dirs)
+    exited = client.post(f"{API}/session/exit").json()
+
+    idle = client.get(f"{API}/session/status").json()
+    _activate(client, broker_dirs)
+    playing = client.get(f"{API}/session/status").json()
+
+    assert idle["last_exit"]["session_id"] == exited["session_id"]
+    assert idle["last_exit"]["upload"] == "report-only"
+    assert idle["last_exit"]["dump_error"] is None
+    assert idle["last_exit"]["duration_s"] >= 0
+    assert playing["last_exit"] == idle["last_exit"]
+
+
+def test_a_failed_upload_logs_the_exit_line_as_a_warning(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An exit whose archive never reached the parent logs `upload=failed` at WARNING."""
+    _activate(client, broker_dirs)
+    _write_save_after_launch(fake_emulator[0].save_root / "saves" / "card.bin", b"played")
+
+    async def _refuse_upload(
+        cb: Optional[dict[str, Any]], zip_bytes: bytes, filename: str, sess: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Report an upload the parent would not take.
+
+        Args:
+            cb: The session's callback block.
+            zip_bytes: The archive body.
+            filename: The archive name.
+            sess: The session the archive belongs to.
+
+        Returns:
+            A failed upload report.
+        """
+        return {"mode": "failed", "ok": False, "error": "connection refused"}
+
+    monkeypatch.setattr(callback, "push_save_archive", _refuse_upload)
+
+    with caplog.at_level(logging.INFO, logger="webstation_broker.api"):
+        client.post(f"{API}/session/exit")
+
+    done = [r for r in caplog.records if r.getMessage().startswith("exit: session")]
+    assert [r.levelname for r in done] == ["WARNING"]
+    assert "upload=failed" in done[0].getMessage()
+    assert session.LAST_OUTCOME is not None
+    assert session.LAST_OUTCOME["archive_path"] in done[0].getMessage()
 
 
 def test_exit_reports_files_skipped_during_the_dump(
@@ -3409,3 +3490,177 @@ def test_import_spec_requires_the_broker_secret(
 
     secret_client.headers["X-Broker-Secret"] = "s3cret"
     assert secret_client.get(f"{API}/session/import-spec", params={"emulator": "fake"}).status_code == 200
+
+
+def test_api_answers_are_not_cached_or_sniffed(client: TestClient) -> None:
+    """API answers can carry a seat token, so none may be stored by a cache."""
+    response = client.get(f"{API}/health")
+
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+async def test_find_viewer_tolerates_a_non_ascii_token() -> None:
+    """A junk token is an unknown viewer, not a 500 from the constant-time compare."""
+    session.new_session({"emulator": "fake"}, FakeEmulator(), None)
+    viewer = await session.add_viewer("participant")
+
+    assert session.find_viewer("éé") is None
+    assert session.find_viewer(viewer["token"]) is viewer
+
+
+def test_redact_url_hides_userinfo() -> None:
+    """Credentials in a callback base_url never reach a log line or a report."""
+    assert callback.redact_url("https://u:pw@romm.example:8443/x") == "https://***@romm.example:8443/x"
+    assert callback.redact_url("https://romm.example/x") == "https://romm.example/x"
+    assert callback.public_view({"base_url": "https://u:pw@h", "token": "t"}) == {"base_url": "https://***@h"}
+
+
+async def test_the_save_upload_log_hides_callback_credentials(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed upload logs and reports the URL without its password."""
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        callback.httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(refuse), **kw)
+    )
+    caplog.set_level(logging.INFO, logger="webstation_broker.callback")
+
+    report = await callback.push_save_archive(
+        {"base_url": "https://u:hunter2@romm.example"}, b"PK", "a.zip", {"id": "s", "emulator": "fake"}
+    )
+
+    assert report["ok"] is False
+    assert "hunter2" not in report["url"]
+    assert "hunter2" not in caplog.text
+
+
+_SECRET_GATED = [
+    ("POST", "/session/activate"),
+    ("POST", "/session/join"),
+    ("POST", "/session/exit"),
+    ("POST", "/session/save-state"),
+    ("POST", "/session/load-state"),
+    ("POST", "/session/swap-disc"),
+    ("GET", "/session/state-file"),
+    ("GET", "/session/state-screenshot"),
+    ("PUT", "/session/state-file"),
+    ("GET", "/session/import-spec"),
+    ("GET", "/retroarch/cores"),
+    ("GET", "/session/memory-card"),
+    ("PUT", "/session/memory-card"),
+    ("GET", "/session/status"),
+    ("PUT", "/session/imports/a.zip"),
+    ("GET", "/session/exports"),
+    ("GET", "/session/exports/a.zip"),
+    ("DELETE", "/session/exports/a.zip"),
+]
+
+
+@pytest.mark.parametrize(("method", "path"), _SECRET_GATED)
+@pytest.mark.parametrize("presented", [None, "wrong", "s3crét"])
+def test_every_secret_gated_route_refuses_a_bad_secret(
+    secret_client: TestClient, method: str, path: str, presented: Optional[str]
+) -> None:
+    """No gated route answers, or falls over, for a missing, wrong or non-ASCII secret."""
+    headers = {} if presented is None else {"X-Broker-Secret": presented.encode("utf-8")}
+
+    headers["Content-Type"] = "application/json"
+
+    response = secret_client.request(method, f"{API}{path}", headers=headers, content=b"{}")
+
+    # 403 before any of the route's own parameters are validated: an
+    # unauthenticated caller learns nothing about what a route expects.
+    assert response.status_code == 403, response.text
+
+
+_OPEN_ROUTES = {
+    "/api/health",
+    "/api/session/invite",
+    "/api/session/exit",
+    "/api/session/context",
+    "/ws/room",
+}
+
+
+def test_every_route_is_behind_the_secret_or_deliberately_open() -> None:
+    """A new route is gated by the router it sits on; an open one has to be listed here."""
+    gated = {route.path for route in api.secret_router.routes}
+    open_ = {route.path for route in api.router.routes} | {route.path for route in room.router.routes}
+
+    assert open_ == _OPEN_ROUTES
+    # The sweep above has to cover every gated route, so none is skipped by it.
+    assert {f"/api{path}" for _, path in _SECRET_GATED} >= {
+        path.replace("{name}", "a.zip") for path in gated
+    }
+
+
+@pytest.fixture
+def page_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> TestClient:
+    """Serve a stub room page through the real frontend mount, which dev mode leaves out.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher, undone when the test ends.
+        tmp_path: The per-test temporary directory.
+
+    Returns:
+        A client for an app built with a secret and dev mode off. No lifespan
+        runs; the page and health routes don't need one.
+    """
+    (tmp_path / "index.html").write_text("<!doctype html><title>room</title>")
+    monkeypatch.setattr(settings, "BROKER_SECRET", "s3cret")
+    monkeypatch.setattr(settings, "DEV_MODE", False)
+    monkeypatch.setattr(settings, "FRONTEND_DIST", tmp_path)
+    return TestClient(create_app())
+
+
+def test_room_page_csp_is_report_only_by_default(page_client: TestClient) -> None:
+    """Off by default the policy only reports, and nothing restricts who may frame the room."""
+    response = page_client.get(f"{PREFIX}/")
+
+    assert response.status_code == 200
+    assert "script-src 'self' blob:" in response.headers["Content-Security-Policy-Report-Only"]
+    assert "Content-Security-Policy" not in response.headers
+
+
+def test_frame_ancestors_is_enforced_even_while_the_policy_only_reports(
+    page_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Browsers ignore frame-ancestors in a report-only policy, so it rides its own enforced header."""
+    monkeypatch.setattr(settings, "FRAME_ANCESTORS", "https://romm.example")
+
+    headers = page_client.get(f"{PREFIX}/").headers
+
+    assert headers["Content-Security-Policy"] == "frame-ancestors https://romm.example"
+    assert "frame-ancestors" not in headers["Content-Security-Policy-Report-Only"]
+
+
+@pytest.mark.parametrize("ancestors", ["", "'self'"])
+def test_enforced_room_page_csp_carries_frame_ancestors_when_set(
+    page_client: TestClient, monkeypatch: pytest.MonkeyPatch, ancestors: str
+) -> None:
+    """Enforcing folds frame-ancestors into the one policy and drops the report-only header."""
+    monkeypatch.setattr(settings, "CSP_ENFORCE", True)
+    monkeypatch.setattr(settings, "FRAME_ANCESTORS", ancestors)
+
+    headers = page_client.get(f"{PREFIX}/").headers
+    policy = headers["Content-Security-Policy"]
+
+    assert policy.startswith("default-src 'self'")
+    assert policy.endswith("frame-ancestors 'self'") == bool(ancestors)
+    assert "Content-Security-Policy-Report-Only" not in headers
+
+
+def test_json_answers_carry_no_csp(page_client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The policy is for the page; a JSON answer has nothing for it to govern."""
+    monkeypatch.setattr(settings, "CSP_ENFORCE", True)
+    monkeypatch.setattr(settings, "FRAME_ANCESTORS", "'self'")
+
+    headers = page_client.get(f"{PREFIX}/api/health").headers
+
+    assert "Content-Security-Policy" not in headers
+    assert "Content-Security-Policy-Report-Only" not in headers

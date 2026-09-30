@@ -113,6 +113,11 @@ activate unless the payload supplies one.
 SAVE_UPLOAD_TIMEOUT = float(os.environ.get("BROKER_SAVE_UPLOAD_TIMEOUT", "30"))
 """Seconds allowed for the exit upload, from `BROKER_SAVE_UPLOAD_TIMEOUT` (default `30`)."""
 
+EMULATOR_WATCH_INTERVAL = float(os.environ.get("BROKER_EMULATOR_WATCH_INTERVAL", "15"))
+"""Seconds between checks that the session's emulator is still running, from
+`BROKER_EMULATOR_WATCH_INTERVAL` (default `15`); `0` turns the watch off.
+"""
+
 FRONTEND_DIST = Path(
     os.environ.get("BROKER_FRONTEND_DIST", "/usr/share/webstation-broker/www")
 )
@@ -148,6 +153,22 @@ state's thumbnail.
 
 DEV_MODE = os.environ.get("BROKER_DEV_MODE", "").lower() == "true"
 """Whether dev mode is on, from `BROKER_DEV_MODE` (default off; only the string `true` enables it)."""
+
+FRAME_ANCESTORS = os.environ.get("BROKER_FRAME_ANCESTORS", "").strip()
+"""Who may embed the room, from `BROKER_FRAME_ANCESTORS` (default unset: anyone).
+
+A CSP `frame-ancestors` source list, e.g. `'self'` when RomM serves the room
+under its own `SUBFOLDER`, or `https://romm.example.com` when it embeds the
+room cross-origin. Unset by default, since the right value depends on how
+RomM is deployed and a wrong one blanks the player.
+"""
+
+CSP_ENFORCE = truthy(os.environ.get("BROKER_CSP_ENFORCE"))
+"""Whether the room page's Content-Security-Policy is enforced, from `BROKER_CSP_ENFORCE`.
+
+Default off: the policy is sent as `Content-Security-Policy-Report-Only`, so a
+page it would break still works and the violation shows in the browser console.
+"""
 
 GAMEPAD_SLOTS = int(os.environ.get("BROKER_GAMEPAD_SLOTS", "4"))
 """Number of virtual gamepad slots, from `BROKER_GAMEPAD_SLOTS` (default `4`)."""

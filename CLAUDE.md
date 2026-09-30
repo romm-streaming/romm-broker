@@ -31,7 +31,7 @@ Most of them are enforced: `ruff`'s `D` and `ANN` rules make the docstring and t
 **Lint:** `.venv/bin/ruff check webstation_broker tests` (CI runs exactly this, pinned to `ruff==0.16.1`, on every push/PR to `master`; see `.github/workflows/ci.yml`). The `D` and `ANN` rules feed the generated developer reference, so a malformed docstring is a docs regression as well as a lint failure.
 **Tests travel with code.** New logic gets a test in `tests/`; new endpoints get endpoint tests.
 **Don't commit until approved.** Never run `git commit` (or push) without the user explicitly signing off first.
-**Link PRs to issues.** `Fixes #XXXX` for bug fixes, `Closes #XXXX` for feature implementations.
+**Link PRs to existing issues.** If an issue already exists for what the PR resolves, link it: `Fixes #XXXX` for bug fixes, `Closes #XXXX` for feature implementations. Don't open an issue just to have one to link.
 
 Full detail on comments, docstrings, logging, secrets, and the security invariants lives in [CONTRIBUTING.md](CONTRIBUTING.md) - read it, don't duplicate it here.
 
@@ -54,9 +54,10 @@ uv venv && uv pip install -e . pytest pytest-asyncio "ruff==0.16.1"   # first ti
 # only surface when s6 restarts the service in the container.
 BROKER_DEV_MODE=true .venv/bin/python -c "from webstation_broker.app import create_app; create_app()"
 
-cd frontend && npm ci && npm run build                # room UI, not covered by CI
+cd frontend && npm test                               # room helper tests (node --test, no install)
+cd frontend && npm ci && npm run build                # room UI build, not covered by CI
 ```
 
-The three CI gates are lint, the `create_app()` import check, and `pytest -q`.
-The `frontend/` build is not one of them, so run it yourself when you touch
-`frontend/src`.
+The four CI gates are lint, the `create_app()` import check, `pytest -q`, and
+`npm test` in `frontend/`. The `frontend/` build is not one of them, so run it
+yourself when you touch `frontend/src`.

@@ -1452,7 +1452,7 @@ def _archive_member_names(archive: Path) -> Optional[list[str]]:
         Its member paths, or None when it cannot be listed.
     """
     try:
-        return extraction_cache.list_members(archive, ARCHIVE_LIST_TIMEOUT)
+        return extraction_cache.list_members(archive, ARCHIVE_LIST_TIMEOUT, "retroarch")
     except RuntimeError as exc:
         log.warning("retroarch: could not list archive %s: %s", archive.name, exc)
         return None

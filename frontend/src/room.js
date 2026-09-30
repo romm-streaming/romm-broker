@@ -1,6 +1,12 @@
 import '@fortawesome/fontawesome-free/css/all.min.css';
 import './room.css';
 import { getTranslator } from './translation.js';
+import {
+    MIN_TOUCH_OPACITY,
+    STORAGE_KEY as TOUCH_OPACITY_KEY,
+    applyTouchOpacity,
+    parseTouchOpacity,
+} from './touchOpacity.js';
 
 // ---------------------------------------------------------------------------
 // WebCodecs track plumbing: capture (MediaStreamTrack -> VideoFrame/AudioData for
@@ -3523,6 +3529,36 @@ document.addEventListener('DOMContentLoaded', async () => {
         localStorage.setItem('collab_preferredCamId', preferredCamId);
         restartMediaForDeviceChange().catch(err => console.error('[Media] webcam switch failed:', err));
     });
+
+    // Per viewer: each browser keeps its own level, and it reaches the touch
+    // gamepad inside the stream frame on every (re)load.
+    const touchOpacitySlider = document.getElementById('touch-opacity-slider');
+    const touchOpacityValue = document.getElementById('touch-opacity-value');
+    touchOpacitySlider.min = MIN_TOUCH_OPACITY;
+    let touchOpacity = parseTouchOpacity(localStorage.getItem(TOUCH_OPACITY_KEY));
+    const applyTouchOpacityToFrame = () => {
+        const el = document.getElementById('session-frame');
+        let doc = null;
+        try { doc = el ? el.contentDocument : null; } catch (err) { doc = null; }
+        applyTouchOpacity(doc, touchOpacity);
+    };
+    const showTouchOpacity = () => {
+        touchOpacitySlider.value = touchOpacity;
+        touchOpacityValue.textContent = `${Math.round(touchOpacity * 100)}%`;
+    };
+    showTouchOpacity();
+    touchOpacitySlider.addEventListener('input', (e) => {
+        touchOpacity = parseTouchOpacity(e.target.value);
+        showTouchOpacity();
+        applyTouchOpacityToFrame();
+        // Blocked or full storage only costs remembering it next visit.
+        try {
+            localStorage.setItem(TOUCH_OPACITY_KEY, touchOpacity);
+        } catch (err) {
+            console.warn('[Touch] Could not save touch controls opacity:', err);
+        }
+    });
+    document.getElementById('session-frame').addEventListener('load', applyTouchOpacityToFrame);
     
     videoStrip.addEventListener('click', (e) => {
         const btn = e.target.closest('.remote-control-btn');

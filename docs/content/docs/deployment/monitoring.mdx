@@ -1,0 +1,232 @@
+---
+title: "Monitoring"
+description: "Watching a running broker: the check script, where to run it, what normal looks like in the log, and what to do about each alert."
+---
+
+The broker's job that matters most is getting save data back to RomM. When
+that fails, the save archive waits on the container and nobody is told unless
+something is watching. This page sets that watch up.
+
+There are two separate questions, and they get two separate answers:
+
+- **Is the broker up?** Answered by `GET /api/health`. Safe to use as a
+  container healthcheck.
+- **Did anything go wrong with a game or its saves?** Answered by
+  `scripts/check_broker.py`. Run it on a schedule and send its output to a
+  person. Do **not** use it as a container healthcheck (see
+  [below](#why-the-check-is-not-a-container-healthcheck)).
+
+## The check script
+
+`scripts/check_broker.py` reads three routes (`/api/health`,
+`/api/session/status` and `/api/session/exports`), prints one line and exits
+with a Nagios-style code:
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | OK |
+| `1` | WARNING: something needs a look, no save data is at risk yet |
+| `2` | CRITICAL: save data did not reach RomM, or the broker or its emulator is down |
+| `3` | UNKNOWN: the check could not read the broker (usually a wrong secret) |
+
+It needs Python 3 and nothing else, so it runs anywhere that can reach the
+broker. It reads the broker secret from the `BROKER_SECRET` environment
+variable.
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `--url` | `$BROKER_URL`, else `http://` plus `BROKER_HOST` and `BROKER_PORT` (`127.0.0.1:8000` when unset) plus the `SUBFOLDER` prefix (`/streaming` when unset) | The broker's base URL, prefix included. |
+| `--insecure` | off | Skip TLS certificate checks, for the container's self-signed port `3001`. |
+| `--timeout` | `5` | Seconds to wait for each request. |
+| `--max-session-hours` | `12` | Warn when one session has been open longer than this. |
+| `--max-exit-seconds` | `120` | Warn when the last exit took longer than this. |
+| `--max-kept-archives` | `0` | Warn when more save archives than this are waiting on the container. |
+| `--max-last-exit-hours` | `24` | Stop reporting a failed dump, an upload that kept nothing, or a slow exit once the exit is older than this. |
+
+## Where to run it
+
+The script is not installed in the container image, so it is fed in from a
+checkout of this repo, or from a copy of the single file.
+
+### From the Docker host (recommended)
+
+Pipe the script into the container's own Python. It then talks to the broker
+directly (on `127.0.0.1:8000` unless `BROKER_HOST` or `BROKER_PORT` move it),
+with no TLS and no reverse proxy in the way, and `docker exec` hands it the
+container's `BROKER_SECRET`, `BROKER_PORT` and `SUBFOLDER`, so there is no
+second copy of any of them to keep in sync:
+
+```bash
+docker exec -i webstation python3 - < scripts/check_broker.py
+```
+
+Pass options after the `-`:
+
+```bash
+docker exec -i webstation python3 - --max-session-hours 6 < scripts/check_broker.py
+```
+
+Replace `webstation` with your `container_name`.
+
+### From another machine
+
+Point it at the container's HTTPS port. Port `3001` carries a self-signed
+certificate, hence `--insecure`; drop it when you go through a reverse proxy
+with a real certificate instead:
+
+```bash
+BROKER_SECRET=change-me python3 check_broker.py \
+  --url https://yourhost:3001/streaming --insecure
+```
+
+### On a schedule
+
+Every 5 minutes is plenty: nothing it watches changes faster than a game
+session does. A cron entry that only speaks up when something is wrong:
+
+```bash
+*/5 * * * * out=$(docker exec -i webstation python3 - < /opt/romm-broker/scripts/check_broker.py) || echo "$out"
+```
+
+Cron mails any output to the crontab's owner, so this sends one message per
+failing run and stays silent while things are OK. To send it somewhere else,
+replace `echo "$out"` with your notifier (`curl` to an ntfy, Gotify, Discord
+or Slack webhook, for example).
+
+Any monitoring system that runs a command and reads its exit code (Nagios,
+Icinga, Checkmk, Zabbix, Uptime Kuma's push monitors driven by cron) can run the
+same command directly and use its own alert routing.
+
+## The container healthcheck
+
+For a healthcheck, ask only whether the broker answers:
+
+```yaml
+services:
+  webstation:
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:8000/streaming/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 240s
+```
+
+`start_period` is long on purpose: the broker does not start until selkies is
+up, and a cold first boot can take a few minutes.
+
+### Why the check is not a container healthcheck
+
+Docker marks a container unhealthy whenever its healthcheck fails, and tools
+such as autoheal (common on Unraid) restart unhealthy containers. Most of what
+`check_broker.py` reports is fixed by a person, not by a restart. A failed
+upload is not fixed by one, and an emulator that crashed mid-game still has save
+data on disk that a restart would strand. A restart also ends every game in
+progress and clears `last_exit`, so the alert that explained the problem goes
+too.
+
+## What normal looks like
+
+Idle, the check prints:
+
+```text
+OK: broker up, idle, 0 kept archive(s)
+```
+
+During a game it names the session instead of `idle`.
+
+In the broker log (`docker logs webstation`), every game is bracketed by two
+lines:
+
+```text
+activate: session 3f2a... launched pcsx2 in 4.2s (restored 3 save file(s), tokens pushed: True)
+exit: session 3f2a... done in 18.6s: state_saved=True upload=uploaded kept=-
+```
+
+A launch usually takes a few seconds; shadPS4 and RPCS3 can take minutes while
+they unpack a `.pkg`. An exit takes from a few seconds up to about a minute,
+depending on how long the emulator takes to save its state and stop.
+
+On the `exit:` line, `upload` is one of:
+
+| `upload=` | Meaning |
+| --- | --- |
+| `uploaded` | RomM took the save archive. |
+| `skipped` | The game wrote no saves this session, so there was nothing to send. |
+| `failed` | RomM did not take the archive. The line is logged as a `WARNING`, and `kept=` names the copy left on the container, or `-` if even that could not be written. |
+| `report-only` | Dev mode: nothing is uploaded, and the archive is always kept. |
+
+### When the emulator goes mid-session
+
+Between those two lines, the broker checks every 15 seconds
+(`BROKER_EMULATOR_WATCH_INTERVAL`) that the session's emulator is still
+running. If it is gone while the session is still open, one line is logged for
+that session:
+
+```text
+emulator watch: session 3f2a...: pcsx2 exited while the session was open (exit code -11, rom Game); exit the session from RomM to save and upload what it wrote
+```
+
+It is an `ERROR` for a crash (a signal or an error code) and a `WARNING` for
+exit code `0`, which is usually a player quitting from the emulator's own
+menu. To be told about crashes as they happen, have your log shipper alert on
+`emulator watch:` at `ERROR`. What each exit code means, and what to do, is in
+[The game froze mid-session](/docs/troubleshooting#the-game-froze-mid-session-and-the-emulator-is-gone).
+
+## What each alert means
+
+Worst first. When one run finds several problems it prints them all on one
+line, separated by `;`, under the worst state.
+
+Alerts about the last exit clear on their own once they are dealt with. A
+failed upload with a kept archive stays raised until that archive is deleted
+from `BROKER_EXPORT_DIR`. A failed dump, an upload that kept nothing and a
+slow exit leave nothing on disk to track, so they stay raised for
+`--max-last-exit-hours` (24 by default) and then drop; the next exit also
+replaces them. Deal with them inside that window, or raise it if nobody reads
+the alerts that often.
+
+| The check says | What it means | What to do |
+| --- | --- | --- |
+| `CRITICAL: broker health ... unreachable` | Nothing answers on the broker port. | Check the container is running, then read `docker logs webstation` for the startup error. |
+| `CRITICAL: ... emulator ... is not running` | A session is still open but its emulator exited or crashed. Players see a frozen stream. | Exit the session from RomM. The teardown still dumps and uploads whatever saves the emulator wrote before it went down. The log's `emulator watch:` line for the session says when it ended and with what exit code. |
+| `CRITICAL: ... save dump failed` | The last exit could not zip the save tree, so nothing reached RomM. | The saves are still in that emulator's save directory under `/config`; the log line `save dump failed` says why. Copy them out before the next game on that emulator, because a launch clears the working save slot. |
+| `CRITICAL: ... upload failed and the archive could not be kept` | RomM did not take the archive, and writing the fallback copy failed too (a full disk, usually). | Recover the saves from the emulator's save directory as above, then free space under `BROKER_EXPORT_DIR` (default `/config/broker-exports`). |
+| `WARNING: ... upload failed, archive kept at ...` | RomM did not take the archive; the broker kept a copy. | Find out why in the log (`save upload rejected by ...` or `save upload to ... failed`) and fix the RomM side. Then download the archive and delete it, as below; the alert clears once it is gone. |
+| `WARNING: N save archive(s) kept on disk, not in RomM` | Archives are waiting in `BROKER_EXPORT_DIR`. Outside dev mode each one is a failed upload. | Download and delete them, as below. The warning clears once the directory is empty. In dev mode every exit keeps one, so raise `--max-kept-archives` there. |
+| `WARNING: ... emulator reports a failed boot` | The emulator is running but never reached the game (PCSX2 reports this today). | Read the log around the launch for the emulator's own error, and see [Activate fails](/docs/troubleshooting#activate-fails-or-a-specific-game-wont-launch). |
+| `WARNING: session ... has run 13.0h` | A session has been open longer than `--max-session-hours`. Usually a browser tab closed without exiting. | Check whether someone is really still playing; if not, exit it from RomM. |
+| `WARNING: last exit ... took 300s` | A teardown took longer than `--max-exit-seconds`. | Look for `still running after its exit` in the log: an emulator that ignored its exit request and had to be killed. |
+| `UNKNOWN: broker refused the secret (HTTP 403) ...` | The check's `BROKER_SECRET` does not match the broker's. | Use the same secret the container was started with. |
+| `UNKNOWN: broker answered HTTP 404 ...` (or `500`, `502`) | The status route answered, but not with a status. | A `404` means the `--url` prefix is wrong or a proxy does not forward the route; a `5xx` means the broker or the proxy in front of it failed, so read its log. |
+| `UNKNOWN: could not read broker status` | The broker answered its health route but not the status route. | Usually a proxy that forwards only part of the API; try the check from the Docker host instead. |
+
+### Recovering a kept archive
+
+List what is waiting, download each archive, then delete it once it is safe
+elsewhere (in RomM, or anywhere you keep backups):
+
+```bash
+curl -k -H "X-Broker-Secret: $BROKER_SECRET" https://yourhost:3001/streaming/api/session/exports
+curl -k -H "X-Broker-Secret: $BROKER_SECRET" -o save.zip \
+  https://yourhost:3001/streaming/api/session/exports/<name>
+curl -k -X DELETE -H "X-Broker-Secret: $BROKER_SECRET" \
+  https://yourhost:3001/streaming/api/session/exports/<name>
+```
+
+See [Save archives](/docs/api/archives) for the archive layout.
+
+## What the check cannot see
+
+- **A restart forgets the last exit.** `last_exit` lives in memory. A failed
+  upload is still caught after a restart, because its archive stays on disk,
+  but a slow exit or a failed dump from before the restart is not.
+- **Old alerts expire.** A failed dump or slow exit older than
+  `--max-last-exit-hours` stops being reported even if nobody acted on it.
+  The `exit:` line in the log keeps the record.
+- **It samples; it does not watch.** An emulator that crashes and is exited
+  between two runs never shows as `not running`. The broker's own
+  [emulator watch](#when-the-emulator-goes-mid-session) still logs the crash,
+  and the exit's own line records how its saves went.
+- **It only knows what the broker knows.** An archive RomM accepted but filed
+  wrongly shows as `uploaded`.

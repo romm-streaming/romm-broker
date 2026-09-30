@@ -5,8 +5,9 @@ Thanks for looking at romm-broker. A few ground rules before you open a PR.
 ## Workflow
 
 - Branch off `master`; open PRs against `master`. Don't push to `master` directly.
-- Link the issue your PR addresses: `Fixes #XXXX` for a bug fix, `Closes #XXXX`
-  for a feature, in the PR description.
+- If an issue already exists for what your PR resolves, link it in the PR
+  description: `Fixes #XXXX` for a bug fix, `Closes #XXXX` for a feature. A PR
+  with no existing issue doesn't need one opened first.
 - Keep commit messages short, concise, and accurate: what changed and why, no
   filler.
 - Every commit must be signed, so GitHub marks it Verified. `commit.gpgsign` is
@@ -23,12 +24,13 @@ BROKER_DEV_MODE=true .venv/bin/python -c "from webstation_broker.app import crea
 .venv/bin/pytest -q
 ```
 
-CI runs three gates on every push and PR to `master`: lint, a `create_app()`
+CI runs four gates on every push and PR to `master`: lint, a `create_app()`
 import check under `BROKER_DEV_MODE=true` (catching an import or syntax error
 before it would otherwise only surface when s6 restarts the service in the
-container), and the test suite. There is no frontend lint, test, or build
-step in CI; if you touch `frontend/`, read your diff carefully before opening
-the PR.
+container), the test suite, and `npm test` in `frontend/`. That last one only
+covers the helpers split out of `room.js` with a `*.test.js` beside them.
+There is no frontend lint or build step in CI, so if you touch `frontend/`,
+read your diff carefully and build it before opening the PR.
 
 ## Code conventions
 
@@ -122,6 +124,10 @@ blocks a PR.
 - **Validate every caller-supplied rom or disc path against `ROM_ROOT`** with
   `os.path.realpath` (symlinks resolved) before it reaches a subprocess. Outside
   the root is a clean 400, not a launch.
+- **Put a RomM-facing route on `api.secret_router`**, never on `api.router`.
+  The secret is checked there before anything else, so the route can't forget
+  to. `api.router` is for routes with a credential of their own (a seat
+  token); adding one means adding it to `_OPEN_ROUTES` in `tests/test_api.py`.
 - **Put `--` before a path in an argv list**, so a leading-dash filename can't
   become a flag.
 - **Never `shell=True`.** Always list-form argv.

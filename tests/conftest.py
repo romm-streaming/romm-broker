@@ -307,12 +307,14 @@ def clean_session() -> Iterator[None]:
     """
     session.SESSION = None
     session.LAST_EXIT = None
+    session.LAST_OUTCOME = None
     session.ROOM["controller"] = None
     session.ROOM["viewers"] = {}
     session.ROOM["cooldowns"] = {}
     yield
     session.SESSION = None
     session.LAST_EXIT = None
+    session.LAST_OUTCOME = None
     session.ROOM["controller"] = None
     session.ROOM["viewers"] = {}
     session.ROOM["cooldowns"] = {}

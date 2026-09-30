@@ -23,7 +23,14 @@ from typing import Any, Optional, Union
 
 from .. import imports, memcard
 from . import pine
-from .base import XDG_RUNTIME_DIR, Emulator, base_launch_env, disc_number, xdg_config_dir
+from .base import (
+    XDG_RUNTIME_DIR,
+    Emulator,
+    base_launch_env,
+    disc_number,
+    scrubbed_env,
+    xdg_config_dir,
+)
 
 log = logging.getLogger(__name__)
 
@@ -481,7 +488,7 @@ def _run_step(verb: str, cmd: list[str], timeout: float) -> bool:
     """
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, errors="replace", timeout=timeout
+            cmd, capture_output=True, text=True, errors="replace", timeout=timeout, env=scrubbed_env()
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.warning("patches fetch: %s failed: %s", verb, exc)

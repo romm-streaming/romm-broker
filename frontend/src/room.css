@@ -823,6 +823,24 @@ iframe {
   border-color: var(--accent);
 }
 
+.modal-body .settings-range {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.modal-body .settings-range input[type="range"] {
+  flex: 1;
+  accent-color: var(--accent);
+}
+
+.modal-body .settings-range output {
+  min-width: 3.5em;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--panel-text);
+}
+
 /* The popup list is drawn by the browser, not the page; these are what it
    honours. Opaque so the panel behind never bleeds through. */
 .modal-body select option {
