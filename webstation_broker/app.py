@@ -141,6 +141,7 @@ def create_app() -> FastAPI:
         title="webstation-broker", lifespan=None if prefixed else _lifespan
     )
     inner.include_router(api.router)
+    inner.include_router(api.secret_router)
     inner.include_router(room.router)
 
     @inner.middleware("http")
