@@ -16,6 +16,8 @@ frontend/
     room.js          everything: websocket, media capture/playback, DOM rendering, drag-and-drop
     translation.js    one object literal per language, plus getTranslator()
     room.css          all styling
+    touchOpacity.js   touch-gamepad opacity, split out of room.js so it can be tested
+    *.test.js         tests for the split-out helpers (node --test)
 ```
 
 There is no component framework: the chrome is static markup in
@@ -25,10 +27,13 @@ HTML strings as people arrive (`addRemoteStream`). It is one large file by
 design, not by neglect; keep new UI in that same direct-DOM style rather
 than introducing a second pattern.
 
-<Callout type="warn" title="Nothing here is linted or tested in CI.">
-`ci.yml` only runs the Python lint, app build, and pytest suite. There's no
-`npm run lint`, no frontend test, no type checker. Read your diff carefully;
-nothing else will catch a mistake before it ships.
+<Callout type="warn" title="Almost nothing here is tested in CI.">
+`ci.yml` runs `npm test` in `frontend/`, which covers only the few helpers
+that live in their own module with a `*.test.js` beside them. It uses Node's
+built-in runner, so it needs no install. `room.js` itself has no tests, lint,
+or type checker. Read your diff carefully, because nothing else will catch a
+mistake there before it ships. If a piece of logic can be tested without a
+browser, splitting it into its own module with a test is fine.
 </Callout>
 
 ## Running it

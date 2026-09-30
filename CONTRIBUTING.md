@@ -24,12 +24,13 @@ BROKER_DEV_MODE=true .venv/bin/python -c "from webstation_broker.app import crea
 .venv/bin/pytest -q
 ```
 
-CI runs three gates on every push and PR to `master`: lint, a `create_app()`
+CI runs four gates on every push and PR to `master`: lint, a `create_app()`
 import check under `BROKER_DEV_MODE=true` (catching an import or syntax error
 before it would otherwise only surface when s6 restarts the service in the
-container), and the test suite. There is no frontend lint, test, or build
-step in CI; if you touch `frontend/`, read your diff carefully before opening
-the PR.
+container), the test suite, and `npm test` in `frontend/`. That last one only
+covers the helpers split out of `room.js` with a `*.test.js` beside them.
+There is no frontend lint or build step in CI, so if you touch `frontend/`,
+read your diff carefully and build it before opening the PR.
 
 ## Code conventions
 

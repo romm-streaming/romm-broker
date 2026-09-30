@@ -35,3 +35,9 @@ jobs:
 
       - name: Test
         run: pytest -q
+
+      # Room-frontend helpers that can run without a browser. Node's own test
+      # runner, so no npm install; the runner image ships Node.
+      - name: Test the room frontend
+        working-directory: frontend
+        run: npm test
