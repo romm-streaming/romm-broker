@@ -190,7 +190,7 @@ def test_an_alternate_may_not_claim_the_platform_untested() -> None:
 
 @pytest.mark.parametrize("slug", ["mac", "fm-towns"])
 def test_a_platform_whose_core_is_unsafe_or_unbootable_stays_unmapped(slug: str) -> None:
-    """Mac and FM Towns stay out of the table until their cores can run safely (#61).
+    """Mac and FM Towns stay out of the table until their cores can run safely (#104).
 
     minivmac opens the disk image read-write and writes game saves into it, with
     no core option to redirect them, so it would write into the ROM library. The
