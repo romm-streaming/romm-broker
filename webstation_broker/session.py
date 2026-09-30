@@ -197,7 +197,17 @@ def find_viewer(token: str) -> Optional[dict[str, Any]]:
     """
     if SESSION is None:
         return None
-    return next((v for v in SESSION.get("viewers", []) if v["token"] == token), None)
+    # Constant-time, like every other credential check here; bytes for the
+    # same non-ASCII reason as `find_invite`.
+    presented = token.encode("utf-8", "replace")
+    return next(
+        (
+            v
+            for v in SESSION.get("viewers", [])
+            if hmac.compare_digest(v["token"].encode("utf-8"), presented)
+        ),
+        None,
+    )
 
 
 def public_id_for(token: str) -> Optional[str]:
