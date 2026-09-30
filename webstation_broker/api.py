@@ -595,6 +595,7 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
             path that cannot be resolved or lies outside ROM_ROOT; 404 for a
             rom path or save archive that does not exist.
     """
+    started = time.monotonic()
     if session.SESSION is not None and session.SESSION.get("active"):
         log.warning(
             "activate refused: session %s is already active", session.SESSION.get("id")
@@ -925,6 +926,14 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     sess["save_baseline"] = time.time()
 
     tokens_pushed = await _push_seat_tokens(sess, "activate")
+    log.info(
+        "activate: session %s launched %s in %.1fs (restored %d save file(s), tokens pushed: %s)",
+        sess["id"],
+        body.emulator,
+        time.monotonic() - started,
+        restore_report["written"] + len(restore_report["imported"]) if restore_report else 0,
+        tokens_pushed,
+    )
 
     # core_identity() also carries library_name, which belongs in the exit
     # manifest but not here: only core and its tier are activate's contract.
@@ -1294,6 +1303,7 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
     Raises:
         HTTPException: 409 when no session is active.
     """
+    started = time.monotonic()
     sess = session.SESSION
     if sess is None or not sess.get("active"):
         log.debug("exit refused: no active session")
@@ -1421,6 +1431,27 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
     report["selkies_tokens_cleared"] = await _clear_seat_tokens(sess["id"])
     session.retire_session()
     log.info("exit report: %s", report)
+    duration = time.monotonic() - started
+    session.LAST_OUTCOME = {
+        "session_id": sess["id"],
+        "ended_at": time.time(),
+        "duration_s": round(duration, 1),
+        "state_saved": bool(exit_report.get("state_saved")),
+        "dump_error": dump["error"],
+        "upload": upload["mode"],
+        "archive_path": archive_path,
+    }
+    # One fixed-shape line per exit, so an alert can match `upload=failed`
+    # without parsing the report dict above.
+    log.log(
+        logging.WARNING if upload["mode"] == "failed" else logging.INFO,
+        "exit: session %s done in %.1fs: state_saved=%s upload=%s kept=%s",
+        sess["id"],
+        duration,
+        session.LAST_OUTCOME["state_saved"],
+        upload["mode"],
+        archive_path or "-",
+    )
     return report
 
 
@@ -2230,12 +2261,13 @@ async def status(x_broker_secret: Optional[str] = Header(default=None)) -> dict[
         x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
-        `{"active": False}` when no session exists. Otherwise the session's
+        `{"active": False, "last_exit": ...}` when no session exists. Otherwise the session's
         `active` flag, `session_id`, `emulator`, `rom`, `rom_file` and
         `multiplayer` flag, whether the process is `emulator_alive`, the
         emulator's `boot_failed`, `extraction_phase`, `supports_states` and
         `state_slot` signals, `started_at`, the controlling `user` and the
-        seated `viewers`.
+        seated `viewers`. Both shapes carry `last_exit`, how the most recent
+        exit of this broker process ended, or None before the first one.
 
     Raises:
         HTTPException: 403 on a bad secret.
@@ -2243,8 +2275,9 @@ async def status(x_broker_secret: Optional[str] = Header(default=None)) -> dict[
     _check_secret(x_broker_secret)
     sess = session.SESSION
     if sess is None:
-        return {"active": False}
+        return {"active": False, "last_exit": session.LAST_OUTCOME}
     return {
+        "last_exit": session.LAST_OUTCOME,
         "active": sess.get("active", False),
         "session_id": sess["id"],
         "emulator": sess["emulator"],
