@@ -3,7 +3,6 @@
 import logging
 from typing import Any, Optional
 
-import anyio
 import pytest
 
 from webstation_broker import api, session
@@ -29,29 +28,62 @@ def _activate(session_id: str = "sess-1") -> FakeEmulator:
     return emulator
 
 
-def _errors(caplog: pytest.LogCaptureFixture) -> list[str]:
-    """The ERROR messages the watch logged.
+class _Exited:
+    """A spawned process that has exited with `returncode`."""
+
+    def __init__(self, returncode: int) -> None:
+        """Record the exit code.
+
+        Args:
+            returncode: The code `subprocess` would report.
+        """
+        self.returncode = returncode
+
+
+class _StopWatch(BaseException):
+    """Ends the watch loop from a stubbed check; the loop only catches `Exception`."""
+
+
+def _logged(caplog: pytest.LogCaptureFixture, level: int = logging.ERROR) -> list[str]:
+    """The messages the watch logged at one level.
 
     Args:
         caplog: The pytest log capture fixture.
+        level: The level to collect.
 
     Returns:
-        Each ERROR record's message, in order.
+        Each matching record's message, in order.
     """
-    return [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    return [r.getMessage() for r in caplog.records if r.levelno == level]
 
 
 def test_a_dead_emulator_is_logged_once_per_session(caplog: pytest.LogCaptureFixture) -> None:
     """A crash is one ERROR naming the session, emulator and rom, however many checks see it."""
-    _activate().running = False
+    emulator = _activate()
+    emulator.running = False
+    emulator._proc = _Exited(-11)
 
     reported = api.check_emulator_alive(None)
     reported = api.check_emulator_alive(reported)
 
     assert reported == "sess-1"
-    [line] = _errors(caplog)
+    [line] = _logged(caplog)
     assert "session sess-1: fake exited" in line
     assert "rom Game" in line
+    assert "exit code -11" in line
+
+
+def test_a_clean_quit_is_a_warning_not_an_error(caplog: pytest.LogCaptureFixture) -> None:
+    """Exit code 0 is the player quitting from the emulator's own menu, not a crash."""
+    emulator = _activate()
+    emulator.running = False
+    emulator._proc = _Exited(0)
+
+    api.check_emulator_alive(None)
+
+    assert _logged(caplog) == []
+    [line] = _logged(caplog, logging.WARNING)
+    assert "exit code 0" in line
 
 
 def test_the_next_session_is_watched_afresh(caplog: pytest.LogCaptureFixture) -> None:
@@ -61,7 +93,7 @@ def test_the_next_session_is_watched_afresh(caplog: pytest.LogCaptureFixture) ->
     _activate("sess-2").running = False
 
     assert api.check_emulator_alive(reported) == "sess-2"
-    assert len(_errors(caplog)) == 2
+    assert len(_logged(caplog)) == 2
 
 
 @pytest.mark.parametrize("running", [True, None])
@@ -78,7 +110,7 @@ def test_a_running_emulator_or_no_session_logs_nothing(
         _activate().running = running
 
     assert api.check_emulator_alive(None) is None
-    assert _errors(caplog) == []
+    assert _logged(caplog) == []
 
 
 def test_a_session_operation_in_flight_is_left_alone(caplog: pytest.LogCaptureFixture) -> None:
@@ -87,7 +119,7 @@ def test_a_session_operation_in_flight_is_left_alone(caplog: pytest.LogCaptureFi
 
     with api._session_operation("exit"):
         assert api.check_emulator_alive(None) is None
-    assert _errors(caplog) == []
+    assert _logged(caplog) == []
 
 
 def test_exit_code_reports_how_the_process_ended() -> None:
@@ -95,32 +127,36 @@ def test_exit_code_reports_how_the_process_ended() -> None:
     emulator = FakeEmulator()
     assert emulator.exit_code is None
 
-    class Finished:
-        """A spawned process that died of a segfault."""
-
-        returncode = -11
-
-    emulator._proc = Finished()
+    emulator._proc = _Exited(-11)
 
     assert emulator.exit_code == -11
 
 
-async def test_the_watch_keeps_going_after_a_failed_check(
+async def test_a_failing_check_is_logged_once_until_it_recovers(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """One check raising is logged, and the loop carries on checking."""
-    calls: list[Any] = []
+    """Two failures in a row are one ERROR; the next good check logs the recovery.
 
-    def flaky(reported: Optional[str]) -> Optional[str]:
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        caplog: The pytest log capture fixture.
+    """
+    outcomes: list[Any] = [RuntimeError("boom"), RuntimeError("boom"), None, _StopWatch()]
+    calls: list[Optional[str]] = []
+
+    def scripted(reported: Optional[str]) -> Optional[str]:
         calls.append(reported)
-        if len(calls) == 1:
-            raise RuntimeError("boom")
+        outcome = outcomes.pop(0)
+        if outcome is not None:
+            raise outcome
         return reported
 
-    monkeypatch.setattr(api, "check_emulator_alive", flaky)
+    monkeypatch.setattr(api, "check_emulator_alive", scripted)
+    caplog.set_level(logging.INFO)
 
-    with anyio.move_on_after(0.2):
-        await api.watch_emulator_forever(0.01)
+    with pytest.raises(_StopWatch):
+        await api.watch_emulator_forever(0)
 
-    assert len(calls) > 1
-    assert "emulator watch: check failed" in _errors(caplog)
+    assert len(calls) == 4
+    assert _logged(caplog) == ["emulator watch: check failed"]
+    assert "emulator watch: check recovered" in _logged(caplog, logging.INFO)

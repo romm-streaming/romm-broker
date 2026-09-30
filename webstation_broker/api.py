@@ -2223,6 +2223,11 @@ async def put_memory_card(
 def check_emulator_alive(reported: Optional[str]) -> Optional[str]:
     """Log once when the open session's emulator has exited on its own.
 
+    Exit code 0 is a clean quit, usually the player leaving from the emulator's
+    own menu or quitting the desktop, and is a WARNING. Anything else, a signal
+    or an error code, is a crash and an ERROR. Either way the session is left
+    with nothing playing.
+
     Nothing is torn down: the saves the emulator wrote before it went are still
     on disk, and exiting the session from RomM is what dumps and uploads them.
     Skipped while a session operation holds `_SESSION_LOCK`, because exit and
@@ -2242,7 +2247,8 @@ def check_emulator_alive(reported: Optional[str]) -> Optional[str]:
     if emulator.alive():
         return reported
     rom = sess.get("rom") or {}
-    log.error(
+    log.log(
+        logging.WARNING if emulator.exit_code == 0 else logging.ERROR,
         "emulator watch: session %s: %s exited while the session was open (exit code %s, rom %s); "
         "exit the session from RomM to save and upload what it wrote",
         sess["id"],
@@ -2256,17 +2262,30 @@ def check_emulator_alive(reported: Optional[str]) -> Optional[str]:
 async def watch_emulator_forever(interval: float) -> None:
     """Run `check_emulator_alive` every `interval` seconds until cancelled.
 
+    A check that raises is logged as an ERROR once, then at DEBUG until one
+    succeeds again.
+
     Args:
         interval: Seconds between checks.
     """
     reported: Optional[str] = None
+    failing = False
     while True:
         await anyio.sleep(interval)
         try:
             reported = check_emulator_alive(reported)
         except Exception:
-            # A watch that dies quietly is worse than none: keep going.
-            log.exception("emulator watch: check failed")
+            # A watch that dies quietly is worse than none, so it keeps going;
+            # a failure that repeats every tick is logged once, not every tick.
+            if failing:
+                log.debug("emulator watch: check still failing", exc_info=True)
+            else:
+                log.exception("emulator watch: check failed")
+            failing = True
+            continue
+        if failing:
+            log.info("emulator watch: check recovered")
+            failing = False
 
 
 @router.get("/api/session/status")
