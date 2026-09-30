@@ -22,13 +22,13 @@ streaming:
   enabled: true
   containers:
     - platform: ps2
-      host: https://192.168.1.51:3001
-      broker_host: http://192.168.1.51:8000
+      host: https://10.0.1.56:3001
+      broker_host: http://10.0.1.56:8000
       label: PCSX2
       memory_card_sync: true
     - platform: ngc
-      host: https://192.168.1.52:3001
-      broker_host: http://192.168.1.52:8000
+      host: https://10.0.1.57:3001
+      broker_host: http://10.0.1.57:8000
       label: Dolphin
 
 # after: one webstation container serving both
@@ -36,7 +36,7 @@ streaming:
   enabled: true
   containers:
     - host: https://romm.DOMAIN.com/streaming
-      broker_host: http://192.168.1.51:3010
+      broker_host: http://10.0.1.56:3000
       protocol: webstation
       subfolder: /streaming
       label: Emulation station

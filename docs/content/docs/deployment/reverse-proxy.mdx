@@ -98,7 +98,7 @@ streaming:
       host: /streaming
       # Where RomM's backend goes, server to server. Required when host is a
       # path, since a path carries no address RomM could call.
-      broker_host: http://10.0.1.56:3009
+      broker_host: http://10.0.1.56:3000
       # The container's SUBFOLDER. RomM builds broker API paths under it.
       subfolder: /streaming
       broker_secret: "..."
@@ -139,7 +139,7 @@ not a port you published on the host:
 broker_host: http://romm_webstation:3000
 ```
 
-A published host port (`3009:3000`) is only reachable through the host's
+A published host port (`3000:3000`) is only reachable through the host's
 address, which a container on a bridge network often can't see. Once a
 reverse proxy and `broker_host` both reach the container over the Docker
 network, it needs no published ports at all.
@@ -154,7 +154,7 @@ container behind a proxy does not disturb a session it is already holding.
 
 ```nginx
 location /streaming/ {
-    proxy_pass http://10.0.1.56:3009;
+    proxy_pass http://10.0.1.56:3000;
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
@@ -187,7 +187,7 @@ the bottom of its Details tab, add one:
   has to match `SUBFOLDER` exactly, trailing slash included.
 - **Scheme**: `http`
 - **Forward Hostname/IP**: the container's address, e.g. `10.0.1.56`
-- **Forward Port**: `3009` (or whatever host port maps to the container's 3000)
+- **Forward Port**: `3000` (or whatever host port you mapped to the container's 3000)
 
 Custom Locations send traffic straight to that host and port with no path
 added in front, so the prefix isn't stripped by default. NPM already gets
@@ -217,7 +217,7 @@ has no effect on anything described here.
 
 ```txt title="Caddyfile"
 handle /streaming/* {
-    reverse_proxy 10.0.1.56:3009
+    reverse_proxy 10.0.1.56:3000
 }
 ```
 
@@ -362,12 +362,12 @@ streaming:
     - platform: ps2
       host: /streaming
       subfolder: /streaming
-      broker_host: http://10.0.1.56:3009
+      broker_host: http://10.0.1.56:3000
       # ...remaining keys as above
     - platform: ps2
       host: /streaming-2
       subfolder: /streaming-2
-      broker_host: http://10.0.1.57:3009
+      broker_host: http://10.0.1.57:3000
       # ...remaining keys as above
 ```
 
