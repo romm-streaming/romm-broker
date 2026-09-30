@@ -80,8 +80,9 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     next activate is what keeps it killable at all: exit answers 409 without a
     session, so otherwise the only way out is launching another game.
 
-    Also sweeps the shadPS4 and RPCS3 extraction scratch dirs left behind by
-    a crashed broker process, before any new extraction can be in flight.
+    Also sweeps the shadPS4, RPCS3, ScummVM and PPSSPP extraction scratch
+    dirs left behind by a crashed broker process, before any new extraction
+    can be in flight.
 
     Loads the RetroArch core catalog: the bundled one merged with a cache from
     a previous refresh, so a cache another process wrote is used right away.

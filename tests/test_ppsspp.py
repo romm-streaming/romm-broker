@@ -1267,6 +1267,59 @@ def test_a_folder_of_several_archives_is_refused(rom_root: Path, cache: Path) ->
     assert ppsspp.Ppsspp().resolve_rom_file(rom_root / "game") is None
 
 
+def test_an_archive_in_a_subfolder_never_makes_the_games_own_ambiguous(
+    rom_root: Path, cache: Path
+) -> None:
+    """An extras bundle one folder down is not a second candidate for the game."""
+    archive = _zip(rom_root / "game" / "Game.zip", {"Game.cso": b"cso"})
+    _zip(rom_root / "game" / "extras" / "Manual.zip", {"Manual.iso": b"iso"})
+
+    assert ppsspp.Ppsspp().resolve_rom_file(rom_root / "game") == archive.resolve()
+
+
+def test_an_extracted_archive_is_not_listed_again(
+    rom_root: Path, cache: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its extraction already showed a PSP image, so a later activate skips the listing."""
+    archive = _zip(rom_root / "Game.zip", {"Game.iso": b"iso"})
+    emu = ppsspp.Ppsspp()
+    _launched(emu, emu.resolve_rom_file(archive))
+
+    def never_lists(archive: Path, timeout: float) -> list[str]:
+        """Fail the test if the archive is listed.
+
+        Args:
+            archive: The archive.
+            timeout: The lister timeout.
+
+        Raises:
+            AssertionError: Always.
+        """
+        raise AssertionError(f"listed {archive.name} again")
+
+    monkeypatch.setattr(ppsspp.extraction_cache, "list_members", never_lists)
+
+    assert ppsspp.Ppsspp().resolve_rom_file(archive) == archive
+
+
+def test_a_startup_sweep_it_cannot_read_never_stops_the_broker(
+    cache: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable cache dir skips the sweep instead of failing startup."""
+
+    def unreadable() -> None:
+        """Fail the way an unreadable scratch dir would.
+
+        Raises:
+            PermissionError: Always.
+        """
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(ppsspp._CACHE, "_clear_scratch", unreadable)
+
+    ppsspp.sweep_stale_extractions()
+
+
 def test_an_archived_rom_boots_its_extracted_image(rom_root: Path, cache: Path) -> None:
     """The image inside the archive, wrapper folder and all, is what PPSSPP is handed."""
     archive = _zip(rom_root / "Game.zip", {"Game (USA)/Game (USA).iso": b"iso"})

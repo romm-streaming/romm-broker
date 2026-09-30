@@ -225,6 +225,7 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path, root: Optional[Path] 
         The resolved path of the winning ROM, or None when nothing qualifies.
     """
     ranked = []
+    root = root or ROM_ROOT.resolve()
     for p in candidates:
         if p.name.startswith("."):
             continue
@@ -239,7 +240,7 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path, root: Optional[Path] 
         except (OSError, ValueError) as exc:
             log.debug("ppsspp: skipping rom candidate %s: %s", p, exc)
             continue
-        if not real.is_relative_to(root or ROM_ROOT.resolve()):
+        if not real.is_relative_to(root):
             continue
         ranked.append((ROM_EXTENSIONS.index(ext), len(rel.parts), p.name.lower(), real))
     if not ranked:
@@ -317,6 +318,23 @@ def _archive_holds_rom(archive: Path) -> bool:
     return False
 
 
+def _already_extracted(archive: Path) -> bool:
+    """Whether the cache holds an extraction of this exact archive.
+
+    One that does already showed a PSP image, so it needs no second listing.
+
+    Args:
+        archive: The archive.
+
+    Returns:
+        True when its extraction is on disk.
+    """
+    try:
+        return (CACHE_DIR / extraction_cache._cache_key(archive)).is_dir()
+    except (RuntimeError, OSError):
+        return False
+
+
 _CACHE = ExtractionCache(
     name="ppsspp",
     cache_dir=lambda: CACHE_DIR,
@@ -336,7 +354,7 @@ def sweep_stale_extractions() -> None:
     """
     try:
         _CACHE.sweep_stale_extractions()
-    except RuntimeError as exc:
+    except (RuntimeError, OSError) as exc:
         log.warning("ppsspp cache: startup scratch sweep skipped: %s", exc)
 
 
@@ -928,22 +946,25 @@ class Ppsspp(Emulator):
                 archive.name,
             )
             return False
-        return _archive_holds_rom(archive)
+        return _already_extracted(archive) or _archive_holds_rom(archive)
 
     def _folder_archive(self, candidates: list[Path], base: Path) -> Optional[Path]:
         """A ROM folder's lone archive, for a folder holding no PSP image of its own.
 
-        Several archives are refused rather than guessed between.
+        Only the shallowest archives count, so one in an extras subfolder
+        never makes the game's own archive ambiguous. Several at that depth
+        are refused rather than guessed between.
 
         Args:
             candidates: The paths found under `base`.
             base: The ROM folder.
 
         Returns:
-            The resolved archive, or None when there is none, more than one,
-            or it cannot be booted.
+            The resolved archive, or None when there is none, more than one
+            at the shallowest depth, or it cannot be booted.
         """
-        archives: list[Path] = []
+        root = ROM_ROOT.resolve()
+        found: list[tuple[int, Path]] = []
         for p in candidates:
             if p.name.startswith(".") or p.suffix.lower() not in _ARCHIVE_EXTS:
                 continue
@@ -951,13 +972,16 @@ class Ppsspp(Emulator):
                 if not p.is_file():
                     continue
                 real = p.resolve()
-            except OSError as exc:
+                depth = len(p.relative_to(base).parts)
+            except (OSError, ValueError) as exc:
                 log.debug("ppsspp: skipping archive candidate %s: %s", p, exc)
                 continue
-            if real.is_relative_to(ROM_ROOT.resolve()):
-                archives.append(real)
-        if not archives:
+            if real.is_relative_to(root):
+                found.append((depth, real))
+        if not found:
             return None
+        shallowest = min(depth for depth, _ in found)
+        archives = [real for depth, real in found if depth == shallowest]
         if len(archives) > 1:
             log.warning(
                 "ppsspp: %s holds %d archives and no PSP image, refusing to guess: %s",

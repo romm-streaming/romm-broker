@@ -213,9 +213,10 @@ A PSP image stored as a `.7z`, `.zip`, or `.rar` archive boots too.
 PPSSPP can't read one directly, so the first launch extracts it into the
 [extraction cache](/docs/configuration/emulators#ppsspp) and later launches
 reuse that copy. `rom.path` can name the archive itself, or a folder that
-holds exactly one archive and no loose image. A folder with several archives
-is refused, since there's no telling which one is the game, and so is an
-archive whose image sits more than one folder down. Save data is
+holds exactly one archive and no loose image; an archive in a subfolder
+beside it, such as extras, doesn't count. A folder with several archives
+side by side is refused, since there's no telling which one is the game, and
+so is an archive whose image sits more than one folder down. Save data is
 keyed by the game's serial, not its file path, so zipping a game you already
 have saves for keeps them.
 

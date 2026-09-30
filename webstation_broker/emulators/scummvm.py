@@ -731,6 +731,11 @@ def _drop_dead_domains(gameid: str, keep: Optional[Path] = None) -> int:
     library folder would be: dropping it would hand both copies one target
     and one set of saves.
 
+    An extraction whose archive is gone (renamed, moved, or replaced by a
+    loose folder) is dead too, whatever `keep` is. No launch can reach it
+    any more, since the cache is keyed by the archive's path, yet its domain
+    would block every other copy of the game until the cache evicts it.
+
     Args:
         gameid: The game whose stale domains are in the way.
         keep: The folder being registered, or None.
@@ -747,11 +752,14 @@ def _drop_dead_domains(gameid: str, keep: Optional[Path] = None) -> int:
             path = Path(keys["path"])
             if not path.is_dir():
                 doomed.add(name)
-            elif (
-                source is not None
-                and path.resolve() != keep.resolve()
-                and _extraction_source(path) == source
-            ):
+                continue
+            recorded = _extraction_source(path)
+            if recorded is None:
+                continue
+            if not Path(recorded).exists():
+                log.info("scummvm: domain %s was extracted from %s, which is gone", name, recorded)
+                doomed.add(name)
+            elif source is not None and recorded == source and path.resolve() != keep.resolve():
                 doomed.add(name)
         except (OSError, ValueError) as exc:
             log.warning(
@@ -831,7 +839,10 @@ def _extraction_source(path: Path) -> Optional[str]:
         if root is None:
             return None
         return (root / _SOURCE_FILE).read_text().strip() or None
-    except OSError:
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        log.warning("scummvm: could not read which archive %s was extracted from: %s", path, exc)
         return None
 
 
@@ -950,9 +961,11 @@ def _is_archive(rom: Path) -> bool:
         rom: What `resolve_rom_file` returned.
 
     Returns:
-        True for an archive file.
+        True for anything with an archive's suffix that is not a folder. An
+        archive deleted since `resolve_rom_file` still counts, so the launch
+        fails on its extraction rather than asking `--add` to scan a file.
     """
-    return rom.suffix.lower() in _ARCHIVE_EXTS and rom.is_file()
+    return rom.suffix.lower() in _ARCHIVE_EXTS and not rom.is_dir()
 
 
 def _game_dir(rom: Path, emu: Emulator) -> Path:
@@ -967,6 +980,7 @@ def _game_dir(rom: Path, emu: Emulator) -> Path:
 
     Raises:
         RuntimeError: When the archive cannot be extracted or holds nothing.
+        OSError: When the cache dir cannot be created at all.
     """
     if not _is_archive(rom):
         return rom
@@ -1010,7 +1024,7 @@ def sweep_stale_extractions() -> None:
     """
     try:
         _CACHE.sweep_stale_extractions()
-    except RuntimeError as exc:
+    except (RuntimeError, OSError) as exc:
         log.warning("scummvm cache: startup scratch sweep skipped: %s", exc)
 
 
@@ -1172,7 +1186,7 @@ def _session_game(emu: Emulator, ctx: imports.ImportCtx) -> tuple[Optional[str],
     if rom_dir is not None:
         try:
             rom_dir = _game_dir(rom_dir, emu)
-        except RuntimeError as exc:
+        except (RuntimeError, OSError) as exc:
             log.warning("scummvm: import preflight could not extract %s: %s", rom_dir, exc)
             ctx.memo[_NO_GAME_KEY] = f"the archived game could not be extracted: {exc}"
             rom_dir = None
@@ -1490,7 +1504,8 @@ class Scummvm(Emulator):
         except OSError as exc:
             log.warning("scummvm: could not read %s: %s", archive, exc)
             return None
-        if not _archive_holds_files(resolved):
+        # Already extracted means it held a game, so only a new archive is listed.
+        if _cached_game_dir(resolved) is None and not _archive_holds_files(resolved):
             return None
         self._rom_dir = resolved
         log.debug("scummvm: resolved archived game %s", resolved)
