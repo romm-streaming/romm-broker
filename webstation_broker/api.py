@@ -557,6 +557,32 @@ async def activate(
         return await _start_session(body, request)
 
 
+def _unknown_emulator(name: str) -> HTTPException:
+    """Build the 422 for an emulator name no emulator answers to.
+
+    A RomM release older than the `core:` config sends the shorthand
+    `retroarch:bsnes` as the emulator name itself, so that case names the fix.
+
+    Args:
+        name: The emulator name as the request sent it.
+
+    Returns:
+        The exception to raise.
+    """
+    emulator, sep, core = name.partition(":")
+    if sep and get_emulator(emulator) is not None:
+        return HTTPException(
+            status_code=422,
+            detail=(
+                f"unknown emulator: {name}; this RomM sent the core shorthand "
+                f"{emulator}:{core} as the emulator name, which means it predates "
+                f"core: support. Upgrade RomM past 5.3.1, or set the platform to "
+                f"{emulator} to use its default core"
+            ),
+        )
+    return HTTPException(status_code=422, detail=f"unknown emulator: {name}")
+
+
 def _select_core(emulator: Emulator, route: str) -> None:
     """Resolve the emulator's requested core, answering 422 when it will not launch.
 
@@ -626,7 +652,7 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     emulator = get_emulator(body.emulator)
     if emulator is None:
         log.debug("activate: unknown emulator: %s", body.emulator)
-        raise HTTPException(status_code=422, detail=f"unknown emulator: {body.emulator}")
+        raise _unknown_emulator(body.emulator)
     # General-purpose emulators (retroarch) pick their core from the platform,
     # and a multilingual folder (ScummVM) picks its target from the language.
     # gui_language describes the player, not the rom, so it is set for a launch
@@ -1999,7 +2025,7 @@ def _memory_card(name: str, platform: Optional[str]) -> tuple[Path, Optional[str
     emulator = get_emulator(name)
     if emulator is None:
         log.debug("memory-card: unknown emulator: %s", name)
-        raise HTTPException(status_code=422, detail=f"unknown emulator: {name}")
+        raise _unknown_emulator(name)
     card = emulator.memory_card_path(platform)
     if card is None:
         log.debug("memory-card: %s has no memory card to sync", emulator.display_name)
@@ -2045,7 +2071,7 @@ async def get_import_spec(
     inst = get_emulator(emulator)
     if inst is None:
         log.debug("import-spec: unknown emulator: %s", emulator)
-        raise HTTPException(status_code=422, detail=f"unknown emulator: {emulator}")
+        raise _unknown_emulator(emulator)
     inst.platform = platform
     inst.core = core
     inst.experimental_cores = experimental_cores
