@@ -3573,17 +3573,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
     sessionFrame().addEventListener('load', applyTouchOpacityToFrame);
 
-    // The slider sits in a popover off the stream controls, not the settings
-    // dialog: solo mode hides the tile whose gear opens that dialog, and solo
-    // on a phone is where the touch gamepad is used most.
+    // Opened from the stream controls because solo mode hides your own tile.
     const touchOpacityBtn = document.getElementById('touch-opacity-btn');
     const touchOpacityPopover = document.getElementById('touch-opacity-popover');
     const POPOVER_GAP = 8;
     const placeTouchOpacityPopover = () => {
         const btn = touchOpacityBtn.getBoundingClientRect();
         const width = touchOpacityPopover.offsetWidth;
-        // Beside the button, on whichever side has room: in solo mode the
-        // cluster sits against the right edge.
+        // Solo mode puts the cluster against the right edge, so flip left there.
         const fitsRight = btn.right + POPOVER_GAP + width + POPOVER_GAP <= window.innerWidth;
         const left = fitsRight ? btn.right + POPOVER_GAP : btn.left - POPOVER_GAP - width;
         touchOpacityPopover.style.left = `${Math.max(POPOVER_GAP, left)}px`;

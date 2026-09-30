@@ -242,9 +242,8 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-/* On a short touch screen the bar can't fit the fader above the stream
-   buttons once the opacity button joins them, so the buttons sit beside it
-   and wrap into a second column when they run out of room. */
+/* A short bar can't fit the fader above the stream buttons once the opacity
+   button joins them, so they sit beside it and wrap into a second column. */
 @media (max-width: 768px) and (any-pointer: coarse), (max-height: 500px) and (any-pointer: coarse) {
   #stream-volume {
     flex-direction: row;
