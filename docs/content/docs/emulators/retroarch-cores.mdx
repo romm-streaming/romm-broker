@@ -261,6 +261,13 @@ platforms:
 `snes: retroarch` with an indented `core:` under it is invalid YAML; use one
 of the two forms above.
 
+`core:` needs a RomM release newer than 5.3.1. RomM 5.3.1 and older read the
+shorthand `retroarch:bsnes` as the emulator's name and send it to the broker
+whole, and every launch on that platform fails with a 422 `unknown emulator`
+naming the upgrade. The block form's `core:` key is ignored with a warning
+there, so the platform keeps its default core. Until you upgrade, set the
+platform to plain `retroarch`.
+
 ### Tiers
 
 `core:` accepts one of four kinds of core:
