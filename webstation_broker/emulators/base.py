@@ -169,6 +169,25 @@ def xdg_data_dir(app: str) -> Path:
     return _xdg_dir(app, "XDG_DATA_HOME", ".local/share")
 
 
+def scrubbed_env() -> dict[str, str]:
+    """Copy the broker's environment with secret-shaped variables stripped out.
+
+    For helper tools (archive extractors, pkg_extractor, qemu-img, curl) that
+    parse untrusted input but need none of the display setup
+    `base_launch_env` adds. They get the same scrub as the emulators, since a
+    bug in any of them hands its environment to whoever crafted the input.
+
+    Returns:
+        A copy of `os.environ` without `_SENSITIVE_ENV_VARS` or any variable
+        ending in one of `_SENSITIVE_ENV_SUFFIXES`.
+    """
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _SENSITIVE_ENV_VARS and not k.endswith(_SENSITIVE_ENV_SUFFIXES)
+    }
+
+
 def base_launch_env() -> dict[str, str]:
     """Build the environment apps are launched into.
 
@@ -180,11 +199,7 @@ def base_launch_env() -> dict[str, str]:
         A copy of the broker's environment with the display variables set and
         the emulator binary directories appended to `PATH`.
     """
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if k not in _SENSITIVE_ENV_VARS and not k.endswith(_SENSITIVE_ENV_SUFFIXES)
-    }
+    env = scrubbed_env()
     env["WAYLAND_DISPLAY"] = WAYLAND_DISPLAY
     env["DISPLAY"] = X_DISPLAY
     # s6 services get a minimal PATH; emulator binaries live in /usr/games.

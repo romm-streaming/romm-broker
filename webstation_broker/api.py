@@ -348,10 +348,12 @@ def _check_callback_scheme(base_url: str) -> None:
     scheme = urlsplit(base_url).scheme.lower()
     if scheme not in ("http", "https"):
         log.warning(
-            "activate: rejected callback.base_url with a non-http(s) scheme: %s", base_url
+            "activate: rejected callback.base_url with a non-http(s) scheme: %s",
+            callback.redact_url(base_url),
         )
         raise HTTPException(
-            status_code=422, detail=f"callback.base_url must be http(s): {base_url!r}"
+            status_code=422,
+            detail=f"callback.base_url must be http(s): {callback.redact_url(base_url)!r}",
         )
 
 

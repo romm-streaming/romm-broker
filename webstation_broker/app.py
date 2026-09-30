@@ -28,6 +28,10 @@ logging.basicConfig(
     format="%(asctime)s [broker] %(levelname)s %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
+# httpx logs every request line, full URL and all, at INFO: that would put
+# a callback base_url's credentials in the log. The broker logs each of its
+# own requests already, redacted (see `callback.redact_url`).
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 log = logging.getLogger(__name__)
 
@@ -149,6 +153,11 @@ def create_app() -> FastAPI:
         # out to.
         response = await call_next(request)
         response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        # API answers can carry a live seat token (context's userToken) and
+        # sit under a URL that carries one too; keep both out of any cache.
+        if request.url.path.startswith(f"{settings.PREFIX}/api/"):
+            response.headers.setdefault("Cache-Control", "no-store")
         return response
 
     if not settings.DEV_MODE:

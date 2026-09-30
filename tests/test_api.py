@@ -3409,3 +3409,87 @@ def test_import_spec_requires_the_broker_secret(
 
     secret_client.headers["X-Broker-Secret"] = "s3cret"
     assert secret_client.get(f"{API}/session/import-spec", params={"emulator": "fake"}).status_code == 200
+
+
+def test_api_answers_are_not_cached_or_sniffed(client: TestClient) -> None:
+    """API answers can carry a seat token, so none may be stored by a cache."""
+    response = client.get(f"{API}/health")
+
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+async def test_find_viewer_tolerates_a_non_ascii_token() -> None:
+    """A junk token is an unknown viewer, not a 500 from the constant-time compare."""
+    session.new_session({"emulator": "fake"}, FakeEmulator(), None)
+    viewer = await session.add_viewer("participant")
+
+    assert session.find_viewer("éé") is None
+    assert session.find_viewer(viewer["token"]) is viewer
+
+
+def test_redact_url_hides_userinfo() -> None:
+    """Credentials in a callback base_url never reach a log line or a report."""
+    assert callback.redact_url("https://u:pw@romm.example:8443/x") == "https://***@romm.example:8443/x"
+    assert callback.redact_url("https://romm.example/x") == "https://romm.example/x"
+    assert callback.public_view({"base_url": "https://u:pw@h", "token": "t"}) == {"base_url": "https://***@h"}
+
+
+async def test_the_save_upload_log_hides_callback_credentials(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed upload logs and reports the URL without its password."""
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        callback.httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(refuse), **kw)
+    )
+    caplog.set_level(logging.INFO, logger="webstation_broker.callback")
+
+    report = await callback.push_save_archive(
+        {"base_url": "https://u:hunter2@romm.example"}, b"PK", "a.zip", {"id": "s", "emulator": "fake"}
+    )
+
+    assert report["ok"] is False
+    assert "hunter2" not in report["url"]
+    assert "hunter2" not in caplog.text
+
+
+_SECRET_GATED = [
+    ("POST", "/session/activate"),
+    ("POST", "/session/join"),
+    ("POST", "/session/exit"),
+    ("POST", "/session/save-state"),
+    ("POST", "/session/load-state"),
+    ("POST", "/session/swap-disc"),
+    ("GET", "/session/state-file"),
+    ("GET", "/session/state-screenshot"),
+    ("PUT", "/session/state-file"),
+    ("GET", "/session/import-spec"),
+    ("GET", "/retroarch/cores"),
+    ("GET", "/session/memory-card"),
+    ("PUT", "/session/memory-card"),
+    ("GET", "/session/status"),
+    ("PUT", "/session/imports/a.zip"),
+    ("GET", "/session/exports"),
+    ("GET", "/session/exports/a.zip"),
+    ("DELETE", "/session/exports/a.zip"),
+]
+
+
+@pytest.mark.parametrize(("method", "path"), _SECRET_GATED)
+@pytest.mark.parametrize("presented", [None, "wrong", "s3crét"])
+def test_every_secret_gated_route_refuses_a_bad_secret(
+    secret_client: TestClient, method: str, path: str, presented: Optional[str]
+) -> None:
+    """No gated route answers, or falls over, for a missing, wrong or non-ASCII secret."""
+    headers = {} if presented is None else {"X-Broker-Secret": presented.encode("utf-8")}
+
+    response = secret_client.request(method, f"{API}{path}", headers=headers, content=b"PK")
+
+    # 422 is FastAPI refusing a missing required parameter before the handler
+    # runs, so it never reaches anything the secret guards either.
+    assert response.status_code in (403, 422), response.text

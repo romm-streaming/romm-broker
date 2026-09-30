@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Optional
 
-from .base import Emulator
+from .base import Emulator, scrubbed_env
 
 log = logging.getLogger(__name__)
 
@@ -132,7 +132,7 @@ def run_extractor(cmd: list[str], what: str, timeout: float, owner: str = "") ->
         RuntimeError: When the tool cannot start, times out, or exits non-zero.
     """
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=scrubbed_env())
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.error("%s: %s failed to run: %s", _log_label(owner), what, exc)
         raise RuntimeError(f"{what} failed to run: {exc}") from exc

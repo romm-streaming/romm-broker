@@ -44,7 +44,7 @@ from typing import Any, Optional, Union
 
 from .. import imports, settings
 from . import extraction_cache
-from .base import Emulator, base_launch_env, xdg_data_dir
+from .base import Emulator, base_launch_env, scrubbed_env, xdg_data_dir
 from .extraction_cache import ExtractionCache
 
 log = logging.getLogger(__name__)
@@ -449,6 +449,7 @@ def _run_pkg_extractor(pkg: Path, dest: Path) -> None:
             capture_output=True,
             text=True,
             timeout=PKG_EXTRACT_TIMEOUT,
+            env=scrubbed_env(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.error("shadps4: pkg_extractor failed to run on %s: %s", pkg.name, exc)
@@ -713,7 +714,7 @@ def _probe_gpu_id() -> Optional[int]:
         The device index to pin, or None when vulkaninfo is missing, fails,
         times out, or every enumerated device is a CPU/unrecognized type.
     """
-    env = dict(os.environ)
+    env = scrubbed_env()
     env["DISPLAY"] = ""
     try:
         result = subprocess.run(

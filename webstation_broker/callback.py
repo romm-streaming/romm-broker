@@ -8,6 +8,7 @@ for split-origin deployments.
 
 import logging
 from typing import Any, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -16,8 +17,29 @@ from . import settings
 log = logging.getLogger(__name__)
 
 
+def redact_url(url: str) -> str:
+    """Drop any `user:password@` from a URL, for logs and reports.
+
+    A split-origin `callback.base_url` may carry credentials in its userinfo;
+    they authenticate the upload but have no business in the broker's log.
+
+    Args:
+        url: The URL to redact.
+
+    Returns:
+        The URL with its userinfo replaced by `***@`, or unchanged when it has none.
+    """
+    parts = urlsplit(url)
+    if "@" not in parts.netloc:
+        return url
+    host = parts.netloc.rsplit("@", 1)[1]
+    return urlunsplit(parts._replace(netloc=f"***@{host}"))
+
+
 def public_view(callback: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     """Return the callback info that is safe to echo in reports: everything but the token.
+
+    Any credentials in `base_url` are redacted as well (see `redact_url`).
 
     Args:
         callback: The session's callback dict, or None when the session has none.
@@ -28,7 +50,10 @@ def public_view(callback: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     """
     if not callback:
         return None
-    return {k: v for k, v in callback.items() if k != "token"}
+    view = {k: v for k, v in callback.items() if k != "token"}
+    if view.get("base_url"):
+        view["base_url"] = redact_url(view["base_url"])
+    return view
 
 
 async def push_save_archive(
@@ -52,6 +77,7 @@ async def push_save_archive(
         upload failed.
     """
     url = callback["base_url"].rstrip("/") + settings.SAVE_UPLOAD_PATH
+    shown = redact_url(url)
     headers = {}
     if callback.get("token"):
         headers["Authorization"] = f"Bearer {callback['token']}"
@@ -67,16 +93,16 @@ async def push_save_archive(
             resp = await client.post(url, data=data, files=files, headers=headers)
             resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        log.warning("save upload rejected by %s: HTTP %d", url, exc.response.status_code)
+        log.warning("save upload rejected by %s: HTTP %d", shown, exc.response.status_code)
         return {
             "mode": "failed",
             "ok": False,
-            "url": url,
+            "url": shown,
             "status_code": exc.response.status_code,
             "error": f"upload rejected: HTTP {exc.response.status_code}",
         }
     except Exception as exc:
-        log.warning("save upload to %s failed: %s", url, exc)
-        return {"mode": "failed", "ok": False, "url": url, "error": str(exc)}
-    log.info("save upload: %d bytes to %s (HTTP %d)", len(zip_bytes), url, resp.status_code)
-    return {"mode": "uploaded", "ok": True, "url": url, "status_code": resp.status_code}
+        log.warning("save upload to %s failed: %s", shown, exc)
+        return {"mode": "failed", "ok": False, "url": shown, "error": str(exc)}
+    log.info("save upload: %d bytes to %s (HTTP %d)", len(zip_bytes), shown, resp.status_code)
+    return {"mode": "uploaded", "ok": True, "url": shown, "status_code": resp.status_code}
