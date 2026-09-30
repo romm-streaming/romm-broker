@@ -47,6 +47,20 @@ def _cache(tmp_path: Path, *, enabled: bool = True, max_gb: float = 8 / 1024**3,
     )
 
 
+def test_entry_dir_finds_an_extraction_without_making_one(tmp_path: Path) -> None:
+    """entry_dir is None before the first extract, the entry after, and None for a missing rom."""
+    archive = _make_zip(tmp_path / "Game.zip", {"PS_GAME/EBOOT.BIN": b"boot"})
+    cache = _cache(tmp_path, max_gb=1.0)
+    assert cache.entry_dir(archive) is None
+    assert not (tmp_path / "cache").exists()
+
+    boot = cache.extract(archive, _FakeEmulator())
+
+    entry = cache.entry_dir(archive)
+    assert entry is not None and boot.is_relative_to(entry)
+    assert cache.entry_dir(tmp_path / "Gone.zip") is None
+
+
 def test_root_returns_the_configured_cache_dir(tmp_path: Path) -> None:
     """root() reflects the cache_dir callable, read live rather than snapshotted."""
     cache_dir = tmp_path / "cache"

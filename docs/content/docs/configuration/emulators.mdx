@@ -216,6 +216,9 @@ RPCS3's data folder isn't configurable here either. On Linux, everything
 | `PPSSPP_STATE_WAIT` | `20.0` | How long a save state has to land on disk after the save hotkey. |
 | `PPSSPP_RESUME_LOAD_WAIT` | `90.0` | How long a resume load waits for the game window. |
 | `PPSSPP_RESUME_LOAD_SETTLE` | `12.0` | How long the window has to be up before the load hotkey is sent. |
+| `PPSSPP_CACHE_ENABLED` | `false` | Whether `.7z`/`.zip`/`.rar` ROMs boot. PPSSPP can't boot from inside an archive, so the first launch extracts one into `PPSSPP_CACHE_DIR` and every later launch reuses that extraction. Off, an archived ROM is refused. |
+| `PPSSPP_CACHE_DIR` | `$XDG_DATA_HOME/ppsspp/extracted` | Where a kept extraction is cached. Broker-owned scratch, written and read by the broker alone. |
+| `PPSSPP_CACHE_MAX_GB` | `20` | Ceiling on the cache's total size; the oldest extraction is evicted first once a new one would exceed it. An archive that still doesn't fit, or that exceeds the free space on the filesystem, is refused rather than extracted until the disk fills. |
 
 PPSSPP's config folder isn't configurable here either. It's
 `/config/.config/ppsspp`. PPSSPP's emulated memory stick lives inside it as
@@ -258,5 +261,8 @@ and the save state together at the top level.
 | `SCUMMVM_RESUME_LOAD_WAIT` | `45` | How long a deferred resume waits for the parent to push its state. |
 | `SCUMMVM_RESUME_LOAD_SETTLE` | `8` | How long that resume then gives the game to reach a state where it answers the menu. |
 | `SCUMMVM_FILL_SCREEN` | `true` | Grow the game window to the display after launch, so a 640x480 game is not a postage stamp on a 1080p stream. Done through the window manager, not ScummVM's own fullscreen, which would make SDL grab and confine the pointer against a stack that feeds it absolutely. Best-effort: a failure leaves the game at its own size. |
+| `SCUMMVM_CACHE_ENABLED` | `true` | Whether a game stored as a `.7z`/`.zip`/`.rar` archive boots. A ScummVM game is a folder, so the first launch extracts the archive into `SCUMMVM_CACHE_DIR` and registers the extraction as its target; every later launch reuses both. Off, an archived game is refused. |
+| `SCUMMVM_CACHE_DIR` | `$SCUMMVM_DATA_DIR/extracted` | Where a kept extraction is cached. Broker-owned scratch, written and read by the broker alone. |
+| `SCUMMVM_CACHE_MAX_GB` | `10` | Ceiling on the cache's total size; the oldest extraction is evicted first once a new one would exceed it. An archive that still doesn't fit, or that exceeds the free space on the filesystem, is refused rather than extracted until the disk fills. |
 | `SCUMMVM_FILL_SCREEN_WAIT` | `10` | Seconds to wait for the game window to appear before giving up on growing it. |
 | `SCUMMVM_STOP_WAIT` | `10` | Seconds SIGTERM gets, which ScummVM spends flushing its config, before escalating to SIGKILL. |

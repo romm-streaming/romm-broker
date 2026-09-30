@@ -475,6 +475,22 @@ class ExtractionCache:
         """The configured cache directory, read live from the `cache_dir` callable."""
         return self._cache_dir()
 
+    def entry_dir(self, rom: Path) -> Optional[Path]:
+        """The cache entry an earlier `extract` of `rom` left, without extracting anything.
+
+        Args:
+            rom: The archive or package.
+
+        Returns:
+            The entry's directory, or None when `rom` has not been extracted
+            or cannot be read to key it.
+        """
+        try:
+            entry = self._cache_dir() / _cache_key(rom)
+            return entry if entry.is_dir() else None
+        except (RuntimeError, OSError):
+            return None
+
     def _cache_size_bytes(self) -> int:
         """Sum the sizes of all cache entries, or zero if the cache dir doesn't exist yet.
 

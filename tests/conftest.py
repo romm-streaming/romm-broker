@@ -27,7 +27,16 @@ from fastapi.testclient import TestClient
 
 from webstation_broker import imports, saves, screenshot, selkies, session, settings
 from webstation_broker.app import create_app
-from webstation_broker.emulators import base, retroarch, retroarch_cores, xemu
+from webstation_broker.emulators import (
+    base,
+    ppsspp,
+    retroarch,
+    retroarch_cores,
+    rpcs3,
+    scummvm,
+    shadps4,
+    xemu,
+)
 from webstation_broker.emulators.base import Emulator
 
 PREFIX = settings.PREFIX
@@ -673,9 +682,9 @@ def client(
 ) -> Iterator[TestClient]:
     """Serve the app through a TestClient with no secret and dev mode off.
 
-    Also redirects RetroArch's data dir and core dir into tmp_path before the
-    app starts, so the lifespan's core catalog load never reads a real
-    container's config tree.
+    Also redirects RetroArch's data dir and core dir, and every extraction
+    cache, into tmp_path before the app starts, so neither the lifespan's core
+    catalog load nor its scratch sweeps reach a real container's config tree.
 
     Args:
         broker_dirs: The redirected ROM root and archive directories. Requested so they exist before
@@ -693,6 +702,8 @@ def client(
     monkeypatch.setattr(settings, "DEV_MODE", True)
     monkeypatch.setattr(retroarch, "RA_DATA_DIR", tmp_path / "retroarch_data")
     monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path / "retroarch_cores")
+    for module in (shadps4, rpcs3, scummvm, ppsspp):
+        monkeypatch.setattr(module, "CACHE_DIR", tmp_path / "extracted" / module.__name__.rsplit(".", 1)[-1])
     app = create_app()
     monkeypatch.setattr(settings, "DEV_MODE", False)
     with TestClient(app) as c:

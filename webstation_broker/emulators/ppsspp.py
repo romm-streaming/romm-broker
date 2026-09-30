@@ -26,13 +26,15 @@ import os
 import re
 import subprocess
 import time
-from collections.abc import Iterable
-from pathlib import Path
+from collections.abc import Iterable, Iterator
+from pathlib import Path, PurePosixPath
 from threading import Thread
 from typing import Any, Optional, Union
 
-from .. import imports
-from .base import Emulator, base_launch_env, xdg_config_dir
+from .. import imports, settings
+from . import extraction_cache
+from .base import Emulator, base_launch_env, xdg_config_dir, xdg_data_dir
+from .extraction_cache import ExtractionCache
 
 log = logging.getLogger(__name__)
 
@@ -135,6 +137,27 @@ there is no disc number to rank on.
 """
 _ROM_SEARCH_GLOBS = ("*", "*/*")
 
+_ARCHIVE_EXTS = extraction_cache._ARCHIVE_EXTS
+"""Archive formats a ROM can come in: `.7z`, `.zip` and `.rar`. PPSSPP boots none of them itself."""
+
+CACHE_DIR = Path(os.environ.get("PPSSPP_CACHE_DIR", str(xdg_data_dir("ppsspp") / "extracted")))
+"""Where archived ROMs are extracted and booted from (env `PPSSPP_CACHE_DIR`).
+
+Defaults to `$XDG_DATA_HOME/ppsspp/extracted`.
+
+An extraction is kept and reused by every later launch of the same archive.
+"""
+CACHE_MAX_GB = float(os.environ.get("PPSSPP_CACHE_MAX_GB", "20"))
+"""Cap on the extraction cache in GB (env `PPSSPP_CACHE_MAX_GB`, default 20).
+
+The least recently booted ROMs are evicted to make room for a new one.
+"""
+ARCHIVE_LIST_TIMEOUT = 60.0
+"""Seconds `7z` or `unrar` gets to list an archive's members before it is considered hung."""
+
+_MAX_MEMBER_DEPTH = max(len(PurePosixPath(g).parts) for g in _ROM_SEARCH_GLOBS)
+"""How deep in an archive a PSP image can sit and still be found once extracted, from `_ROM_SEARCH_GLOBS`."""
+
 _STAGING_SUFFIX = ".tmp"
 """Suffix PPSSPP saves a state under before renaming it over the real name once the save succeeds."""
 
@@ -186,41 +209,152 @@ or a second key the player mapped to Save State keeps working.
 """
 
 
-def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
-    """Pick the best bootable ROM out of a set of candidate paths.
-
-    Hidden files, unsupported extensions, non-files and anything resolving
-    outside `ROM_ROOT` are dropped. The rest rank by position in
-    `ROM_EXTENSIONS`, then by depth and name.
+def _qualifying(
+    candidates: Iterable[Path], base: Path, exts: tuple[str, ...], root: Path
+) -> Iterator[tuple[str, int, Path, Path]]:
+    """The candidates that are real, visible files with one of `exts`, inside `root`.
 
     Args:
         candidates: Paths found under the ROM folder.
         base: The ROM folder the candidates are relative to.
+        exts: The lower-cased suffixes that count.
+        root: The tree every candidate must resolve inside.
 
-    Returns:
-        The resolved path of the winning ROM, or None when nothing qualifies.
+    Yields:
+        Each qualifying candidate's suffix, its depth under `base`, the path
+        as found, and its resolved path.
     """
-    ranked = []
     for p in candidates:
-        if p.name.startswith("."):
-            continue
         ext = p.suffix.lower()
-        if ext not in ROM_EXTENSIONS:
+        if p.name.startswith(".") or ext not in exts:
             continue
         try:
             if not p.is_file():
                 continue
             real = p.resolve()
-            rel = p.relative_to(base)
+            depth = len(p.relative_to(base).parts)
         except (OSError, ValueError) as exc:
-            log.debug("ppsspp: skipping rom candidate %s: %s", p, exc)
+            log.debug("ppsspp: skipping candidate %s: %s", p, exc)
             continue
-        if not real.is_relative_to(ROM_ROOT):
-            continue
-        ranked.append((ROM_EXTENSIONS.index(ext), len(rel.parts), p.name.lower(), real))
+        if real.is_relative_to(root):
+            yield ext, depth, p, real
+
+
+def _pick_rom_file(candidates: Iterable[Path], base: Path, root: Optional[Path] = None) -> Optional[Path]:
+    """Pick the best bootable ROM out of a set of candidate paths.
+
+    Hidden files, unsupported extensions, non-files and anything resolving
+    outside `root` are dropped. The rest rank by position in
+    `ROM_EXTENSIONS`, then by depth and name.
+
+    Args:
+        candidates: Paths found under the ROM folder.
+        base: The ROM folder the candidates are relative to.
+        root: The tree every pick must resolve inside; `ROM_ROOT` when None.
+
+    Returns:
+        The resolved path of the winning ROM, or None when nothing qualifies.
+    """
+    ranked = [
+        (ROM_EXTENSIONS.index(ext), depth, p.name.lower(), real)
+        for ext, depth, p, real in _qualifying(candidates, base, ROM_EXTENSIONS, root or ROM_ROOT.resolve())
+    ]
     if not ranked:
         return None
     return min(ranked)[-1]
+
+
+def _search(folder: Path) -> list[Path]:
+    """The ROM candidates under `folder`, one level deep.
+
+    A pattern that cannot be walked (an unreadable subdirectory, a broken
+    mount) costs only what that pattern would have contributed.
+
+    Args:
+        folder: The folder to search.
+
+    Returns:
+        Every path the search patterns matched.
+    """
+    candidates: list[Path] = []
+    for pattern in _ROM_SEARCH_GLOBS:
+        try:
+            candidates.extend(folder.glob(pattern))
+        except OSError as exc:
+            log.warning("rom search %r under %s failed: %s", pattern, folder, exc)
+    return candidates
+
+
+def _extracted_rom(folder: Path) -> Optional[Path]:
+    """The ROM to boot out of an extracted archive, ranked as a ROM folder is.
+
+    Args:
+        folder: Where the archive was extracted to.
+
+    Returns:
+        The ROM, or None when the extraction holds nothing PPSSPP boots.
+    """
+    try:
+        root = folder.resolve()
+    except OSError as exc:
+        log.warning("ppsspp: could not resolve the extraction %s: %s", folder, exc)
+        return None
+    return _pick_rom_file(_search(folder), folder, root)
+
+
+def _archive_holds_rom(archive: Path) -> bool:
+    """Whether an archive's members include a format PPSSPP boots.
+
+    Checked before the launch, off its member listing, so an archive holding
+    no PSP image is a clean refusal rather than an extraction that fails.
+    Only members `_extracted_rom` would find count: no deeper than one folder
+    down, and not hidden.
+
+    Args:
+        archive: The archive.
+
+    Returns:
+        True when a member carries one of `ROM_EXTENSIONS`; a refusal is logged.
+    """
+    try:
+        members = extraction_cache.list_members(archive, ARCHIVE_LIST_TIMEOUT, "ppsspp")
+    except RuntimeError as exc:
+        log.warning("ppsspp: could not list %s: %s", archive.name, exc)
+        return False
+    for member in members:
+        path = PurePosixPath(member.replace("\\", "/"))
+        reachable = 1 <= len(path.parts) <= _MAX_MEMBER_DEPTH and not path.name.startswith(".")
+        if reachable and path.suffix.lower() in ROM_EXTENSIONS:
+            return True
+    log.warning(
+        "ppsspp: %s holds nothing PPSSPP boots within one folder of its top (%s)",
+        archive.name,
+        ", ".join(ROM_EXTENSIONS),
+    )
+    return False
+
+
+_CACHE = ExtractionCache(
+    name="ppsspp",
+    cache_dir=lambda: CACHE_DIR,
+    enabled=lambda: settings.PPSSPP_CACHE_ENABLED,
+    max_gb=lambda: CACHE_MAX_GB,
+    find_boot_target=_extracted_rom,
+    missing_target_error="held no PSP image",
+)
+"""Extracts archived ROMs into CACHE_DIR, one folder per archive, reused on every later launch."""
+
+
+def sweep_stale_extractions() -> None:
+    """Remove extraction scratch dirs orphaned by a crashed broker process.
+
+    Call once at broker startup, so the space is reclaimed before the first
+    launch rather than only when the next extraction happens to run.
+    """
+    try:
+        _CACHE.sweep_stale_extractions()
+    except (RuntimeError, OSError) as exc:
+        log.warning("ppsspp cache: startup scratch sweep skipped: %s", exc)
 
 
 def _merge_binding(existing: str, required: str) -> str:
@@ -721,7 +855,7 @@ class Ppsspp(Emulator):
         display_name: Human-readable name shown in the UI.
         save_root: The emulated memory stick root, which the save subtrees hang off.
         save_subtrees: `SAVEDATA` and `PPSSPP_STATE`, the directories the save archive carries.
-        rom_extensions: Bootable ROM formats, best first.
+        rom_extensions: Bootable ROM formats, best first, then the archive formats while the cache is on.
         supports_states: True, states are saved and loaded over the bracket hotkeys.
         state_slot: The one slot the broker works in, echoed back as the effective slot.
         state_dir: Where PPSSPP writes `.ppst` files.
@@ -735,7 +869,6 @@ class Ppsspp(Emulator):
     save_root = PSP_DIR
     save_subtrees = ("SAVEDATA", "PPSSPP_STATE")
     state_subtrees = ("PPSSPP_STATE",)
-    rom_extensions = ROM_EXTENSIONS
     supports_states = True
     state_slot = STATE_SLOT
     state_dir = STATE_DIR
@@ -746,46 +879,107 @@ class Ppsspp(Emulator):
         super().__init__()
         self._launch_seq = 0
 
+    @property
+    def rom_extensions(self) -> tuple[str, ...]:
+        """Bootable formats, plus the archive formats while the extraction cache is on."""
+        if settings.PPSSPP_CACHE_ENABLED:
+            return ROM_EXTENSIONS + _ARCHIVE_EXTS
+        return ROM_EXTENSIONS
+
     def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """Resolve a RomM path to the ROM to boot.
 
-        A file is taken as is. A directory is searched one level deep for the
-        best candidate by `_pick_rom_file`. A pattern that cannot be walked
-        (an unreadable subdirectory, a broken mount) costs only what that
-        pattern would have contributed: the candidates already found still
-        rank, since reporting a title unbootable over one bad directory is
-        worse than booting the best of what could be read.
+        A file is taken as is, an archive once its members show a PSP image.
+        A directory is searched one level deep for the best candidate by
+        `_pick_rom_file`, and when it holds none, a lone archive holding one is
+        taken instead. A pattern that cannot be walked (an unreadable
+        subdirectory, a broken mount) costs only what that pattern would have
+        contributed: the candidates already found still rank, since reporting
+        a title unbootable over one bad directory is worse than booting the
+        best of what could be read.
 
         Args:
             path: The ROM file or folder RomM handed over.
 
         Returns:
-            The ROM to pass to PPSSPPQt, or None when there is nothing bootable.
+            The ROM or archive to pass to `launch`, or None when there is
+            nothing bootable.
         """
         if path.is_file():
             # Defense in depth: api.py already validates path is under
             # ROM_ROOT before calling in, but this checks it independently
             # rather than trusting every future caller to do the same.
             try:
-                if not path.resolve().is_relative_to(ROM_ROOT):
+                if not path.resolve().is_relative_to(ROM_ROOT.resolve()):
                     return None
             except OSError as exc:
                 log.debug("resolve_rom_file: could not resolve %s: %s", path, exc)
                 return None
+            if path.suffix.lower() in _ARCHIVE_EXTS:
+                return path if self._archive_bootable(path) else None
             log.debug("resolve_rom_file: resolved directly to %s", path)
             return path
         if not path.is_dir():
             return None
-        candidates: list[Path] = []
-        for pattern in _ROM_SEARCH_GLOBS:
-            try:
-                candidates.extend(path.glob(pattern))
-            except OSError as exc:
-                log.warning("rom search %r under %s failed: %s", pattern, path, exc)
+        candidates = _search(path)
         resolved = _pick_rom_file(candidates, path)
+        if resolved is None:
+            resolved = self._folder_archive(candidates, path)
         if resolved is not None:
             log.debug("resolve_rom_file: resolved %s to %s", path, resolved)
         return resolved
+
+    def _archive_bootable(self, archive: Path) -> bool:
+        """Whether an archive can be booted: the cache is on and a member is a PSP image.
+
+        Args:
+            archive: The archive, already checked to sit under the ROM root.
+
+        Returns:
+            True when `launch` can extract and boot it; a refusal is logged.
+        """
+        if not settings.PPSSPP_CACHE_ENABLED:
+            log.warning(
+                "ppsspp: refusing %s, an archived ROM needs the extraction cache "
+                "(set PPSSPP_CACHE_ENABLED=true, or extract it)",
+                archive.name,
+            )
+            return False
+        # Already extracted means it held a PSP image, so only a new archive is listed.
+        return _CACHE.entry_dir(archive) is not None or _archive_holds_rom(archive)
+
+    def _folder_archive(self, candidates: list[Path], base: Path) -> Optional[Path]:
+        """A ROM folder's lone archive, for a folder holding no PSP image of its own.
+
+        Only the shallowest archives count, so one in an extras subfolder
+        never makes the game's own archive ambiguous. Several at that depth
+        are refused rather than guessed between.
+
+        Args:
+            candidates: The paths found under `base`.
+            base: The ROM folder.
+
+        Returns:
+            The resolved archive, or None when there is none, more than one
+            at the shallowest depth, or it cannot be booted.
+        """
+        found = [
+            (depth, real)
+            for _, depth, _, real in _qualifying(candidates, base, _ARCHIVE_EXTS, ROM_ROOT.resolve())
+        ]
+        if not found:
+            return None
+        shallowest = min(depth for depth, _ in found)
+        archives = [real for depth, real in found if depth == shallowest]
+        if len(archives) > 1:
+            log.warning(
+                "ppsspp: %s holds %d archives and no PSP image, refusing to guess: %s",
+                base.name,
+                len(archives),
+                ", ".join(sorted(a.name for a in archives)),
+            )
+            return None
+        return archives[0] if self._archive_bootable(archives[0]) else None
 
     def _xdotool(self, *args: str) -> Optional[str]:
         """Run one xdotool command against the session display.
@@ -890,16 +1084,22 @@ class Ppsspp(Emulator):
         `resume_slot` set, a deferred thread waits for the state file and
         loads it over the hotkey once the window is up.
 
+        An archive is extracted into the cache first (or its earlier
+        extraction reused), and the PSP image inside it is what boots.
+
         Args:
-            rom_path: The ROM to boot.
+            rom_path: The ROM or archive to boot.
             resume_slot: Slot to resume from, or None to boot clean.
 
         Raises:
-            RuntimeError: When either ini could not be patched, so nothing is
-                spawned; see `_patch_ini_file`.
+            RuntimeError: When either ini could not be patched or an archive
+                could not be extracted, so nothing is spawned; see
+                `_patch_ini_file`.
         """
         self.stop()
         _patch_config()
+        if rom_path.suffix.lower() in _ARCHIVE_EXTS:
+            rom_path = _CACHE.extract(rom_path, self)
         self._launch_seq += 1
         seq = self._launch_seq
 

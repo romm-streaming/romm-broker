@@ -10,6 +10,7 @@ real ScummVM.
 import subprocess
 import time
 import unicodedata
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -48,6 +49,8 @@ def dirs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Path]:
     monkeypatch.setattr(scummvm, "CONFIG_DIR", config)
     monkeypatch.setattr(scummvm, "INI_PATH", ini)
     monkeypatch.setattr(scummvm, "SAVE_DIR", saves)
+    monkeypatch.setattr(scummvm, "CACHE_DIR", tmp_path / "extracted")
+    monkeypatch.setattr(scummvm.settings, "SCUMMVM_CACHE_ENABLED", True)
     # The class resolves its root once at import, and the save subtree hangs off
     # it rather than off SAVE_DIR, so the clear would reach outside tmp_path.
     monkeypatch.setattr(scummvm.Scummvm, "save_root", tmp_path)
@@ -113,7 +116,7 @@ def test_a_file_resolves_to_the_folder_holding_it(dirs: dict[str, Path]) -> None
     assert Scummvm().resolve_rom_file(marker) == folder.resolve()
 
 
-def test_an_archive_resolves_to_nothing_rather_than_its_folder(
+def test_an_archive_resolves_to_itself_rather_than_its_folder(
     dirs: dict[str, Path],
 ) -> None:
     """A zipped game must not be read as "the folder it sits in".
@@ -122,12 +125,56 @@ def test_an_archive_resolves_to_nothing_rather_than_its_folder(
     loose file is the platform folder. Registering that would `--add` every
     game on the platform and boot whichever target sorts first: the player
     asks for one game and gets another, which is worse than a refused launch.
+    The archive itself is what `launch` extracts and registers instead.
     """
-    folder = game_folder(dirs["roms"])
-    archive = folder.parent / "woodruff.zip"
-    archive.write_bytes(b"PK")
+    game_folder(dirs["roms"])
+    archive = zipped_game(dirs["roms"], {"WOODRUFF.000": b"data"}, "woodruff.zip")
 
-    assert Scummvm().resolve_rom_file(archive) is None
+    assert Scummvm().resolve_rom_file(archive) == archive.resolve()
+
+
+def test_an_archive_is_refused_with_the_cache_off(
+    dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With nowhere to extract it, an archived game cannot boot and is not advertised."""
+    monkeypatch.setattr(scummvm.settings, "SCUMMVM_CACHE_ENABLED", False)
+    archive = dirs["roms"] / "woodruff.zip"
+    archive.write_bytes(b"PK\x03\x04")
+    emu = Scummvm()
+
+    assert emu.resolve_rom_file(archive) is None
+    assert ".zip" not in emu.rom_extensions
+
+
+def test_a_folder_holding_only_an_archive_resolves_to_the_archive(dirs: dict[str, Path]) -> None:
+    """A game folder whose only content is its zip (and a marker) boots the zip."""
+    folder = dirs["roms"] / "woodruff"
+    folder.mkdir()
+    archive = zipped_game(folder, {"WOODRUFF.000": b"data"}, "woodruff.zip")
+    (folder / "woodruff.scummvm").write_text("woodruff")
+
+    assert Scummvm().resolve_rom_file(folder) == archive.resolve()
+    assert Scummvm().resolve_rom_file(folder / "woodruff.scummvm") == archive.resolve()
+
+
+def test_a_folder_with_an_archive_beside_game_files_is_the_game(dirs: dict[str, Path]) -> None:
+    """An extras zip next to the data files does not stand in for the game."""
+    folder = game_folder(dirs["roms"])
+    (folder / "extras.zip").write_bytes(b"PK\x03\x04")
+
+    assert Scummvm().resolve_rom_file(folder) == folder.resolve()
+
+
+def test_an_archive_linked_in_from_outside_the_library_is_refused(
+    dirs: dict[str, Path], tmp_path: Path
+) -> None:
+    """The file about to be extracted must itself live under the ROM root."""
+    outside = tmp_path / "elsewhere.zip"
+    outside.write_bytes(b"PK\x03\x04")
+    link = dirs["roms"] / "woodruff.zip"
+    link.symlink_to(outside)
+
+    assert Scummvm().resolve_rom_file(link) is None
 
 
 def test_an_empty_folder_resolves_to_nothing(dirs: dict[str, Path]) -> None:
@@ -389,7 +436,8 @@ def test_another_live_copy_of_the_same_game_is_left_alone(
     write_ini(dirs["ini"], f"[monkey-en]\ngameid=monkey\npath={other}")
     monkeypatch.setattr(scummvm.subprocess, "run", AddRuns(folder))
 
-    scummvm.register_target(folder)
+    with pytest.raises(scummvm.RegisteredElsewhere, match=str(other)):
+        scummvm.register_target(folder)
 
     assert "monkey-en" in scummvm._ini_domains()
 
@@ -2240,7 +2288,7 @@ def test_preflight_picks_the_target_launch_boots(
     rom = emu.resolve_rom_file(folder)
     ctx = imports.ImportCtx(rom_file=rom, rom=None, memory_card_synced=False, excluded=(), resume_slot=None)
 
-    target, _ = scummvm._session_game(emu, ctx)
+    target, _, _ = scummvm._session_game(emu, ctx)
     emu.launch(rom, None)
 
     assert target == expected == emu._target
@@ -2318,3 +2366,536 @@ def test_the_hotkey_table_holds_the_letters_its_names_say() -> None:
     for code, names in expected.items():
         assert tuple(unicodedata.name(key) for key in scummvm._GMM_HOTKEYS[code]) == names
     assert Path(scummvm.__file__).read_text(encoding="utf-8").isascii()
+
+
+# -- Archived games --
+
+
+def zipped_game(roms: Path, members: dict[str, bytes], name: str = "monkey.zip") -> Path:
+    """Write a zip of a game under the ROM root.
+
+    Args:
+        roms: The ROM root.
+        members: Member path to its contents.
+        name: The archive's file name.
+
+    Returns:
+        The archive.
+    """
+    archive = roms / name
+    with zipfile.ZipFile(archive, "w") as zf:
+        for member, data in members.items():
+            zf.writestr(member, data)
+    return archive
+
+
+class AddsWhatItScans:
+    """A `scummvm --add` stand-in registering `monkey` at whatever path it was given.
+
+    Like ScummVM, it deduplicates by game: while any `monkey` domain is
+    registered, a scan adds nothing and says the game was already added.
+
+    Attributes:
+        paths: The `--path` of every scan, in order.
+    """
+
+    def __init__(self) -> None:
+        """Start with no scans."""
+        self.paths: list[Path] = []
+
+    def __call__(self, cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        """Register the scanned folder the way a detecting ScummVM would.
+
+        Args:
+            cmd: The argv the launcher ran.
+            **kwargs: The rest of the subprocess arguments, ignored.
+
+        Returns:
+            ScummVM's output for a detected game.
+        """
+        path = Path(next(a for a in cmd if a.startswith("--path="))[len("--path="):])
+        self.paths.append(path)
+        ini = scummvm.INI_PATH
+        existing = ini.read_text() if ini.exists() else ""
+        if "[monkey]" in existing:
+            return subprocess.CompletedProcess(
+                cmd, 0, "Found scumm:monkey, but has already been added, skipping\nAdded 0 games\n", ""
+            )
+        ini.write_text(existing + f"\n[monkey]\ngameid=monkey\npath={path}\n")
+        return subprocess.CompletedProcess(cmd, 0, "Game Added\n", "")
+
+
+def _count_extractions(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Record every archive the cache actually extracts, and still extract it.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher, undone when the test ends.
+
+    Returns:
+        The archives extracted, appended to as they are.
+    """
+    extractions: list[Path] = []
+    real_extract = scummvm.extraction_cache.extract_archive
+
+    def counting(rom: Path, dest: Path, timeout: float, **kwargs: Any) -> None:
+        """Record an extraction and run it.
+
+        Args:
+            rom: The archive.
+            dest: Where it goes.
+            timeout: The extractor timeout.
+            **kwargs: The escape hook and owner, passed on or ignored.
+        """
+        extractions.append(rom)
+        real_extract(rom, dest, timeout, **kwargs)
+
+    monkeypatch.setattr(scummvm.extraction_cache, "extract_archive", counting)
+    return extractions
+
+
+def test_an_archived_game_boots_from_its_extraction(
+    dirs: dict[str, Path], spawned: Spawned, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The zip is extracted, its wrapper folder walked into, and that folder registered."""
+    archive = zipped_game(
+        dirs["roms"], {"Monkey Island/MONKEY.000": b"data", "Monkey Island/MONKEY.001": b"d"}
+    )
+    add = AddsWhatItScans()
+    monkeypatch.setattr(scummvm.subprocess, "run", add)
+    emu = Scummvm()
+
+    emu.launch(emu.resolve_rom_file(archive), None)
+
+    assert spawned.cmd[-1] == "monkey"
+    [scanned] = add.paths
+    assert scanned.name == "Monkey Island"
+    assert scanned.is_relative_to(scummvm.CACHE_DIR)
+    assert (scanned / "MONKEY.000").read_bytes() == b"data"
+    assert emu.extraction_phase is None
+
+
+def test_a_second_launch_reuses_the_extraction_and_its_target(
+    dirs: dict[str, Path], spawned: Spawned, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same folder comes back, so the target, and the saves named after it, carry over."""
+    archive = zipped_game(dirs["roms"], {"MONKEY.000": b"data"})
+    add = AddsWhatItScans()
+    monkeypatch.setattr(scummvm.subprocess, "run", add)
+    extractions = _count_extractions(monkeypatch)
+    emu = Scummvm()
+
+    emu.launch(emu.resolve_rom_file(archive), None)
+    emu.launch(emu.resolve_rom_file(archive), None)
+
+    assert len(extractions) == 1
+    assert len(add.paths) == 1
+    assert spawned.cmd[-1] == "monkey"
+
+
+def test_a_replaced_archive_is_extracted_again(
+    dirs: dict[str, Path], spawned: Spawned, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-uploaded archive under the same name never boots the old extraction.
+
+    The old extraction is still on disk waiting for eviction, and its domain
+    would block the new one's scan. It gives way, so the new extraction
+    registers under the same target and the saves named after it still load.
+    """
+    archive = zipped_game(dirs["roms"], {"MONKEY.000": b"old"})
+    add = AddsWhatItScans()
+    monkeypatch.setattr(scummvm.subprocess, "run", add)
+    extractions = _count_extractions(monkeypatch)
+    emu = Scummvm()
+    emu.launch(emu.resolve_rom_file(archive), None)
+    first = add.paths[0]
+
+    archive.unlink()
+    zipped_game(dirs["roms"], {"MONKEY.000": b"new data"})
+    emu.launch(emu.resolve_rom_file(archive), None)
+
+    assert len(extractions) == 2
+    assert first.is_dir()
+    assert scummvm.target_for_path(add.paths[-1]) == "monkey"
+    assert scummvm.target_for_path(first) is None
+    assert spawned.cmd[-1] == "monkey"
+
+
+def test_a_live_library_copy_never_gives_way_to_an_extraction(
+    dirs: dict[str, Path], spawned: Spawned, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the broker's own older extractions are superseded, never a folder in the library."""
+    loose = dirs["roms"] / "Monkey Loose"
+    loose.mkdir()
+    (loose / "MONKEY.000").write_bytes(b"data")
+    add = AddsWhatItScans()
+    monkeypatch.setattr(scummvm.subprocess, "run", add)
+    emu = Scummvm()
+    emu.launch(emu.resolve_rom_file(loose), None)
+    archive = zipped_game(dirs["roms"], {"MONKEY.000": b"data"})
+
+    with pytest.raises(scummvm.RegisteredElsewhere, match=f"already registered from {loose}"):
+        emu.launch(emu.resolve_rom_file(archive), None)
+
+    assert scummvm.target_for_path(loose) == "monkey"
+
+
+def test_a_second_copy_names_the_first_in_the_import_refusal(
+    dirs: dict[str, Path], spawned: Spawned, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The preflight says which folder holds the game, not that there is no game."""
+    loose = dirs["roms"] / "Monkey Loose"
+    loose.mkdir()
+    (loose / "MONKEY.000").write_bytes(b"data")
+    monkeypatch.setattr(scummvm.subprocess, "run", AddsWhatItScans())
+    emu = Scummvm()
+    emu.launch(emu.resolve_rom_file(loose), None)
+    rom = emu.resolve_rom_file(zipped_game(dirs["roms"], {"MONKEY.000": b"data"}))
+    ctx = imports.ImportCtx(rom_file=rom, rom=None, memory_card_synced=False, excluded=(), resume_slot=None)
+
+    target, names, why = scummvm._session_game(emu, ctx)
+
+    assert (target, names) == (None, [])
+    assert why is not None and str(loose) in why
+
+
+def test_macos_metadata_does_not_hide_the_wrapper_folder(
+    dirs: dict[str, Path], spawned: Spawned, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Mac-made zip's `__MACOSX` fork is not a second top-level entry."""
+    archive = zipped_game(
+        dirs["roms"], {"Monkey/MONKEY.000": b"data", "__MACOSX/Monkey/._MONKEY.000": b"fork"}
+    )
+    add = AddsWhatItScans()
+    monkeypatch.setattr(scummvm.subprocess, "run", add)
+    emu = Scummvm()
+
+    emu.launch(emu.resolve_rom_file(archive), None)
+
+    assert add.paths[0].name == "Monkey"
+
+
+def test_an_archive_escaping_the_cache_never_launches(
+    dirs: dict[str, Path], spawned: Spawned, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Zip Slip member fails the launch before anything is written or spawned."""
+    archive = zipped_game(dirs["roms"], {"../../escaped.txt": b"x", "MONKEY.000": b"data"})
+    monkeypatch.setattr(scummvm.subprocess, "run", _never_runs)
+    emu = Scummvm()
+
+    with pytest.raises(RuntimeError, match="escapes"):
+        emu.launch(emu.resolve_rom_file(archive), None)
+
+    assert spawned.cmd is None
+    assert not (scummvm.CACHE_DIR.parent / "escaped.txt").exists()
+
+
+@pytest.mark.parametrize(
+    "members",
+    [{}, {"__MACOSX/._x": b"fork"}, {".DS_Store": b"x", "Monkey/": b""}],
+    ids=["empty", "mac-fork-only", "hidden-and-folders-only"],
+)
+def test_an_archive_with_no_game_files_is_refused_at_activate(
+    dirs: dict[str, Path], members: dict[str, bytes], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its listing already shows there is nothing to boot, so nothing is extracted to find out."""
+    archive = zipped_game(dirs["roms"], members)
+    extractions = _count_extractions(monkeypatch)
+
+    assert Scummvm().resolve_rom_file(archive) is None
+    assert extractions == []
+
+
+def test_a_corrupt_archive_is_refused_at_activate(dirs: dict[str, Path]) -> None:
+    """An archive that cannot even be listed never reaches the launch."""
+    archive = dirs["roms"] / "monkey.zip"
+    archive.write_bytes(b"PK\x03\x04 not really")
+
+    assert Scummvm().resolve_rom_file(archive) is None
+
+
+def test_an_archive_with_no_game_in_it_fails_and_caches_nothing(
+    dirs: dict[str, Path], spawned: Spawned, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past the activate check, an extraction holding nothing is a launch failure, not a cache entry."""
+    archive = zipped_game(dirs["roms"], {"__MACOSX/._x": b"fork"})
+    monkeypatch.setattr(scummvm.subprocess, "run", _never_runs)
+    emu = Scummvm()
+
+    with pytest.raises(RuntimeError, match="held no game files"):
+        emu.launch(archive.resolve(), None)
+
+    assert spawned.cmd is None
+    assert [p.name for p in scummvm.CACHE_DIR.iterdir()] == [".scratch"]
+    assert not any((scummvm.CACHE_DIR / ".scratch").iterdir())
+
+
+def test_an_extraction_cut_short_leaves_nothing_to_boot_from(
+    dirs: dict[str, Path], spawned: Spawned, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure mid-extraction leaves no half-written game for the next launch to trust."""
+    archive = zipped_game(dirs["roms"], {"MONKEY.000": b"data"})
+
+    def dies(rom: Path, dest: Path, timeout: float, **kwargs: Any) -> None:
+        """Write part of the game, then fail the way a full disk would.
+
+        Args:
+            rom: The archive.
+            dest: Where it goes.
+            timeout: The extractor timeout.
+            **kwargs: The escape hook and owner, passed on or ignored.
+
+        Raises:
+            RuntimeError: Always.
+        """
+        (dest / "MONKEY.000").write_bytes(b"da")
+        raise RuntimeError("no space left on device")
+
+    monkeypatch.setattr(scummvm.extraction_cache, "extract_archive", dies)
+    emu = Scummvm()
+
+    with pytest.raises(RuntimeError, match="no space"):
+        emu.launch(emu.resolve_rom_file(archive), None)
+
+    assert [p.name for p in scummvm.CACHE_DIR.iterdir() if p.name != ".scratch"] == []
+    assert not any((scummvm.CACHE_DIR / ".scratch").iterdir())
+    assert spawned.cmd is None
+
+
+def test_saves_imported_for_an_archived_game_land_under_its_target(
+    dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preflight registers the extraction, not the zip, so the saves find their target.
+
+    Scanning the archive file itself detects nothing, which would refuse every
+    save the session carries in.
+    """
+    archive = zipped_game(dirs["roms"], {"Monkey/MONKEY.000": b"data"})
+    add = AddsWhatItScans()
+    monkeypatch.setattr(scummvm.subprocess, "run", add)
+
+    result = _preflight(Scummvm(), archive, {".import/save/monkey.003": b"one"})
+
+    assert result.refusals == ()
+    assert _dests(result) == {".import/save/monkey.003": "saves/monkey.003"}
+    assert add.paths[0].is_relative_to(scummvm.CACHE_DIR)
+
+
+def test_the_launch_after_an_archived_preflight_reuses_its_extraction(
+    dirs: dict[str, Path], spawned: Spawned, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preflight already extracted and registered the game, so the launch does neither again."""
+    archive = zipped_game(dirs["roms"], {"MONKEY.000": b"data"})
+    add = AddsWhatItScans()
+    monkeypatch.setattr(scummvm.subprocess, "run", add)
+    extractions = _count_extractions(monkeypatch)
+    emu = Scummvm()
+    _preflight(emu, archive, {".import/save/monkey.003": b"one"})
+
+    emu.launch(emu.resolve_rom_file(archive), None)
+
+    assert len(extractions) == 1
+    assert len(add.paths) == 1
+    assert spawned.cmd[-1] == "monkey"
+
+
+def test_the_identity_of_an_extracted_archive_is_its_target(
+    dirs: dict[str, Path], spawned: Spawned, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once extracted and registered, an archived game reads back its target without scanning."""
+    archive = zipped_game(dirs["roms"], {"MONKEY.000": b"data"})
+    monkeypatch.setattr(scummvm.subprocess, "run", AddsWhatItScans())
+    emu = Scummvm()
+    rom = emu.resolve_rom_file(archive)
+    emu.launch(rom, None)
+    monkeypatch.setattr(scummvm.subprocess, "run", _never_runs)
+
+    assert imports.resolve_activate_identity(Scummvm(), rom, None).value == "monkey"
+
+
+def test_the_identity_of_an_archive_not_yet_extracted_is_none(
+    dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The identity read never extracts: that is the launch's work, off this lookup."""
+    archive = zipped_game(dirs["roms"], {"MONKEY.000": b"data"})
+    monkeypatch.setattr(scummvm.subprocess, "run", _never_runs)
+
+    identity = imports.resolve_activate_identity(Scummvm(), archive.resolve(), None)
+
+    assert identity == imports.SessionIdentity(None, "none")
+    assert not scummvm.CACHE_DIR.exists()
+
+
+def test_another_archive_of_the_same_game_never_takes_its_target(
+    dirs: dict[str, Path], spawned: Spawned, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two archived copies of one game never end up sharing one target and one set of saves.
+
+    Only a re-upload of the same archive supersedes its old extraction. A
+    second copy is refused the way a second library folder would be.
+    """
+    floppy = zipped_game(dirs["roms"], {"MONKEY.000": b"floppy"}, "monkey-floppy.zip")
+    cd = zipped_game(dirs["roms"], {"MONKEY.000": b"cd"}, "monkey-cd.zip")
+    add = AddsWhatItScans()
+    monkeypatch.setattr(scummvm.subprocess, "run", add)
+    emu = Scummvm()
+    emu.launch(emu.resolve_rom_file(floppy), None)
+    first = add.paths[0]
+
+    with pytest.raises(RuntimeError):
+        emu.launch(emu.resolve_rom_file(cd), None)
+
+    assert scummvm.target_for_path(first) == "monkey"
+
+
+def test_a_preflight_whose_archive_will_not_extract_says_so(
+    dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal names the extraction, not a detection miss the player cannot act on."""
+    archive = zipped_game(dirs["roms"], {"MONKEY.000": b"data"})
+    monkeypatch.setattr(scummvm.subprocess, "run", _never_runs)
+
+    def fails(rom: Path, dest: Path, timeout: float, **kwargs: Any) -> None:
+        """Fail the way a full disk would.
+
+        Args:
+            rom: The archive.
+            dest: Where it goes.
+            timeout: The extractor timeout.
+            **kwargs: The escape hook and owner, passed on or ignored.
+
+        Raises:
+            RuntimeError: Always.
+        """
+        raise RuntimeError("No space left on device")
+
+    monkeypatch.setattr(scummvm.extraction_cache, "extract_archive", fails)
+
+    result = _preflight(Scummvm(), archive, {".import/save/monkey.003": b"one"})
+
+    assert [r.reason for r in result.refusals] == ["identity_unknown"]
+    assert "could not be extracted" in (result.refusals[0].detail or "")
+    assert "No space left on device" in (result.refusals[0].detail or "")
+
+
+def test_a_preflight_whose_cache_dir_cannot_be_made_refuses_rather_than_fails(
+    dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An OSError out of the cache is a refusal naming it, not an unhandled preflight error."""
+    archive = zipped_game(dirs["roms"], {"MONKEY.000": b"data"})
+    monkeypatch.setattr(scummvm.subprocess, "run", _never_runs)
+    blocker = dirs["roms"].parent / "not-a-dir"
+    blocker.write_bytes(b"x")
+    monkeypatch.setattr(scummvm, "CACHE_DIR", blocker / "extracted")
+
+    result = _preflight(Scummvm(), archive, {".import/save/monkey.003": b"one"})
+
+    assert [r.reason for r in result.refusals] == ["identity_unknown"]
+    assert "could not be extracted" in (result.refusals[0].detail or "")
+
+
+@pytest.mark.parametrize("replacement", ["renamed", "extracted"])
+def test_an_extraction_whose_archive_is_gone_gives_way(
+    dirs: dict[str, Path], spawned: Spawned, monkeypatch: pytest.MonkeyPatch, replacement: str
+) -> None:
+    """An archive renamed, or swapped for its loose folder, still boots.
+
+    Its old extraction waits on disk for eviction and no launch can reach it
+    any more, yet its domain would block the new copy's scan until then.
+    """
+    archive = zipped_game(dirs["roms"], {"MONKEY.000": b"data"})
+    add = AddsWhatItScans()
+    monkeypatch.setattr(scummvm.subprocess, "run", add)
+    emu = Scummvm()
+    emu.launch(emu.resolve_rom_file(archive), None)
+    first = add.paths[0]
+
+    if replacement == "renamed":
+        rom = archive.rename(dirs["roms"] / "Monkey Island.zip")
+    else:
+        archive.unlink()
+        rom = dirs["roms"] / "Monkey"
+        rom.mkdir()
+        (rom / "MONKEY.000").write_bytes(b"data")
+    emu.launch(emu.resolve_rom_file(rom), None)
+
+    assert spawned.cmd[-1] == "monkey"
+    assert scummvm.target_for_path(first) is None
+    assert first.is_dir()
+
+
+def test_an_extraction_whose_archive_is_still_there_keeps_its_target(
+    dirs: dict[str, Path], spawned: Spawned, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a vanished archive frees its extraction's target; a live one is another copy."""
+    archive = zipped_game(dirs["roms"], {"MONKEY.000": b"data"})
+    add = AddsWhatItScans()
+    monkeypatch.setattr(scummvm.subprocess, "run", add)
+    emu = Scummvm()
+    emu.launch(emu.resolve_rom_file(archive), None)
+    first = add.paths[0]
+    loose = dirs["roms"] / "Monkey"
+    loose.mkdir()
+    (loose / "MONKEY.000").write_bytes(b"data")
+
+    with pytest.raises(RuntimeError):
+        emu.launch(emu.resolve_rom_file(loose), None)
+
+    assert scummvm.target_for_path(first) == "monkey"
+
+
+def test_an_extracted_archive_is_not_listed_again(
+    dirs: dict[str, Path], spawned: Spawned, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its extraction already showed game files, so a later activate skips the listing."""
+    archive = zipped_game(dirs["roms"], {"MONKEY.000": b"data"})
+    monkeypatch.setattr(scummvm.subprocess, "run", AddsWhatItScans())
+    emu = Scummvm()
+    emu.launch(emu.resolve_rom_file(archive), None)
+
+    def never_lists(archive: Path, timeout: float) -> list[str]:
+        """Fail the test if the archive is listed.
+
+        Args:
+            archive: The archive.
+            timeout: The lister timeout.
+
+        Raises:
+            AssertionError: Always.
+        """
+        raise AssertionError(f"listed {archive.name} again")
+
+    monkeypatch.setattr(scummvm.extraction_cache, "list_members", never_lists)
+
+    assert Scummvm().resolve_rom_file(archive) == archive.resolve()
+
+
+def test_an_archive_deleted_before_its_launch_fails_on_the_archive(
+    dirs: dict[str, Path], spawned: Spawned, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The error names the archive, rather than `--add` scanning a path that is no folder."""
+    archive = zipped_game(dirs["roms"], {"MONKEY.000": b"data"})
+    monkeypatch.setattr(scummvm.subprocess, "run", _never_runs)
+    emu = Scummvm()
+    rom = emu.resolve_rom_file(archive)
+    archive.unlink()
+
+    with pytest.raises(RuntimeError, match="monkey.zip"):
+        emu.launch(rom, None)
+
+    assert spawned.cmd is None
+
+
+def test_a_startup_sweep_it_cannot_read_never_stops_the_broker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unreadable cache dir skips the sweep instead of failing startup."""
+
+    def unreadable() -> None:
+        """Fail the way an unreadable scratch dir would.
+
+        Raises:
+            PermissionError: Always.
+        """
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(scummvm._CACHE, "_clear_scratch", unreadable)
+
+    scummvm.sweep_stale_extractions()

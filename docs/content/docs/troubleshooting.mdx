@@ -76,6 +76,12 @@ off, which is the default. Turn the relevant one on to allow those formats.
 See [Configuration](/docs/configuration/emulators#shadps4) and
 [Configuration](/docs/configuration/emulators#rpcs3).
 
+ScummVM extracts archived games by default; PPSSPP only does once
+`PPSSPP_CACHE_ENABLED=true` is set. If one refuses an archive, check that its
+cache is on, and that the archive actually holds the game: ScummVM
+refuses one with no game files in it, and PPSSPP refuses one with no
+`.iso`, `.cso`, or other PSP image inside.
+
 Xenia never reaches the game, or seems to hang on launch: no Xbox Live
 profile exists yet. Launch Xenia once from the desktop and create one through
 its "No Profiles Found" prompt before launching anything through RomM.
