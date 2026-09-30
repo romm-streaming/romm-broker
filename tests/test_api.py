@@ -22,7 +22,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketState
 
-from webstation_broker import api, callback, imports, saves, screenshot, selkies, session, settings
+from webstation_broker import api, callback, imports, room, saves, screenshot, selkies, session, settings
 from webstation_broker.app import create_app
 from webstation_broker.emulators import base, dolphin, rpcs3, shadps4
 from webstation_broker.outbox import Outbox
@@ -3569,11 +3569,34 @@ def test_every_secret_gated_route_refuses_a_bad_secret(
     """No gated route answers, or falls over, for a missing, wrong or non-ASCII secret."""
     headers = {} if presented is None else {"X-Broker-Secret": presented.encode("utf-8")}
 
-    response = secret_client.request(method, f"{API}{path}", headers=headers, content=b"PK")
+    headers["Content-Type"] = "application/json"
 
-    # 422 is FastAPI refusing a missing required parameter before the handler
-    # runs, so it never reaches anything the secret guards either.
-    assert response.status_code in (403, 422), response.text
+    response = secret_client.request(method, f"{API}{path}", headers=headers, content=b"{}")
+
+    # 403 before any of the route's own parameters are validated: an
+    # unauthenticated caller learns nothing about what a route expects.
+    assert response.status_code == 403, response.text
+
+
+_OPEN_ROUTES = {
+    "/api/health",
+    "/api/session/invite",
+    "/api/session/exit",
+    "/api/session/context",
+    "/ws/room",
+}
+
+
+def test_every_route_is_behind_the_secret_or_deliberately_open() -> None:
+    """A new route is gated by the router it sits on; an open one has to be listed here."""
+    gated = {route.path for route in api.secret_router.routes}
+    open_ = {route.path for route in api.router.routes} | {route.path for route in room.router.routes}
+
+    assert open_ == _OPEN_ROUTES
+    # The sweep above has to cover every gated route, so none is skipped by it.
+    assert {f"/api{path}" for _, path in _SECRET_GATED} >= {
+        path.replace("{name}", "a.zip") for path in gated
+    }
 
 
 @pytest.fixture

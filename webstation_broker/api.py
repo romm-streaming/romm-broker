@@ -21,7 +21,7 @@ from typing import Any, Optional
 from urllib.parse import urlsplit
 
 import anyio
-from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
@@ -31,6 +31,21 @@ from .emulators.base import STATE_HEAD_BYTES, CoreRejectedError, Emulator, reap_
 
 log = logging.getLogger(__name__)
 router = APIRouter()
+"""Routes with their own credential: health, and those the room frontend calls with a seat token."""
+
+
+def _require_secret(x_broker_secret: Optional[str] = Header(default=None)) -> None:
+    """Router-level dependency form of `_check_secret`, for `secret_router`.
+
+    Args:
+        x_broker_secret: The `X-Broker-Secret` header as received, or None when absent.
+    """
+    _check_secret(x_broker_secret)
+
+
+secret_router = APIRouter(dependencies=[Depends(_require_secret)])
+"""Every RomM-facing route. The secret is checked before any route's own
+parameters are, so a new route here is gated without having to remember to be."""
 
 TOKEN_CLEAR_GRACE_SECONDS = 1.5
 """Seconds the room gets between being told the session ended and losing its tokens.
@@ -514,11 +529,10 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@router.post("/api/session/activate")
+@secret_router.post("/api/session/activate")
 async def activate(
     body: ActivateIn,
     request: Request,
-    x_broker_secret: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     """Start a session: restore save data, launch the emulator and mint the controller seat.
 
@@ -530,7 +544,6 @@ async def activate(
     Args:
         body: The launch request: emulator, rom, save data, callback and the multiplayer flag.
         request: The incoming request, used to derive the callback origin.
-        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
         The launch report from `_start_session`.
@@ -540,7 +553,6 @@ async def activate(
             or another session operation is still running; everything else
             `_start_session` raises.
     """
-    _check_secret(x_broker_secret)
     with _session_operation("activate"):
         return await _start_session(body, request)
 
@@ -1000,8 +1012,8 @@ async def _mint_viewer(
         return viewer, tokens_pushed
 
 
-@router.post("/api/session/join")
-async def join(body: JoinIn, x_broker_secret: Optional[str] = Header(default=None)) -> dict[str, Any]:
+@secret_router.post("/api/session/join")
+async def join(body: JoinIn) -> dict[str, Any]:
     """Add a user to the running session.
 
     Membership policy belongs to the caller; whoever is sent gets a personal
@@ -1009,7 +1021,6 @@ async def join(body: JoinIn, x_broker_secret: Optional[str] = Header(default=Non
 
     Args:
         body: The user to seat and the permission they get.
-        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
         A dict with `status`, `session_id`, `permission`, `username`,
@@ -1020,8 +1031,6 @@ async def join(body: JoinIn, x_broker_secret: Optional[str] = Header(default=Non
             another session operation is in flight; 422 for an unknown
             permission; 429 when the room is already at its seat cap.
     """
-    _check_secret(x_broker_secret)
-
     viewer, tokens_pushed = await _mint_viewer(body.permission, body.user)
     sess = session.SESSION
     log.info(
@@ -1574,8 +1583,8 @@ def _readable_emulator() -> Emulator:
     return retired["emulator_obj"]
 
 
-@router.post("/api/session/save-state")
-async def save_state(body: StateIn, x_broker_secret: Optional[str] = Header(default=None)) -> dict[str, Any]:
+@secret_router.post("/api/session/save-state")
+async def save_state(body: StateIn) -> dict[str, Any]:
     """Save a state into the emulator's working slot.
 
     The requested slot is resolved to the single working slot and the reply
@@ -1587,7 +1596,6 @@ async def save_state(body: StateIn, x_broker_secret: Optional[str] = Header(defa
 
     Args:
         body: The requested slot.
-        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
         A dict with `status` (`saved` or `failed`), the `slot` used and a `saved` flag.
@@ -1597,7 +1605,6 @@ async def save_state(body: StateIn, x_broker_secret: Optional[str] = Header(defa
             emulator is not running, or another session operation is in flight;
             400 when the emulator has no save states.
     """
-    _check_secret(x_broker_secret)
     with _session_operation("save-state"):
         emulator = _state_emulator()
         frame = await anyio.to_thread.run_sync(screenshot.capture_frame)
@@ -1612,8 +1619,8 @@ async def save_state(body: StateIn, x_broker_secret: Optional[str] = Header(defa
     return {"status": "saved" if saved else "failed", "slot": slot, "saved": saved}
 
 
-@router.post("/api/session/load-state")
-async def load_state(body: StateIn, x_broker_secret: Optional[str] = Header(default=None)) -> dict[str, Any]:
+@secret_router.post("/api/session/load-state")
+async def load_state(body: StateIn) -> dict[str, Any]:
     """Load the state in the emulator's working slot.
 
     The requested slot is resolved to the single working slot and the reply
@@ -1621,7 +1628,6 @@ async def load_state(body: StateIn, x_broker_secret: Optional[str] = Header(defa
 
     Args:
         body: The requested slot.
-        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
         A dict with `status` (`loaded` or `failed`), the `slot` used and a `loaded` flag.
@@ -1631,7 +1637,6 @@ async def load_state(body: StateIn, x_broker_secret: Optional[str] = Header(defa
             emulator is not running, or another session operation is in flight;
             400 when the emulator has no save states.
     """
-    _check_secret(x_broker_secret)
     with _session_operation("load-state"):
         emulator = _state_emulator()
         loaded = await anyio.to_thread.run_sync(emulator.load_state, body.slot)
@@ -1647,13 +1652,12 @@ async def load_state(body: StateIn, x_broker_secret: Optional[str] = Header(defa
     }
 
 
-@router.post("/api/session/swap-disc")
-async def swap_disc(body: DiscIn, x_broker_secret: Optional[str] = Header(default=None)) -> dict[str, str]:
+@secret_router.post("/api/session/swap-disc")
+async def swap_disc(body: DiscIn) -> dict[str, str]:
     """Swap the running emulator's disc for the one at the given path.
 
     Args:
         body: The absolute container path of the new disc.
-        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
         A dict with `status` and the resolved disc `path`.
@@ -1665,7 +1669,6 @@ async def swap_disc(body: DiscIn, x_broker_secret: Optional[str] = Header(defaul
             or it lies outside ROM_ROOT; 404 when the disc does not exist; 502
             when the emulator refuses the swap.
     """
-    _check_secret(x_broker_secret)
     with _session_operation("swap-disc"):
         emulator = _swap_emulator()
         try:
@@ -1709,8 +1712,8 @@ def _header_token(value: str, fallback: str) -> str:
     return cleaned or fallback
 
 
-@router.get("/api/session/state-file")
-async def get_state_file(x_broker_secret: Optional[str] = Header(default=None)) -> Response:
+@secret_router.get("/api/session/state-file")
+async def get_state_file() -> Response:
     """Serve the working slot's state file so RomM can file it in the library.
 
     The slot is the emulator's own, not the caller's: `slot` is accepted for
@@ -1718,9 +1721,6 @@ async def get_state_file(x_broker_secret: Optional[str] = Header(default=None)) 
     routes ignore it. Served after exit as well as during the session, because
     the state exit captures is exactly the one RomM comes back for once the
     teardown has answered.
-
-    Args:
-        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
         The state file as an octet stream, with `X-State-Filename` and `X-State-Slot` headers.
@@ -1731,7 +1731,6 @@ async def get_state_file(x_broker_secret: Optional[str] = Header(default=None)) 
             slot has no state file; 500 when the file cannot be read; 413 when
             it exceeds STATE_FILE_MAX_BYTES.
     """
-    _check_secret(x_broker_secret)
     # Under the session lock so the read never starts on a slot an exit or a
     # push is part way through writing: half a state serves as a whole one, and
     # RomM would file it over the state the player actually has. The body is
@@ -1776,17 +1775,14 @@ async def get_state_file(x_broker_secret: Optional[str] = Header(default=None)) 
         )
 
 
-@router.get("/api/session/state-screenshot")
-async def get_state_screenshot(x_broker_secret: Optional[str] = Header(default=None)) -> Response:
+@secret_router.get("/api/session/state-screenshot")
+async def get_state_screenshot() -> Response:
     """Serve the frame captured with the working slot's state.
 
     The frame is the streamed desktop as it was when the save was sent, held
     on the emulator by the save and exit routes, so it stays readable after
     exit on the same terms as the state itself. `slot` is accepted and
     ignored the same way the state-file routes ignore it.
-
-    Args:
-        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
         The frame as a PNG.
@@ -1796,7 +1792,6 @@ async def get_state_screenshot(x_broker_secret: Optional[str] = Header(default=N
             read from or another session operation is in flight; 404 when the
             slot's state has no frame.
     """
-    _check_secret(x_broker_secret)
     with _session_operation("state-screenshot read"):
         emulator = _readable_emulator()
         body = emulator.state_screenshot
@@ -1820,11 +1815,10 @@ def _unlink_best_effort(path: Path) -> None:
         log.warning("could not remove temp file %s: %s", path, exc)
 
 
-@router.put("/api/session/state-file")
+@secret_router.put("/api/session/state-file")
 async def put_state_file(
     request: Request,
     filename: str = Query(...),
-    x_broker_secret: Optional[str] = Header(default=None),
     x_state_core: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     """Write a state RomM is sending back into the working slot.
@@ -1838,7 +1832,6 @@ async def put_state_file(
     Args:
         request: The request whose raw body is the state file, streamed to disk.
         filename: The name RomM filed the state under; only its basename is used.
-        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
         x_state_core: The core that wrote the state, from X-State-Core header; when
             set and different from the running core, the push is refused.
 
@@ -1853,7 +1846,6 @@ async def put_state_file(
             empty, or the state opens as another game's; 413 when the body
             exceeds STATE_FILE_MAX_BYTES; 500 when the file cannot be written.
     """
-    _check_secret(x_broker_secret)
     # Held across the upload, not just the rename: the slot this publishes into
     # is the one an exit captures and serves, so a push landing over the top of
     # a teardown hands RomM back a different state than the one it just took.
@@ -2018,13 +2010,12 @@ def _memory_card(name: str, platform: Optional[str]) -> tuple[Path, Optional[str
     return card, emulator.memory_card_marker, emulator.arrange_card
 
 
-@router.get("/api/session/import-spec")
+@secret_router.get("/api/session/import-spec")
 async def get_import_spec(
     emulator: str = Query(...),
     platform: Optional[str] = Query(default=None),
     core: Optional[str] = Query(default=None),
     experimental_cores: bool = Query(default=False),
-    x_broker_secret: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     """Tell RomM what an emulator accepts as a declared import, before it builds an archive.
 
@@ -2035,7 +2026,6 @@ async def get_import_spec(
             discovery and activate agree on whether it is offered.
         experimental_cores: RomM's opt-in to a core the broker lists as known
             broken, lifting the same block `rom.experimental_cores` lifts.
-        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
         The API and manifest versions, the emulator's spec, its state slot
@@ -2047,7 +2037,6 @@ async def get_import_spec(
             `core` that is not a core name (`^[a-z0-9_]+$`, as `RomIn.core`),
             or a core that emulator will not take or launch.
     """
-    _check_secret(x_broker_secret)
     # Checked here rather than with a Query pattern so a bad secret is still
     # answered 403 first, and before `core` is set on the shared instance.
     if core is not None and not retroarch_cores.CORE_NAME_RE.match(core):
@@ -2075,16 +2064,14 @@ async def get_import_spec(
     }
 
 
-@router.get("/api/retroarch/cores")
+@secret_router.get("/api/retroarch/cores")
 def get_retroarch_cores(
     platform: Optional[str] = Query(default=None),
-    x_broker_secret: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     """List the libretro cores an operator may set with `core:`, by tier.
 
     Args:
         platform: One RomM platform slug, or None for every platform.
-        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
         For one platform, its `default` core and `cores` rows; for none,
@@ -2093,7 +2080,6 @@ def get_retroarch_cores(
     Raises:
         HTTPException: 403 on a bad secret; 404 for a platform RetroArch does not serve.
     """
-    _check_secret(x_broker_secret)
     table, cat, tiers = retroarch.PLATFORMS, retroarch_cores.catalog(), retroarch_cores.TIERS
 
     def one(slug: str) -> dict[str, Any]:
@@ -2112,11 +2098,10 @@ def get_retroarch_cores(
     return {"platform": slug, **one(slug)}
 
 
-@router.get("/api/session/memory-card")
+@secret_router.get("/api/session/memory-card")
 async def get_memory_card(
     emulator: str = Query(...),
     platform: Optional[str] = Query(default=None),
-    x_broker_secret: Optional[str] = Header(default=None),
 ) -> Response:
     """Serve the whole Slot-1 card so RomM can file it against the player.
 
@@ -2128,7 +2113,6 @@ async def get_memory_card(
     Args:
         emulator: The name of the emulator whose card to capture.
         platform: The platform slug, when the emulator's card depends on it.
-        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
         The card as a zip, with an `X-Memory-Card-Slot: 1` header.
@@ -2139,7 +2123,6 @@ async def get_memory_card(
             operation is in flight, a session is active, or the card could not
             be captured; 404 with `X-Memory-Card: absent` when the slot is empty.
     """
-    _check_secret(x_broker_secret)
     card, marker, _ = _memory_card(emulator, platform)
     # The session lock keeps an activate from launching over the capture, the
     # card lock keeps another card operation off the same staging paths.
@@ -2173,12 +2156,11 @@ async def get_memory_card(
     )
 
 
-@router.put("/api/session/memory-card")
+@secret_router.put("/api/session/memory-card")
 async def put_memory_card(
     request: Request,
     emulator: str = Query(...),
     platform: Optional[str] = Query(default=None),
-    x_broker_secret: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     """Wipe Slot 1 and lay down the card RomM is sending.
 
@@ -2191,7 +2173,6 @@ async def put_memory_card(
         request: The request whose raw body is the card archive.
         emulator: The name of the emulator whose card to replace.
         platform: The platform slug, when the emulator's card depends on it.
-        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
         A dict with `status`, the number of files `written`, the members
@@ -2205,7 +2186,6 @@ async def put_memory_card(
             another card or session operation is in flight or a session is
             active; 500 when the body cannot be staged on disk.
     """
-    _check_secret(x_broker_secret)
     card, marker, arrange = _memory_card(emulator, platform)
 
     # Staged on disk rather than buffered: a card runs to the whole size limit,
@@ -2253,12 +2233,79 @@ async def put_memory_card(
     return {"status": "ok", "written": result.written, "unread": list(result.unread), "slot": 1}
 
 
-@router.get("/api/session/status")
-async def status(x_broker_secret: Optional[str] = Header(default=None)) -> dict[str, Any]:
-    """Report the current session, or that there is none.
+def check_emulator_alive(reported: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Log once when the open session's emulator has exited on its own.
+
+    Exit code 0 is a clean quit, usually the player leaving from the emulator's
+    own menu or quitting the desktop, and is a WARNING. Anything else, a signal
+    or an error code, is a crash and an ERROR. Either way the session is left
+    with nothing playing.
+
+    Nothing is torn down: the saves the emulator wrote before it went are still
+    on disk, and exiting the session from RomM is what dumps and uploads them.
+    Skipped while a session operation holds `_SESSION_LOCK`, because exit and
+    the state routes stop or restart the emulator on purpose.
 
     Args:
-        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
+        reported: The session record already logged, so one crash is one line.
+            Matched by identity, not by id: RomM supplies the id and may reuse
+            it, while every activate builds a new record.
+
+    Returns:
+        The session record logged so far: `reported`, or the current session
+        when this call logged it.
+    """
+    sess = session.SESSION
+    if sess is None or not sess.get("active") or sess is reported or _SESSION_LOCK.locked():
+        return reported
+    emulator = sess["emulator_obj"]
+    if emulator.alive():
+        return reported
+    rom = sess.get("rom") or {}
+    log.log(
+        logging.WARNING if emulator.exit_code == 0 else logging.ERROR,
+        "emulator watch: session %s: %s exited while the session was open (exit code %s, rom %s); "
+        "exit the session from RomM to save and upload what it wrote",
+        sess["id"],
+        emulator.name,
+        emulator.exit_code,
+        rom.get("name") or sess.get("rom_file") or "-",
+    )
+    return sess
+
+
+async def watch_emulator_forever(interval: float) -> None:
+    """Run `check_emulator_alive` every `interval` seconds until cancelled.
+
+    A check that raises is logged as an ERROR once, then at DEBUG until one
+    succeeds again.
+
+    Args:
+        interval: Seconds between checks.
+    """
+    reported: Optional[dict[str, Any]] = None
+    failing = False
+    while True:
+        await anyio.sleep(interval)
+        try:
+            reported = check_emulator_alive(reported)
+        except Exception:
+            # A watch that dies quietly is worse than none, so it keeps going;
+            # a failure that repeats every tick is logged once, not every tick.
+            if failing:
+                log.debug("emulator watch: check still failing", exc_info=True)
+            else:
+                log.exception("emulator watch: check failed")
+            failing = True
+            continue
+        if failing:
+            log.info("emulator watch: check recovered")
+            failing = False
+
+
+@secret_router.get("/api/session/status")
+async def status() -> dict[str, Any]:
+    """Report the current session, or that there is none.
 
     Returns:
         `{"active": False, "last_exit": ...}` when no session exists. Otherwise the session's
@@ -2272,7 +2319,6 @@ async def status(x_broker_secret: Optional[str] = Header(default=None)) -> dict[
     Raises:
         HTTPException: 403 on a bad secret.
     """
-    _check_secret(x_broker_secret)
     sess = session.SESSION
     if sess is None:
         return {"active": False, "last_exit": session.LAST_OUTCOME}
@@ -2351,9 +2397,9 @@ def _export_file(name: str) -> Path:
     return candidate
 
 
-@router.put("/api/session/imports/{name}")
+@secret_router.put("/api/session/imports/{name}")
 async def upload_import(
-    name: str, request: Request, x_broker_secret: Optional[str] = Header(default=None)
+    name: str, request: Request
 ) -> dict[str, Any]:
     """Take a save archive from the parent and return the path activate wants.
 
@@ -2364,7 +2410,6 @@ async def upload_import(
     Args:
         name: The archive basename to store it under.
         request: The request whose raw body is the zip.
-        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
         A dict with `status`, the stored `name`, its container `path` and its `size` in bytes.
@@ -2374,7 +2419,6 @@ async def upload_import(
             the body exceeds SAVE_FILE_MAX_BYTES; 422 when the body is not a
             zip; 500 when the archive cannot be written.
     """
-    _check_secret(x_broker_secret)
     safe = _archive_name(name)
 
     settings.IMPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -2416,12 +2460,9 @@ async def upload_import(
     return {"status": "stored", "name": safe, "path": str(target), "size": total}
 
 
-@router.get("/api/session/exports")
-async def list_exports(x_broker_secret: Optional[str] = Header(default=None)) -> dict[str, Any]:
+@secret_router.get("/api/session/exports")
+async def list_exports() -> dict[str, Any]:
     """List the save archives sitting on disk, newest first.
-
-    Args:
-        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
         A dict with `exports`, a list of entries each carrying `name`, `size` and `mtime`.
@@ -2429,7 +2470,6 @@ async def list_exports(x_broker_secret: Optional[str] = Header(default=None)) ->
     Raises:
         HTTPException: 403 on a bad secret.
     """
-    _check_secret(x_broker_secret)
     if not settings.EXPORT_DIR.is_dir():
         return {"exports": []}
     items = []
@@ -2444,9 +2484,9 @@ async def list_exports(x_broker_secret: Optional[str] = Header(default=None)) ->
     return {"exports": items}
 
 
-@router.get("/api/session/exports/{name}")
+@secret_router.get("/api/session/exports/{name}")
 async def download_export(
-    name: str, x_broker_secret: Optional[str] = Header(default=None)
+    name: str
 ) -> FileResponse:
     """Hand an archive to the parent on request.
 
@@ -2456,7 +2496,6 @@ async def download_export(
 
     Args:
         name: The archive basename.
-        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
         The archive as a zip download.
@@ -2464,20 +2503,18 @@ async def download_export(
     Raises:
         HTTPException: 403 on a bad secret; 400 for an unsafe name; 404 when no such export exists.
     """
-    _check_secret(x_broker_secret)
     path = _export_file(name)
     return FileResponse(path, media_type="application/zip", filename=path.name)
 
 
-@router.delete("/api/session/exports/{name}")
+@secret_router.delete("/api/session/exports/{name}")
 async def delete_export(
-    name: str, x_broker_secret: Optional[str] = Header(default=None)
+    name: str
 ) -> dict[str, str]:
     """Drop an archive once the parent has stored it.
 
     Args:
         name: The archive basename.
-        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
         A dict with `status` and the deleted `name`.
@@ -2485,7 +2522,6 @@ async def delete_export(
     Raises:
         HTTPException: 403 on a bad secret; 400 for an unsafe name; 404 when no such export exists.
     """
-    _check_secret(x_broker_secret)
     path = _export_file(name)
     await anyio.to_thread.run_sync(path.unlink)
     log.info("export collected and removed: %s", path.name)

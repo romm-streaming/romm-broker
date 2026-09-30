@@ -113,6 +113,11 @@ activate unless the payload supplies one.
 SAVE_UPLOAD_TIMEOUT = float(os.environ.get("BROKER_SAVE_UPLOAD_TIMEOUT", "30"))
 """Seconds allowed for the exit upload, from `BROKER_SAVE_UPLOAD_TIMEOUT` (default `30`)."""
 
+EMULATOR_WATCH_INTERVAL = float(os.environ.get("BROKER_EMULATOR_WATCH_INTERVAL", "15"))
+"""Seconds between checks that the session's emulator is still running, from
+`BROKER_EMULATOR_WATCH_INTERVAL` (default `15`); `0` turns the watch off.
+"""
+
 FRONTEND_DIST = Path(
     os.environ.get("BROKER_FRONTEND_DIST", "/usr/share/webstation-broker/www")
 )

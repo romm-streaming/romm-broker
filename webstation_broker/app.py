@@ -90,6 +90,9 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     When `RETROARCH_CORE_INFO_REFRESH` is on, a background task then keeps that
     cache current; startup itself never waits on the network for it.
 
+    Starts the emulator watch, which logs an ERROR when a session's emulator
+    exits on its own, unless `EMULATOR_WATCH_INTERVAL` is 0.
+
     Args:
         _app: The application being started; unused.
 
@@ -103,6 +106,8 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         retroarch_cores.load_startup_catalog, retroarch.RA_DATA_DIR, retroarch.CORES_DIR, retroarch.PLATFORMS
     )
     async with anyio.create_task_group() as tg:
+        if settings.EMULATOR_WATCH_INTERVAL > 0:
+            tg.start_soon(api.watch_emulator_forever, settings.EMULATOR_WATCH_INTERVAL)
         if settings.RETROARCH_CORE_INFO_REFRESH:
             # In the background: startup never waits on the network.
             tg.start_soon(
@@ -179,6 +184,7 @@ def create_app() -> FastAPI:
         title="webstation-broker", lifespan=None if prefixed else _lifespan
     )
     inner.include_router(api.router)
+    inner.include_router(api.secret_router)
     inner.include_router(room.router)
 
     @inner.middleware("http")
