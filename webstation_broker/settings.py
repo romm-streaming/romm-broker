@@ -180,8 +180,8 @@ A ScummVM game is a folder, so a `.zip`, `.7z` or `.rar` only boots once
 extracted. Off, an archived game is refused.
 """
 
-PPSSPP_CACHE_ENABLED = truthy(os.environ.get("PPSSPP_CACHE_ENABLED", "true"))
-"""Whether PPSSPP extracts archived ROMs into its cache, from `PPSSPP_CACHE_ENABLED` (default on).
+PPSSPP_CACHE_ENABLED = truthy(os.environ.get("PPSSPP_CACHE_ENABLED"))
+"""Whether PPSSPP extracts archived ROMs into its cache, from `PPSSPP_CACHE_ENABLED` (default off).
 
 PPSSPP does not boot from inside an archive, so a zipped image only boots once
 extracted. Off, an archived ROM is refused.

@@ -5,6 +5,8 @@ naming contract, and finding the game window among PPSSPP's windows.
 """
 
 import os
+import subprocess
+import sys
 import time
 import zipfile
 from collections.abc import Iterator
@@ -1444,3 +1446,14 @@ def test_archives_resolve_under_a_symlinked_rom_root(
 
     assert ppsspp.Ppsspp().resolve_rom_file(folder) == archive.resolve()
     assert ppsspp.Ppsspp().resolve_rom_file(archive) == archive
+
+
+def test_the_cache_is_disabled_by_default() -> None:
+    """The cache is disabled by default when PPSSPP_CACHE_ENABLED is unset."""
+    env = {k: v for k, v in os.environ.items() if k != "PPSSPP_CACHE_ENABLED"}
+    code = "from webstation_broker import settings; print(settings.PPSSPP_CACHE_ENABLED)"
+    probe = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env, capture_output=True, text=True, check=True,
+    )
+    assert probe.stdout.strip() == "False"

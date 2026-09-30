@@ -242,8 +242,8 @@ handling (see [Supported emulators](/docs/emulators#ppsspp)). Set up the
 standalone version anyway if you want it available too; it needs no extra
 files either way.
 
-Archived PSP ROMs (`.7z`, `.zip`, `.rar`) boot without any setup: the broker
-extracts one on its first launch and keeps it, capped by
+Archived PSP ROMs (`.7z`, `.zip`, `.rar`) boot once `PPSSPP_CACHE_ENABLED=true`
+is set: the broker extracts one on its first launch and keeps it, capped by
 `PPSSPP_CACHE_MAX_GB` (default 20GB). The RetroArch core reads zips on its
 own and doesn't use this cache.
 

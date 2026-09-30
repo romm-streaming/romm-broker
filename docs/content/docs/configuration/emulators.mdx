@@ -216,7 +216,7 @@ RPCS3's data folder isn't configurable here either. On Linux, everything
 | `PPSSPP_STATE_WAIT` | `20.0` | How long a save state has to land on disk after the save hotkey. |
 | `PPSSPP_RESUME_LOAD_WAIT` | `90.0` | How long a resume load waits for the game window. |
 | `PPSSPP_RESUME_LOAD_SETTLE` | `12.0` | How long the window has to be up before the load hotkey is sent. |
-| `PPSSPP_CACHE_ENABLED` | `true` | Whether `.7z`/`.zip`/`.rar` ROMs boot. PPSSPP can't boot from inside an archive, so the first launch extracts one into `PPSSPP_CACHE_DIR` and every later launch reuses that extraction. Off, an archived ROM is refused. |
+| `PPSSPP_CACHE_ENABLED` | `false` | Whether `.7z`/`.zip`/`.rar` ROMs boot. PPSSPP can't boot from inside an archive, so the first launch extracts one into `PPSSPP_CACHE_DIR` and every later launch reuses that extraction. Off, an archived ROM is refused. |
 | `PPSSPP_CACHE_DIR` | `$XDG_DATA_HOME/ppsspp/extracted` | Where a kept extraction is cached. Broker-owned scratch, written and read by the broker alone. |
 | `PPSSPP_CACHE_MAX_GB` | `20` | Ceiling on the cache's total size; the oldest extraction is evicted first once a new one would exceed it. An archive that still doesn't fit, or that exceeds the free space on the filesystem, is refused rather than extracted until the disk fills. |
 

@@ -209,8 +209,8 @@ screenshot, which needs `resume_slot`. The RetroArch `ppsspp` core takes no
 imported PSP save: RetroArch refuses one and names `ppsspp` in the refusal's
 `suggest_emulator`.
 
-A PSP image stored as a `.7z`, `.zip`, or `.rar` archive boots too.
-PPSSPP can't read one directly, so the first launch extracts it into the
+With `PPSSPP_CACHE_ENABLED=true`, a PSP image stored as a `.7z`, `.zip`, or
+`.rar` archive boots too. PPSSPP can't read one directly, so the first launch extracts it into the
 [extraction cache](/docs/configuration/emulators#ppsspp) and later launches
 reuse that copy. `rom.path` can name the archive itself, or a folder that
 holds exactly one archive and no loose image; an archive in a subfolder
