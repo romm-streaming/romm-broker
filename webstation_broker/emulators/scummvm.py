@@ -721,20 +721,10 @@ def _drop_dead_domains(gameid: str, keep: Optional[Path] = None) -> int:
     library that is merely unmounted keeps its registrations and the save
     files named after them.
 
-    The one exception is an older extraction of the same archive when `keep`
-    is itself an extraction. A re-uploaded archive gets a fresh extraction
-    while the old one waits for eviction, and the old one's domain would
-    otherwise block the new one for as long as it sits there. Dropping it
-    frees the target name, so the new extraction registers under the same
-    target and the saves named after it still load. An extraction of a
-    different archive is another copy of the game and is left alone, as a
-    library folder would be: dropping it would hand both copies one target
-    and one set of saves.
-
-    An extraction whose archive is gone (renamed, moved, or replaced by a
-    loose folder) is dead too, whatever `keep` is. No launch can reach it
-    any more, since the cache is keyed by the archive's path, yet its domain
-    would block every other copy of the game until the cache evicts it.
+    Two extractions count as dead while still on disk: one whose archive is
+    gone, which no launch can reach again, and an older extraction of the
+    archive `keep` came from, so a re-upload takes over its target and saves.
+    An extraction of a different archive is another copy and is left alone.
 
     Args:
         gameid: The game whose stale domains are in the way.
@@ -991,9 +981,8 @@ def _game_dir(rom: Path, emu: Emulator) -> Path:
     if not _is_archive(rom):
         return rom
     game = _CACHE.extract(rom, emu)
-    # Rewritten on every launch, so a record lost to a failed write comes
-    # back. Without it a re-upload's old extraction is indistinguishable from
-    # another copy, and blocks the new one.
+    # Rewritten on every launch, so a record lost to a failed write comes back;
+    # without it a re-upload's old extraction blocks the new one.
     try:
         root = _CACHE.entry_dir(rom)
         if root is not None:
