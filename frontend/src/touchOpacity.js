@@ -3,8 +3,8 @@
 // The gamepad is the universal-touch-gamepad add-on, bundled into the Selkies
 // page that runs in the stream frame, and it has no opacity setting of its
 // own. The frame is same-origin, so the room adds a <style> to its document
-// instead. The selectors are the add-on's class names: if upstream renames
-// them the rule stops matching and the controls simply stay opaque.
+// instead. The selectors are the add-on's own id and class names: if upstream
+// renames them the rule stops matching and the controls simply stay opaque.
 
 export const STORAGE_KEY = 'collab_touch_opacity';
 export const STYLE_ID = 'collab-touch-opacity';
@@ -19,18 +19,21 @@ export const parseTouchOpacity = (raw) => {
     return Math.min(1, Math.max(MIN_TOUCH_OPACITY, value));
 };
 
+/** The add-on's live overlay; its profile-picker previews sit outside it. */
+const OVERLAY = '#universal-touch-gamepad-controls-overlay';
+
 /**
  * Applies `value` to the gamepad in `doc`. Full opacity removes the style so
- * the add-on renders exactly as it ships. Returns false when `doc` has no
- * head to add to yet (the frame is still on about:blank or mid-load).
+ * the add-on renders exactly as it ships. A frame with no head yet (still on
+ * about:blank, or mid-load) is skipped; its load event applies it again.
  */
 export const applyTouchOpacity = (doc, value) => {
-    if (!doc || !doc.head) return false;
+    if (!doc || !doc.head) return;
     const opacity = parseTouchOpacity(value);
     let style = doc.getElementById(STYLE_ID);
     if (opacity >= 1) {
         if (style) style.remove();
-        return true;
+        return;
     }
     if (!style) {
         style = doc.createElement('style');
@@ -40,6 +43,5 @@ export const applyTouchOpacity = (doc, value) => {
     // The joystick handle and trigger fill are children, so they fade with
     // their base. Opacity has no effect on hit testing: faint buttons still
     // take touches.
-    style.textContent = `.touch-gamepad-control, .settings-icon-host { opacity: ${opacity}; }`;
-    return true;
+    style.textContent = `${OVERLAY} .touch-gamepad-control, ${OVERLAY} .settings-icon-host { opacity: ${opacity}; }`;
 };

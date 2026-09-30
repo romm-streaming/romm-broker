@@ -54,9 +54,10 @@ uv venv && uv pip install -e . pytest pytest-asyncio "ruff==0.16.1"   # first ti
 # only surface when s6 restarts the service in the container.
 BROKER_DEV_MODE=true .venv/bin/python -c "from webstation_broker.app import create_app; create_app()"
 
-cd frontend && npm ci && npm run build                # room UI, not covered by CI
+cd frontend && npm test                               # room helper tests (node --test, no install)
+cd frontend && npm ci && npm run build                # room UI build, not covered by CI
 ```
 
-The three CI gates are lint, the `create_app()` import check, and `pytest -q`.
-The `frontend/` build is not one of them, so run it yourself when you touch
-`frontend/src`.
+The four CI gates are lint, the `create_app()` import check, `pytest -q`, and
+`npm test` in `frontend/`. The `frontend/` build is not one of them, so run it
+yourself when you touch `frontend/src`.

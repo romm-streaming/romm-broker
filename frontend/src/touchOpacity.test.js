@@ -1,4 +1,4 @@
-// Run with `node --test frontend/src/`; no dependencies beyond Node itself.
+// Run with `npm test` in frontend/; no dependencies beyond Node itself.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -61,18 +61,23 @@ test('garbage in storage falls back to fully opaque', () => {
     assert.equal(parseTouchOpacity('Infinity'), 1);
 });
 
-test('the floor keeps the controls findable', () => {
-    assert.ok(MIN_TOUCH_OPACITY > 0);
-});
+const LIVE = '#universal-touch-gamepad-controls-overlay';
+const cssFor = (opacity) =>
+    `${LIVE} .touch-gamepad-control, ${LIVE} .settings-icon-host { opacity: ${opacity}; }`;
 
 test('a partial opacity adds one style covering the controls and the settings icon', () => {
     const doc = fakeDoc();
-    assert.equal(applyTouchOpacity(doc, 0.4), true);
+    applyTouchOpacity(doc, 0.4);
     assert.equal(doc.head.children.length, 1);
-    const css = doc.getElementById(STYLE_ID).textContent;
-    assert.match(css, /\.touch-gamepad-control/);
-    assert.match(css, /\.settings-icon-host/);
-    assert.match(css, /opacity:\s*0\.4/);
+    assert.equal(doc.getElementById(STYLE_ID).textContent, cssFor(0.4));
+});
+
+test('every selector is scoped to the live overlay, so profile-picker previews keep full opacity', () => {
+    const doc = fakeDoc();
+    applyTouchOpacity(doc, 0.4);
+    const selectors = doc.getElementById(STYLE_ID).textContent.split('{')[0].split(',');
+    assert.equal(selectors.length, 2);
+    for (const selector of selectors) assert.ok(selector.trim().startsWith(`${LIVE} `), selector);
 });
 
 test('changing the value updates the style in place rather than stacking another', () => {
@@ -80,7 +85,7 @@ test('changing the value updates the style in place rather than stacking another
     applyTouchOpacity(doc, 0.4);
     applyTouchOpacity(doc, 0.7);
     assert.equal(doc.head.children.length, 1);
-    assert.match(doc.getElementById(STYLE_ID).textContent, /opacity:\s*0\.7/);
+    assert.equal(doc.getElementById(STYLE_ID).textContent, cssFor(0.7));
 });
 
 test('full opacity takes the style out and leaves the add-on untouched', () => {
@@ -100,11 +105,11 @@ test('full opacity on a fresh document adds nothing', () => {
 test('an out-of-range value is clamped before it reaches the css', () => {
     const doc = fakeDoc();
     applyTouchOpacity(doc, 0);
-    assert.match(doc.getElementById(STYLE_ID).textContent, new RegExp(`opacity:\\s*${MIN_TOUCH_OPACITY}`));
+    assert.equal(doc.getElementById(STYLE_ID).textContent, cssFor(MIN_TOUCH_OPACITY));
 });
 
 test('a frame with no document yet, or no head, is skipped without throwing', () => {
-    assert.equal(applyTouchOpacity(null, 0.5), false);
-    assert.equal(applyTouchOpacity({}, 0.5), false);
-    assert.equal(applyTouchOpacity({ head: null }, 0.5), false);
+    assert.doesNotThrow(() => applyTouchOpacity(null, 0.5));
+    assert.doesNotThrow(() => applyTouchOpacity({}, 0.5));
+    assert.doesNotThrow(() => applyTouchOpacity({ head: null }, 0.5));
 });

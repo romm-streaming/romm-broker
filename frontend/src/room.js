@@ -1,7 +1,12 @@
 import '@fortawesome/fontawesome-free/css/all.min.css';
 import './room.css';
 import { getTranslator } from './translation.js';
-import { STORAGE_KEY as TOUCH_OPACITY_KEY, applyTouchOpacity, parseTouchOpacity } from './touchOpacity.js';
+import {
+    MIN_TOUCH_OPACITY,
+    STORAGE_KEY as TOUCH_OPACITY_KEY,
+    applyTouchOpacity,
+    parseTouchOpacity,
+} from './touchOpacity.js';
 
 // ---------------------------------------------------------------------------
 // WebCodecs track plumbing: capture (MediaStreamTrack -> VideoFrame/AudioData for
@@ -3529,6 +3534,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // gamepad inside the stream frame on every (re)load.
     const touchOpacitySlider = document.getElementById('touch-opacity-slider');
     const touchOpacityValue = document.getElementById('touch-opacity-value');
+    touchOpacitySlider.min = MIN_TOUCH_OPACITY;
     let touchOpacity = parseTouchOpacity(localStorage.getItem(TOUCH_OPACITY_KEY));
     const applyTouchOpacityToFrame = () => {
         const el = document.getElementById('session-frame');
@@ -3543,9 +3549,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     showTouchOpacity();
     touchOpacitySlider.addEventListener('input', (e) => {
         touchOpacity = parseTouchOpacity(e.target.value);
-        localStorage.setItem(TOUCH_OPACITY_KEY, touchOpacity);
         showTouchOpacity();
         applyTouchOpacityToFrame();
+        // Blocked or full storage only costs remembering it next visit.
+        try {
+            localStorage.setItem(TOUCH_OPACITY_KEY, touchOpacity);
+        } catch (err) {
+            console.warn('[Touch] Could not save touch controls opacity:', err);
+        }
     });
     document.getElementById('session-frame').addEventListener('load', applyTouchOpacityToFrame);
     
