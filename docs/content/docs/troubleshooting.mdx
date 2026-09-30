@@ -80,6 +80,28 @@ Xenia never reaches the game, or seems to hang on launch: no Xbox Live
 profile exists yet. Launch Xenia once from the desktop and create one through
 its "No Profiles Found" prompt before launching anything through RomM.
 
+## The game froze mid-session and the emulator is gone
+
+When an emulator crashes or quits on its own while a session is open, the
+stream freezes and the broker logs one error for that session:
+
+```text
+emulator watch: session 3f2a...: pcsx2 exited while the session was open (exit code -11, rom Game); exit the session from RomM to save and upload what it wrote
+```
+
+The session stays open on purpose. The saves the emulator wrote before it
+went are still on disk, and exiting the session from RomM is what dumps them
+and uploads them. Exit it as soon as you see this.
+
+The exit code says how the emulator ended. A negative number is the signal
+that killed it (`-11` is a segfault, `-9` a forced kill, often the kernel's
+out-of-memory killer); a positive one is the emulator's own error code, so
+read the log just above the line for the emulator's own messages.
+
+The check runs every 15 seconds by default (`BROKER_EMULATOR_WATCH_INTERVAL`).
+It skips a check while an exit, launch or state operation is running, since
+those stop or restart the emulator on purpose.
+
 ## A controller isn't working
 
 Desktop sessions and single-game launches share the exact same controller

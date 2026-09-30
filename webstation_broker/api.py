@@ -2220,6 +2220,55 @@ async def put_memory_card(
     return {"status": "ok", "written": result.written, "unread": list(result.unread), "slot": 1}
 
 
+def check_emulator_alive(reported: Optional[str]) -> Optional[str]:
+    """Log once when the open session's emulator has exited on its own.
+
+    Nothing is torn down: the saves the emulator wrote before it went are still
+    on disk, and exiting the session from RomM is what dumps and uploads them.
+    Skipped while a session operation holds `_SESSION_LOCK`, because exit and
+    the state routes stop or restart the emulator on purpose.
+
+    Args:
+        reported: The id of the session already logged, so one crash is one line.
+
+    Returns:
+        The id of the session logged so far: `reported`, or the current
+        session's id when this call logged it.
+    """
+    sess = session.SESSION
+    if sess is None or not sess.get("active") or sess["id"] == reported or _SESSION_LOCK.locked():
+        return reported
+    emulator = sess["emulator_obj"]
+    if emulator.alive():
+        return reported
+    rom = sess.get("rom") or {}
+    log.error(
+        "emulator watch: session %s: %s exited while the session was open (exit code %s, rom %s); "
+        "exit the session from RomM to save and upload what it wrote",
+        sess["id"],
+        emulator.name,
+        emulator.exit_code,
+        rom.get("name") or sess.get("rom_file") or "-",
+    )
+    return sess["id"]
+
+
+async def watch_emulator_forever(interval: float) -> None:
+    """Run `check_emulator_alive` every `interval` seconds until cancelled.
+
+    Args:
+        interval: Seconds between checks.
+    """
+    reported: Optional[str] = None
+    while True:
+        await anyio.sleep(interval)
+        try:
+            reported = check_emulator_alive(reported)
+        except Exception:
+            # A watch that dies quietly is worse than none: keep going.
+            log.exception("emulator watch: check failed")
+
+
 @router.get("/api/session/status")
 async def status(x_broker_secret: Optional[str] = Header(default=None)) -> dict[str, Any]:
     """Report the current session, or that there is none.

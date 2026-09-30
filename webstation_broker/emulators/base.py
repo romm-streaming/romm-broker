@@ -969,6 +969,15 @@ class Emulator:
         """Whether a spawned process exists and has not exited."""
         return self._proc is not None and self._proc.poll() is None
 
+    @property
+    def exit_code(self) -> Optional[int]:
+        """The spawned process's exit code once it has exited, else None.
+
+        Negative for a process killed by a signal, as `subprocess` reports it:
+        `-11` is a segfault.
+        """
+        return self._proc.returncode if self._proc is not None else None
+
     def _forget(self) -> None:
         """Drop the handle on the emulator and the record of it on disk.
 
