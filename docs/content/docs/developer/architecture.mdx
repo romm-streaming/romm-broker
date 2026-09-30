@@ -24,8 +24,8 @@ emulator left behind by an earlier broker process, using the pid record in
 
 [`api`](/docs/developer/reference/api) holds every REST endpoint. Activate is
 the long one: secret check, registry lookup, rom resolution under `ROM_ROOT`,
-working-slot clear, archive restore, launch, token mint, selkies push, and the
-deferred resume watchdog. Exit mirrors it: final state, stop, delta dump,
+import preflight, working-slot clear, archive restore, launch, token mint,
+selkies push, and the deferred resume watchdog. Exit mirrors it: final state, stop, delta dump,
 upload, room teardown, token clear.
 
 [`room`](/docs/developer/reference/room) is the websocket the room UI connects

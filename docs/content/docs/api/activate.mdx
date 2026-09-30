@@ -118,8 +118,8 @@ curl -k -X POST https://localhost:3001/streaming/api/session/swap-disc \
 
 `path` is checked against `ROM_ROOT` the same way activate checks its rom
 path. Returns `{"status": "ok", "path": "<path to the disc>"}`. You get `400` if the running
-emulator has no disc tray to swap into, and `409` if there's no active
-session. Disc swaps can't happen at the same time as each other, or at the
+emulator has no disc tray to swap into, `404` if the disc path doesn't exist,
+`409` if there's no active session, and `502` if the emulator refused the swap. Disc swaps can't happen at the same time as each other, or at the
 same time as a deferred resume load that's already running. A swap only
 counts as finished once the core confirms it's running a game again.
 
@@ -130,7 +130,9 @@ counts as finished once the core confirms it's running a game again.
 Checks the shared secret and makes sure no session is already active
 (answers `409` if one is), looks up the emulator by name (answers `422` if
 it's not recognised), and works out which file under `ROM_ROOT` should
-actually boot.
+actually boot. A rom path that doesn't exist answers `404`. A folder with
+nothing bootable in it, or a missing `rom` for an emulator that needs one,
+answers `422`.
 </Step>
 <Step>
 Shuts down any emulator left running by an earlier broker process, using the
@@ -150,6 +152,10 @@ one with imports lists the file as `unrecognised_layout`, `unsafe_path` or
 `unreadable_member`. A corrupt file refuses the restore even when a newer
 copy on disk means it would not have been written. Only a synced memory
 card sitting in an older archive gets skipped.
+
+A `save.archive` path that doesn't exist answers `404`. If checking the
+imports against the emulator crashes outright, activate answers `500` with
+`{"error": "import_preflight_failed"}` instead of launching.
 </Step>
 <Step>
 Launches the emulator in its own process group, with its output captured to

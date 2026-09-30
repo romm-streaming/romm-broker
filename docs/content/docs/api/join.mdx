@@ -16,7 +16,10 @@ curl -k -X POST https://localhost:3001/streaming/api/session/join \
 ```
 
 Returns `{"status": "joined", "url": "/streaming/?token=<personal token>", ...}`,
-`409` when no session is up. `permission: "readonly"` for spectators. Re-joining
+`409` when no session is up, `422` for a `permission` other than `participant`
+or `readonly`, and `429` when the room already holds
+[`BROKER_MAX_ROOM_VIEWERS`](/docs/configuration) people.
+`permission: "readonly"` for spectators. Re-joining
 the same user (by id, else username) replaces their old token.
 
 Every user gets a personal token. The broker pushes the full token map,
@@ -36,7 +39,8 @@ curl -k -X POST 'https://localhost:3001/streaming/api/session/invite?token=<cont
 
 This route is gated by the controller token instead of the broker secret,
 since the room UI (which never holds the broker secret) is what actually
-calls it.
+calls it. It answers `403` without a valid controller token, and `422` for a
+`permission` other than `participant` or `readonly`.
 
 Returns the session's shareable link for that permission (`?invite=...`
 rather than `?token=...`). It is the same link on every call, seats nobody by

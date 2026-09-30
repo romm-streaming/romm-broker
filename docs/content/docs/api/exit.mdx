@@ -27,6 +27,9 @@ Query parameters:
 | `slot` | `0` | The state slot to save into. Mapped to the emulator's working slot the same way other routes do it; the report echoes back the slot actually used. |
 | `save` | `true` | `false` (or `0`) stops without writing a state. The game's own save data is still flushed and shipped either way: skipping the state is the whole of "exit without saving", and discarding an in-game save the player made at a save point would mean losing real progress. |
 
+Exit answers `403` when neither the secret nor the controller token checks
+out, and `409` when there's no session to end.
+
 Slot 0 counts as a real slot on this broker, which is why `save` is a
 separate flag: there is no slot number left over to mean "do not save".
 

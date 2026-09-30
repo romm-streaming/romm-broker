@@ -2335,8 +2335,8 @@ async def status() -> dict[str, Any]:
         # and RPCS3, both via PINE). Passive: RomM decides what to do about it, this
         # route only reports it.
         "boot_failed": sess["emulator_obj"].boot_failed,
-        # Set while a slow pre-launch extraction (shadPS4/RPCS3 pkg or
-        # archive) is running, else None. Same passive-signal shape as
+        # Set while a slow pre-launch extraction (a shadPS4 pkg, or an
+        # archive for shadPS4, RPCS3, PPSSPP or ScummVM) is running, else None. Same passive-signal shape as
         # boot_failed: RomM decides what to show, this route only reports it.
         "extraction_phase": sess["emulator_obj"].extraction_phase,
         # The emulator class is the authority on what it can do, so RomM reads

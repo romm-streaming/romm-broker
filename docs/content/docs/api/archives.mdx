@@ -45,6 +45,9 @@ curl -k -X DELETE https://localhost:3001/streaming/api/session/exports/abc123-17
   -H 'X-Broker-Secret: <shared secret>'
 ```
 
+An upload larger than [`SAVE_FILE_MAX_BYTES`](/docs/configuration) answers `413`,
+and a body that isn't a zip answers `422`.
+
 Members under `.import/` are not restored path for path; they are placed by
 the emulator's own rules. See [Declared imports](/docs/api/imports).
 
@@ -137,7 +140,7 @@ It's refused with `409` while a session is running: the emulator keeps the
 card file open for as long as the game runs, and replacing it underneath
 would corrupt it. RomM sends the card down before activate and pulls it
 back out after exit, so the card is only ever swapped while nothing is
-running.
+running. A card larger than `SAVE_FILE_MAX_BYTES` answers `413`.
 
 The `platform` parameter says which card to sync, for an emulator whose card
 depends on which platform it's currently running. Dolphin is the case that

@@ -17,7 +17,7 @@ See [README.md](README.md) for the full request flow and save-archive layout.
 
 ---
 
-## Conventions - read before touching code
+## Conventions: read before touching code
 
 [CONTRIBUTING.md](CONTRIBUTING.md) holds the house rules for this repo: test coverage, comment and docstring style, type hints, logging, secrets and configuration, the security invariants, and PR/commit conventions. Read it before writing, editing, or reviewing any code, comments, tests, log statements, or PR/commit descriptions here. These rules are strict, not suggestions: follow them exactly, every time, even when not reminded.
 
@@ -33,7 +33,7 @@ Most of them are enforced: `ruff`'s `D` and `ANN` rules make the docstring and t
 **Don't commit until approved.** Never run `git commit` (or push) without the user explicitly signing off first.
 **Link PRs to existing issues.** If an issue already exists for what the PR resolves, link it: `Fixes #XXXX` for bug fixes, `Closes #XXXX` for feature implementations. Don't open an issue just to have one to link.
 
-Full detail on comments, docstrings, logging, secrets, and the security invariants lives in [CONTRIBUTING.md](CONTRIBUTING.md) - read it, don't duplicate it here.
+Full detail on comments, docstrings, logging, secrets, and the security invariants lives in [CONTRIBUTING.md](CONTRIBUTING.md); read it, don't duplicate it here.
 
 ---
 
