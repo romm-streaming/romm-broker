@@ -11,29 +11,14 @@ import {
 
 // Just enough of a Document for the one <style> element the helper manages.
 const fakeDoc = () => {
-    const byId = new Map();
-    const head = {
-        children: [],
-        appendChild(el) {
-            this.children.push(el);
-            el.parentNode = this;
-            byId.set(el.id, el);
-            return el;
-        },
-        removeChild(el) {
-            this.children = this.children.filter(c => c !== el);
-            byId.delete(el.id);
-            el.parentNode = null;
-        },
-    };
+    const head = { children: [], appendChild(el) { this.children.push(el); } };
     return {
         head,
-        getElementById: (id) => byId.get(id) || null,
-        createElement: (tag) => ({
-            tagName: tag.toUpperCase(),
+        getElementById: (id) => head.children.find(el => el.id === id) || null,
+        createElement: () => ({
             id: '',
             textContent: '',
-            remove() { if (this.parentNode) this.parentNode.removeChild(this); },
+            remove() { head.children = head.children.filter(el => el !== this); },
         }),
     };
 };
@@ -62,6 +47,8 @@ test('garbage in storage falls back to fully opaque', () => {
     assert.equal(parseTouchOpacity('Infinity'), 1);
 });
 
+// Every selector starts at the live overlay, so the profile picker's
+// previews, which reuse the control class outside it, keep full opacity.
 const LIVE = '#universal-touch-gamepad-controls-overlay';
 const cssFor = (opacity) =>
     `${LIVE} .touch-gamepad-control, ${LIVE} .settings-icon-host { opacity: ${opacity}; }`;
@@ -71,14 +58,6 @@ test('a partial opacity adds one style covering the controls and the settings ic
     applyTouchOpacity(doc, 0.4);
     assert.equal(doc.head.children.length, 1);
     assert.equal(doc.getElementById(STYLE_ID).textContent, cssFor(0.4));
-});
-
-test('every selector is scoped to the live overlay, so profile-picker previews keep full opacity', () => {
-    const doc = fakeDoc();
-    applyTouchOpacity(doc, 0.4);
-    const selectors = doc.getElementById(STYLE_ID).textContent.split('{')[0].split(',');
-    assert.equal(selectors.length, 2);
-    for (const selector of selectors) assert.ok(selector.trim().startsWith(`${LIVE} `), selector);
 });
 
 test('changing the value updates the style in place rather than stacking another', () => {

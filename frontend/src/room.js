@@ -2988,14 +2988,15 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         gamingModeBtn.addEventListener('click', () => gamingMode.toggle());
 
-        // The open chat, the invite tile and the self-view controls all
-        // minimize the same way: interacting anywhere outside them. Captured
-        // so it runs before a target's own handler can re-open what it just
-        // closed.
+        // The open chat, the invite tile, the self-view controls and the
+        // touch opacity popover all minimize the same way: interacting
+        // anywhere outside them. Captured so it runs before a target's own
+        // handler can re-open what it just closed.
         document.addEventListener('pointerdown', (e) => {
             if (isChatOpen && !e.target.closest('#chat-dock')) closeChat();
             if (isInviteOpen() && !e.target.closest('#invite-tile')) closeInvite();
             if (!e.target.closest('#local-user-container')) localContainer.classList.remove('controls-shown');
+            if (isTouchOpacityOpen() && !e.target.closest('#touch-opacity-popover, #touch-opacity-btn')) setTouchOpacityPopover(false);
         }, true);
         // The chat column is fixed rather than in the bar's flow, so its
         // closed height tracks whatever the bar is currently laid out at.
@@ -3530,10 +3531,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         restartMediaForDeviceChange().catch(err => console.error('[Media] webcam switch failed:', err));
     });
 
+    const sessionFrame = () => document.getElementById('session-frame');
     // Null while the frame shows a document this page cannot reach, such as
     // a browser error page after a failed load.
     const sessionFrameDoc = () => {
-        const el = document.getElementById('session-frame');
+        const el = sessionFrame();
         try { return el ? el.contentDocument : null; } catch (err) { return null; }
     };
 
@@ -3557,7 +3559,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     touchOpacitySlider.value = touchOpacity;
     showTouchOpacity();
     touchOpacitySlider.addEventListener('input', (e) => {
-        touchOpacity = parseTouchOpacity(e.target.value);
+        touchOpacity = Number(e.target.value);
         showTouchOpacity();
         applyTouchOpacityToFrame();
     });
@@ -3569,7 +3571,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             console.warn('[Touch] Could not save touch controls opacity:', err);
         }
     });
-    document.getElementById('session-frame').addEventListener('load', applyTouchOpacityToFrame);
+    sessionFrame().addEventListener('load', applyTouchOpacityToFrame);
 
     // The slider sits in a popover off the stream controls, not the settings
     // dialog: solo mode hides the tile whose gear opens that dialog, and solo
@@ -3587,27 +3589,23 @@ document.addEventListener('DOMContentLoaded', async () => {
         touchOpacityPopover.style.left = `${Math.max(POPOVER_GAP, left)}px`;
         touchOpacityPopover.style.bottom = `${Math.max(POPOVER_GAP, window.innerHeight - btn.bottom)}px`;
     };
+    const isTouchOpacityOpen = () => !touchOpacityPopover.classList.contains('hidden');
     const setTouchOpacityPopover = (open) => {
         touchOpacityPopover.classList.toggle('hidden', !open);
         touchOpacityBtn.setAttribute('aria-expanded', String(open));
         if (open) placeTouchOpacityPopover();
     };
     touchOpacityBtn.addEventListener('click', () => {
-        setTouchOpacityPopover(touchOpacityPopover.classList.contains('hidden'));
-    });
-    document.addEventListener('pointerdown', (e) => {
-        if (touchOpacityPopover.classList.contains('hidden')) return;
-        if (touchOpacityPopover.contains(e.target) || touchOpacityBtn.contains(e.target)) return;
-        setTouchOpacityPopover(false);
+        setTouchOpacityPopover(!isTouchOpacityOpen());
     });
     document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && !touchOpacityPopover.classList.contains('hidden')) {
+        if (e.key === 'Escape' && isTouchOpacityOpen()) {
             setTouchOpacityPopover(false);
             touchOpacityBtn.focus();
         }
     });
     window.addEventListener('resize', () => {
-        if (!touchOpacityPopover.classList.contains('hidden')) placeTouchOpacityPopover();
+        if (isTouchOpacityOpen()) placeTouchOpacityPopover();
     });
 
     videoStrip.addEventListener('click', (e) => {
@@ -3758,15 +3756,13 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (lockTimer !== null) { clearTimeout(lockTimer); lockTimer = null; }
         };
 
-        const frame = () => document.getElementById('session-frame');
         const isFullscreen = () => {
-            const el = frame();
+            const el = sessionFrame();
             return !!el && document.fullscreenElement === el;
         };
-        const frameDoc = sessionFrameDoc;
         const lockTarget = () => {
-            const el = frame();
-            const doc = frameDoc();
+            const el = sessionFrame();
+            const doc = sessionFrameDoc();
             if (!el || !doc) return null;
             const input = el.contentWindow && el.contentWindow.webrtcInput;
             return (input && input.element) || doc.getElementById('overlayInput');
@@ -3774,7 +3770,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         const requestLock = () => {
             if (!isFullscreen()) return;
-            const doc = frameDoc();
+            const doc = sessionFrameDoc();
             const target = lockTarget();
             if (!doc || !target || typeof target.requestPointerLock !== 'function') {
                 waitForTarget();
@@ -3826,7 +3822,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             scheduleLock(LOCK_RETRY_MS);
         };
         const releaseLock = () => {
-            const doc = frameDoc();
+            const doc = sessionFrameDoc();
             if (doc && doc.pointerLockElement && typeof doc.exitPointerLock === 'function') doc.exitPointerLock();
         };
         const lockKeyboard = () => {
@@ -3874,7 +3870,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             boundDoc = null;
         };
         const bindFrame = () => {
-            const doc = frameDoc();
+            const doc = sessionFrameDoc();
             if (!doc || doc === boundDoc) return;
             unbindFrame();
             const win = doc.defaultView;
@@ -3894,7 +3890,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         };
 
         const enter = () => {
-            const el = frame();
+            const el = sessionFrame();
             if (!el || typeof el.requestFullscreen !== 'function') return;
             // Locks are taken on fullscreenchange; the transition cancels an earlier lock.
             el.requestFullscreen().catch((err) => console.error('[Gaming] Fullscreen refused:', err));
@@ -3925,7 +3921,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
         });
         // Bind every frame document as it loads; handlers idle outside gaming mode.
-        const el = frame();
+        const el = sessionFrame();
         if (el) {
             el.addEventListener('load', () => {
                 bindFrame();

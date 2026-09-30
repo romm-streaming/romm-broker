@@ -224,28 +224,41 @@ body {
   color: var(--panel-text);
 }
 
-#touch-opacity-popover label {
-  display: block;
-  margin-bottom: 0.5rem;
-  font-weight: 500;
-}
-
-.settings-range {
+#touch-opacity-popover .settings-range {
   display: flex;
   align-items: center;
   gap: 0.75rem;
 }
 
-.settings-range input[type="range"] {
+#touch-opacity-popover input[type="range"] {
   flex: 1;
   min-width: 0;
   accent-color: var(--accent);
 }
 
-.settings-range output {
+#touch-opacity-popover output {
   min-width: 3.5em;
   text-align: right;
   font-variant-numeric: tabular-nums;
+}
+
+/* On a short touch screen the bar can't fit the fader above the stream
+   buttons once the opacity button joins them, so the buttons sit beside it
+   and wrap into a second column when they run out of room. */
+@media (max-width: 768px) and (any-pointer: coarse), (max-height: 500px) and (any-pointer: coarse) {
+  #stream-volume {
+    flex-direction: row;
+    align-items: stretch;
+  }
+
+  #stream-buttons {
+    flex-flow: column wrap;
+    justify-content: flex-end;
+  }
+
+  #stream-volume-slider {
+    flex: 0 0 auto;
+  }
 }
 
 /* Holds the chat column's place in the bar. The column itself is fixed so it
@@ -313,17 +326,11 @@ body {
     font-size: 1.1rem;
   }
 
-  /* The bar is too short here for the fader above three buttons, so they
-     sit beside it and wrap into a second column when they run out of room. */
   #stream-volume {
-    flex-direction: row;
-    align-items: stretch;
     gap: 3px;
   }
 
   #stream-buttons {
-    flex-flow: column wrap;
-    justify-content: flex-end;
     gap: 2px;
   }
 
@@ -334,7 +341,6 @@ body {
   }
 
   #stream-volume-slider {
-    flex: 0 0 auto;
     min-height: 16px;
     margin: 2px 0;
   }
@@ -808,10 +814,6 @@ iframe {
   box-shadow: 0 5px 15px var(--panel-shadow);
   width: 90%;
   max-width: 500px;
-  /* A phone held landscape is shorter than the settings dialog; scroll it
-     rather than clip its close button and last control off screen. */
-  max-height: calc(100% - 2rem);
-  overflow-y: auto;
   transform: scale(0.95);
   transition: transform 0.2s ease-in-out;
 }
@@ -856,7 +858,8 @@ iframe {
   margin-bottom: 1.5rem;
 }
 
-.modal-body label {
+.modal-body label,
+#touch-opacity-popover label {
   display: block;
   margin-bottom: 0.5rem;
   font-weight: 500;
