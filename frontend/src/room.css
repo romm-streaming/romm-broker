@@ -203,6 +203,51 @@ body {
   background: var(--button-hover-bg);
 }
 
+/* Only a touch screen gets the Selkies touch gamepad, so only one gets its
+   opacity button. */
+@media not (any-pointer: coarse) {
+  #touch-opacity-btn {
+    display: none;
+  }
+}
+
+#touch-opacity-popover {
+  position: fixed;
+  z-index: 1000;
+  width: 240px;
+  max-width: calc(100vw - 16px);
+  padding: 0.75rem 1rem;
+  background-color: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  box-shadow: 0 5px 15px var(--panel-shadow);
+  color: var(--panel-text);
+}
+
+#touch-opacity-popover label {
+  display: block;
+  margin-bottom: 0.5rem;
+  font-weight: 500;
+}
+
+.settings-range {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.settings-range input[type="range"] {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent);
+}
+
+.settings-range output {
+  min-width: 3.5em;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 /* Holds the chat column's place in the bar. The column itself is fixed so it
    can grow up over the play space without the bar clipping it. */
 #chat-dock-slot {
@@ -268,11 +313,17 @@ body {
     font-size: 1.1rem;
   }
 
+  /* The bar is too short here for the fader above three buttons, so they
+     sit beside it and wrap into a second column when they run out of room. */
   #stream-volume {
+    flex-direction: row;
+    align-items: stretch;
     gap: 3px;
   }
 
   #stream-buttons {
+    flex-flow: column wrap;
+    justify-content: flex-end;
     gap: 2px;
   }
 
@@ -283,6 +334,7 @@ body {
   }
 
   #stream-volume-slider {
+    flex: 0 0 auto;
     min-height: 16px;
     margin: 2px 0;
   }
@@ -825,24 +877,6 @@ iframe {
 .modal-body select:focus {
   outline: none;
   border-color: var(--accent);
-}
-
-.modal-body .settings-range {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-}
-
-.modal-body .settings-range input[type="range"] {
-  flex: 1;
-  accent-color: var(--accent);
-}
-
-.modal-body .settings-range output {
-  min-width: 3.5em;
-  text-align: right;
-  font-variant-numeric: tabular-nums;
-  color: var(--panel-text);
 }
 
 /* The popup list is drawn by the browser, not the page; these are what it

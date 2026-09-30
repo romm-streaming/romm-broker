@@ -3570,7 +3570,46 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     });
     document.getElementById('session-frame').addEventListener('load', applyTouchOpacityToFrame);
-    
+
+    // The slider sits in a popover off the stream controls, not the settings
+    // dialog: solo mode hides the tile whose gear opens that dialog, and solo
+    // on a phone is where the touch gamepad is used most.
+    const touchOpacityBtn = document.getElementById('touch-opacity-btn');
+    const touchOpacityPopover = document.getElementById('touch-opacity-popover');
+    const POPOVER_GAP = 8;
+    const placeTouchOpacityPopover = () => {
+        const btn = touchOpacityBtn.getBoundingClientRect();
+        const width = touchOpacityPopover.offsetWidth;
+        // Beside the button, on whichever side has room: in solo mode the
+        // cluster sits against the right edge.
+        const fitsRight = btn.right + POPOVER_GAP + width + POPOVER_GAP <= window.innerWidth;
+        const left = fitsRight ? btn.right + POPOVER_GAP : btn.left - POPOVER_GAP - width;
+        touchOpacityPopover.style.left = `${Math.max(POPOVER_GAP, left)}px`;
+        touchOpacityPopover.style.bottom = `${Math.max(POPOVER_GAP, window.innerHeight - btn.bottom)}px`;
+    };
+    const setTouchOpacityPopover = (open) => {
+        touchOpacityPopover.classList.toggle('hidden', !open);
+        touchOpacityBtn.setAttribute('aria-expanded', String(open));
+        if (open) placeTouchOpacityPopover();
+    };
+    touchOpacityBtn.addEventListener('click', () => {
+        setTouchOpacityPopover(touchOpacityPopover.classList.contains('hidden'));
+    });
+    document.addEventListener('pointerdown', (e) => {
+        if (touchOpacityPopover.classList.contains('hidden')) return;
+        if (touchOpacityPopover.contains(e.target) || touchOpacityBtn.contains(e.target)) return;
+        setTouchOpacityPopover(false);
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && !touchOpacityPopover.classList.contains('hidden')) {
+            setTouchOpacityPopover(false);
+            touchOpacityBtn.focus();
+        }
+    });
+    window.addEventListener('resize', () => {
+        if (!touchOpacityPopover.classList.contains('hidden')) placeTouchOpacityPopover();
+    });
+
     videoStrip.addEventListener('click', (e) => {
         const btn = e.target.closest('.remote-control-btn');
         if (!btn) return;
