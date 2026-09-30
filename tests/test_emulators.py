@@ -14,7 +14,7 @@ import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pytest
 
@@ -1155,3 +1155,45 @@ def test_an_accepted_member_lands_inside_the_save_tree(
 def test_disc_number_reads_only_a_disc_marker(name: str, expected: int) -> None:
     """The disc number comes from an explicit disc marker, not any digit in the name."""
     assert base.disc_number(Path(name)) == expected
+
+
+def test_the_scrubbed_env_strips_secrets_but_leaves_the_displays(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Helper tools lose the secrets without being pointed at labwc's displays."""
+    monkeypatch.setenv("BROKER_SECRET", "s3cret")
+    monkeypatch.setenv("OAUTH_TOKEN", "tok")
+    monkeypatch.setenv("DISPLAY", ":7")
+
+    env = base.scrubbed_env()
+
+    assert "BROKER_SECRET" not in env
+    assert "OAUTH_TOKEN" not in env
+    assert env["DISPLAY"] == ":7"
+
+
+@pytest.mark.parametrize(
+    ("module", "call"),
+    [
+        ("extraction_cache", lambda m: m.run_extractor(["7z", "x", "a.7z"], "7z", 5)),
+        ("shadps4", lambda m: m._run_pkg_extractor(Path("a.pkg"), Path("out"))),
+        ("pcsx2", lambda m: m._run_step("download", ["curl", "x"], 5)),
+    ],
+)
+def test_helper_tools_never_inherit_the_broker_secret(
+    monkeypatch: pytest.MonkeyPatch, module: str, call: Callable[[Any], Any]
+) -> None:
+    """An extractor or fetch parsing untrusted input gets the scrubbed env, not the broker's own."""
+    import importlib
+
+    mod = importlib.import_module(f"webstation_broker.emulators.{module}")
+    monkeypatch.setenv("BROKER_SECRET", "s3cret")
+    seen: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    call(mod)
+
+    assert seen.get("env") is not None
+    assert "BROKER_SECRET" not in seen["env"]

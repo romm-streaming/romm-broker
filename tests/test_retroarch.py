@@ -4552,12 +4552,15 @@ class TestCoreProfile:
         monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
         rom = tmp_path / "Game.7z"
         rom.write_bytes(b"7z")
+        owners: list[str] = []
         monkeypatch.setattr(
-            retroarch.extraction_cache, "list_members", lambda archive, timeout: ["dir/Game.SMC"]
+            retroarch.extraction_cache, "list_members",
+            lambda archive, timeout, owner="": owners.append(owner) or ["dir/Game.SMC"],
         )
         emu = _with_core("snes", "bsnes")
         emu.select_core()
         assert emu.resolve_rom_file(rom) == rom
+        assert owners == ["retroarch"]
 
     def test_untested_core_refuses_an_archive_holding_none_of_its_content(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture

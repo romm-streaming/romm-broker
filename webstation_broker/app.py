@@ -28,6 +28,10 @@ logging.basicConfig(
     format="%(asctime)s [broker] %(levelname)s %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
+# httpx logs every request line, full URL and all, at INFO: that would put
+# a callback base_url's credentials in the log. The broker logs each of its
+# own requests already, redacted (see `callback.redact_url`).
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 log = logging.getLogger(__name__)
 
@@ -86,6 +90,9 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     When `RETROARCH_CORE_INFO_REFRESH` is on, a background task then keeps that
     cache current; startup itself never waits on the network for it.
 
+    Starts the emulator watch, which logs an ERROR when a session's emulator
+    exits on its own, unless `EMULATOR_WATCH_INTERVAL` is 0.
+
     Args:
         _app: The application being started; unused.
 
@@ -99,6 +106,8 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         retroarch_cores.load_startup_catalog, retroarch.RA_DATA_DIR, retroarch.CORES_DIR, retroarch.PLATFORMS
     )
     async with anyio.create_task_group() as tg:
+        if settings.EMULATOR_WATCH_INTERVAL > 0:
+            tg.start_soon(api.watch_emulator_forever, settings.EMULATOR_WATCH_INTERVAL)
         if settings.RETROARCH_CORE_INFO_REFRESH:
             # In the background: startup never waits on the network.
             tg.start_soon(
@@ -109,6 +118,49 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
             )
         yield
         tg.cancel_scope.cancel()
+
+
+ROOM_CSP = "; ".join(
+    (
+        "default-src 'self'",
+        # The media and socket workers and the audio worklets are built from
+        # blob: URLs (room.js); nothing else runs that the page did not ship.
+        "script-src 'self' blob:",
+        "worker-src 'self' blob:",
+        "connect-src 'self'",
+        "img-src 'self' data: blob:",
+        "media-src 'self' blob:",
+        "font-src 'self' data:",
+        # Inline style= attributes in markup room.js builds; no inline <style>.
+        "style-src 'self'",
+        "style-src-attr 'unsafe-inline'",
+        # The selkies stream, served under the same prefix.
+        "frame-src 'self'",
+        "object-src 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+    )
+)
+"""The room page's Content-Security-Policy, minus `frame-ancestors` (see `_page_csp_headers`)."""
+
+
+def _page_csp_headers() -> dict[str, str]:
+    """Build the CSP headers for an HTML page.
+
+    `frame-ancestors` is always enforced when configured: browsers ignore it
+    in a report-only policy, so it cannot wait for `BROKER_CSP_ENFORCE`.
+
+    Returns:
+        The header names and values to set; empty of `frame-ancestors` when
+        `BROKER_FRAME_ANCESTORS` is unset.
+    """
+    ancestors = f"frame-ancestors {settings.FRAME_ANCESTORS}" if settings.FRAME_ANCESTORS else ""
+    if settings.CSP_ENFORCE:
+        return {"Content-Security-Policy": "; ".join(filter(None, (ROOM_CSP, ancestors)))}
+    headers = {"Content-Security-Policy-Report-Only": ROOM_CSP}
+    if ancestors:
+        headers["Content-Security-Policy"] = ancestors
+    return headers
 
 
 def create_app() -> FastAPI:
@@ -132,6 +184,7 @@ def create_app() -> FastAPI:
         title="webstation-broker", lifespan=None if prefixed else _lifespan
     )
     inner.include_router(api.router)
+    inner.include_router(api.secret_router)
     inner.include_router(room.router)
 
     @inner.middleware("http")
@@ -144,6 +197,14 @@ def create_app() -> FastAPI:
         # out to.
         response = await call_next(request)
         response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        # API answers can carry a live seat token (context's userToken) and
+        # sit under a URL that carries one too; keep both out of any cache.
+        if request.url.path.startswith(f"{settings.PREFIX}/api/"):
+            response.headers.setdefault("Cache-Control", "no-store")
+        if response.headers.get("content-type", "").startswith("text/html"):
+            for name, value in _page_csp_headers().items():
+                response.headers[name] = value
         return response
 
     if not settings.DEV_MODE:
