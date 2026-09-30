@@ -22,6 +22,7 @@ uv venv && uv pip install -e . pytest pytest-asyncio "ruff==0.16.1"
 .venv/bin/ruff check webstation_broker tests
 BROKER_DEV_MODE=true .venv/bin/python -c "from webstation_broker.app import create_app; create_app()"
 .venv/bin/pytest -q
+(cd frontend && npm test)
 ```
 
 CI runs four gates on every push and PR to `master`: lint, a `create_app()`
@@ -104,7 +105,9 @@ makes a malformed one a docs regression too.
 ### Tests
 
 - **Tests travel with code.** New logic gets a test in `tests/`. New endpoints
-  get endpoint tests. One module per emulator or subsystem.
+  get endpoint tests. One module per emulator or subsystem. A room helper
+  split out of `room.js` is the exception: its test is a `*.test.js` beside
+  it in `frontend/src/`.
 - **Tests are linted too.** CI runs `ruff check webstation_broker tests`, so the
   docstring and annotation rules apply to fixtures as well.
 - **Reset module-global state with an autouse fixture** on both sides of the

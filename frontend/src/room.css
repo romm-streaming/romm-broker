@@ -203,6 +203,63 @@ body {
   background: var(--button-hover-bg);
 }
 
+/* Only a touch screen gets the Selkies touch gamepad, so only one gets its
+   opacity button. */
+@media not (any-pointer: coarse) {
+  #touch-opacity-btn {
+    display: none;
+  }
+}
+
+#touch-opacity-popover {
+  position: fixed;
+  z-index: 1000;
+  width: 240px;
+  max-width: calc(100vw - 16px);
+  padding: 0.75rem 1rem;
+  background-color: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  box-shadow: 0 5px 15px var(--panel-shadow);
+  color: var(--panel-text);
+}
+
+#touch-opacity-popover .settings-range {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+#touch-opacity-popover input[type="range"] {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent);
+}
+
+#touch-opacity-popover output {
+  min-width: 3.5em;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A short bar can't fit the fader above the stream buttons once the opacity
+   button joins them, so they sit beside it and wrap into a second column. */
+@media (max-width: 768px) and (any-pointer: coarse), (max-height: 500px) and (any-pointer: coarse) {
+  #stream-volume {
+    flex-direction: row;
+    align-items: stretch;
+  }
+
+  #stream-buttons {
+    flex-flow: column wrap;
+    justify-content: flex-end;
+  }
+
+  #stream-volume-slider {
+    flex: 0 0 auto;
+  }
+}
+
 /* Holds the chat column's place in the bar. The column itself is fixed so it
    can grow up over the play space without the bar clipping it. */
 #chat-dock-slot {
@@ -800,7 +857,8 @@ iframe {
   margin-bottom: 1.5rem;
 }
 
-.modal-body label {
+.modal-body label,
+#touch-opacity-popover label {
   display: block;
   margin-bottom: 0.5rem;
   font-weight: 500;
@@ -821,24 +879,6 @@ iframe {
 .modal-body select:focus {
   outline: none;
   border-color: var(--accent);
-}
-
-.modal-body .settings-range {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-}
-
-.modal-body .settings-range input[type="range"] {
-  flex: 1;
-  accent-color: var(--accent);
-}
-
-.modal-body .settings-range output {
-  min-width: 3.5em;
-  text-align: right;
-  font-variant-numeric: tabular-nums;
-  color: var(--panel-text);
 }
 
 /* The popup list is drawn by the browser, not the page; these are what it

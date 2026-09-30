@@ -2988,14 +2988,15 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         gamingModeBtn.addEventListener('click', () => gamingMode.toggle());
 
-        // The open chat, the invite tile and the self-view controls all
-        // minimize the same way: interacting anywhere outside them. Captured
-        // so it runs before a target's own handler can re-open what it just
-        // closed.
+        // The open chat, the invite tile, the self-view controls and the
+        // touch opacity popover all minimize the same way: interacting
+        // anywhere outside them. Captured so it runs before a target's own
+        // handler can re-open what it just closed.
         document.addEventListener('pointerdown', (e) => {
             if (isChatOpen && !e.target.closest('#chat-dock')) closeChat();
             if (isInviteOpen() && !e.target.closest('#invite-tile')) closeInvite();
             if (!e.target.closest('#local-user-container')) localContainer.classList.remove('controls-shown');
+            if (isTouchOpacityOpen() && !e.target.closest('#touch-opacity-popover, #touch-opacity-btn')) setTouchOpacityPopover(false);
         }, true);
         // The chat column is fixed rather than in the bar's flow, so its
         // closed height tracks whatever the bar is currently laid out at.
@@ -3530,36 +3531,80 @@ document.addEventListener('DOMContentLoaded', async () => {
         restartMediaForDeviceChange().catch(err => console.error('[Media] webcam switch failed:', err));
     });
 
+    const sessionFrame = () => document.getElementById('session-frame');
+    // Null while the frame shows a document this page cannot reach, such as
+    // a browser error page after a failed load.
+    const sessionFrameDoc = () => {
+        const el = sessionFrame();
+        try { return el ? el.contentDocument : null; } catch (err) { return null; }
+    };
+
     // Per viewer: each browser keeps its own level, and it reaches the touch
     // gamepad inside the stream frame on every (re)load.
     const touchOpacitySlider = document.getElementById('touch-opacity-slider');
     const touchOpacityValue = document.getElementById('touch-opacity-value');
+    const touchOpacityPercent = new Intl.NumberFormat(navigator.language, { style: 'percent', maximumFractionDigits: 0 });
     touchOpacitySlider.min = MIN_TOUCH_OPACITY;
-    let touchOpacity = parseTouchOpacity(localStorage.getItem(TOUCH_OPACITY_KEY));
-    const applyTouchOpacityToFrame = () => {
-        const el = document.getElementById('session-frame');
-        let doc = null;
-        try { doc = el ? el.contentDocument : null; } catch (err) { doc = null; }
-        applyTouchOpacity(doc, touchOpacity);
-    };
+    // Blocked or full storage only costs remembering the level between visits.
+    let touchOpacity = 1;
+    try {
+        touchOpacity = parseTouchOpacity(localStorage.getItem(TOUCH_OPACITY_KEY));
+    } catch (err) {
+        console.warn('[Touch] Could not read touch controls opacity:', err);
+    }
+    const applyTouchOpacityToFrame = () => applyTouchOpacity(sessionFrameDoc(), touchOpacity);
     const showTouchOpacity = () => {
-        touchOpacitySlider.value = touchOpacity;
-        touchOpacityValue.textContent = `${Math.round(touchOpacity * 100)}%`;
+        touchOpacityValue.textContent = touchOpacityPercent.format(touchOpacity);
     };
+    touchOpacitySlider.value = touchOpacity;
     showTouchOpacity();
     touchOpacitySlider.addEventListener('input', (e) => {
-        touchOpacity = parseTouchOpacity(e.target.value);
+        touchOpacity = Number(e.target.value);
         showTouchOpacity();
         applyTouchOpacityToFrame();
-        // Blocked or full storage only costs remembering it next visit.
+    });
+    // Saved once the drag settles, not on every step of it.
+    touchOpacitySlider.addEventListener('change', () => {
         try {
             localStorage.setItem(TOUCH_OPACITY_KEY, touchOpacity);
         } catch (err) {
             console.warn('[Touch] Could not save touch controls opacity:', err);
         }
     });
-    document.getElementById('session-frame').addEventListener('load', applyTouchOpacityToFrame);
-    
+    sessionFrame().addEventListener('load', applyTouchOpacityToFrame);
+
+    // Opened from the stream controls because solo mode hides your own tile.
+    const touchOpacityBtn = document.getElementById('touch-opacity-btn');
+    const touchOpacityPopover = document.getElementById('touch-opacity-popover');
+    const POPOVER_GAP = 8;
+    const placeTouchOpacityPopover = () => {
+        const btn = touchOpacityBtn.getBoundingClientRect();
+        const width = touchOpacityPopover.offsetWidth;
+        // Solo mode puts the cluster against the right edge, so flip left there.
+        const fitsRight = btn.right + POPOVER_GAP + width + POPOVER_GAP <= window.innerWidth;
+        const left = fitsRight ? btn.right + POPOVER_GAP : btn.left - POPOVER_GAP - width;
+        touchOpacityPopover.style.left = `${Math.max(POPOVER_GAP, left)}px`;
+        touchOpacityPopover.style.bottom = `${Math.max(POPOVER_GAP, window.innerHeight - btn.bottom)}px`;
+    };
+    const isTouchOpacityOpen = () => !touchOpacityPopover.classList.contains('hidden');
+    const setTouchOpacityPopover = (open) => {
+        touchOpacityPopover.classList.toggle('hidden', !open);
+        touchOpacityBtn.setAttribute('aria-expanded', String(open));
+        if (open) placeTouchOpacityPopover();
+    };
+    touchOpacityBtn.addEventListener('click', () => {
+        setTouchOpacityPopover(!isTouchOpacityOpen());
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && isTouchOpacityOpen()) {
+            setTouchOpacityPopover(false);
+            touchOpacityBtn.focus();
+        }
+    });
+    window.addEventListener('resize', () => {
+        if (isTouchOpacityOpen()) placeTouchOpacityPopover();
+    });
+
     videoStrip.addEventListener('click', (e) => {
         const btn = e.target.closest('.remote-control-btn');
         if (!btn) return;
@@ -3708,18 +3753,13 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (lockTimer !== null) { clearTimeout(lockTimer); lockTimer = null; }
         };
 
-        const frame = () => document.getElementById('session-frame');
         const isFullscreen = () => {
-            const el = frame();
+            const el = sessionFrame();
             return !!el && document.fullscreenElement === el;
         };
-        const frameDoc = () => {
-            const el = frame();
-            try { return el ? el.contentDocument : null; } catch (err) { return null; }
-        };
         const lockTarget = () => {
-            const el = frame();
-            const doc = frameDoc();
+            const el = sessionFrame();
+            const doc = sessionFrameDoc();
             if (!el || !doc) return null;
             const input = el.contentWindow && el.contentWindow.webrtcInput;
             return (input && input.element) || doc.getElementById('overlayInput');
@@ -3727,7 +3767,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         const requestLock = () => {
             if (!isFullscreen()) return;
-            const doc = frameDoc();
+            const doc = sessionFrameDoc();
             const target = lockTarget();
             if (!doc || !target || typeof target.requestPointerLock !== 'function') {
                 waitForTarget();
@@ -3779,7 +3819,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             scheduleLock(LOCK_RETRY_MS);
         };
         const releaseLock = () => {
-            const doc = frameDoc();
+            const doc = sessionFrameDoc();
             if (doc && doc.pointerLockElement && typeof doc.exitPointerLock === 'function') doc.exitPointerLock();
         };
         const lockKeyboard = () => {
@@ -3827,7 +3867,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             boundDoc = null;
         };
         const bindFrame = () => {
-            const doc = frameDoc();
+            const doc = sessionFrameDoc();
             if (!doc || doc === boundDoc) return;
             unbindFrame();
             const win = doc.defaultView;
@@ -3847,7 +3887,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         };
 
         const enter = () => {
-            const el = frame();
+            const el = sessionFrame();
             if (!el || typeof el.requestFullscreen !== 'function') return;
             // Locks are taken on fullscreenchange; the transition cancels an earlier lock.
             el.requestFullscreen().catch((err) => console.error('[Gaming] Fullscreen refused:', err));
@@ -3878,7 +3918,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
         });
         // Bind every frame document as it loads; handlers idle outside gaming mode.
-        const el = frame();
+        const el = sessionFrame();
         if (el) {
             el.addEventListener('load', () => {
                 bindFrame();
