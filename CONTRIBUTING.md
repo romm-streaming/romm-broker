@@ -122,6 +122,10 @@ blocks a PR.
 - **Validate every caller-supplied rom or disc path against `ROM_ROOT`** with
   `os.path.realpath` (symlinks resolved) before it reaches a subprocess. Outside
   the root is a clean 400, not a launch.
+- **Put a RomM-facing route on `api.secret_router`**, never on `api.router`.
+  The secret is checked there before anything else, so the route can't forget
+  to. `api.router` is for routes with a credential of their own (a seat
+  token); adding one means adding it to `_OPEN_ROUTES` in `tests/test_api.py`.
 - **Put `--` before a path in an argv list**, so a leading-dash filename can't
   become a flag.
 - **Never `shell=True`.** Always list-form argv.
