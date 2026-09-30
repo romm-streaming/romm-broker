@@ -42,6 +42,7 @@ test('nothing stored means fully opaque, the add-on as it ships', () => {
     assert.equal(parseTouchOpacity(null), 1);
     assert.equal(parseTouchOpacity(undefined), 1);
     assert.equal(parseTouchOpacity(''), 1);
+    assert.equal(parseTouchOpacity('  '), 1);
 });
 
 test('a stored value inside the range comes back as is', () => {

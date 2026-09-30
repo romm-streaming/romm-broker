@@ -3530,28 +3530,39 @@ document.addEventListener('DOMContentLoaded', async () => {
         restartMediaForDeviceChange().catch(err => console.error('[Media] webcam switch failed:', err));
     });
 
+    // Null while the frame shows a document this page cannot reach, such as
+    // a browser error page after a failed load.
+    const sessionFrameDoc = () => {
+        const el = document.getElementById('session-frame');
+        try { return el ? el.contentDocument : null; } catch (err) { return null; }
+    };
+
     // Per viewer: each browser keeps its own level, and it reaches the touch
     // gamepad inside the stream frame on every (re)load.
     const touchOpacitySlider = document.getElementById('touch-opacity-slider');
     const touchOpacityValue = document.getElementById('touch-opacity-value');
+    const touchOpacityPercent = new Intl.NumberFormat(navigator.language, { style: 'percent', maximumFractionDigits: 0 });
     touchOpacitySlider.min = MIN_TOUCH_OPACITY;
-    let touchOpacity = parseTouchOpacity(localStorage.getItem(TOUCH_OPACITY_KEY));
-    const applyTouchOpacityToFrame = () => {
-        const el = document.getElementById('session-frame');
-        let doc = null;
-        try { doc = el ? el.contentDocument : null; } catch (err) { doc = null; }
-        applyTouchOpacity(doc, touchOpacity);
-    };
+    // Blocked or full storage only costs remembering the level between visits.
+    let touchOpacity = 1;
+    try {
+        touchOpacity = parseTouchOpacity(localStorage.getItem(TOUCH_OPACITY_KEY));
+    } catch (err) {
+        console.warn('[Touch] Could not read touch controls opacity:', err);
+    }
+    const applyTouchOpacityToFrame = () => applyTouchOpacity(sessionFrameDoc(), touchOpacity);
     const showTouchOpacity = () => {
-        touchOpacitySlider.value = touchOpacity;
-        touchOpacityValue.textContent = `${Math.round(touchOpacity * 100)}%`;
+        touchOpacityValue.textContent = touchOpacityPercent.format(touchOpacity);
     };
+    touchOpacitySlider.value = touchOpacity;
     showTouchOpacity();
     touchOpacitySlider.addEventListener('input', (e) => {
         touchOpacity = parseTouchOpacity(e.target.value);
         showTouchOpacity();
         applyTouchOpacityToFrame();
-        // Blocked or full storage only costs remembering it next visit.
+    });
+    // Saved once the drag settles, not on every step of it.
+    touchOpacitySlider.addEventListener('change', () => {
         try {
             localStorage.setItem(TOUCH_OPACITY_KEY, touchOpacity);
         } catch (err) {
@@ -3713,10 +3724,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             const el = frame();
             return !!el && document.fullscreenElement === el;
         };
-        const frameDoc = () => {
-            const el = frame();
-            try { return el ? el.contentDocument : null; } catch (err) { return null; }
-        };
+        const frameDoc = sessionFrameDoc;
         const lockTarget = () => {
             const el = frame();
             const doc = frameDoc();

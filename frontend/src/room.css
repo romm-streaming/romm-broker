@@ -756,6 +756,10 @@ iframe {
   box-shadow: 0 5px 15px var(--panel-shadow);
   width: 90%;
   max-width: 500px;
+  /* A phone held landscape is shorter than the settings dialog; scroll it
+     rather than clip its close button and last control off screen. */
+  max-height: calc(100% - 2rem);
+  overflow-y: auto;
   transform: scale(0.95);
   transition: transform 0.2s ease-in-out;
 }

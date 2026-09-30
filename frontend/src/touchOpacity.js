@@ -13,7 +13,8 @@ export const MIN_TOUCH_OPACITY = 0.2;
 
 /** Reads a stored value; anything missing or unreadable means fully opaque. */
 export const parseTouchOpacity = (raw) => {
-    if (raw === null || raw === undefined || raw === '') return 1;
+    // Number() reads a blank string as 0, which would clamp to the faintest.
+    if (raw === null || raw === undefined || String(raw).trim() === '') return 1;
     const value = Number(raw);
     if (!Number.isFinite(value)) return 1;
     return Math.min(1, Math.max(MIN_TOUCH_OPACITY, value));
