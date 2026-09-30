@@ -235,6 +235,26 @@ def test_activate_refuses_an_emulator_that_is_not_installed(
     assert _activate(client, broker_dirs, emulator="gameboy").status_code == 422
 
 
+def test_activate_names_the_romm_upgrade_for_core_shorthand_as_the_emulator(
+    client: TestClient, broker_dirs: dict[str, Path]
+) -> None:
+    """A RomM too old for `core:` sends `retroarch:bsnes` whole; the 422 says to upgrade."""
+    response = _activate(client, broker_dirs, emulator="retroarch:bsnes")
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail.startswith("unknown emulator: retroarch:bsnes; ")
+    assert "Upgrade RomM past 5.3.1" in detail
+
+
+def test_activate_keeps_the_plain_detail_when_the_prefix_is_not_an_emulator(
+    client: TestClient, broker_dirs: dict[str, Path]
+) -> None:
+    """A colon after a name that is not an emulator is just an unknown emulator."""
+    response = _activate(client, broker_dirs, emulator="gameboy:bsnes")
+    assert response.status_code == 422
+    assert response.json()["detail"] == "unknown emulator: gameboy:bsnes"
+
+
 def test_activate_refuses_a_rom_outside_the_library(
     client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator], tmp_path: Path
 ) -> None:
