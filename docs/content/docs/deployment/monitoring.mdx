@@ -156,6 +156,23 @@ On the `exit:` line, `upload` is one of:
 | `failed` | RomM did not take the archive. The line is logged as a `WARNING`, and `kept=` names the copy left on the container, or `-` if even that could not be written. |
 | `report-only` | Dev mode: nothing is uploaded, and the archive is always kept. |
 
+### When the emulator goes mid-session
+
+Between those two lines, the broker checks every 15 seconds
+(`BROKER_EMULATOR_WATCH_INTERVAL`) that the session's emulator is still
+running. If it is gone while the session is still open, one line is logged for
+that session:
+
+```text
+emulator watch: session 3f2a...: pcsx2 exited while the session was open (exit code -11, rom Game); exit the session from RomM to save and upload what it wrote
+```
+
+It is an `ERROR` for a crash (a signal or an error code) and a `WARNING` for
+exit code `0`, which is usually a player quitting from the emulator's own
+menu. To be told about crashes as they happen, have your log shipper alert on
+`emulator watch:` at `ERROR`. What each exit code means, and what to do, is in
+[The game froze mid-session](/docs/troubleshooting#the-game-froze-mid-session-and-the-emulator-is-gone).
+
 ## What each alert means
 
 Worst first. When one run finds several problems it prints them all on one
@@ -172,7 +189,7 @@ the alerts that often.
 | The check says | What it means | What to do |
 | --- | --- | --- |
 | `CRITICAL: broker health ... unreachable` | Nothing answers on the broker port. | Check the container is running, then read `docker logs webstation` for the startup error. |
-| `CRITICAL: ... emulator ... is not running` | A session is still open but its emulator exited or crashed. Players see a frozen stream. | Exit the session from RomM. The teardown still dumps and uploads whatever saves the emulator wrote before it went down. |
+| `CRITICAL: ... emulator ... is not running` | A session is still open but its emulator exited or crashed. Players see a frozen stream. | Exit the session from RomM. The teardown still dumps and uploads whatever saves the emulator wrote before it went down. The log's `emulator watch:` line for the session says when it ended and with what exit code. |
 | `CRITICAL: ... save dump failed` | The last exit could not zip the save tree, so nothing reached RomM. | The saves are still in that emulator's save directory under `/config`; the log line `save dump failed` says why. Copy them out before the next game on that emulator, because a launch clears the working save slot. |
 | `CRITICAL: ... upload failed and the archive could not be kept` | RomM did not take the archive, and writing the fallback copy failed too (a full disk, usually). | Recover the saves from the emulator's save directory as above, then free space under `BROKER_EXPORT_DIR` (default `/config/broker-exports`). |
 | `WARNING: ... upload failed, archive kept at ...` | RomM did not take the archive; the broker kept a copy. | Find out why in the log (`save upload rejected by ...` or `save upload to ... failed`) and fix the RomM side. Then download the archive and delete it, as below; the alert clears once it is gone. |
@@ -208,7 +225,8 @@ See [Save archives](/docs/api/archives) for the archive layout.
   `--max-last-exit-hours` stops being reported even if nobody acted on it.
   The `exit:` line in the log keeps the record.
 - **It samples; it does not watch.** An emulator that crashes and is exited
-  between two runs never shows as `not running`. The exit's own line in the
-  log still records how its saves went.
+  between two runs never shows as `not running`. The broker's own
+  [emulator watch](#when-the-emulator-goes-mid-session) still logs the crash,
+  and the exit's own line records how its saves went.
 - **It only knows what the broker knows.** An archive RomM accepted but filed
   wrongly shows as `uploaded`.
