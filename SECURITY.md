@@ -30,7 +30,9 @@ problem:
   a cleaned-up environment.** Before launch, the broker strips out
   `BROKER_SECRET`, `SELKIES_MASTER_TOKEN`, `GITHUB_TOKEN`, and anything
   shaped like `*_SECRET` / `*_TOKEN` / `*_PASSWORD` / `*_KEY`
-  ([base.py](webstation_broker/emulators/base.py)). That means a terminal
+  ([base.py](webstation_broker/emulators/base.py)). The helper tools the
+  broker runs on untrusted files (`7z`, `unrar`, `pkg_extractor`,
+  `qemu-img`, the PCSX2 patch fetch) get the same cleanup. That means a terminal
   opened inside a desktop session can't read the broker's own secret back
   out of its environment. This exists because RetroArch loads third-party
   cores with no protective sandbox around them (nothing walling off what a
