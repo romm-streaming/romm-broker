@@ -75,6 +75,22 @@ actually hit called out as they come up, and a
 [Troubleshooting](https://romm-streaming.github.io/romm-broker/docs/troubleshooting)
 page if something still doesn't work.
 
+## Configuration
+
+Everything is set through environment variables on the container. Two of
+them have to match RomM's `config.yml`:
+
+- `SUBFOLDER` (default `/streaming/`) is the URL path the broker and the room
+  live under.
+- `BROKER_SECRET` is the shared password RomM sends as `X-Broker-Secret`.
+  The broker refuses to start without it, unless it's running in dev mode.
+
+`ROM_ROOT` (default `/romm`) only needs changing if your library is mounted
+somewhere outside `/romm`. Every other variable, broker-wide and
+per-emulator, is listed on the
+[Configuration](https://romm-streaming.github.io/romm-broker/docs/configuration)
+page.
+
 ## Documentation
 
 | | |
@@ -86,7 +102,7 @@ page if something still doesn't work.
 | [Using the room](https://romm-streaming.github.io/romm-broker/docs/using-the-room) | the collab room from a player's side: chat, webcam, controller handoff |
 | [Developer guide](https://romm-streaming.github.io/romm-broker/docs/developer) | layout, conventions, adding an emulator, the generated Python reference |
 
-## Getting help
+## Troubleshooting and help
 
 Start with [Troubleshooting](https://romm-streaming.github.io/romm-broker/docs/troubleshooting),
 which is organized by symptom. If nothing there matches, search or open an
