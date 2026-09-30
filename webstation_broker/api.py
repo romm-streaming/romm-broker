@@ -2332,7 +2332,7 @@ async def status() -> dict[str, Any]:
         "multiplayer": bool(sess.get("multiplayer")),
         "emulator_alive": sess["emulator_obj"].alive(),
         # Set only by emulators with their own boot-verification signal (PCSX2
-        # today, via PINE). Passive: RomM decides what to do about it, this
+        # and RPCS3, both via PINE). Passive: RomM decides what to do about it, this
         # route only reports it.
         "boot_failed": sess["emulator_obj"].boot_failed,
         # Set while a slow pre-launch extraction (shadPS4/RPCS3 pkg or

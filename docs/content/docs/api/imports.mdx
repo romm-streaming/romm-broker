@@ -131,7 +131,7 @@ through a symlink, or the member is refused.
 | `emulator` | `save` | `memcard` | `state` |
 | --- | --- | --- | --- |
 | `retroarch` | one `.srm`, on a platform whose core loads one; on `wii`, title folders, `title/<type>/<title id>/data/`; on `3ds`, folders inside Azahar's `sdmc/Nintendo 3DS/` or `nand/data/` | not taken; `expected` names `save` | `PUT /api/session/state-file` after activate |
-| `flycast` | raw 131072-byte `vmu_save_<A-D><1-2>.bin` images, and `dc_nvmem.bin` | a raw 131072-byte VMU image | one `.state`; needs `save.resume_slot` |
+| `flycast` | raw 131072-byte `vmu_save_<A-D><1-2>.bin` images, and `dc_nvmem.bin` | a raw 131072-byte VMU (Dreamcast memory card) image | one `.state`; needs `save.resume_slot` |
 | `duckstation` | a raw 131072-byte `.mcd`, `.mcr`, `.mc` or `.srm` card | the same as `save` | one `<serial>_resume.sav` or `<serial>_<n>.sav`; needs `save.resume_slot` |
 | `ppsspp` | PSP save folders, `SAVEDATA/<product code><suffix>/`, each holding `PARAM.SFO` | not taken | one `<game id>_<version>_<n>.ppst`, with its `.jpg` screenshot if sent; needs `save.resume_slot` |
 | `dolphin` on `ngc` | GameCube `.gci` saves, each in `<region>/Card A/` | the same as `save` | one `<game id>.sNN` that opens with the game's id; needs `save.resume_slot` |

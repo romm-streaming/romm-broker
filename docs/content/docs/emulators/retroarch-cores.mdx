@@ -146,8 +146,7 @@ platforms take one:
 
 On `nds`, the `.srm` is the melondsds core's NDS cart SRAM, exposed through
 the standard `RETRO_MEMORY_SAVE_RAM` libretro call. The older, unmaintained
-`melonds` core did not expose this — it managed its own `.sav` file instead,
-which is why this platform used to refuse a `.srm` import.
+`melonds` core doesn't expose this; it manages its own `.sav` file instead.
 
 On `psx`, the `.srm` is the SwanStation core's first memory card. The core
 loads it only while its `swanstation_MemoryCards_Card1Type` option stays at
@@ -174,7 +173,7 @@ The other platforms refuse a `.srm`:
 
 | Core (platforms) | Where the save is |
 | --- | --- |
-| `flycast` (dc) | VMU files in the system folder, `dc/vmu_save_<port>.bin`, per game — the broker pins `flycast_per_content_vmus` to `All VMUs`; its shared-by-default setting would leak saves between games |
+| `flycast` (dc) | VMU files in the system folder, `dc/vmu_save_<port>.bin`, per game. The broker pins `flycast_per_content_vmus` to `All VMUs`; its shared-by-default setting would leak saves between games |
 | `fbneo` (arcade, cps1, cps2, cps3, neogeoaes, neogeomvs) | `fbneo/<driver>.fs` or `.nv`, named for the driver |
 | `mednafen_ngp` (neo-geo-pocket, neo-geo-pocket-color) | `<game>.flash` |
 | `handy` (lynx) | `<game>.eeprom` |
@@ -185,7 +184,7 @@ The other platforms refuse a `.srm`:
 | `yabasanshiro` (saturn) | `yabasanshiro/backup.bin`, shared by every game |
 | `genesis_plus_gx` (segacd) | `scd_<region>.brm`, shared by every game of that region |
 | `mesen` (fds) | `<game>.ips`, a patch against the disk |
-| `puae` (amiga) | written to a substitute disk under `saves/`, not the mounted image — the broker pins `puae_floppy_write_redirect` to `enabled` |
+| `puae` (amiga) | written to a substitute disk under `saves/`, not the mounted image. The broker pins `puae_floppy_write_redirect` to `enabled` |
 | `vice_x64`, `hatari` (c64, atari-st) | written into the disk image by default; see the write-protection note below |
 | `a5200`, `prosystem`, `freeintv`, `vecx`, `o2em`, `fuse` | no battery save |
 

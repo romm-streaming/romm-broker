@@ -54,15 +54,15 @@ Launchers differ in how they are driven:
 | Mechanism | Launchers |
 | --- | --- |
 | A control socket or stdin protocol | PCSX2 (PINE), RetroArch (stdin command protocol), shadPS4 (stdin IPC) |
-| xdotool hotkeys against the render window | Dolphin, PPSSPP, ScummVM (via its Global Main Menu, not a single hotkey), Flycast (Alt+F4 window-close triggers its own autosave, falling back to SIGTERM/SIGKILL) |
-| Command line flags and config pinning only, SIGTERM to stop | DuckStation, Cemu, Azahar, Eden, RPCS3 (opens a PINE socket, but only for boot verification and title-id lookup, not save-state control), xemu, Xenia |
+| xdotool hotkeys against the render window | Dolphin, PPSSPP, ScummVM (via its Global Main Menu, not a single hotkey), Flycast (Alt+F4 window-close triggers its own autosave, falling back to SIGTERM/SIGKILL), RPCS3 (a save-state hotkey at exit only; its PINE socket is for boot verification and title-id lookup) |
+| Command line flags and config pinning only, SIGTERM to stop | DuckStation, Cemu, Azahar, Eden, xemu, Xenia |
 
 ## Save data flow
 
 [`saves`](/docs/developer/reference/saves) restores an archive into
-`save_root` scoped to `save_subtrees`, skipping members outside them and never
-overwriting a newer file, and dumps a delta of everything modified since the
-session's `save_baseline`. [`callback`](/docs/developer/reference/callback)
+`save_root` scoped to `save_subtrees`, refusing the whole archive when any
+member falls outside them and never overwriting a newer file. It then dumps a
+delta of everything modified since the session's `save_baseline`. [`callback`](/docs/developer/reference/callback)
 uploads that delta to the parent; failures are reported, never raised, because
 the exit teardown has to finish regardless.
 [`memcard`](/docs/developer/reference/memcard) handles the whole-card sync for

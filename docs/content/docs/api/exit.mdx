@@ -73,13 +73,15 @@ The response carries everything the parent needs to file the session:
 | Field | Meaning |
 | --- | --- |
 | `status` | `exited` |
-| `session_id`, `emulator`, `rom` | Echoed from activate. |
-| `state_saved`, `state_slot`, `state_file` | Whether a final state was saved, which slot it went into, and its filename. `state_saved` is `false` when you passed `save=0`; you can still fetch the working slot's file through the state-file GET route until the next activate. DuckStation and RPCS3 are the exception: they only serve a state the exit confirmed as saved. |
-| `save_dump` | What got zipped up: the archive's name and size, plus the list of `files` with their paths relative to the save root. |
-| `upload` | The `mode` (`uploaded`, `failed`, `report-only`, or `skipped` - the last when the save dump succeeded but there were no save changes to upload), the target `url`, the HTTP status, and, if it failed, the `error` message and the `path` the archive was written to. |
+| `session_id`, `rom` | Echoed from activate. |
+| `state_saved`, `state_slot`, `state_file` | Whether a final state was saved, which slot it went into, and the written file as `{path, size, mtime}`. `state_saved` is `false` when you passed `save=0`; you can still fetch the working slot's file through the state-file GET route until the next activate. DuckStation and RPCS3 are the exception: they only serve a state the exit confirmed as saved. |
+| `sram_flushed` | Whether the game's own save data was confirmed written to disk before the emulator stopped. `null` when the emulator has no way to confirm it; `false` means the dump shipped whatever was already on disk, which may be stale, and the controller is told so in chat. |
+| `exit_error` | Only present when the emulator's own shutdown raised. The broker stops it anyway and still dumps the saves. |
+| `save_dump` | What got zipped up: `files` (each `{path, size, mtime}`, path relative to the save root), `skipped` and `skipped_files` (the count and paths of files that could not be read into the archive; a partial skip still ships the rest), `total_bytes`, `archive_path` (set only when the archive was kept on disk), and `error` when the dump itself failed. |
+| `upload` | The `mode` (`uploaded`, `failed`, `report-only`, or `skipped` when the save dump succeeded but found no save changes to upload), the target `url`, the HTTP `status_code`, and, if it failed, the `error` message and the `archive_path` the archive was written to. A failed save dump also reports `mode: "failed"`, with no archive to keep. |
+| `selkies_tokens_cleared` | Whether selkies (the streaming layer) accepted the emptied token map. |
 
-After the report goes out, the room's websocket connection closes, the token
-map pushed to selkies (the streaming layer) is emptied so every stream
-disconnects, and the session is retired. The emulator object sticks around
-just long enough afterward for the state-file and screenshot GET requests to
-still answer.
+The route tears the session down before it answers. It tells the room the
+session ended, empties the token map pushed to selkies so every stream
+disconnects, and retires the session. The emulator object sticks around a
+little longer, so the state-file and screenshot GET requests still answer.

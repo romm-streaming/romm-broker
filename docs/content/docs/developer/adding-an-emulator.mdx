@@ -50,14 +50,16 @@ class Newemu(Emulator):
     log_path = LOG_PATH
     term_timeout = float(os.environ.get("NEWEMU_STOP_WAIT", "10"))
 
-    def resolve_rom_file(self, path: Path) -> Path | None: ...
-    def launch(self, rom_path: Path | None, resume_slot: int | None) -> None:
+    def resolve_rom_file(self, path: Path) -> Optional[Path]: ...
+    def launch(self, rom_path: Optional[Path], resume_slot: Optional[int]) -> None:
         self.stop()
-        self._spawn([BIN, str(rom_path)], base_launch_env())
+        self._spawn([BIN, "--", str(rom_path)], base_launch_env())
 ```
 
 Use `base_launch_env()` for the environment so the process lands on the
 selkies display, and `_spawn` so output is captured and the pid recorded.
+Check that the emulator's argument parser accepts `--`, then put it before the
+rom path so a filename starting with a dash can't be read as a flag.
 Override `save_state`, `load_state`, `state_path` and `state_target` only if
 `supports_states` is on. The one exception is an emulator that writes a
 state only on exit: it overrides `state_path` alone, to serve the state its

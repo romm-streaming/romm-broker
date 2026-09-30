@@ -146,14 +146,25 @@ def main(argv: Optional[list[str]] = None) -> int:
         The Nagios exit code of the worst state found.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--url", default=_default_url())
-    parser.add_argument("--timeout", type=float, default=5.0)
+    parser.add_argument("--url", default=_default_url(), help="broker base URL, SUBFOLDER prefix included")
+    parser.add_argument("--timeout", type=float, default=5.0, help="seconds to wait for each request")
     # The container's own port 3001 serves a self-signed certificate.
     parser.add_argument("--insecure", action="store_true", help="skip TLS certificate verification")
-    parser.add_argument("--max-session-hours", type=float, default=12.0)
-    parser.add_argument("--max-exit-seconds", type=float, default=120.0)
-    parser.add_argument("--max-kept-archives", type=int, default=0)
-    parser.add_argument("--max-last-exit-hours", type=float, default=24.0)
+    parser.add_argument(
+        "--max-session-hours", type=float, default=12.0, help="warn when one session has been open longer"
+    )
+    parser.add_argument(
+        "--max-exit-seconds", type=float, default=120.0, help="warn when the last exit took longer"
+    )
+    parser.add_argument(
+        "--max-kept-archives", type=int, default=0, help="warn when more save archives than this wait on disk"
+    )
+    parser.add_argument(
+        "--max-last-exit-hours",
+        type=float,
+        default=24.0,
+        help="stop reporting a bad exit once it is older than this",
+    )
     args = parser.parse_args(argv)
     base = args.url.rstrip("/") + "/api"
     secret = os.environ.get("BROKER_SECRET") or None

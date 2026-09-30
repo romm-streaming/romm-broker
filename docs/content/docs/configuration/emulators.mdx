@@ -16,7 +16,7 @@ are in seconds.
 
 | Env var | Default | Purpose |
 | --- | --- | --- |
-| `XDOTOOL_BIN` | `xdotool` | The xdotool used to send save/load hotkeys to Dolphin and PPSSPP. |
+| `XDOTOOL_BIN` | `xdotool` | The xdotool used to send hotkeys and window commands to Dolphin, PPSSPP, Flycast, RPCS3 and ScummVM. |
 | `XDG_RUNTIME_DIR` | `/config/.XDG` | Where PCSX2's PINE socket (`pcsx2.sock`) is looked for. |
 | `DESKTOP_BIN` | `selkies-desktop` | What the `desktop` type launches. |
 | `DESKTOP_STOP_WAIT` | `15` | SIGTERM grace before SIGKILL for the desktop session, and for every app left open on it. Longer than the base 5 s because it is mostly spent on those apps writing their config and save data on the way out. |
@@ -33,6 +33,7 @@ are in seconds.
 | `PINE_WAIT` | `20.0` | How long a save state has to land on disk after the PINE save command. |
 | `RESUME_LOAD_WAIT` | `90.0` | How long a resume load waits for PCSX2 to report a running game. |
 | `RESUME_LOAD_SETTLE` | `3.0` | How long the game has to be running before the resume load fires. |
+| `PCSX2_RESUME_STATE_WAIT` | `60.0` | How long a booted game waits for the resume state to arrive. RomM pushes it after activate returns, so this is its own budget rather than what's left of the boot wait. |
 
 PCSX2's data folder isn't configurable here. Everything (`inis/PCSX2.ini`,
 `sstates/`, `memcards/`) lives under `/config/.config/PCSX2`.
@@ -69,6 +70,8 @@ DuckStation's data folder isn't configurable here either. Everything
 | `DOLPHIN_STATE_WAIT` | `20.0` | How long a save state has to land on disk after the save hotkey. |
 | `DOLPHIN_RESUME_LOAD_WAIT` | `90.0` | How long a resume load waits for the render window. |
 | `DOLPHIN_RESUME_LOAD_SETTLE` | `5.0` | How long the window has to be up before the load hotkey is sent. |
+| `DOLPHIN_LOAD_WAIT` | `20.0` | How long Dolphin has to read the state back after the load hotkey. |
+| `DOLPHIN_LOAD_SETTLE` | `2.0` | How long a load gets to deserialize after the state file has been read. Nothing marks the end of the deserialize, so this is a bounded guess. |
 | `DOLPHIN_PAD_NAME` | `Xbox 360 Controller` | The selkies virtual pad's name as Dolphin's SDL backend presents it, used in the seeded `GCPadNew.ini` bindings. |
 
 Dolphin's folders aren't configurable here either. Config (`GCPadNew.ini` and
@@ -130,6 +133,9 @@ lives under `/config/.local/share/eden`.
 | `SHADPS4_CACHE_ENABLED` | `false` | Whether `.pkg` and `.7z`/`.zip`/`.rar` ROMs boot at all. On, the first launch extracts one into `SHADPS4_CACHE_DIR` and every later launch reuses that extraction. Off, such a ROM is refused outright rather than re-extracted and thrown away on every launch; only natively bootable formats work. |
 | `SHADPS4_CACHE_DIR` | `$XDG_DATA_HOME/shadPS4/extracted` | Where a kept extraction is cached, when `SHADPS4_CACHE_ENABLED` is on. Broker-owned scratch, written and read by the broker alone, so moving it moves the whole of it. |
 | `SHADPS4_CACHE_MAX_GB` | `30` | Ceiling on the cache's total size; the oldest extraction is evicted first once a new one would exceed it. A ROM that still doesn't fit once there is nothing left to evict, or that exceeds the free space on the filesystem, is refused at activate rather than extracted until the disk fills. |
+| `SHADPS4_PKG_EXPANSION_FACTOR` | `1.1` | Assumed extracted-to-`.pkg` size ratio for the free-space check. A `.pkg` is already compressed per file, so its output lands close to its own size. |
+| `SHADPS4_ARCHIVE_PEAK_FACTOR` | `2.2` | Assumed peak disk use relative to an archived `.pkg`'s size, since the unpacked `.pkg` and its extraction sit on disk at the same time. |
+| `SHADPS4_CACHE_LOCK_WAIT` | `120` | How long a launch waits for another extraction to release the cache before giving up. |
 | `SHADPS4_GPU_ID` | `auto` | Which Vulkan device shadPS4 renders on. shadPS4's own `-1` auto-select can land on a software rasterizer, which renders a black screen while the game otherwise runs. `auto` detects the best real GPU; an integer pins that device index directly; `-1` or `KEEP` leaves `config.json` alone. |
 | `SHADPS4_VULKANINFO_BIN` | `vulkaninfo` | The binary `SHADPS4_GPU_ID=auto` enumerates devices with. If it is missing or fails, no pin is written and shadPS4 keeps its own setting. |
 
@@ -163,8 +169,18 @@ written) sits at the root of that folder, and saves live under
 | `RETROARCH_SLOT_HOME_STEPS` | `24` | Slot-down presses to reach the -1 floor from anywhere the player could have cycled to. |
 | `RETROARCH_STATE_CONFIRM_WAIT` | `10.0` | How long a save state has to land on disk after `SAVE_STATE`. |
 | `RETROARCH_LOAD_ACK_WAIT` | `10.0` | How long `LOAD_STATE_SLOT` has to be acknowledged. |
+| `RETROARCH_LOAD_CONFIRM_WAIT` | `10.0` | How long RetroArch gets to actually read the state file after acknowledging the load. The acknowledgement only means the command was parsed. |
+| `RETROARCH_LOAD_LOCK_WAIT` | `30.0` | How long a manual load waits for an in-flight resume load or disc swap to finish. |
+| `RETROARCH_LOAD_TAINT_RETRY_LIMIT` | `2` | Extra attempts a load gets when another read of the state file landed during its read check and made that check unreliable. |
+| `RETROARCH_STATE_HANDOUT_GRACE` | `2.0` | How long after a state file is handed out (for example to the state-file GET route) a read of it is not trusted as the core's own. |
+| `RETROARCH_SAVE_LOCK_WAIT` | `30.0` | How long a save waits for an in-flight resume load or disc swap, rather than writing the pre-resume state. |
+| `RETROARCH_EXIT_SAVE_LOCK_WAIT` | `3.0` | The same wait for the save at exit, kept short because exit holds the session lock the whole time. |
+| `RETROARCH_FIRST_SAVE_SETTLE` | `3.0` | How long a session's first save waits after the game starts running, so a fast-booting core isn't saved mid boot logo. |
+| `RETROARCH_FIRST_SAVE_SETTLE_WAIT` | `20.0` | How long that first save waits to see the game start running at all. |
 | `RETROARCH_RESUME_WAIT` | `90.0` | How long a resume load waits for the core to report a running game. |
 | `RETROARCH_RESUME_SETTLE` | `3.0` | How long the game has to be running before the resume load fires. |
+| `RETROARCH_RESUME_RETRY_GAP` | `2.0` | Pause between resume load attempts when the core acknowledged a load but never read the state. |
+| `RETROARCH_RESUME_LOCK_WAIT` | `15.0` | How long one resume load attempt waits for an in-flight save or disc swap. |
 | `RETROARCH_SAVE_FILES_WAIT` | `10.0` | How long `SAVE_FILES` (flush SRAM to disk) has to answer at exit. |
 | `RETROARCH_QUIT_WAIT` | `10.0` | How long `QUIT` gets to finish before SIGTERM. |
 | `RETROARCH_QUIT_CONFIRM_GAP` | `0.1` | Gap before the second `QUIT`, for configs that ask for confirmation. |
@@ -188,6 +204,7 @@ written) sits at the root of that folder, and saves live under
 | `RPCS3_CACHE_ENABLED` | `false` | Whether `.7z`/`.zip`/`.rar` ROMs boot at all. On, the first launch extracts one into `RPCS3_CACHE_DIR` and every later launch reuses that extraction. Off, an archive ROM is refused outright rather than re-extracted and thrown away on every launch. `.pkg` is unaffected either way: it always installs through its own always-on installer. |
 | `RPCS3_CACHE_DIR` | `$XDG_CONFIG_HOME/rpcs3/extracted` | Where a kept extraction is cached, when `RPCS3_CACHE_ENABLED` is on. Broker-owned scratch, written and read by the broker alone, so moving it moves the whole of it. |
 | `RPCS3_CACHE_MAX_GB` | `30` | Ceiling on the cache's total size; the oldest extraction is evicted first once a new one would exceed it. An archive that still doesn't fit once there is nothing left to evict, or that exceeds the free space on the filesystem, is refused at activate rather than extracted until the disk fills. |
+| `RPCS3_ARCHIVE_EXPANSION` | `4.0` | Assumed unpacked-to-archive size ratio, used by the free-space check only when the archive's file listing can't be read. |
 | `RPCS3_STOP_WAIT` | `2` | SIGTERM grace before SIGKILL (no SIGTERM handler, covers the AppImage wrapper teardown). |
 
 RPCS3's data folder isn't configurable here either. On Linux, everything
@@ -205,6 +222,7 @@ RPCS3's data folder isn't configurable here either. On Linux, everything
 | `XEMU_SOFTWARE_GL` | unset | Truthy renders xemu on the CPU (`LIBGL_ALWAYS_SOFTWARE` for xemu only); slow, for hosts where both GPU paths abort. |
 | `XEMU_LOG_PATH` | `/config/xemu.log` | Where xemu's stdout/stderr is captured. |
 | `XEMU_STOP_WAIT` | `15` | SIGTERM grace before SIGKILL; QEMU's clean shutdown flushes the HDD image the save extraction reads. |
+| `XEMU_STRAY_TERM_WAIT` | `5` | Grace a leftover xemu process from an earlier session gets to exit cleanly (flushing the HDD image) before SIGKILL. |
 
 ## PPSSPP
 
@@ -216,6 +234,9 @@ RPCS3's data folder isn't configurable here either. On Linux, everything
 | `PPSSPP_STATE_WAIT` | `20.0` | How long a save state has to land on disk after the save hotkey. |
 | `PPSSPP_RESUME_LOAD_WAIT` | `90.0` | How long a resume load waits for the game window. |
 | `PPSSPP_RESUME_LOAD_SETTLE` | `12.0` | How long the window has to be up before the load hotkey is sent. |
+| `PPSSPP_STATE_STABLE` | `1.5` | How long a state's size and mtime must both hold still before it counts as written. |
+| `PPSSPP_LOAD_WAIT` | `20.0` | How long PPSSPP has to read the state back after the load hotkey. |
+| `PPSSPP_LOAD_SETTLE` | `2.0` | How long a load gets to deserialize after the state file has been read. Nothing marks the end of the deserialize, so this is a bounded guess. |
 | `PPSSPP_CACHE_ENABLED` | `false` | Whether `.7z`/`.zip`/`.rar` ROMs boot. PPSSPP can't boot from inside an archive, so the first launch extracts one into `PPSSPP_CACHE_DIR` and every later launch reuses that extraction. Off, an archived ROM is refused. |
 | `PPSSPP_CACHE_DIR` | `$XDG_DATA_HOME/ppsspp/extracted` | Where a kept extraction is cached. Broker-owned scratch, written and read by the broker alone. |
 | `PPSSPP_CACHE_MAX_GB` | `20` | Ceiling on the cache's total size; the oldest extraction is evicted first once a new one would exceed it. An archive that still doesn't fit, or that exceeds the free space on the filesystem, is refused rather than extracted until the disk fills. |
@@ -240,6 +261,8 @@ together.
 | `FLYCAST_BIN` | `/opt/flycast/AppRun` | Flycast binary. |
 | `FLYCAST_LOG_PATH` | `/config/flycast.log` | Where Flycast's stdout/stderr is captured. |
 | `FLYCAST_STOP_WAIT` | `20` | How long the Alt+F4 close request gets before escalating to a SIGTERM that Flycast has no handler for, and which skips the save entirely. |
+| `FLYCAST_STATE_WAIT` | `30.0` | How long the save state written at shutdown has to land on disk. |
+| `FLYCAST_STATE_STABLE` | `1.5` | How long a state's size and mtime must both hold still before it counts as written. |
 
 Flycast's data folder isn't configurable here either. It's
 `/config/.local/share/flycast`, flat, holding the VMU (memory card) saves
@@ -256,6 +279,7 @@ and the save state together at the top level.
 | `SCUMMVM_STATE_SLOT` | `1` | The slot the broker saves into. Kept low because the chooser is walked one `Down` per slot, and slot 0 is ScummVM's write-protected autosave. |
 | `SCUMMVM_MENU_KEY` | `F11` | Key the broker binds to the global menu action in `scummvm.ini`, and opens the Global Main Menu with. ScummVM's own `C+F5` loses its modifier on the way through Xwayland, and the unmodified `F5` belongs to the engine keymap, which an engine may take for itself. |
 | `SCUMMVM_STATE_WAIT` | `10` | How long a save waits for the slot's file to change before reporting failure. The menu macro gives no acknowledgement of its own. |
+| `SCUMMVM_STATE_STABLE` | `1.0` | How long a save's size and mtime must both hold still before it counts as written. |
 | `SCUMMVM_KEY_DELAY` | `0.8` | Seconds between the macro's steps. The menu and its chooser animate in, and a keystroke sent into either transition is dropped. |
 | `SCUMMVM_ADD_TIMEOUT` | `120` | How long `scummvm --add` gets to scan a folder. Detection reads through every file in it. |
 | `SCUMMVM_RESUME_LOAD_WAIT` | `45` | How long a deferred resume waits for the parent to push its state. |
@@ -265,4 +289,5 @@ and the save state together at the top level.
 | `SCUMMVM_CACHE_DIR` | `$SCUMMVM_DATA_DIR/extracted` | Where a kept extraction is cached. Broker-owned scratch, written and read by the broker alone. |
 | `SCUMMVM_CACHE_MAX_GB` | `10` | Ceiling on the cache's total size; the oldest extraction is evicted first once a new one would exceed it. An archive that still doesn't fit, or that exceeds the free space on the filesystem, is refused rather than extracted until the disk fills. |
 | `SCUMMVM_FILL_SCREEN_WAIT` | `10` | Seconds to wait for the game window to appear before giving up on growing it. |
+| `SCUMMVM_FILL_SCREEN_POLL` | `2` | Seconds between checks that the game window still matches the display, which changes size with whichever client is connected. |
 | `SCUMMVM_STOP_WAIT` | `10` | Seconds SIGTERM gets, which ScummVM spends flushing its config, before escalating to SIGKILL. |

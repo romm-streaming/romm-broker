@@ -86,6 +86,14 @@ page if something still doesn't work.
 | [Using the room](https://romm-streaming.github.io/romm-broker/docs/using-the-room) | the collab room from a player's side: chat, webcam, controller handoff |
 | [Developer guide](https://romm-streaming.github.io/romm-broker/docs/developer) | layout, conventions, adding an emulator, the generated Python reference |
 
+## Getting help
+
+Start with [Troubleshooting](https://romm-streaming.github.io/romm-broker/docs/troubleshooting),
+which is organized by symptom. If nothing there matches, search or open an
+issue on [GitHub](https://github.com/romm-streaming/romm-broker/issues). For a
+security problem, follow [SECURITY.md](SECURITY.md) instead of opening a
+public issue.
+
 ## Layout
 
 ```
@@ -94,6 +102,7 @@ webstation_broker/       FastAPI app (pip installable, console script webstation
   room.py                collab websocket (chat, webcam fanout, resolution, input passing)
   session.py             single-session state, room broadcast, gamepad/MK assignment
   selkies.py             token pushes to the selkies control plane
+  outbox.py              per-connection outbound queue, so a slow room socket delays only itself
   saves.py               save archive restore on activate, delta dump on exit
   memcard.py             whole memory card capture and hydrate
   imports.py             declared save/state/card imports, placed or refused per emulator in preflight
@@ -104,6 +113,7 @@ webstation_broker/       FastAPI app (pip installable, console script webstation
   app.py                 application factory, SUBFOLDER mount, orphan reaping on start
   emulators/             one launcher per emulator, all subclassing emulators.base.Emulator
 frontend/                vite vanilla-JS room interface
+scripts/                 check_broker.py (monitoring check), sync_core_info.py (core catalog upkeep, dev only)
 tests/                   pytest suite
 docs/                    the documentation site (Fumadocs, deployed to GitHub Pages)
 ```

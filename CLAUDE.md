@@ -46,7 +46,7 @@ them by path, or activate the venv first.
 uv venv && uv pip install -e . pytest pytest-asyncio "ruff==0.16.1"   # first time only
 
 .venv/bin/ruff check webstation_broker tests          # lint
-.venv/bin/pytest -q                                   # run tests (3760, ~50s)
+.venv/bin/pytest -q                                   # run tests (~3950, ~45s)
 .venv/bin/pytest tests/test_flycast.py                # run a subset
 .venv/bin/webstation-broker                           # run the app (console script)
 
