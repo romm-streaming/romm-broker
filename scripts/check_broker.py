@@ -3,8 +3,8 @@
 
 Reads `/api/health`, `/api/session/status` and `/api/session/exports`, prints
 one status line and exits with the worst state it found. Standard library
-only, so it runs from cron, a container healthcheck or a monitoring agent with
-nothing installed.
+only, so it runs from cron or a monitoring agent with nothing installed. It is
+not a container healthcheck: a restart fixes none of what it reports.
 
     BROKER_SECRET=... scripts/check_broker.py --url http://127.0.0.1:8000/streaming
 

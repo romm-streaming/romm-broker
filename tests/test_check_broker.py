@@ -1,4 +1,7 @@
-"""Offline checks on scripts/check_broker.py's thresholds; no broker is contacted."""
+"""Offline checks on scripts/check_broker.py: thresholds, URL defaults and error reporting.
+
+No broker is contacted; `main` runs against a stubbed `_get`.
+"""
 
 import importlib.util
 import types
@@ -155,18 +158,20 @@ def test_kept_archives_over_the_limit_warn(check: types.ModuleType) -> None:
     assert [s for s, _ in problems] == [check.WARNING]
 
 
-def _raise(exc: Exception) -> Any:
-    """A `_get` stand-in that fails every request with `exc`.
+def _failing_get(exc: Exception, health_ok: bool) -> Any:
+    """A `_get` stand-in that fails requests with `exc`.
 
     Args:
         exc: The exception to raise.
+        health_ok: Whether `/api/health` answers normally, so only the secret
+            routes fail.
 
     Returns:
         A function with `_get`'s signature.
     """
 
     def fake_get(url: str, *_args: Any) -> Any:
-        if isinstance(exc, urllib.error.HTTPError) and url.endswith("/health"):
+        if health_ok and url.endswith("/health"):
             return {"status": "ok"}
         raise exc
 
@@ -183,7 +188,9 @@ def test_an_unreachable_broker_is_critical(
         monkeypatch: The pytest monkeypatch fixture.
         capsys: The pytest stdout capture fixture.
     """
-    monkeypatch.setattr(check, "_get", _raise(urllib.error.URLError("connection refused")))
+    monkeypatch.setattr(
+        check, "_get", _failing_get(urllib.error.URLError("connection refused"), health_ok=False)
+    )
 
     assert check.main(["--url", "http://broker.invalid"]) == check.CRITICAL
     assert capsys.readouterr().out.startswith("CRITICAL: broker health")
@@ -210,12 +217,30 @@ def test_only_a_refused_secret_is_blamed_on_the_secret(
         blames_secret: Whether the message should point at BROKER_SECRET.
     """
     url = "http://broker.invalid/api/session/status"
-    monkeypatch.setattr(check, "_get", _raise(urllib.error.HTTPError(url, code, "x", {}, None)))  # type: ignore[arg-type]
+    error = urllib.error.HTTPError(url, code, "x", {}, None)
+    monkeypatch.setattr(check, "_get", _failing_get(error, health_ok=True))
 
     assert check.main(["--url", "http://broker.invalid"]) == check.UNKNOWN
     out = capsys.readouterr().out
     assert f"HTTP {code}" in out
     assert ("BROKER_SECRET" in out) is blames_secret
+
+
+def test_a_broker_up_but_its_status_unreadable_is_unknown(
+    check: types.ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Health answering while the status route cannot be reached is UNKNOWN, not CRITICAL.
+
+    Args:
+        check: The loaded check module.
+        monkeypatch: The pytest monkeypatch fixture.
+        capsys: The pytest stdout capture fixture.
+    """
+    error = urllib.error.URLError("connection reset")
+    monkeypatch.setattr(check, "_get", _failing_get(error, health_ok=True))
+
+    assert check.main(["--url", "http://broker.invalid"]) == check.UNKNOWN
+    assert capsys.readouterr().out.startswith("UNKNOWN: could not read broker status")
 
 
 @pytest.mark.parametrize(
