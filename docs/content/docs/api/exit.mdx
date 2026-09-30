@@ -47,6 +47,14 @@ proxy is involved, the broker reads that origin from the `X-Forwarded-Proto`
 and `X-Forwarded-Host` headers if the proxy sets them, or from `Host`
 otherwise.
 
+<Callout type="warn" title="Sending a token? Send base_url with it.">
+A derived origin is only as trustworthy as those headers, and
+`callback.token` goes to whatever origin they name. If you send a `token`,
+send an explicit `base_url` too, so the token can only ever go where you
+meant it to. Any proxy that does sit in front of `activate` should set
+`X-Forwarded-Host` itself rather than pass along one a client sent.
+</Callout>
+
 ## Report-only and failed uploads
 
 In dev mode (`BROKER_DEV_MODE=true`) nothing gets uploaded: the archive is

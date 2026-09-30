@@ -42,6 +42,17 @@ problem:
 None of this makes the terminal safe to expose. It just means the secret
 that guards reaching it isn't also sitting there once you're inside.
 
+## Environment variables are trusted input
+
+The broker treats its own environment as coming from whoever runs the
+container, and trusts it fully. Several variables name a binary to run
+(`DESKTOP_BIN`, `RPCS3_BIN`, `DUCKSTATION_BIN`, `SHADPS4_BIN`,
+`XDOTOOL_BIN`, and the other `*_BIN` settings), so anyone who can set them
+can already run anything in the container. That is by design, not a gap:
+the boundary is who controls the container's configuration, the same as
+for `BROKER_SECRET` itself. Only the request body, headers and query
+string are untrusted.
+
 ## The real boundary: `BROKER_SECRET`
 
 `BROKER_SECRET` is the one thing standing between the public internet and a
