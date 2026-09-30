@@ -114,11 +114,27 @@ def _touch_last_accessed(game_dir: Path) -> None:
         log.warning("extraction cache: could not update last-accessed marker for %s: %s", game_dir, exc)
 
 
-def _run_extractor(cmd: list[str], what: str, timeout: float) -> str:
+def _log_label(owner: str) -> str:
+    """The log prefix for a helper call made on `owner`'s behalf, matching ExtractionCache's own."""
+    return f"{owner} extraction cache" if owner else "extraction cache"
+
+
+def run_extractor(cmd: list[str], what: str, timeout: float, owner: str = "") -> str:
+    """Run an archive tool and return its stdout.
+
+    Args:
+        cmd: The command line to run.
+        what: What the run is for, named in errors.
+        timeout: Seconds the tool gets before it is considered hung.
+        owner: The emulator the run is for, named in the log.
+
+    Raises:
+        RuntimeError: When the tool cannot start, times out, or exits non-zero.
+    """
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        log.error("extraction cache: %s failed to run: %s", what, exc)
+        log.error("%s: %s failed to run: %s", _log_label(owner), what, exc)
         raise RuntimeError(f"{what} failed to run: {exc}") from exc
     if result.returncode != 0:
         raise RuntimeError(f"{what} exited {result.returncode}: {result.stderr.strip()}")
@@ -133,7 +149,7 @@ _7Z_PATH_PREFIX = "Path = "
 """Prefix of the `7z l -slt` line carrying one member's full path."""
 
 
-def reject_unsafe_members(dest: Path, members: list[str]) -> None:
+def reject_unsafe_members(dest: Path, members: list[str], owner: str = "") -> None:
     """Reject any archive member whose path would land outside dest.
 
     A `../` (or absolute) member path can escape dest on extraction (Zip
@@ -146,6 +162,7 @@ def reject_unsafe_members(dest: Path, members: list[str]) -> None:
     Args:
         dest: The directory the extraction must stay under.
         members: Member paths as the archive names them.
+        owner: The emulator the check is for, named in the log.
 
     Raises:
         RuntimeError: On the first member that escapes dest or carries a
@@ -154,20 +171,28 @@ def reject_unsafe_members(dest: Path, members: list[str]) -> None:
     dest_real = dest.resolve()
     for member in members:
         if _CONTROL_CHAR_RE.search(member):
-            log.error("extraction cache: archive member name holds a control character: %r", member)
+            log.error(
+                "%s: archive member name holds a control character: %r", _log_label(owner), member
+            )
             raise RuntimeError(f"archive member name holds a control character: {member!r}")
         target = (dest / member).resolve()
         if target != dest_real and dest_real not in target.parents:
             raise RuntimeError(f"archive member escapes extraction dir: {member}")
 
 
-def _safe_extract_zip(zf: zipfile.ZipFile, dest: Path) -> None:
-    """Extract `zf` into dest after rejecting any Zip Slip member."""
-    reject_unsafe_members(dest, zf.namelist())
+def safe_extract_zip(zf: zipfile.ZipFile, dest: Path, owner: str = "") -> None:
+    """Extract `zf` into dest after rejecting any Zip Slip member.
+
+    Args:
+        zf: The open archive.
+        dest: The directory the extraction must stay under.
+        owner: The emulator the extraction is for, named in the log.
+    """
+    reject_unsafe_members(dest, zf.namelist(), owner)
     zf.extractall(dest)
 
 
-def _7z_listing_body(archive: Path, what: str, timeout: float) -> list[str]:
+def _7z_listing_body(archive: Path, what: str, timeout: float, owner: str = "") -> list[str]:
     """The member section of `7z l -slt`, the only mode giving a full untruncated path.
 
     Everything before the dashed separator line describes the archive itself,
@@ -177,6 +202,7 @@ def _7z_listing_body(archive: Path, what: str, timeout: float) -> list[str]:
         archive: The archive to list.
         what: What the listing is for, named in errors.
         timeout: Seconds `7z` gets before it is considered hung.
+        owner: The emulator the listing is for, named in the log.
 
     Returns:
         The listing's lines after the separator.
@@ -184,7 +210,7 @@ def _7z_listing_body(archive: Path, what: str, timeout: float) -> list[str]:
     Raises:
         RuntimeError: When 7z fails or the listing carries no separator line.
     """
-    listing = _run_extractor(["7z", "l", "-slt", str(archive)], f"{what} ({archive.name})", timeout)
+    listing = run_extractor(["7z", "l", "-slt", str(archive)], f"{what} ({archive.name})", timeout, owner)
     lines = listing.splitlines()
     for i, line in enumerate(lines):
         if _7Z_SEPARATOR_RE.match(line):
@@ -192,7 +218,7 @@ def _7z_listing_body(archive: Path, what: str, timeout: float) -> list[str]:
     raise RuntimeError(f"7z listing of {archive.name} has no member section")
 
 
-def list_members(archive: Path, timeout: float) -> list[str]:
+def list_members(archive: Path, timeout: float, owner: str = "") -> list[str]:
     """List the member paths of a .zip, .rar or .7z archive.
 
     A .zip is read in process, a .rar through `unrar lb`, and anything else
@@ -205,6 +231,7 @@ def list_members(archive: Path, timeout: float) -> list[str]:
     Args:
         archive: The archive to list.
         timeout: Seconds `unrar` or `7z` gets before it is considered hung.
+        owner: The emulator the listing is for, named in the log.
 
     Returns:
         One path per member, as the archive names it.
@@ -221,11 +248,13 @@ def list_members(archive: Path, timeout: float) -> list[str]:
         except (zipfile.BadZipFile, OSError) as exc:
             raise RuntimeError(f"could not list zip {archive.name}: {exc}") from exc
     if ext == ".rar":
-        listing = _run_extractor(["unrar", "lb", "-y", str(archive)], f"unrar list ({archive.name})", timeout)
+        listing = run_extractor(
+            ["unrar", "lb", "-y", str(archive)], f"unrar list ({archive.name})", timeout, owner,
+        )
         members = [line for line in listing.splitlines() if line.strip()]
         tool = "unrar"
     else:
-        body = _7z_listing_body(archive, "7z list", timeout)
+        body = _7z_listing_body(archive, "7z list", timeout, owner)
         members = [line[len(_7Z_PATH_PREFIX) :] for line in body if line.startswith(_7Z_PATH_PREFIX)]
         tool = "7z"
     if not members:
@@ -233,7 +262,7 @@ def list_members(archive: Path, timeout: float) -> list[str]:
     return members
 
 
-def _reject_escaped_tree(dest: Path) -> None:
+def reject_escaped_tree(dest: Path, owner: str = "") -> None:
     """Post-extraction safety net: any real symlink or entry resolving outside dest is fatal.
 
     unrar/7z extraction is trusted to confine writes under dest, but the
@@ -241,8 +270,23 @@ def _reject_escaped_tree(dest: Path) -> None:
     and a name holding a raw control character can render differently there
     than in the archive's real central directory. This walks the real
     result instead of trusting the listing as a proxy for it.
+
+    Every offender is logged with the host path it points at, because that is
+    where the extractor may have written and it is the one thing the caller
+    cannot clean up on its own judgement.
+
+    Args:
+        dest: The directory the extraction was confined to.
+        owner: The emulator the extraction is for, named in the log.
+
+    Raises:
+        RuntimeError: If any entry resolves outside dest or cannot be resolved.
     """
     dest_real = dest.resolve()
+    escaped: list[Path] = []
+    # followlinks=False means os.walk never descends through a symlinked
+    # directory, but it still lists one in dirnames for its parent's
+    # iteration -- exactly where this loop catches it.
     for dirpath, dirnames, filenames in os.walk(dest, followlinks=False):
         base = Path(dirpath)
         for name in dirnames + filenames:
@@ -251,31 +295,73 @@ def _reject_escaped_tree(dest: Path) -> None:
                 target_real = p.resolve()
             except OSError as exc:
                 log.error(
-                    "extraction cache: could not resolve extracted member %s under %s: %s",
-                    p, dest, exc
+                    "%s: could not resolve extracted member %s under %s: %s",
+                    _log_label(owner), p, dest, exc
                 )
                 raise RuntimeError(f"could not resolve extracted member {p}: {exc}") from exc
             if target_real != dest_real and dest_real not in target_real.parents:
-                raise RuntimeError(f"extracted member escapes cache dir: {p}")
+                log.error(
+                    "%s: extracted member %s points outside %s, at %s",
+                    _log_label(owner), p, dest, target_real,
+                )
+                escaped.append(p)
+    if escaped:
+        raise RuntimeError(f"extracted member escapes cache dir: {escaped[0]}")
 
 
-def _extract_archive(archive: Path, dest: Path, timeout: float) -> None:
+def extract_archive(
+    archive: Path,
+    dest: Path,
+    timeout: float,
+    on_escape: Optional[Callable[[Path, str], None]] = None,
+    owner: str = "",
+) -> None:
+    """Extract a .zip, .rar or .7z into dest, refusing anything that would land outside it.
+
+    A .zip is extracted in process; anything else goes through unrar or 7z,
+    the latter also covering any other format 7z can identify (RAR5,
+    tar-in-7z dumps). Member names are checked before a byte is written, and
+    the external tools' result is walked again afterwards.
+
+    Args:
+        archive: The archive to extract.
+        dest: The directory the extraction must stay under.
+        timeout: Seconds `unrar` or `7z` gets, per run, before it is
+            considered hung.
+        on_escape: Called with (dest, archive name) when the post-extraction
+            walk rejects the tree -- an entry resolving outside dest, or one
+            that cannot be resolved at all -- before the error propagates.
+            The tool has already written by then, so this is the caller's
+            chance to discard what it left.
+        owner: The emulator the extraction is for, named in the log.
+
+    Raises:
+        RuntimeError: When the archive is unreadable, a member would escape
+            dest, or the extractor fails.
+    """
     ext = archive.suffix.lower()
-    log.info("extraction cache: extracting %s (%s)", archive.name, ext)
+    log.info("%s: extracting %s (%s)", _log_label(owner), archive.name, ext)
     if ext == ".zip":
         try:
             with zipfile.ZipFile(archive) as zf:
-                _safe_extract_zip(zf, dest)
+                safe_extract_zip(zf, dest, owner)
         except (zipfile.BadZipFile, OSError) as exc:
-            log.error("extraction cache: zip extraction of %s failed: %s", archive.name, exc)
+            log.error("%s: zip extraction of %s failed: %s", _log_label(owner), archive.name, exc)
             raise RuntimeError(f"zip extraction of {archive.name} failed: {exc}") from exc
+        return
+    reject_unsafe_members(dest, list_members(archive, timeout, owner), owner)
+    if ext == ".rar":
+        run_extractor(
+            ["unrar", "x", "-y", str(archive), f"{dest}/"], f"unrar ({archive.name})", timeout, owner,
+        )
     else:
-        reject_unsafe_members(dest, list_members(archive, timeout))
-        if ext == ".rar":
-            _run_extractor(["unrar", "x", "-y", str(archive), f"{dest}/"], f"unrar ({archive.name})", timeout)
-        else:
-            _run_extractor(["7z", "x", "-y", str(archive), f"-o{dest}"], f"7z ({archive.name})", timeout)
-        _reject_escaped_tree(dest)
+        run_extractor(["7z", "x", "-y", str(archive), f"-o{dest}"], f"7z ({archive.name})", timeout, owner)
+    try:
+        reject_escaped_tree(dest, owner)
+    except RuntimeError:
+        if on_escape is not None:
+            on_escape(dest, archive.name)
+        raise
 
 
 def _sum_listed_sizes(lines: Iterable[str], prefix: str) -> Optional[int]:
@@ -293,12 +379,13 @@ def _sum_listed_sizes(lines: Iterable[str], prefix: str) -> Optional[int]:
     return total if found else None
 
 
-def listed_size(archive: Path, timeout: float) -> Optional[int]:
+def listed_size(archive: Path, timeout: float, owner: str = "") -> Optional[int]:
     """Uncompressed total the archive's own member listing reports.
 
     Args:
         archive: The .zip, .rar or .7z to interrogate.
         timeout: Seconds `unrar` or `7z` gets before it is considered hung.
+        owner: The emulator the listing is for, named in the log.
 
     Returns:
         The sum of the members' uncompressed sizes, or None when the listing
@@ -310,13 +397,15 @@ def listed_size(archive: Path, timeout: float) -> Optional[int]:
             with zipfile.ZipFile(archive) as zf:
                 return sum(i.file_size for i in zf.infolist()) or None
         if ext == ".rar":
-            listing = _run_extractor(
-                ["unrar", "lt", "-y", str(archive)], f"unrar sizes ({archive.name})", timeout,
+            listing = run_extractor(
+                ["unrar", "lt", "-y", str(archive)], f"unrar sizes ({archive.name})", timeout, owner,
             )
             return _sum_listed_sizes(listing.splitlines(), "Size:")
-        return _sum_listed_sizes(_7z_listing_body(archive, "7z sizes", timeout), "Size =")
+        return _sum_listed_sizes(_7z_listing_body(archive, "7z sizes", timeout, owner), "Size =")
     except (RuntimeError, OSError, zipfile.BadZipFile) as exc:
-        log.warning("extraction cache: could not read the member sizes of %s: %s", archive.name, exc)
+        log.warning(
+            "%s: could not read the member sizes of %s: %s", _log_label(owner), archive.name, exc
+        )
         return None
 
 
@@ -539,11 +628,11 @@ class ExtractionCache:
         self, archive: Path, staged: Path, scratch: Path, emulator: Emulator, kept_bytes: int
     ) -> None:
         """The default `stage`: extract `archive` directly into `staged`."""
-        _extract_archive(archive, staged, self._extract_timeout())
+        extract_archive(archive, staged, self._extract_timeout(), owner=self._name)
 
     def _default_budget(self, rom: Path) -> tuple[int, int]:
         """The default `budget`: the archive's own listed size, or a compressed-size fallback."""
-        listed = listed_size(rom, self._extract_timeout())
+        listed = listed_size(rom, self._extract_timeout(), self._name)
         if listed is not None:
             return (listed, listed)
         try:

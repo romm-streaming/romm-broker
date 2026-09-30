@@ -36,7 +36,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-import zipfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -406,68 +405,6 @@ def _check_expansion(actual_bytes: int, reserved_bytes: int, rom_name: str) -> N
         )
 
 
-def _run_extractor(cmd: list[str], what: str) -> str:
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=PKG_EXTRACT_TIMEOUT)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        log.error("shadps4: %s failed to run: %s", what, exc)
-        raise RuntimeError(f"{what} failed to run: {exc}") from exc
-    if result.returncode != 0:
-        raise RuntimeError(f"{what} exited {result.returncode}: {result.stderr.strip()}")
-    return result.stdout
-
-
-def _safe_extract_zip(zf: zipfile.ZipFile, dest: Path) -> None:
-    """Extract `zf` into dest after rejecting any Zip Slip member.
-
-    zf.extractall() writes a member's path verbatim, so a `../` name in
-    the archive can escape dest; reject any member that would first.
-    """
-    extraction_cache.reject_unsafe_members(dest, zf.namelist())
-    zf.extractall(dest)
-
-
-def _reject_escaped_tree(dest: Path) -> None:
-    """Post-extraction safety net for the .rar/.7z paths.
-
-    unrar/7z extraction is trusted to confine writes under dest, but the
-    pre-extraction member-name check above parses each tool's own text
-    listing to decide what's safe before anything is written, and a member
-    name holding a raw control character can render differently in that
-    listing than in the archive's real central directory. Rather than trust
-    the listing as a proxy for what actually landed on disk, walk the real
-    result: any symlink whose target resolves outside dest, or any entry
-    not contained under dest at all, means the extractor's own traversal
-    protection didn't hold.
-
-    Every offender is logged with the host path it points at, because that is
-    where the extractor may have written and it is the one thing the caller
-    cannot clean up on its own judgement.
-
-    Args:
-        dest: The directory the extraction was confined to.
-
-    Raises:
-        RuntimeError: If any entry resolves outside dest or cannot be resolved.
-    """
-    dest_real = dest.resolve()
-    escaped: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(dest, followlinks=False):
-        base = Path(dirpath)
-        for name in dirnames + filenames:
-            p = base / name
-            try:
-                target_real = p.resolve()
-            except OSError as exc:
-                log.error("shadps4: could not resolve extracted member %s: %s", p, exc)
-                raise RuntimeError(f"could not resolve extracted member {p}: {exc}") from exc
-            if target_real != dest_real and dest_real not in target_real.parents:
-                log.error("shadps4: extracted member %s points outside %s, at %s", p, dest, target_real)
-                escaped.append(p)
-    if escaped:
-        raise RuntimeError(f"extracted member escapes cache dir: {escaped[0]}")
-
-
 def _purge_extraction(dest: Path, what: str) -> None:
     """Empty an extraction directory whose contents failed the escape check.
 
@@ -489,31 +426,14 @@ def _purge_extraction(dest: Path, what: str) -> None:
 
 
 def _extract_archive(archive: Path, dest: Path) -> None:
-    ext = archive.suffix.lower()
-    log.info("shadps4: extracting %s (%s)", archive.name, ext)
-    if ext == ".zip":
-        try:
-            with zipfile.ZipFile(archive) as zf:
-                _safe_extract_zip(zf, dest)
-        except (zipfile.BadZipFile, OSError) as exc:
-            log.error("shadps4: zip extraction of %s failed: %s", archive.name, exc)
-            raise RuntimeError(f"zip extraction of {archive.name} failed: {exc}") from exc
-    else:
-        members = extraction_cache.list_members(archive, PKG_EXTRACT_TIMEOUT)
-        extraction_cache.reject_unsafe_members(dest, members)
-        if ext == ".rar":
-            _run_extractor(["unrar", "x", "-y", str(archive), f"{dest}/"], f"unrar ({archive.name})")
-        else:
-            # .7z, plus a fallback attempt for any other archive format 7z can
-            # identify.
-            _run_extractor(["7z", "x", "-y", str(archive), f"-o{dest}"], f"7z ({archive.name})")
-        try:
-            _reject_escaped_tree(dest)
-        except RuntimeError:
-            # unrar/7z have already written by the time this runs, so what
-            # they left goes rather than staying for a later launch to boot.
-            _purge_extraction(dest, archive.name)
-            raise
+    """Extract an archive holding a .pkg into dest, bounded by PKG_EXTRACT_TIMEOUT per tool run.
+
+    unrar/7z have already written by the time an escaped entry is found, so
+    what they left is purged rather than staying for a later launch to boot.
+    """
+    extraction_cache.extract_archive(
+        archive, dest, PKG_EXTRACT_TIMEOUT, on_escape=_purge_extraction, owner="shadps4"
+    )
 
 
 def _run_pkg_extractor(pkg: Path, dest: Path) -> None:
