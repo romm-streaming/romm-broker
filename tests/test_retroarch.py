@@ -96,6 +96,113 @@ def test_an_unmapped_platform_has_no_core() -> None:
     assert retroarch._platform_info(None) is None
 
 
+@pytest.mark.parametrize(
+    ("slug", "core", "savestate"),
+    [
+        ("philips-cd-i", "same_cdi", False),
+        ("ti-83", "numero", True),
+    ],
+)
+def test_a_bios_core_platform_keeps_no_srm_and_states_only_where_the_core_has_them(
+    slug: str, core: str, savestate: bool
+) -> None:
+    """CD-i and TI-83 boot their core, take no `.srm`, and claim states only where the core serializes.
+
+    SAME CDi keeps its saves in per-game NVRAM files and Numero in a calculator
+    image under the save dir, so neither exposes `RETRO_MEMORY_SAVE_RAM`.
+    SAME CDi's core-info says `savestate = "false"`, so asking it for an exit
+    state would only wait out the confirm timeout.
+
+    Args:
+        slug: The RomM platform slug.
+        core: The libretro core it boots.
+        savestate: Whether the core serializes.
+    """
+    emu = _on(slug)
+
+    assert retroarch._platform_info(slug)["core"] == core
+    assert retroarch._platform_info(slug)["save_ram"] is False
+    assert emu.supports_states is savestate
+
+
+def test_cd_i_offers_only_the_images_same_cdi_loads() -> None:
+    """A bare `.bin` is not a SAME CDi extension, so it never wins over the `.cue` beside it."""
+    assert ".bin" not in retroarch._platform_info("philips-cd-i")["extensions"]
+
+
+def test_a_cd_i_folder_with_a_cue_and_its_track_boots_the_cue(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A CD-i dump's `.cue` is picked over the `.bin` track sitting beside it.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher.
+        tmp_path: Holds the ROM folder, and stands in for `ROM_ROOT`.
+    """
+    monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+    for name in ("Game.cue", "Game.bin"):
+        (tmp_path / name).touch()
+    extensions = retroarch._platform_info("philips-cd-i")["extensions"]
+
+    picked = retroarch._pick_rom_file(tmp_path.iterdir(), tmp_path, extensions)
+
+    assert picked == (tmp_path / "Game.cue").resolve()
+
+
+@pytest.mark.parametrize("slug", ["philips-cd-i", "ti-83"])
+def test_a_platform_nobody_has_booted_yet_ships_flagged_untested(slug: str) -> None:
+    """CD-i and TI-83 launch, but carry the `untested` flag until a tester confirms them (#61).
+
+    Args:
+        slug: The RomM platform slug.
+    """
+    assert retroarch._platform_info(slug)["untested"] is True
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_a_platform_with_a_non_boolean_untested_fails_the_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: Any
+) -> None:
+    """An `untested` spelled as anything but a bool stops the table loading.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher.
+        tmp_path: The per-test temporary directory.
+        value: The `untested` value.
+    """
+    table = tmp_path / "platforms.json"
+    info = {"core": "snes9x", "library_name": "Snes9x", "save_ram": True, "extensions": [".sfc"]}
+    info["untested"] = value
+    table.write_text(json.dumps({"snes": info}))
+    monkeypatch.setattr(retroarch, "_PLATFORMS_FILE", table)
+
+    with pytest.raises(ValueError, match="platforms.json: snes needs a true or false untested"):
+        retroarch._load_platforms()
+
+
+def test_an_alternate_may_not_claim_the_platform_untested() -> None:
+    """`untested` describes the platform's default core, so an alternate carrying it is rejected."""
+    with pytest.raises(ValueError, match="unknown key"):
+        retroarch._validate_entry(
+            "snes/bsnes", {"library_name": "bsnes", "save_ram": True, "untested": True}, alternate=True
+        )
+
+
+@pytest.mark.parametrize("slug", ["mac", "fm-towns"])
+def test_a_platform_whose_core_is_unsafe_or_unbootable_stays_unmapped(slug: str) -> None:
+    """Mac and FM Towns stay out of the table until their cores can run safely (#104).
+
+    minivmac opens the disk image read-write and writes game saves into it, with
+    no core option to redirect them, so it would write into the ROM library. The
+    MAME core only loads `.cmd` and archives, so an FM Towns disc boots to black
+    until the broker writes a `.cmd` for it.
+
+    Args:
+        slug: The RomM platform slug.
+    """
+    assert retroarch._platform_info(slug) is None
+
+
 def test_psp_declares_where_the_core_finds_its_assets() -> None:
     """The psp platform points the PPSSPP asset link straight at the assets tree.
 
@@ -602,6 +709,8 @@ def test_extensions_and_save_subtrees_survive_the_load_as_tuples() -> None:
         ("vectrex", "VecX"),
         ("intellivision", "freeintv"),
         ("atari-st", "hatari"),
+        ("philips-cd-i", "SAME_CDI"),
+        ("ti-83", "Numero"),
     ],
 )
 def test_a_platform_names_the_sorted_dir_its_core_reports(platform: str, name: str) -> None:
@@ -781,6 +890,30 @@ class TestResumeGate:
         emu.platform = "snes"
         emu.launch(tmp_path / "game.sfc", resume_slot)
         return emu
+
+    def test_launching_an_untested_platform_warns_it_is_untested(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A launch on a platform flagged `untested` says so in the log, and still launches."""
+        emu = retroarch.Retroarch()
+        emu.platform = "ti-83"
+
+        with caplog.at_level(logging.WARNING):
+            emu.launch(tmp_path / "game.8xp", None)
+
+        assert "ti-83 is untested" in caplog.text
+
+    def test_launching_a_tested_platform_does_not_warn(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A platform without the flag launches with no untested warning."""
+        emu = retroarch.Retroarch()
+        emu.platform = "snes"
+
+        with caplog.at_level(logging.WARNING):
+            emu.launch(tmp_path / "game.sfc", None)
+
+        assert "untested" not in caplog.text
 
     def test_slot_zero_still_defers_a_load(self, tmp_path: Path, _stub_launch: list[tuple[Any, ...]]) -> None:
         """A resume request for slot 0 schedules a deferred load of slot 0."""

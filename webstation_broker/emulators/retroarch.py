@@ -415,7 +415,7 @@ _PLATFORMS_FILE = Path(__file__).with_name("retroarch_platforms.json")
 
 
 _ENTRY_KEYS = (
-    frozenset({"core", "library_name", "save_ram", "extensions", "alternates"})
+    frozenset({"core", "library_name", "save_ram", "extensions", "alternates", "untested"})
     | retroarch_cores.CORE_OWNED_FIELDS
 )
 """Every key a platform entry may carry."""
@@ -435,6 +435,7 @@ def _validate_entry(slug: str, info: dict[str, Any], *, alternate: bool) -> None
         ValueError: On an unknown key, a missing `library_name`, or a
             `save_ram` that is not a boolean. It decides whether an import may
             place a `.srm`, so a missing one is never read as either answer.
+            Also on an `untested` that is present but not a boolean.
     """
     unknown = set(info) - (_ALTERNATE_KEYS if alternate else _ENTRY_KEYS)
     if unknown:
@@ -443,6 +444,8 @@ def _validate_entry(slug: str, info: dict[str, Any], *, alternate: bool) -> None
         raise ValueError(f"{_PLATFORMS_FILE.name}: {slug} needs a true or false save_ram")
     if not isinstance(info.get("library_name"), str):
         raise ValueError(f"{_PLATFORMS_FILE.name}: {slug} needs a library_name")
+    if "untested" in info and not isinstance(info["untested"], bool):
+        raise ValueError(f"{_PLATFORMS_FILE.name}: {slug} needs a true or false untested")
     for key in ("extensions", "save_subtrees", "extra_extensions"):
         if key in info:
             info[key] = tuple(info[key])
@@ -526,6 +529,11 @@ belong to the core that set them, not to the platform.
 `extra_extensions` lists extensions a core handles that core-info's
 `supported_extensions` omits, so the offline check that `extensions` is a
 subset of what the core supports (plus this list) still passes.
+
+`untested` marks a platform whose default core nobody has booted a real game
+on yet. It still launches; the cores route reports the default unverified, the
+docs tier table tags it, and every launch logs a warning. It belongs to the
+platform rather than the core, so an alternate may not carry it.
 """
 
 RA_ARCHIVE_EXTS = (".zip", ".7z")
@@ -2719,6 +2727,12 @@ class Retroarch(Emulator):
             raise RuntimeError(
                 f"no retroarch core mapped for platform {self.platform!r}; "
                 f"mapped: {', '.join(sorted(PLATFORMS))}"
+            )
+        if info.get("untested"):
+            log.warning(
+                "retroarch: %s is untested; %s has not been confirmed to boot a real game here",
+                self.platform,
+                info["core"],
             )
         core = _ensure_core(info["core"], info.get("core_source"))
         _ensure_core_info(info["core"], tier=info["tier"], has_source="core_source" in info)

@@ -393,6 +393,15 @@ def test_cores_for_platform_includes_display_name_and_verified() -> None:
     assert untested and all(c["verified"] is False for c in untested)
 
 
+def test_an_untested_platform_s_default_core_is_listed_unverified() -> None:
+    """A platform flagged `untested` keeps its core as the default but reports it unverified."""
+    platforms = {**PLATFORMS, "gba": {**PLATFORMS["gba"], "untested": True}}
+
+    default = rc.cores_for_platform(platforms, "gba", CATALOG, TIERS)[0]
+
+    assert (default["core"], default["tier"], default["verified"]) == ("mgba", "default", False)
+
+
 def test_cores_for_platform_includes_report_url() -> None:
     """Every core row includes a report_url with core and platform."""
     cores = rc.cores_for_platform(PLATFORMS, "snes", CATALOG, TIERS)
