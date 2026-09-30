@@ -173,6 +173,20 @@ SHADPS4_CACHE_ENABLED = truthy(os.environ.get("SHADPS4_CACHE_ENABLED"))
 Off, those formats are refused, since a PS4 title only boots once extracted.
 """
 
+SCUMMVM_CACHE_ENABLED = truthy(os.environ.get("SCUMMVM_CACHE_ENABLED", "true"))
+"""Whether ScummVM extracts archived games into its cache, from `SCUMMVM_CACHE_ENABLED` (default on).
+
+A ScummVM game is a folder, so a `.zip`, `.7z` or `.rar` only boots once
+extracted. Off, an archived game is refused.
+"""
+
+PPSSPP_CACHE_ENABLED = truthy(os.environ.get("PPSSPP_CACHE_ENABLED", "true"))
+"""Whether PPSSPP extracts archived ROMs into its cache, from `PPSSPP_CACHE_ENABLED` (default on).
+
+PPSSPP does not boot from inside an archive, so a zipped image only boots once
+extracted. Off, an archived ROM is refused.
+"""
+
 XEMU_SOFTWARE_GL = truthy(os.environ.get("XEMU_SOFTWARE_GL"))
 """Whether xemu renders on the CPU via `LIBGL_ALWAYS_SOFTWARE`, from `XEMU_SOFTWARE_GL` (default off).
 

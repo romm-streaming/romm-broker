@@ -50,8 +50,10 @@ from pathlib import Path, PurePosixPath
 from threading import Thread
 from typing import Any, Optional, Union
 
-from .. import imports
+from .. import imports, settings
+from . import extraction_cache
 from .base import Emulator, base_launch_env
+from .extraction_cache import ExtractionCache
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +80,26 @@ SAVE_DIR = DATA_DIR / "saves"
 """Where ScummVM writes every save, which is also where the working slot lives."""
 SCUMMVM_LOG_PATH = Path(os.environ.get("SCUMMVM_LOG_PATH", "/config/scummvm.log"))
 """Log file the broker appends this emulator's output to (env `SCUMMVM_LOG_PATH`)."""
+CACHE_DIR = Path(os.environ.get("SCUMMVM_CACHE_DIR", str(DATA_DIR / "extracted")))
+"""Where archived games are extracted and booted from (env `SCUMMVM_CACHE_DIR`, default `DATA_DIR/extracted`).
+
+An extraction is kept and reused by every later launch of the same archive,
+and its folder is what gets registered in scummvm.ini, so the target and the
+saves named after it stay the same from one launch to the next.
+"""
+CACHE_MAX_GB = float(os.environ.get("SCUMMVM_CACHE_MAX_GB", "10"))
+"""Cap on the extraction cache in GB (env `SCUMMVM_CACHE_MAX_GB`, default 10).
+
+The least recently booted games are evicted to make room for a new one.
+"""
+_ARCHIVE_EXTS = extraction_cache._ARCHIVE_EXTS
+"""Archive formats an archived game can come in: `.7z`, `.zip` and `.rar`."""
+_MARKER_EXTS = (".scummvm",)
+"""The marker file some libraries put in a game folder, the one loose file a ROM may point at."""
+_WRAPPER_DEPTH = 4
+"""How many lone wrapper folders an extraction is walked down through to reach the game."""
+ARCHIVE_LIST_TIMEOUT = 60.0
+"""Seconds `7z` or `unrar` gets to list an archive's members before it is considered hung."""
 
 AUTOSAVE_SLOT = 0
 """ScummVM's own autosave slot.
@@ -669,7 +691,7 @@ def register_target(rom_dir: Path, language: Optional[str] = None) -> Optional[s
                 rom_dir,
                 gameid,
             )
-            if _drop_dead_domains(gameid):
+            if _drop_dead_domains(gameid, keep=rom_dir):
                 retry = _run_add(rom_dir)
                 if retry is not None:
                     result = retry
@@ -690,7 +712,7 @@ def register_target(rom_dir: Path, language: Optional[str] = None) -> Optional[s
     return target
 
 
-def _drop_dead_domains(gameid: str) -> int:
+def _drop_dead_domains(gameid: str, keep: Optional[Path] = None) -> int:
     """Remove `gameid`'s domains whose recorded path no longer exists.
 
     Only domains that are already dead go: a path that is not there cannot
@@ -699,18 +721,37 @@ def _drop_dead_domains(gameid: str) -> int:
     library that is merely unmounted keeps its registrations and the save
     files named after them.
 
+    The one exception is an older extraction of the same archive when `keep`
+    is itself an extraction. A re-uploaded archive gets a fresh extraction
+    while the old one waits for eviction, and the old one's domain would
+    otherwise block the new one for as long as it sits there. Dropping it
+    frees the target name, so the new extraction registers under the same
+    target and the saves named after it still load. An extraction of a
+    different archive is another copy of the game and is left alone, as a
+    library folder would be: dropping it would hand both copies one target
+    and one set of saves.
+
     Args:
         gameid: The game whose stale domains are in the way.
+        keep: The folder being registered, or None.
 
     Returns:
         How many domains were dropped.
     """
+    source = _extraction_source(keep) if keep is not None else None
     doomed = set()
     for name, keys in _game_domains().items():
         if keys.get("gameid") != gameid:
             continue
         try:
-            if not Path(keys["path"]).is_dir():
+            path = Path(keys["path"])
+            if not path.is_dir():
+                doomed.add(name)
+            elif (
+                source is not None
+                and path.resolve() != keep.resolve()
+                and _extraction_source(path) == source
+            ):
                 doomed.add(name)
         except (OSError, ValueError) as exc:
             log.warning(
@@ -747,6 +788,230 @@ def _drop_dead_domains(gameid: str) -> int:
         ", ".join(sorted(doomed)),
     )
     return len(doomed)
+
+
+_SOURCE_FILE = ".source"
+"""File in an extraction's root naming the archive it came from.
+
+Hidden, so `_extracted_game_dir` never mistakes it for part of the game.
+"""
+
+
+def _extraction_root(path: Path) -> Optional[Path]:
+    """The cache entry `path` lies in, or None when it is not in the cache.
+
+    Args:
+        path: A folder, typically a registered domain's path.
+
+    Returns:
+        The top-level extraction folder under CACHE_DIR.
+
+    Raises:
+        OSError: When a path cannot be resolved.
+    """
+    cache = CACHE_DIR.resolve()
+    resolved = path.resolve()
+    if resolved == cache or not resolved.is_relative_to(cache):
+        return None
+    return cache / resolved.relative_to(cache).parts[0]
+
+
+def _extraction_source(path: Path) -> Optional[str]:
+    """The archive the extraction holding `path` came from, as recorded at extraction.
+
+    Args:
+        path: A folder inside an extraction.
+
+    Returns:
+        The archive's resolved path, or None outside the cache or when the
+        extraction carries no record.
+    """
+    try:
+        root = _extraction_root(path)
+        if root is None:
+            return None
+        return (root / _SOURCE_FILE).read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _visible_entries(folder: Path) -> list[Path]:
+    """`folder`'s entries, minus hidden ones and the `__MACOSX` fork a Mac-made zip carries.
+
+    Args:
+        folder: The folder to list.
+
+    Returns:
+        The entries that can be part of a game.
+
+    Raises:
+        OSError: When the folder cannot be listed.
+    """
+    return [e for e in folder.iterdir() if not e.name.startswith(".") and e.name != "__MACOSX"]
+
+
+def _extracted_game_dir(root: Path) -> Optional[Path]:
+    """The game folder inside an extracted archive.
+
+    Most zipped games wrap their files in one folder named after the game, and
+    `--add` does not recurse, so registering the extraction root would detect
+    nothing. A lone real folder is walked into until a level holds anything
+    else.
+
+    Args:
+        root: Where the archive was extracted to.
+
+    Returns:
+        The folder to register, or None when the extraction holds nothing.
+    """
+    folder = root
+    try:
+        for _ in range(_WRAPPER_DEPTH):
+            entries = _visible_entries(folder)
+            if not entries:
+                return None
+            only = entries[0]
+            if len(entries) > 1 or only.is_symlink() or not only.is_dir():
+                break
+            folder = only
+    except OSError as exc:
+        log.warning("scummvm: could not read the extraction under %s: %s", root, exc)
+        return None
+    return folder
+
+
+def _archive_holds_files(archive: Path) -> bool:
+    """Whether an archive's listing names anything that could be part of a game.
+
+    Hidden members and a Mac-made zip's `__MACOSX` fork do not count. A 7z or
+    rar listing does not mark folders, so an archive of empty folders still
+    passes here and fails at extraction; an empty or junk-only one is refused
+    before the launch.
+
+    Args:
+        archive: The archive.
+
+    Returns:
+        True when a member could be a game file; a refusal is logged.
+    """
+    try:
+        members = extraction_cache.list_members(archive, ARCHIVE_LIST_TIMEOUT)
+    except RuntimeError as exc:
+        log.warning("scummvm: could not list %s: %s", archive.name, exc)
+        return False
+    for member in members:
+        parts = PurePosixPath(member.replace("\\", "/")).parts
+        if member.endswith("/") or not parts:
+            continue
+        if not any(part.startswith(".") or part == "__MACOSX" for part in parts):
+            return True
+    log.warning("scummvm: %s holds no game files", archive.name)
+    return False
+
+
+def _lone_archive(folder: Path) -> Optional[Path]:
+    """The archive a game folder holds in place of the game's files, or None.
+
+    Only a folder whose sole content, marker files aside, is one archive
+    qualifies. An archive beside anything else (a manual, an extras bundle)
+    leaves the folder as the game.
+
+    Args:
+        folder: The game folder, already resolved.
+
+    Returns:
+        The archive, or None when the folder holds anything else.
+    """
+    try:
+        entries = [e for e in _visible_entries(folder) if e.suffix.lower() not in _MARKER_EXTS]
+        if len(entries) != 1 or entries[0].suffix.lower() not in _ARCHIVE_EXTS or not entries[0].is_file():
+            return None
+    except OSError as exc:
+        log.warning("scummvm: could not list %s: %s", folder, exc)
+        return None
+    return entries[0]
+
+
+_CACHE = ExtractionCache(
+    name="scummvm",
+    cache_dir=lambda: CACHE_DIR,
+    enabled=lambda: settings.SCUMMVM_CACHE_ENABLED,
+    max_gb=lambda: CACHE_MAX_GB,
+    find_boot_target=_extracted_game_dir,
+    missing_target_error="held no game files",
+)
+"""Extracts archived games into CACHE_DIR, one folder per archive, reused on every later launch."""
+
+
+def _is_archive(rom: Path) -> bool:
+    """Whether `rom` is an archived game rather than a game folder or marker.
+
+    Args:
+        rom: What `resolve_rom_file` returned.
+
+    Returns:
+        True for an archive file.
+    """
+    return rom.suffix.lower() in _ARCHIVE_EXTS and rom.is_file()
+
+
+def _game_dir(rom: Path, emu: Emulator) -> Path:
+    """The folder to register for `rom`, extracting an archived game into the cache first.
+
+    Args:
+        rom: What `resolve_rom_file` returned.
+        emu: The launcher, whose `extraction_phase` reports a first extraction.
+
+    Returns:
+        `rom` itself for a folder, or the game folder inside its extraction.
+
+    Raises:
+        RuntimeError: When the archive cannot be extracted or holds nothing.
+    """
+    if not _is_archive(rom):
+        return rom
+    game = _CACHE.extract(rom, emu)
+    # Rewritten on every launch, so a record lost to a failed write comes
+    # back. Without it a re-upload's old extraction is indistinguishable from
+    # another copy, and blocks the new one.
+    try:
+        root = _extraction_root(game)
+        if root is not None:
+            (root / _SOURCE_FILE).write_text(str(rom.resolve()))
+    except OSError as exc:
+        log.warning("scummvm: could not record the source of %s's extraction: %s", rom.name, exc)
+    return game
+
+
+def _cached_game_dir(rom: Path) -> Optional[Path]:
+    """The folder registered for `rom`, without extracting anything.
+
+    Args:
+        rom: What `resolve_rom_file` returned.
+
+    Returns:
+        `rom` itself for a folder, the game folder of an archive extracted
+        earlier, or None for an archive not extracted yet.
+    """
+    if not _is_archive(rom):
+        return rom
+    try:
+        extracted = CACHE_DIR / extraction_cache._cache_key(rom)
+    except RuntimeError:
+        return None
+    return _extracted_game_dir(extracted) if extracted.is_dir() else None
+
+
+def sweep_stale_extractions() -> None:
+    """Remove extraction scratch dirs orphaned by a crashed broker process.
+
+    Call once at broker startup, so the space is reclaimed before the first
+    launch rather than only when the next extraction happens to run.
+    """
+    try:
+        _CACHE.sweep_stale_extractions()
+    except RuntimeError as exc:
+        log.warning("scummvm cache: startup scratch sweep skipped: %s", exc)
 
 
 def slot_names(target: str, slot: int) -> tuple[str, ...]:
@@ -875,13 +1140,19 @@ def _match_name(stem: str, names: list[str]) -> Optional[str]:
     return next((name for name in names if name.casefold() == folded), None)
 
 
+_NO_GAME_KEY = ("scummvm", "no_game")
+"""Memo key for why `_session_game` found no game, when that is not a detection miss."""
+
+
 def _session_game(emu: Emulator, ctx: imports.ImportCtx) -> tuple[Optional[str], list[str]]:
     """Work out the target the session boots, and every name a save may carry.
 
-    This is what `launch` will do, in the same order: look the folder up, and
-    register it when it is not there. It runs once per preflight, and it can
-    take as long as a detection pass. Registering writes `scummvm.ini`, which a
-    refused import leaves behind, exactly as a refused launch would.
+    This is what `launch` will do, in the same order: extract an archived
+    game, look the folder up, and register it when it is not there. It runs
+    once per preflight, and it can take as long as an extraction and a
+    detection pass. Registering writes `scummvm.ini`, and extracting fills the
+    cache, both of which a refused import leaves behind, exactly as a refused
+    launch would; the launch after an accepted one reuses both.
 
     Args:
         emu: The emulator, carrying the activate payload's languages.
@@ -898,6 +1169,13 @@ def _session_game(emu: Emulator, ctx: imports.ImportCtx) -> tuple[Optional[str],
     target: Optional[str] = None
     names: list[str] = []
     rom_dir = ctx.rom_file
+    if rom_dir is not None:
+        try:
+            rom_dir = _game_dir(rom_dir, emu)
+        except RuntimeError as exc:
+            log.warning("scummvm: import preflight could not extract %s: %s", rom_dir, exc)
+            ctx.memo[_NO_GAME_KEY] = f"the archived game could not be extracted: {exc}"
+            rom_dir = None
     if rom_dir is not None:
         language = _wanted_language(emu)
         target = target_for_path(rom_dir, language)
@@ -935,7 +1213,7 @@ def _split_name(
 
 
 def _game_name(
-    member: imports.ImportMember, stem: str, expected: str, names: list[str]
+    member: imports.ImportMember, stem: str, expected: str, names: list[str], ctx: imports.ImportCtx
 ) -> Union[str, imports.ImportRefusal]:
     """Hold a member's stem to the game the session runs.
 
@@ -944,6 +1222,8 @@ def _game_name(
         stem: Its stem.
         expected: The accepted shape, in words.
         names: The session's names, from `_session_game`.
+        ctx: The launch context, whose memo says why there is no game when
+            an archived one would not extract.
 
     Returns:
         The name to file it under, as the ini spells it, or `identity_unknown`
@@ -951,7 +1231,10 @@ def _game_name(
     """
     if not names:
         return imports.ImportRefusal(
-            "identity_unknown", member.name, expected, detail="ScummVM detects no game in this rom folder"
+            "identity_unknown",
+            member.name,
+            expected,
+            detail=ctx.memo.get(_NO_GAME_KEY) or "ScummVM detects no game in this rom folder",
         )
     matched = _match_name(stem, names)
     if matched is None:
@@ -988,7 +1271,7 @@ def _place_save(
     if isinstance(split, imports.ImportRefusal):
         return split
     target, names = _session_game(emu, ctx)
-    named = _game_name(member, split[0], _SAVE_EXPECTED, names)
+    named = _game_name(member, split[0], _SAVE_EXPECTED, names, ctx)
     if isinstance(named, imports.ImportRefusal):
         return named
     dest = imports.build_dest("saves", (), (f"{named}.{split[1]}",), member=member, expected=_SAVE_EXPECTED)
@@ -1026,7 +1309,7 @@ def _place_state(
     if isinstance(split, imports.ImportRefusal):
         return split
     target, names = _session_game(emu, ctx)
-    named = _game_name(member, split[0], _STATE_EXPECTED, names)
+    named = _game_name(member, split[0], _STATE_EXPECTED, names, ctx)
     if isinstance(named, imports.ImportRefusal):
         return named
     slot_ext = f"s{STATE_SLOT:02d}" if split[1].startswith("s") else f"{STATE_SLOT:03d}"
@@ -1087,13 +1370,6 @@ class Scummvm(Emulator):
     """Empty on purpose: ScummVM has no state format, so its states are saves
     living beside the game's own, and `save_file_kind` is what tells them apart."""
     clears_stale_saves = True
-    rom_extensions = (".scummvm",)
-    """The marker file some libraries put in a game folder.
-
-    A ScummVM game is the folder itself, so this is only what a ROM pointing at
-    a single file is allowed to be; the folder holding it is what gets
-    registered either way.
-    """
     supports_states = True
     state_slot = STATE_SLOT
     state_dir = SAVE_DIR
@@ -1104,7 +1380,7 @@ class Scummvm(Emulator):
         """Start with no game folder, no target, and no launch behind it."""
         super().__init__()
         self._rom_dir: Optional[Path] = None
-        """The folder `resolve_rom_file` picked, which `launch` registers."""
+        """What `resolve_rom_file` picked: the folder `launch` registers, or an archive it extracts first."""
         self._target: Optional[str] = None
         """The target the running game booted under, and every save is named after.
 
@@ -1114,36 +1390,52 @@ class Scummvm(Emulator):
         self._launch_seq = 0
         """Bumped per launch, so a deferred resume can tell it has been superseded."""
 
-    def resolve_rom_file(self, path: Path) -> Optional[Path]:
-        """Resolve a RomM path to the game folder to register.
+    @property
+    def rom_extensions(self) -> tuple[str, ...]:
+        """The loose files a ROM may point at: the marker, and archives while the cache is on.
 
-        Kept cheap: this runs on the event loop, while the detection pass that
-        can actually answer "is there a game in here" takes seconds and runs in
-        `launch`. A folder that holds files is accepted here and only a folder
-        ScummVM detects nothing in fails, later, as a launch failure.
+        A ScummVM game is the folder itself, so a marker only stands for the
+        folder holding it, and an archive is booted from its extraction.
+        """
+        if settings.SCUMMVM_CACHE_ENABLED:
+            return _MARKER_EXTS + _ARCHIVE_EXTS
+        return _MARKER_EXTS
+
+    def resolve_rom_file(self, path: Path) -> Optional[Path]:
+        """Resolve a RomM path to the game folder to register, or the archive to extract.
+
+        Kept cheap: the detection pass that can actually answer "is there a
+        game in here" takes seconds, and extracting an archive can take
+        longer, so both run in `launch`. A folder that holds files is accepted
+        here and only a folder ScummVM detects nothing in fails, later, as a
+        launch failure.
 
         Args:
-            path: The ROM as RomM delivered it: the game folder, or a file
-                inside it (a `.scummvm` marker, or the single file a library
-                pointed at).
+            path: The ROM as RomM delivered it: the game folder, a file inside
+                it (a `.scummvm` marker, or the single file a library pointed
+                at), or an archived game.
 
         Returns:
-            The game folder, or None when the path is a file this launcher
-            does not recognise, is outside the ROM root, is not a folder, or
-            holds nothing to detect.
+            The game folder, or the archive when the game is archived (a loose
+            one, or the only thing in its folder). None when the path is a
+            file this launcher does not recognise, an archive with the cache
+            off, outside the ROM root, not a folder, or holds nothing to
+            detect.
         """
         self._rom_dir = None
-        if not path.is_dir() and path.suffix.lower() not in self.rom_extensions:
+        suffix = path.suffix.lower()
+        if not path.is_dir() and suffix in _ARCHIVE_EXTS:
+            return self._resolve_archive(path)
+        if not path.is_dir() and suffix not in _MARKER_EXTS:
             # Falling through to `path.parent` here would register whatever
             # directory the file happens to sit in. For a library laid out as
             # <root>/<platform>/<file>, that is the platform folder: `--add`
             # would scan every game in it and boot whichever target sorts
             # first. A wrong game is worse than a refused launch.
             log.warning(
-                "scummvm: %s is not a game folder or a %s marker; ScummVM games "
-                "are folders, extract an archived one first",
+                "scummvm: %s is not a game folder or a %s marker; ScummVM games are folders",
                 path,
-                " or ".join(self.rom_extensions),
+                " or ".join(_MARKER_EXTS),
             )
             return None
         rom_dir = path if path.is_dir() else path.parent
@@ -1160,8 +1452,48 @@ class Scummvm(Emulator):
         except OSError as exc:
             log.warning("scummvm: could not read %s: %s", rom_dir, exc)
             return None
+        archive = _lone_archive(resolved)
+        if archive is not None:
+            return self._resolve_archive(archive)
         self._rom_dir = resolved
         log.debug("scummvm: resolved rom folder %s", resolved)
+        return resolved
+
+    def _resolve_archive(self, archive: Path) -> Optional[Path]:
+        """Accept an archived game for `launch` to extract.
+
+        Args:
+            archive: The archive, a loose ROM file or the lone file in its folder.
+
+        Returns:
+            The resolved archive, or None when the cache is off, it is not a
+            file, it resolves outside the ROM root, or its listing names no
+            game files.
+        """
+        if not settings.SCUMMVM_CACHE_ENABLED:
+            log.warning(
+                "scummvm: refusing %s, an archived game needs the extraction cache "
+                "(set SCUMMVM_CACHE_ENABLED=true, or extract it into a folder)",
+                archive.name,
+            )
+            return None
+        try:
+            resolved = archive.resolve()
+            # Defense in depth, as for a folder: this is the file about to be
+            # opened and extracted, whatever path the caller handed over.
+            if not resolved.is_relative_to(ROM_ROOT.resolve()):
+                log.warning("scummvm: %s resolves outside %s", archive, ROM_ROOT)
+                return None
+            if not resolved.is_file():
+                log.warning("scummvm: %s is not a file", archive)
+                return None
+        except OSError as exc:
+            log.warning("scummvm: could not read %s: %s", archive, exc)
+            return None
+        if not _archive_holds_files(resolved):
+            return None
+        self._rom_dir = resolved
+        log.debug("scummvm: resolved archived game %s", resolved)
         return resolved
 
     def _xdotool(self, *args: str, quiet: bool = False) -> Optional[str]:
@@ -1337,18 +1669,23 @@ class Scummvm(Emulator):
         `--save-slot`; otherwise a deferred thread waits for RomM's push and
         loads it over the menu.
 
+        An archived game is extracted into the cache first (or its earlier
+        extraction reused), and the game folder inside it is what gets
+        registered.
+
         Args:
-            rom_path: The game folder, as returned by `resolve_rom_file`.
+            rom_path: The game folder or archive, as returned by `resolve_rom_file`.
             resume_slot: The slot to resume from, or None to boot clean.
 
         Raises:
-            RuntimeError: When no ROM folder was resolved, or ScummVM detects
-                no game in it.
+            RuntimeError: When no ROM folder was resolved, an archive could
+                not be extracted, or ScummVM detects no game in it.
         """
         self.stop()
         rom_dir = rom_path or self._rom_dir
         if rom_dir is None:
             raise RuntimeError("scummvm: no game folder to launch")
+        rom_dir = _game_dir(rom_dir, self)
 
         self._launch_seq += 1
         seq = self._launch_seq
@@ -1770,12 +2107,16 @@ class Scummvm(Emulator):
         informational, so an unregistered folder reads as no identity.
 
         Args:
-            rom: The game folder.
+            rom: The game folder, or an archived game.
 
         Returns:
-            The target, or None when the ini has no domain for the folder.
+            The target, or None when the ini has no domain for the folder, or
+            the archive has not been extracted yet.
         """
-        return target_for_path(rom, _wanted_language(self))
+        rom_dir = _cached_game_dir(rom)
+        if rom_dir is None:
+            return None
+        return target_for_path(rom_dir, _wanted_language(self))
 
     def save_and_exit(self, slot: Optional[int]) -> dict[str, Any]:
         """Save through the menu if asked, then stop ScummVM.
