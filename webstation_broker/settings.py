@@ -154,6 +154,22 @@ state's thumbnail.
 DEV_MODE = os.environ.get("BROKER_DEV_MODE", "").lower() == "true"
 """Whether dev mode is on, from `BROKER_DEV_MODE` (default off; only the string `true` enables it)."""
 
+FRAME_ANCESTORS = os.environ.get("BROKER_FRAME_ANCESTORS", "").strip()
+"""Who may embed the room, from `BROKER_FRAME_ANCESTORS` (default unset: anyone).
+
+A CSP `frame-ancestors` source list, e.g. `'self'` when RomM serves the room
+under its own `SUBFOLDER`, or `https://romm.example.com` when it embeds the
+room cross-origin. Unset by default, since the right value depends on how
+RomM is deployed and a wrong one blanks the player.
+"""
+
+CSP_ENFORCE = truthy(os.environ.get("BROKER_CSP_ENFORCE"))
+"""Whether the room page's Content-Security-Policy is enforced, from `BROKER_CSP_ENFORCE`.
+
+Default off: the policy is sent as `Content-Security-Policy-Report-Only`, so a
+page it would break still works and the violation shows in the browser console.
+"""
+
 GAMEPAD_SLOTS = int(os.environ.get("BROKER_GAMEPAD_SLOTS", "4"))
 """Number of virtual gamepad slots, from `BROKER_GAMEPAD_SLOTS` (default `4`)."""
 
