@@ -2253,6 +2253,76 @@ async def put_memory_card(
     return {"status": "ok", "written": result.written, "unread": list(result.unread), "slot": 1}
 
 
+def check_emulator_alive(reported: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Log once when the open session's emulator has exited on its own.
+
+    Exit code 0 is a clean quit, usually the player leaving from the emulator's
+    own menu or quitting the desktop, and is a WARNING. Anything else, a signal
+    or an error code, is a crash and an ERROR. Either way the session is left
+    with nothing playing.
+
+    Nothing is torn down: the saves the emulator wrote before it went are still
+    on disk, and exiting the session from RomM is what dumps and uploads them.
+    Skipped while a session operation holds `_SESSION_LOCK`, because exit and
+    the state routes stop or restart the emulator on purpose.
+
+    Args:
+        reported: The session record already logged, so one crash is one line.
+            Matched by identity, not by id: RomM supplies the id and may reuse
+            it, while every activate builds a new record.
+
+    Returns:
+        The session record logged so far: `reported`, or the current session
+        when this call logged it.
+    """
+    sess = session.SESSION
+    if sess is None or not sess.get("active") or sess is reported or _SESSION_LOCK.locked():
+        return reported
+    emulator = sess["emulator_obj"]
+    if emulator.alive():
+        return reported
+    rom = sess.get("rom") or {}
+    log.log(
+        logging.WARNING if emulator.exit_code == 0 else logging.ERROR,
+        "emulator watch: session %s: %s exited while the session was open (exit code %s, rom %s); "
+        "exit the session from RomM to save and upload what it wrote",
+        sess["id"],
+        emulator.name,
+        emulator.exit_code,
+        rom.get("name") or sess.get("rom_file") or "-",
+    )
+    return sess
+
+
+async def watch_emulator_forever(interval: float) -> None:
+    """Run `check_emulator_alive` every `interval` seconds until cancelled.
+
+    A check that raises is logged as an ERROR once, then at DEBUG until one
+    succeeds again.
+
+    Args:
+        interval: Seconds between checks.
+    """
+    reported: Optional[dict[str, Any]] = None
+    failing = False
+    while True:
+        await anyio.sleep(interval)
+        try:
+            reported = check_emulator_alive(reported)
+        except Exception:
+            # A watch that dies quietly is worse than none, so it keeps going;
+            # a failure that repeats every tick is logged once, not every tick.
+            if failing:
+                log.debug("emulator watch: check still failing", exc_info=True)
+            else:
+                log.exception("emulator watch: check failed")
+            failing = True
+            continue
+        if failing:
+            log.info("emulator watch: check recovered")
+            failing = False
+
+
 @router.get("/api/session/status")
 async def status(x_broker_secret: Optional[str] = Header(default=None)) -> dict[str, Any]:
     """Report the current session, or that there is none.
