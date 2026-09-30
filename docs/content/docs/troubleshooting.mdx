@@ -80,6 +80,31 @@ Xenia never reaches the game, or seems to hang on launch: no Xbox Live
 profile exists yet. Launch Xenia once from the desktop and create one through
 its "No Profiles Found" prompt before launching anything through RomM.
 
+## The game froze mid-session and the emulator is gone
+
+When an emulator crashes or is quit while a session is open, the stream
+freezes and the broker logs one line for that session:
+
+```text
+emulator watch: session 3f2a...: pcsx2 exited while the session was open (exit code -11, rom Game); exit the session from RomM to save and upload what it wrote
+```
+
+The session stays open on purpose. The saves the emulator wrote before it
+went are still on disk, and exiting the session from RomM is what dumps them
+and uploads them. Exit it as soon as you see this.
+
+The exit code says how the emulator ended, and sets the line's level:
+
+| Exit code | Level | What it means |
+| --- | --- | --- |
+| `0` | `WARNING` | A clean quit, usually a player leaving from the emulator's own menu or quitting the desktop. Nothing crashed; the session just has nothing left to play. |
+| negative | `ERROR` | A signal killed it: `-11` is a segfault, `-9` a forced kill, often the kernel's out-of-memory killer. |
+| positive | `ERROR` | The emulator's own error code. Read the log just above the line for its own messages. |
+
+The check runs every 15 seconds by default (`BROKER_EMULATOR_WATCH_INTERVAL`).
+It skips a check while an exit, launch or state operation is running, since
+those stop or restart the emulator on purpose.
+
 ## A controller isn't working
 
 Desktop sessions and single-game launches share the exact same controller
@@ -95,6 +120,12 @@ that loads then sits dead, assets 404ing, camera/mic being refused instantly,
 invite links falling back to a manual copy box, or a broker-secret 403. All
 of these already have a full writeup. See [Reverse proxy
 troubleshooting](/docs/deployment/troubleshooting).
+
+## Save uploads failing without anyone noticing
+
+The broker keeps a save archive RomM did not take, so nothing is lost, but it
+tells nobody. [Monitoring](/docs/deployment/monitoring) sets up a check that
+does, and explains every alert it raises.
 
 ## Where to look next
 

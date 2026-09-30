@@ -607,6 +607,7 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
             path that cannot be resolved or lies outside ROM_ROOT; 404 for a
             rom path or save archive that does not exist.
     """
+    started = time.monotonic()
     if session.SESSION is not None and session.SESSION.get("active"):
         log.warning(
             "activate refused: session %s is already active", session.SESSION.get("id")
@@ -937,6 +938,14 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     sess["save_baseline"] = time.time()
 
     tokens_pushed = await _push_seat_tokens(sess, "activate")
+    log.info(
+        "activate: session %s launched %s in %.1fs (restored %d save file(s), tokens pushed: %s)",
+        sess["id"],
+        body.emulator,
+        time.monotonic() - started,
+        restore_report["written"] + len(restore_report["imported"]) if restore_report else 0,
+        tokens_pushed,
+    )
 
     # core_identity() also carries library_name, which belongs in the exit
     # manifest but not here: only core and its tier are activate's contract.
@@ -1303,6 +1312,7 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
     Raises:
         HTTPException: 409 when no session is active.
     """
+    started = time.monotonic()
     sess = session.SESSION
     if sess is None or not sess.get("active"):
         log.debug("exit refused: no active session")
@@ -1430,6 +1440,27 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
     report["selkies_tokens_cleared"] = await _clear_seat_tokens(sess["id"])
     session.retire_session()
     log.info("exit report: %s", report)
+    duration = time.monotonic() - started
+    session.LAST_OUTCOME = {
+        "session_id": sess["id"],
+        "ended_at": time.time(),
+        "duration_s": round(duration, 1),
+        "state_saved": bool(exit_report.get("state_saved")),
+        "dump_error": dump["error"],
+        "upload": upload["mode"],
+        "archive_path": archive_path,
+    }
+    # One fixed-shape line per exit, so an alert can match `upload=failed`
+    # without parsing the report dict above.
+    log.log(
+        logging.WARNING if upload["mode"] == "failed" else logging.INFO,
+        "exit: session %s done in %.1fs: state_saved=%s upload=%s kept=%s",
+        sess["id"],
+        duration,
+        session.LAST_OUTCOME["state_saved"],
+        upload["mode"],
+        archive_path or "-",
+    )
     return report
 
 
@@ -2202,25 +2233,97 @@ async def put_memory_card(
     return {"status": "ok", "written": result.written, "unread": list(result.unread), "slot": 1}
 
 
+def check_emulator_alive(reported: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Log once when the open session's emulator has exited on its own.
+
+    Exit code 0 is a clean quit, usually the player leaving from the emulator's
+    own menu or quitting the desktop, and is a WARNING. Anything else, a signal
+    or an error code, is a crash and an ERROR. Either way the session is left
+    with nothing playing.
+
+    Nothing is torn down: the saves the emulator wrote before it went are still
+    on disk, and exiting the session from RomM is what dumps and uploads them.
+    Skipped while a session operation holds `_SESSION_LOCK`, because exit and
+    the state routes stop or restart the emulator on purpose.
+
+    Args:
+        reported: The session record already logged, so one crash is one line.
+            Matched by identity, not by id: RomM supplies the id and may reuse
+            it, while every activate builds a new record.
+
+    Returns:
+        The session record logged so far: `reported`, or the current session
+        when this call logged it.
+    """
+    sess = session.SESSION
+    if sess is None or not sess.get("active") or sess is reported or _SESSION_LOCK.locked():
+        return reported
+    emulator = sess["emulator_obj"]
+    if emulator.alive():
+        return reported
+    rom = sess.get("rom") or {}
+    log.log(
+        logging.WARNING if emulator.exit_code == 0 else logging.ERROR,
+        "emulator watch: session %s: %s exited while the session was open (exit code %s, rom %s); "
+        "exit the session from RomM to save and upload what it wrote",
+        sess["id"],
+        emulator.name,
+        emulator.exit_code,
+        rom.get("name") or sess.get("rom_file") or "-",
+    )
+    return sess
+
+
+async def watch_emulator_forever(interval: float) -> None:
+    """Run `check_emulator_alive` every `interval` seconds until cancelled.
+
+    A check that raises is logged as an ERROR once, then at DEBUG until one
+    succeeds again.
+
+    Args:
+        interval: Seconds between checks.
+    """
+    reported: Optional[dict[str, Any]] = None
+    failing = False
+    while True:
+        await anyio.sleep(interval)
+        try:
+            reported = check_emulator_alive(reported)
+        except Exception:
+            # A watch that dies quietly is worse than none, so it keeps going;
+            # a failure that repeats every tick is logged once, not every tick.
+            if failing:
+                log.debug("emulator watch: check still failing", exc_info=True)
+            else:
+                log.exception("emulator watch: check failed")
+            failing = True
+            continue
+        if failing:
+            log.info("emulator watch: check recovered")
+            failing = False
+
+
 @secret_router.get("/api/session/status")
 async def status() -> dict[str, Any]:
     """Report the current session, or that there is none.
 
     Returns:
-        `{"active": False}` when no session exists. Otherwise the session's
+        `{"active": False, "last_exit": ...}` when no session exists. Otherwise the session's
         `active` flag, `session_id`, `emulator`, `rom`, `rom_file` and
         `multiplayer` flag, whether the process is `emulator_alive`, the
         emulator's `boot_failed`, `extraction_phase`, `supports_states` and
         `state_slot` signals, `started_at`, the controlling `user` and the
-        seated `viewers`.
+        seated `viewers`. Both shapes carry `last_exit`, how the most recent
+        exit of this broker process ended, or None before the first one.
 
     Raises:
         HTTPException: 403 on a bad secret.
     """
     sess = session.SESSION
     if sess is None:
-        return {"active": False}
+        return {"active": False, "last_exit": session.LAST_OUTCOME}
     return {
+        "last_exit": session.LAST_OUTCOME,
         "active": sess.get("active", False),
         "session_id": sess["id"],
         "emulator": sess["emulator"],

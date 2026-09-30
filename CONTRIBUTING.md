@@ -5,8 +5,9 @@ Thanks for looking at romm-broker. A few ground rules before you open a PR.
 ## Workflow
 
 - Branch off `master`; open PRs against `master`. Don't push to `master` directly.
-- Link the issue your PR addresses: `Fixes #XXXX` for a bug fix, `Closes #XXXX`
-  for a feature, in the PR description.
+- If an issue already exists for what your PR resolves, link it in the PR
+  description: `Fixes #XXXX` for a bug fix, `Closes #XXXX` for a feature. A PR
+  with no existing issue doesn't need one opened first.
 - Keep commit messages short, concise, and accurate: what changed and why, no
   filler.
 - Every commit must be signed, so GitHub marks it Verified. `commit.gpgsign` is
