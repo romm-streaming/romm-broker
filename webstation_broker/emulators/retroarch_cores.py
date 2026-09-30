@@ -320,7 +320,7 @@ def load_bundled_catalog(installed: frozenset[str] = frozenset()) -> Catalog:
 
 
 LIBRARY_NAME_FIXES: Mapping[str, str] = MappingProxyType(
-    {"dolphin": "dolphin-emu", "vecx": "VecX", "freeintv": "freeintv"}
+    {"dolphin": "dolphin-emu", "vecx": "VecX", "freeintv": "freeintv", "same_cdi": "SAME_CDI"}
 )
 """Cores whose real `library_name` (from their own source) differs from core-info's `corename`."""
 

@@ -382,6 +382,13 @@
     "save_ram": false,
     "extensions": [".zip", ".7z"]
   },
+  "philips-cd-i": {
+    "core": "same_cdi",
+    "library_name": "SAME_CDI",
+    "save_ram": false,
+    "extensions": [".chd", ".cue", ".iso"],
+    "savestate": false
+  },
   "pc-fx": {
     "core": "mednafen_pcfx",
     "save_ram": false,
@@ -451,6 +458,12 @@
     "library_name": "Beetle WonderSwan",
     "extensions": [".pc2", ".zip"],
     "extra_extensions": [".zip"]
+  },
+  "ti-83": {
+    "core": "numero",
+    "library_name": "Numero",
+    "save_ram": false,
+    "extensions": [".8xp", ".8xk", ".8xg"]
   },
   "epoch-super-cassette-vision": {
     "core": "emuscv",
