@@ -113,6 +113,17 @@ activate unless the payload supplies one.
 SAVE_UPLOAD_TIMEOUT = float(os.environ.get("BROKER_SAVE_UPLOAD_TIMEOUT", "30"))
 """Seconds allowed for the exit upload, from `BROKER_SAVE_UPLOAD_TIMEOUT` (default `30`)."""
 
+RA_LOGIN_TIMEOUT = float(os.environ.get("BROKER_RA_LOGIN_TIMEOUT", "10"))
+"""Seconds allowed for the exit's login report, from `BROKER_RA_LOGIN_TIMEOUT` (default `10`)."""
+
+RA_LOGIN_PATH = os.environ.get("BROKER_RA_LOGIN_PATH", "/api/webstation/retroachievements")
+"""Where a changed RetroAchievements login is reported on exit, from `BROKER_RA_LOGIN_PATH`
+(default `/api/webstation/retroachievements`).
+
+Appended to the callback base URL, like `SAVE_UPLOAD_PATH`, and sent with the
+same bearer token.
+"""
+
 EMULATOR_WATCH_INTERVAL = float(os.environ.get("BROKER_EMULATOR_WATCH_INTERVAL", "15"))
 """Seconds between checks that the session's emulator is still running, from
 `BROKER_EMULATOR_WATCH_INTERVAL` (default `15`); `0` turns the watch off.

@@ -65,6 +65,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import zipfile
@@ -75,8 +76,17 @@ from typing import Any, Callable, Optional, Union
 import httpx
 
 from .. import imports, settings
-from . import extraction_cache, retroarch_cores, wii_nand
-from .base import Emulator, _record_pid, base_launch_env, disc_number, xdg_config_dir
+from . import extraction_cache, retroarch_cores, retroarch_credentials, wii_nand
+from .base import (
+    RA_CREDENTIAL_RE,
+    Emulator,
+    RetroAchievementsChange,
+    RetroAchievementsLogin,
+    _record_pid,
+    base_launch_env,
+    disc_number,
+    xdg_config_dir,
+)
 from .retroarch_cores import safe_dir_name
 
 log = logging.getLogger(__name__)
@@ -904,16 +914,20 @@ def _write_core_options(options: dict[str, str]) -> Path:
     return CORE_OPTIONS_CFG
 
 
-def _write_broker_cfg() -> Path:
+def _write_broker_cfg(login: Optional[RetroAchievementsLogin] = None) -> Path:
     """Write the minimal per-launch config, applied *on top of* the user's config.
 
     The stdin interface, the system dir, the broker save dirs and how saves
-    are sorted inside them, and the joypad driver the streamed pads need;
-    nothing else. Save thumbnails are off: the frame RomM
-    files beside a state comes from the broker's own capture, and the
-    framebuffer grab RetroArch would do instead deadlocks GPU-rendered cores.
-    The broker data directories are created first, and the file is written
-    through a temp file.
+    are sorted inside them, the joypad driver the streamed pads need, and the
+    player's RetroAchievements login; nothing else. Save thumbnails are off:
+    the frame RomM files beside a state comes from the broker's own capture,
+    and the framebuffer grab RetroArch would do instead deadlocks GPU-rendered
+    cores. The broker data directories are created first, and the file is
+    written owner-only through a temp file, since it can hold a login token.
+
+    Args:
+        login: The controlling player's RetroAchievements login, or None to
+            pin the credentials empty.
 
     Returns:
         The path of the written config, `BROKER_CFG`.
@@ -958,10 +972,125 @@ def _write_broker_cfg() -> Path:
     )
     if JOYPAD_DRIVER:
         cfg += f'input_joypad_driver = "{JOYPAD_DRIVER}"\n'
+    # Always stated, empty when RomM sent no login, so a login some earlier
+    # session left in the user's config or keychain is never the one used.
+    # The password stays empty: RetroArch logs in with the token alone, and a
+    # player logging in from the menu gets a token back. cheevos_enable is
+    # left to the player.
+    username, token = (login.username, login.token) if login is not None else ("", "")
+    cfg += (
+        f'cheevos_username = "{username}"\n'
+        f'cheevos_token = "{token}"\n'
+        'cheevos_password = ""\n'
+    )
     tmp = BROKER_CFG.with_suffix(".tmp")
-    tmp.write_text(cfg)
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(cfg)
     os.replace(tmp, BROKER_CFG)
     return BROKER_CFG
+
+
+def _ra_login_change(
+    injected: Optional[RetroAchievementsLogin], saved: Optional[RetroAchievementsLogin]
+) -> Optional[RetroAchievementsChange]:
+    """Compare the login RetroArch saved with the one this launch pinned.
+
+    Args:
+        injected: The login the launch pinned, or None for none.
+        saved: What `retroarch_credentials.read_saved_login` found, or None
+            when RetroArch saved nothing readable.
+
+    Returns:
+        The change to report, or None when the login is unchanged or unknown.
+        A saved login with an empty token reads as logged out: RetroArch blanks
+        a token RetroAchievements rejects.
+    """
+    if saved is None:
+        return None
+    ended = saved if saved.token else None
+    if ended is not None and not (
+        RA_CREDENTIAL_RE.match(ended.username) and RA_CREDENTIAL_RE.match(ended.token)
+    ):
+        # RomM would send it back on the next activate, which refuses it, and
+        # every later launch for this player would fail with a 422.
+        log.warning("ra login capture: the saved login has characters the broker cannot pin")
+        return None
+    if ended == injected:
+        return None
+    if ended is None:
+        log.info("ra login capture: the player's login was cleared")
+    else:
+        log.info("ra login capture: the player is now logged in as %s", ended.username)
+    return RetroAchievementsChange(login=ended)
+
+
+RA_CREDENTIAL_LINE = re.compile(rb"^\s*(?:cheevos_username|cheevos_password|cheevos_token)\s*=")
+"""A config line holding a RetroAchievements credential, whatever its spacing or value."""
+
+
+def _scrub_ra_credentials() -> None:
+    """Delete every RetroAchievements credential line from RetroArch's own config files.
+
+    RetroArch saves its whole config on exit, so the login `broker.cfg`
+    injected ends up in the shared `retroarch.cfg` (1.22.x) or, sealed, in
+    `retroarch-keychain.cfg` beside it (later releases). Deleting the line
+    works whether the value is plaintext or sealed, so no key is needed.
+
+    Every other line is kept byte for byte, as are the file's permissions. A
+    file with nothing to remove is not rewritten. A failure is logged and
+    swallowed: the empty pins in `broker.cfg` still keep a leftover login
+    from being used.
+    """
+    for path in (RA_CONFIG_PATH, RA_CONFIG_PATH.parent / retroarch_credentials.KEYCHAIN_CFG):
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            log.warning("ra credentials: could not read %s: %s", path, exc)
+            continue
+        lines = data.splitlines(keepends=True)
+        kept = [line for line in lines if not RA_CREDENTIAL_LINE.match(line)]
+        removed = len(lines) - len(kept)
+        if not removed:
+            continue
+        if kept and not kept[-1].endswith(b"\n"):
+            kept[-1] += b"\n"
+        tmp_name = None
+        try:
+            mode = path.stat().st_mode & 0o7777
+            with tempfile.NamedTemporaryFile(
+                dir=path.parent, prefix=f".{path.name}.", delete=False
+            ) as fh:
+                tmp_name = fh.name
+                fh.write(b"".join(kept))
+            os.chmod(tmp_name, mode)
+            os.replace(tmp_name, path)
+        except OSError as exc:
+            log.warning("ra credentials: could not scrub %s: %s", path, exc)
+            if tmp_name is not None:
+                Path(tmp_name).unlink(missing_ok=True)
+            continue
+        log.info("ra credentials: removed %d line(s) from %s", removed, path)
+
+
+def clear_ra_login(only_if_pinned: bool = False) -> None:
+    """Take every RetroAchievements login off disk: RetroArch's saved one and the `broker.cfg` pin.
+
+    Args:
+        only_if_pinned: Leave `broker.cfg` alone when it does not exist yet,
+            as at startup, where there may be no RetroArch data directory to
+            write it into.
+    """
+    _scrub_ra_credentials()
+    if only_if_pinned and not BROKER_CFG.exists():
+        return
+    try:
+        _write_broker_cfg()
+    except OSError as exc:
+        log.warning("ra credentials: could not blank %s: %s", BROKER_CFG, exc)
 
 
 def _state_suffix(slot: int) -> str:
@@ -2743,7 +2872,6 @@ class Retroarch(Emulator):
         )
         self._resume_settle = info.get("resume_settle", RESUME_LOAD_SETTLE)
         self._state_confirm_wait = info.get("state_confirm_wait", STATE_CONFIRM_WAIT)
-        cfg_path = _write_broker_cfg()
 
         env = base_launch_env()
         binary = os.environ.get("RETROARCH_BIN", "retroarch")
@@ -2752,6 +2880,8 @@ class Retroarch(Emulator):
         launch_path = env.get("PATH")
         if "/" not in binary and shutil.which(binary, path=launch_path) is None:
             raise RuntimeError(f"retroarch binary not found in PATH ({launch_path}): {binary}")
+        _scrub_ra_credentials()
+        cfg_path = _write_broker_cfg(self.retroachievements)
 
         self._rom_base = rom_path.stem
         # A fresh process starts on whatever slot the config left it on.
@@ -2782,7 +2912,14 @@ class Retroarch(Emulator):
         )
         self._prelaunch_mtimes = _sorted_dir_mtimes()
         self._launch_wall = time.time()
-        self._spawn_ra(cmd, env)
+        try:
+            self._spawn_ra(cmd, env)
+        except BaseException:
+            if self._proc is None:
+                # Activate only retires the session, so no exit would come
+                # along to take the pinned login back off disk.
+                clear_ra_login()
+            raise
         self._playing_monotonic = None
         threading.Thread(target=self._track_first_playing, args=(seq,), daemon=True).start()
 
@@ -3776,6 +3913,28 @@ class Retroarch(Emulator):
                     "%s did not exit after QUIT, escalating to SIGTERM", self.name
                 )
         self.stop()
+
+    def _forget(self) -> None:
+        """Drop the handle, note how the player's login changed, then take it out of every config file.
+
+        Every path that ends with RetroArch gone runs through here, the
+        graceful `QUIT` as well as `stop`, and only once the process is
+        confirmed gone: one still running would save its config over the
+        scrub on its way out. The login is only read back when this instance
+        had a process; the `stop` every launch opens with has nothing of this
+        player's to read.
+        """
+        ran = self._proc is not None
+        super()._forget()
+        if ran:
+            try:
+                saved = retroarch_credentials.read_saved_login(RA_CONFIG_PATH)
+                self.retroachievements_change = _ra_login_change(self.retroachievements, saved)
+            except Exception:
+                # The scrub below is what keeps the next player off this
+                # one's account; a capture bug must not get in its way.
+                log.exception("ra login capture: reading RetroArch's saved login failed")
+        clear_ra_login()
 
     def stop(self) -> None:
         """Stop RetroArch, invalidating any in-flight deferred state load before the kill."""

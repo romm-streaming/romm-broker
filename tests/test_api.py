@@ -24,7 +24,16 @@ from starlette.websockets import WebSocketState
 
 from webstation_broker import api, callback, imports, room, saves, screenshot, selkies, session, settings
 from webstation_broker.app import create_app
-from webstation_broker.emulators import base, dolphin, extraction_cache, ppsspp, rpcs3, scummvm, shadps4
+from webstation_broker.emulators import (
+    base,
+    dolphin,
+    extraction_cache,
+    ppsspp,
+    retroarch,
+    rpcs3,
+    scummvm,
+    shadps4,
+)
 from webstation_broker.outbox import Outbox
 
 from .conftest import PREFIX, SLEEPER_CMD, FakeEmulator, corrupt_zip_member, mangle_zip_member
@@ -181,6 +190,274 @@ def test_activate_without_a_gui_language_leaves_it_unset(
     """A payload that names no interface language leaves the emulator's own."""
     assert _activate(client, broker_dirs).status_code == 200
     assert fake_emulator[0].gui_language is None
+
+
+def test_activate_hands_the_emulator_the_player_s_ra_login(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """The controlling player's RetroAchievements login reaches the emulator for this launch."""
+    login = {"username": "alice", "token": "tok123"}
+
+    assert _activate(client, broker_dirs, retroachievements=login).status_code == 200
+    assert fake_emulator[0].retroachievements == base.RetroAchievementsLogin(username="alice", token="tok123")
+
+
+def test_activate_without_an_ra_login_leaves_it_unset(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A payload with no login launches with none, which RetroArch pins empty."""
+    assert _activate(client, broker_dirs).status_code == 200
+    assert fake_emulator[0].retroachievements is None
+
+
+@pytest.mark.parametrize(
+    "login",
+    [
+        {"username": "alice", "token": 'SEKRIT"\ncheevos_enable = "false'},
+        {"username": 'al"ice', "token": "SEKRIT123"},
+        {"username": "", "token": "SEKRIT123"},
+        {"username": "alice", "token": ""},
+        {"username": "alice"},
+        {"token": "SEKRIT123"},
+    ],
+)
+def test_activate_refuses_an_ra_login_that_could_break_out_of_the_config(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    login: dict[str, str],
+) -> None:
+    """A login that is empty, incomplete, or carries quotes or newlines is a 422, not a launch.
+
+    Both values are written into a quoted config line, so anything past the
+    plain charset could close the quote and add keys of its own. The refusal
+    never echoes the token back, even a malformed one.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+        login: The malformed login.
+    """
+    resp = _activate(client, broker_dirs, retroachievements=login)
+    assert resp.status_code == 422
+    assert "SEKRIT" not in resp.text
+    assert not any(emu.launched for emu in fake_emulator)
+
+
+def test_a_422_for_another_field_never_echoes_the_ra_token(
+    client: TestClient, fake_emulator: list[FakeEmulator]
+) -> None:
+    """A missing top-level field echoes the whole body by default, login and all; the broker's 422 does not.
+
+    Args:
+        client: The test client.
+        fake_emulator: The registered fake emulator.
+    """
+    login = {"username": "alice", "token": "SEKRIT123"}
+    resp = client.post(f"{API}/session/activate", json={"session_id": "s", "retroachievements": login})
+
+    assert resp.status_code == 422
+    assert [err["loc"] for err in resp.json()["detail"]] == [["body", "emulator"]]
+    assert "SEKRIT" not in resp.text
+    assert not any(emu.launched for emu in fake_emulator)
+
+
+def test_the_ra_token_never_leaves_through_status_or_the_log(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The token reaches the emulator and nowhere else the broker reports to.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+        caplog: The pytest log capture fixture.
+    """
+    login = {"username": "alice", "token": "tok123secret"}
+
+    with caplog.at_level(logging.DEBUG):
+        activated = _activate(client, broker_dirs, retroachievements=login)
+        status = client.get(f"{API}/session/status")
+
+    assert activated.status_code == 200
+    assert "tok123secret" not in activated.text
+    assert "tok123secret" not in status.text
+    assert "tok123secret" not in caplog.text
+    assert "tok123secret" not in repr(session.SESSION)
+
+
+_RaPushes = list[tuple[dict[str, Any], dict[str, Any], base.RetroAchievementsChange]]
+"""The callback, session and change of each RetroAchievements login push, in order."""
+
+
+@pytest.fixture
+def ra_pushes(monkeypatch: pytest.MonkeyPatch) -> _RaPushes:
+    """Record RetroAchievements login pushes instead of sending them.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher, undone when the test ends.
+
+    Returns:
+        The pushes made during the test, in order.
+    """
+    pushes: _RaPushes = []
+
+    async def _accept(
+        cb: dict[str, Any], sess: dict[str, Any], change: base.RetroAchievementsChange
+    ) -> dict[str, Any]:
+        """Record the push and report it sent."""
+        pushes.append((cb, sess, change))
+        return {"mode": "reported", "ok": True, "url": cb["base_url"], "change": change.kind}
+
+    monkeypatch.setattr(callback, "push_ra_login", _accept)
+    return pushes
+
+
+def test_exit_reports_a_changed_ra_login_to_romm(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    ra_pushes: _RaPushes,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The login the player ended with goes to RomM, and only RomM sees the token.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+        ra_pushes: The recorded pushes.
+        caplog: The pytest log capture fixture.
+    """
+    _activate(client, broker_dirs)
+    ended = base.RetroAchievementsLogin(username="alice", token="tok456secret")
+    fake_emulator[0].retroachievements_change = base.RetroAchievementsChange(login=ended)
+
+    with caplog.at_level(logging.DEBUG):
+        body = client.post(f"{API}/session/exit").json()
+        status = client.get(f"{API}/session/status")
+
+    assert [(sess["id"], change.login) for _, sess, change in ra_pushes] == [("sess-1", ended)]
+    assert body["retroachievements"]["mode"] == "reported"
+    assert body["retroachievements"]["change"] == "set"
+    assert status.json()["last_exit"]["retroachievements"] == "reported"
+    for text in (str(body), status.text, caplog.text):
+        assert "tok456secret" not in text
+
+
+def test_exit_reports_nothing_when_the_ra_login_did_not_change(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    ra_pushes: _RaPushes,
+) -> None:
+    """An unchanged login is not pushed, and the exit report carries no block for it.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+        ra_pushes: The recorded pushes.
+    """
+    assert _activate(client, broker_dirs).status_code == 200
+    exited = client.post(f"{API}/session/exit")
+    body = exited.json()
+
+    assert exited.status_code == 200
+    assert ra_pushes == []
+    assert "retroachievements" not in body
+    assert session.LAST_OUTCOME is not None
+    assert session.LAST_OUTCOME["retroachievements"] is None
+
+
+def test_a_cleared_ra_login_is_reported_too(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    ra_pushes: _RaPushes,
+) -> None:
+    """A player who logged out is pushed as no login, so RomM can drop the stored one.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+        ra_pushes: The recorded pushes.
+    """
+    _activate(client, broker_dirs)
+    fake_emulator[0].retroachievements_change = base.RetroAchievementsChange(login=None)
+
+    body = client.post(f"{API}/session/exit").json()
+
+    assert [change.login for _, _, change in ra_pushes] == [None]
+    assert body["retroachievements"]["change"] == "cleared"
+
+
+def test_dev_mode_reports_an_ra_login_change_without_sending_it(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    ra_pushes: _RaPushes,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dev mode sends nothing anywhere, the login included.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+        ra_pushes: The recorded pushes.
+        monkeypatch: Pytest's attribute patcher, undone when the test ends.
+    """
+    monkeypatch.setattr(settings, "DEV_MODE", True)
+    _activate(client, broker_dirs)
+    fake_emulator[0].retroachievements_change = base.RetroAchievementsChange(
+        login=base.RetroAchievementsLogin(username="alice", token="tok456secret")
+    )
+
+    body = client.post(f"{API}/session/exit").json()
+
+    assert ra_pushes == []
+    assert body["retroachievements"]["mode"] == "report-only"
+    assert "tok456secret" not in str(body)
+
+
+def test_a_failed_ra_login_push_does_not_stop_the_exit(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RomM refusing the login still ends the session and retires it.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+        monkeypatch: Pytest's attribute patcher, undone when the test ends.
+    """
+
+    def _refuse(request: httpx.Request) -> httpx.Response:
+        """Answer as a RomM without the endpoint would."""
+        return httpx.Response(404)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        callback.httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(_refuse), **kw)
+    )
+    _activate(client, broker_dirs)
+    fake_emulator[0].retroachievements_change = base.RetroAchievementsChange(login=None)
+
+    response = client.post(f"{API}/session/exit")
+
+    assert response.status_code == 200
+    assert response.json()["retroachievements"]["mode"] == "failed"
+    assert response.json()["retroachievements"]["status_code"] == 404
+    assert session.SESSION is None or not session.SESSION.get("active")
 
 
 def test_activate_launches_the_rom_and_hands_back_a_landing_url(
@@ -1112,6 +1389,29 @@ def test_starting_the_app_sweeps_the_scratch_dirs_every_caching_emulator_leaves(
         pass
 
     assert [o.exists() for o in orphans] == [False, False, False, False]
+
+
+@pytest.mark.parametrize("prefix", [PREFIX, ""])
+def test_starting_the_app_clears_an_ra_login_an_earlier_broker_left(
+    prefix: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Startup takes a RetroAchievements login off disk when a broker stopped mid-session.
+
+    No session survives a restart, so nothing scrubs that login until the next
+    RetroArch launch.
+    """
+    monkeypatch.setattr(settings, "PREFIX", prefix)
+    monkeypatch.setattr(settings, "BROKER_SECRET", "s3cret")
+    cfg = retroarch.RA_CONFIG_PATH
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('video_fullscreen = "true"\ncheevos_username = "alice"\ncheevos_token = "tok456secret"\n')
+    retroarch._write_broker_cfg(base.RetroAchievementsLogin(username="alice", token="tok456secret"))
+
+    with TestClient(create_app()):
+        pass
+
+    assert cfg.read_text() == 'video_fullscreen = "true"\n'
+    assert "tok456secret" not in retroarch.BROKER_CFG.read_text()
 
 
 def test_exiting_nothing_is_a_conflict(client: TestClient) -> None:
@@ -3557,6 +3857,152 @@ async def test_the_save_upload_log_hides_callback_credentials(
     assert report["ok"] is False
     assert "hunter2" not in report["url"]
     assert "hunter2" not in caplog.text
+
+
+async def test_the_ra_login_push_sends_romm_the_player_and_their_login(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The push is a bearer-authenticated JSON PUT naming the user; the token is in its body only.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher, undone when the test ends.
+        caplog: The pytest log capture fixture.
+    """
+    seen: list[httpx.Request] = []
+
+    def _take(request: httpx.Request) -> httpx.Response:
+        """Accept the push, keeping the request."""
+        seen.append(request)
+        return httpx.Response(204)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        callback.httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(_take), **kw)
+    )
+    caplog.set_level(logging.DEBUG, logger="webstation_broker.callback")
+    change = base.RetroAchievementsChange(
+        login=base.RetroAchievementsLogin(username="alice", token="tok456secret")
+    )
+    sess = {"id": "s", "emulator": "retroarch", "user": {"id": 7, "username": "ana", "display_name": "Ana"}}
+
+    report = await callback.push_ra_login(
+        {"base_url": "https://romm.example/", "token": "cb-token"}, sess, change
+    )
+
+    (request,) = seen
+    assert request.method == "PUT"
+    assert str(request.url) == "https://romm.example/api/webstation/retroachievements"
+    assert request.headers["Authorization"] == "Bearer cb-token"
+    assert json.loads(request.content) == {
+        "session_id": "s",
+        "emulator": "retroarch",
+        "user": {"id": 7, "username": "ana"},
+        "retroachievements": {"username": "alice", "token": "tok456secret"},
+    }
+    assert report == {
+        "mode": "reported",
+        "ok": True,
+        "url": "https://romm.example/api/webstation/retroachievements",
+        "change": "set",
+        "status_code": 204,
+    }
+    assert "tok456secret" not in caplog.text
+
+
+async def test_the_ra_login_push_has_its_own_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The push waits `RA_LOGIN_TIMEOUT`, not the save upload's limit, since exit holds the session lock.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher, undone when the test ends.
+    """
+    timeouts: list[Any] = []
+
+    def _take(request: httpx.Request) -> httpx.Response:
+        """Accept the push."""
+        return httpx.Response(204)
+
+    def _client(**kw: Any) -> httpx.AsyncClient:  # noqa: ANN401
+        """Keep the timeout the push asked for."""
+        timeouts.append(kw.get("timeout"))
+        return real_client(transport=httpx.MockTransport(_take), **kw)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(callback.httpx, "AsyncClient", _client)
+    monkeypatch.setattr(settings, "SAVE_UPLOAD_TIMEOUT", 30.0)
+    monkeypatch.setattr(settings, "RA_LOGIN_TIMEOUT", 4.0)
+    change = base.RetroAchievementsChange(login=None)
+
+    sess = {"id": "s", "emulator": "retroarch"}
+    await callback.push_ra_login({"base_url": "https://romm.example/", "token": "cb-token"}, sess, change)
+
+    assert timeouts == [4.0]
+
+
+async def test_the_ra_login_push_sends_null_for_a_logout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cleared login is pushed as `null`, so RomM knows to drop the one it holds.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher, undone when the test ends.
+    """
+    seen: list[httpx.Request] = []
+
+    def _take(request: httpx.Request) -> httpx.Response:
+        """Accept the push, keeping the request."""
+        seen.append(request)
+        return httpx.Response(200)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        callback.httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(_take), **kw)
+    )
+
+    report = await callback.push_ra_login(
+        {"base_url": "https://romm.example"},
+        {"id": "s", "emulator": "retroarch"},
+        base.RetroAchievementsChange(login=None),
+    )
+
+    (request,) = seen
+    assert "Authorization" not in request.headers
+    assert json.loads(request.content)["retroachievements"] is None
+    assert json.loads(request.content)["user"] == {"id": None, "username": None}
+    assert report["change"] == "cleared"
+
+
+async def test_an_unreachable_romm_fails_the_ra_login_push_without_raising(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A connection failure is reported and logged without the token or the URL's password.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher, undone when the test ends.
+        caplog: The pytest log capture fixture.
+    """
+
+    def _drop(request: httpx.Request) -> httpx.Response:
+        """Fail the connection."""
+        raise httpx.ConnectError("connection refused", request=request)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        callback.httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(_drop), **kw)
+    )
+    caplog.set_level(logging.DEBUG, logger="webstation_broker.callback")
+
+    report = await callback.push_ra_login(
+        {"base_url": "https://u:hunter2@romm.example"},
+        {"id": "s", "emulator": "retroarch"},
+        base.RetroAchievementsChange(
+            login=base.RetroAchievementsLogin(username="alice", token="tok456secret")
+        ),
+    )
+
+    assert report["ok"] is False
+    assert report["mode"] == "failed"
+    assert "connection refused" in report["error"]
+    for text in (str(report), caplog.text):
+        assert "tok456secret" not in text
+        assert "hunter2" not in text
 
 
 _SECRET_GATED = [

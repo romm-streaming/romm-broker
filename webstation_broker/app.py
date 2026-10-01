@@ -9,13 +9,16 @@ mode vite serves the frontend instead.
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 import anyio.to_thread
 from fastapi import FastAPI
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 from . import api, room, settings
 from .emulators import retroarch, retroarch_cores
@@ -103,6 +106,9 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         Nothing; control passes to the running application once the orphan is reaped.
     """
     await anyio.to_thread.run_sync(reap_orphan)
+    # A broker stopped mid-session leaves the player's login on disk, with no
+    # session left to end that would clear it.
+    await anyio.to_thread.run_sync(lambda: retroarch.clear_ra_login(only_if_pinned=True))
     await anyio.to_thread.run_sync(sweep_shadps4_extractions)
     await anyio.to_thread.run_sync(sweep_rpcs3_extractions)
     await anyio.to_thread.run_sync(sweep_scummvm_extractions)
@@ -168,6 +174,38 @@ def _page_csp_headers() -> dict[str, str]:
     return headers
 
 
+async def _validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    """FastAPI's 422 answer, minus the failing input wherever a RetroAchievements login sits in it.
+
+    The default answer echoes each failing value back: a malformed login's is
+    its token, and a missing field's is the object around it, which for a
+    top-level field is the whole body, login included.
+
+    Args:
+        _request: The refused request; unused.
+        exc: The validation failure.
+
+    Returns:
+        The 422, with `input` dropped from every error on the login or holding it.
+    """
+
+    def _carries_login(err: dict[str, Any]) -> bool:
+        """Whether this error's `input` is the login, part of it, or an object holding it."""
+        value = err.get("input")
+        loc = tuple(err.get("loc", ()))
+        return (
+            "retroachievements" in loc
+            or loc == ("body",)
+            or (isinstance(value, dict) and "retroachievements" in value)
+        )
+
+    errors = [
+        {k: v for k, v in err.items() if k != "input"} if _carries_login(err) else err
+        for err in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
+
+
 def create_app() -> FastAPI:
     """Build the broker application, mounted under the configured prefix.
 
@@ -188,6 +226,7 @@ def create_app() -> FastAPI:
     inner = FastAPI(
         title="webstation-broker", lifespan=None if prefixed else _lifespan
     )
+    inner.add_exception_handler(RequestValidationError, _validation_error)
     inner.include_router(api.router)
     inner.include_router(api.secret_router)
     inner.include_router(room.router)

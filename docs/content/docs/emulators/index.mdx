@@ -69,8 +69,9 @@ own `libretro_directory`. That's also where RetroArch keeps the matching
 `.info` file for each core, so a core placed anywhere else has no matching
 info file, and checking its status (`GET_STATUS`) then crashes RetroArch
 mid-session (a segfault, a crash from the program touching memory it isn't
-allowed to). The broker never edits your RetroArch config directly; it only
-layers extra settings on top with `--appendconfig`.
+allowed to). The broker layers its own settings on top of your RetroArch
+config with `--appendconfig`. The only edit it makes to your config is
+removing the RetroAchievements login, described below.
 
 Save states work, but RetroArch has no direct "save to slot number n"
 command. Instead, the broker steps the slot counter all the way down to -1
@@ -104,6 +105,56 @@ A [declared import](/docs/api/imports#what-each-emulator-takes) brings in one
 Azahar's SD card and NAND folders on `3ds`. `ngc` still refuses a save: its
 GCI shape has not been verified, so import through `dolphin` instead. See
 [RetroArch cores](/docs/emulators/retroarch-cores#saves-states-and-imports).
+
+### RetroAchievements
+
+Players log in to RetroAchievements from RetroArch's own Achievements menu,
+the same way they would on any other machine. RetroArch normally keeps that
+login in one config file shared by everyone who plays in the container, so
+without the broker every RomM user would play as whoever logged in last.
+
+The broker keeps the login tied to the player instead:
+
+- **At launch**, it writes the controlling player's login into its
+  `--appendconfig` file, which outranks your own config. RomM sends it as
+  [`retroachievements`](/docs/api/activate#launch-a-game) on activate. When
+  RomM sends none, the broker writes the login fields empty, so the player
+  starts logged out and can log in from the menu. `cheevos_enable` is left
+  to you.
+- **After RetroArch exits**, the broker first reads back the login
+  RetroArch saved. If the player logged in, logged out, or RetroArch
+  refreshed the token during the session, the broker sends the new login to
+  RomM on exit (see [The RetroAchievements login](/docs/api/exit#the-retroachievements-login)),
+  so RomM can hand it back at the player's next launch. Then it deletes the `cheevos_username`,
+  `cheevos_password` and `cheevos_token` lines from `retroarch.cfg` and from
+  `retroarch-keychain.cfg` beside it (newer RetroArch versions keep the
+  login there, encrypted). It also blanks the token in its own
+  `--appendconfig` file. The same cleanup runs at the start of every launch
+  and when the broker starts, which catches a crash or a broker restart.
+  Every other line in your config stays exactly as it was.
+
+If RetroArch closes or crashes on its own mid-session, the login stays on
+disk until the session ends. No other session can start in the meantime, so
+nobody else can reach it.
+
+The `--appendconfig` file is only readable by its owner, since it holds a
+live token while RetroArch runs. The token never appears in the broker's
+logs or in `/session/status`.
+
+If your container already has a RetroAchievements login saved in
+RetroArch, the first launch after upgrading removes it. Each player then
+logs in once from RetroArch's Achievements menu. The broker reports that
+login to RomM when the session ends, but RomM doesn't store it yet
+([#110](https://github.com/romm-streaming/romm-broker/issues/110)). Until it
+does, a player logs in again in each session.
+
+The broker reads the login back from either place RetroArch keeps it. The
+encrypted keychain in newer RetroArch versions opens with this container's
+machine ID. A keychain protected with a passphrase on a different machine
+can't be opened without that passphrase, which the broker never has. In that
+case, and whenever RetroArch didn't save its config on the way out
+(`config_save_on_exit` off), the broker reports nothing and RomM keeps
+whatever it had.
 
 The full list matching each platform to its core lives in
 `retroarch_platforms.json`, next to the launcher's code. To pin exactly where
