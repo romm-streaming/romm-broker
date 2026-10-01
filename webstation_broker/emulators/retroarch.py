@@ -972,11 +972,8 @@ def _write_broker_cfg(login: Optional[RetroAchievementsLogin] = None) -> Path:
     )
     if JOYPAD_DRIVER:
         cfg += f'input_joypad_driver = "{JOYPAD_DRIVER}"\n'
-    # Always stated, empty when RomM sent no login, so a login some earlier
-    # session left in the user's config or keychain is never the one used.
-    # The password stays empty: RetroArch logs in with the token alone, and a
-    # player logging in from the menu gets a token back. cheevos_enable is
-    # left to the player.
+    # Always stated, empty when RomM sent none, so a login an earlier session
+    # left behind is never used. RetroArch logs in with the token alone.
     username, token = (login.username, login.token) if login is not None else ("", "")
     cfg += (
         f'cheevos_username = "{username}"\n'

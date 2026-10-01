@@ -278,11 +278,7 @@ class RetroAchievementsIn(BaseModel):
     @field_validator("username", "token")
     @classmethod
     def _check_charset(cls, value: Any) -> Any:  # noqa: ANN401
-        """Refuse a value that could close its quote in RetroArch's config.
-
-        Both values are written into a quoted `broker.cfg` line, so a quote or
-        a newline would let them add config keys of their own. Real usernames
-        and tokens are plain alphanumerics.
+        """Refuse a value `RA_CREDENTIAL_RE` rejects, since it would be written into a config line.
 
         Args:
             value: The username, or the token as a `SecretStr`.
@@ -333,12 +329,8 @@ class ActivateIn(BaseModel):
     retroachievements: Optional[RetroAchievementsIn] = None
     """The controlling player's RetroAchievements login, if RomM has stored one for them.
 
-    RetroArch keeps one login in a config file every RomM user shares, so
-    without this each player plays as whoever logged in last. It is a field of
-    its own rather than part of `user` because `user` is echoed by
-    `/session/status`, and the token must never leave the broker. Absent, the
-    launch pins the login empty and the player can log in from RetroArch's
-    Achievements menu.
+    Kept out of `user`, which `/session/status` echoes, so the token never
+    leaves the broker. Absent, the launch pins the login empty.
     """
     save: Optional[SaveIn] = None
     callback: Optional[CallbackIn] = None
