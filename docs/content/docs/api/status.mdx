@@ -26,7 +26,7 @@ names players and ROMs. If no session is running, it answers
 | `started_at` | Unix time (seconds since January 1, 1970) marking when the session was created. |
 | `user` | The controller's info (the person playing), exactly as it was given when the session was activated. |
 | `viewers` | Everyone who joined: `username`, `user_id`, and `permission`. |
-| `last_exit` | How the most recent exit ended, in both shapes, or `null` before the first exit since the broker started: `session_id`, `ended_at` (Unix time), `duration_s`, `state_saved`, `dump_error` (`null` unless the save dump failed), `upload` (`uploaded`, `skipped`, `failed` or `report-only` in dev mode) and `archive_path` (where a copy was kept on the container, if one was). It survives the next activate, so a save archive that never reached RomM stays visible until another exit replaces it. |
+| `last_exit` | How the most recent exit ended, in both shapes, or `null` before the first exit since the broker started: `session_id`, `ended_at` (Unix time), `duration_s`, `state_saved`, `dump_error` (`null` unless the save dump failed), `upload` (`uploaded`, `skipped`, `failed` or `report-only` in dev mode), `archive_path` (where a copy was kept on the container, if one was) and `retroachievements` (the [login report](/docs/api/exit#the-retroachievements-login)'s `mode`, or `null` when the login didn't change). It survives the next activate, so a save archive that never reached RomM stays visible until another exit replaces it. |
 
 RomM polls this to know whether a session it launched is still running, to
 decide whether to offer save and load, and to show the player a boot failure

@@ -23,11 +23,18 @@ from urllib.parse import urlsplit
 import anyio
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator
 
 from . import callback, imports, memcard, saves, screenshot, selkies, session, settings
 from .emulators import get_emulator, retroarch, retroarch_cores
-from .emulators.base import STATE_HEAD_BYTES, CoreRejectedError, Emulator, reap_orphan
+from .emulators.base import (
+    RA_CREDENTIAL_RE,
+    STATE_HEAD_BYTES,
+    CoreRejectedError,
+    Emulator,
+    RetroAchievementsLogin,
+    reap_orphan,
+)
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -260,6 +267,35 @@ class DiscIn(BaseModel):
     """
 
 
+class RetroAchievementsIn(BaseModel):
+    """The controlling player's RetroAchievements login, as RomM stores it for them."""
+
+    username: str
+    """The RetroAchievements account name."""
+    token: SecretStr
+    """The login token RetroArch got from RetroAchievements; stands in for the password."""
+
+    @field_validator("username", "token")
+    @classmethod
+    def _check_charset(cls, value: Any) -> Any:  # noqa: ANN401
+        """Refuse a value `RA_CREDENTIAL_RE` rejects, since it would be written into a config line.
+
+        Args:
+            value: The username, or the token as a `SecretStr`.
+
+        Returns:
+            The value, unchanged.
+
+        Raises:
+            ValueError: When it is empty, longer than 128 characters, or
+                carries anything outside letters, digits, `_`, `.` and `-`.
+        """
+        raw = value.get_secret_value() if isinstance(value, SecretStr) else value
+        if not RA_CREDENTIAL_RE.match(raw):
+            raise ValueError("must match ^[A-Za-z0-9_.-]{1,128}$")
+        return value
+
+
 class ActivateIn(BaseModel):
     """The launch request RomM sends to start a session.
 
@@ -269,6 +305,7 @@ class ActivateIn(BaseModel):
         emulator: The emulator name to launch.
         rom: The rom to boot; optional for launch types without a game.
         gui_language: The player's interface language, for emulators with a translated UI.
+        retroachievements: The controlling player's RetroAchievements login, if RomM has one.
         save: Save data to restore before launch, if any.
         callback: Where the exit save archive goes, if not derived from the request.
         multiplayer: Whether RomM advertises the session for joining.
@@ -288,6 +325,12 @@ class ActivateIn(BaseModel):
     when the rom itself carries no language: it is the only thing that says
     which of several detected variants this player wants. Unknown or absent
     values leave the emulator on its own default rather than failing the launch.
+    """
+    retroachievements: Optional[RetroAchievementsIn] = None
+    """The controlling player's RetroAchievements login, if RomM has stored one for them.
+
+    Kept out of `user`, which `/session/status` echoes, so the token never
+    leaves the broker. Absent, the launch pins the login empty.
     """
     save: Optional[SaveIn] = None
     callback: Optional[CallbackIn] = None
@@ -658,6 +701,12 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     # gui_language describes the player, not the rom, so it is set for a launch
     # that carries no rom at all.
     emulator.gui_language = body.gui_language
+    ra = body.retroachievements
+    emulator.retroachievements = (
+        RetroAchievementsLogin(username=ra.username, token=ra.token.get_secret_value())
+        if ra is not None
+        else None
+    )
     if body.rom is not None:
         emulator.platform = body.rom.platform
         emulator.language = body.rom.language
@@ -930,7 +979,8 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     if content is not None:
         await anyio.to_thread.run_sync(emulator.carry_save_across_cores, archive_identity, rom_file)
 
-    payload = body.model_dump()
+    # The login is the emulator's alone; nothing the session keeps carries it.
+    payload = body.model_dump(exclude={"retroachievements"})
     payload["callback"] = _resolve_callback(body.callback, request)
     sess = session.new_session(
         payload, emulator, str(rom_file) if rom_file else None
@@ -1308,6 +1358,36 @@ async def _keep_archive(zip_bytes: bytes, name: str, session_id: str) -> Optiona
         return None
 
 
+async def _report_ra_login(
+    emulator: Emulator, cb: Optional[dict[str, Any]], sess: dict[str, Any]
+) -> Optional[dict[str, Any]]:
+    """Send RomM the RetroAchievements login the player ended the session with, if it changed.
+
+    Runs after the emulator is gone, when it has read its saved login back.
+    The token never enters the returned block, which goes into the exit
+    report, the log and `/api/session/status`.
+
+    Args:
+        emulator: The session's emulator, already stopped.
+        cb: The session's callback dict, or None when there is nowhere to report.
+        sess: The session the login belongs to.
+
+    Returns:
+        None when the login did not change. Otherwise `{"mode", "change", ...}`:
+        `report-only` in dev mode or without a callback, else what
+        `callback.push_ra_login` returned.
+    """
+    change = emulator.retroachievements_change
+    if change is None:
+        return None
+    kind = change.kind
+    if settings.DEV_MODE or not cb:
+        note = "dev mode: nothing was sent" if settings.DEV_MODE else "no callback to report to"
+        log.info("session %s: ra login %s, not reported (%s)", sess["id"], kind, note)
+        return {"mode": "report-only", "change": kind, "note": note}
+    return await callback.push_ra_login(cb, sess, change)
+
+
 async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
     """Save state, stop the emulator, dump the save delta, and report.
 
@@ -1333,7 +1413,8 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
         The exit report: `status`, `session_id`, `rom`, the emulator's own exit
         fields, a `save_dump` block, an `upload` block describing what happened
         to the archive, and `selkies_tokens_cleared`. `exit_error` is added when
-        the emulator's own teardown raised.
+        the emulator's own teardown raised, and `retroachievements` when the
+        player's RetroAchievements login changed.
 
     Raises:
         HTTPException: 409 when no session is active.
@@ -1413,6 +1494,8 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
             archive_path = await _keep_archive(dump["zip_bytes"], archive_name, sess["id"])
             upload["archive_path"] = archive_path
 
+    ra_report = await _report_ra_login(emulator, cb, sess)
+
     report = {
         "status": "exited",
         "session_id": sess["id"],
@@ -1428,6 +1511,8 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
         },
         "upload": upload,
     }
+    if ra_report is not None:
+        report["retroachievements"] = ra_report
 
     outcome, detail = _exit_outcomes(upload, archive_path, cb, dump["error"])
     if exit_report.get("sram_flushed") is False:
@@ -1475,6 +1560,7 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
         "dump_error": dump["error"],
         "upload": upload["mode"],
         "archive_path": archive_path,
+        "retroachievements": ra_report["mode"] if ra_report is not None else None,
     }
     # One fixed-shape line per exit, so an alert can match `upload=failed`
     # without parsing the report dict above.

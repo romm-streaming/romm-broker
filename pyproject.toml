@@ -13,6 +13,7 @@ dependencies = [
     "httpx>=0.27",
     "pillow>=10",
     "pyfatx>=0.0.8",
+    "cryptography>=42",
 ]
 
 [project.scripts]

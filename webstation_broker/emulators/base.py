@@ -14,12 +14,57 @@ import signal
 import subprocess
 import time
 from collections.abc import Callable, Collection, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Union
 
 from .. import imports, memcard
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RetroAchievementsLogin:
+    """A player's RetroAchievements login, as RomM stores it for them.
+
+    The token stands in for the password: RetroArch logs in with it alone and
+    never needs the password again. It stays out of `repr` so a stray log line
+    or traceback cannot print it.
+
+    Attributes:
+        username: The RetroAchievements account name.
+        token: The login token RetroArch got from RetroAchievements.
+    """
+
+    username: str
+    token: str = field(repr=False)
+
+
+RA_CREDENTIAL_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,128}\Z")
+"""What a RetroAchievements username or token may contain to be written into a config line.
+
+Both are written into a quoted RetroArch config line, so a quote or a newline
+would let them add config keys of their own. Real ones are plain alphanumerics.
+It is anchored at the very end of the string: `$` would also match before
+one trailing newline and let it through.
+"""
+
+
+@dataclass(frozen=True)
+class RetroAchievementsChange:
+    """A change to the player's RetroAchievements login, found once the emulator exited.
+
+    Attributes:
+        login: The login the player ended the session with, or None when it
+            was cleared (logged out, or a token RetroAchievements rejected).
+    """
+
+    login: Optional[RetroAchievementsLogin]
+
+    @property
+    def kind(self) -> str:
+        """`set` when the player ended logged in, `cleared` when they ended logged out."""
+        return "set" if self.login is not None else "cleared"
 
 
 class CoreRejectedError(ValueError):
@@ -737,6 +782,8 @@ class Emulator:
         platform: The RomM platform slug the session was activated for, or None.
         language: The language the rom was activated for, or None.
         gui_language: The player's own interface language, or None.
+        retroachievements: The controlling player's RetroAchievements login, or None.
+        retroachievements_change: How that login changed during the session, or None.
         requires_rom: Whether a launch needs a ROM; the desktop session does not.
         save_root: Root of the emulator's writable data.
         save_subtrees: Subtrees under `save_root` that hold save data; save
@@ -803,6 +850,22 @@ class Emulator:
     for a launch with no rom. Only a launcher with a translated interface has
     any use for it (ScummVM pins it in scummvm.ini and falls back to it when
     the rom carries no language of its own).
+    """
+    retroachievements: Optional[RetroAchievementsLogin] = None
+    """The controlling player's RetroAchievements login, or None.
+
+    Set by the activate route on every launch, and set back to None when RomM
+    sends none, so the next player never inherits the last one's account. Only
+    RetroArch reads it today. It is never copied into the session, which
+    `/session/status` echoes.
+    """
+    retroachievements_change: Optional[RetroAchievementsChange] = None
+    """How the player's RetroAchievements login changed during the session, or None.
+
+    Filled in once the emulator has exited, by an emulator that can read back
+    the login it saved: a player who logged in from the emulator's own menu, or
+    a token RetroAchievements rejected. None means unchanged or unknown, and
+    the exit route only reports anything else to RomM.
     """
     requires_rom: bool = True
     """Whether a launch needs a ROM; the desktop session is the one that does not."""

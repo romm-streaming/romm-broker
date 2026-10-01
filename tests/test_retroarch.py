@@ -1,13 +1,16 @@
 """RetroArch's platform table: the map that decides which core a claim loads.
 
 Also covers the core asset links, the per-launch config overlay, the resume
-gate, and playlist-driven disc swapping.
+gate, playlist-driven disc swapping, and how the RetroAchievements login is
+pinned per player and scrubbed from the shared config after every exit.
 """
 
 import dataclasses
+import io
 import json
 import logging
 import os
+import re
 import threading
 import time
 import zipfile
@@ -21,6 +24,7 @@ from fastapi.testclient import TestClient
 
 from webstation_broker import imports, saves
 from webstation_broker.emulators import retroarch, retroarch_cores
+from webstation_broker.emulators.base import RetroAchievementsChange, RetroAchievementsLogin
 
 from .conftest import PREFIX, import_zip, preflight_import, restore_import
 from .test_retroarch_cores import info_zip as info_zip_bytes
@@ -582,6 +586,237 @@ class TestBrokerConfig:
         assert 'global_core_options = "true"' in cfg
         assert 'game_specific_options = "false"' in cfg
 
+    def test_the_player_s_ra_login_is_pinned(self) -> None:
+        """A RetroAchievements login handed in at activate is written into the overlay.
+
+        `--appendconfig` outranks both the user's config and RetroArch's
+        keychain file, so the session logs in as this player and nobody else.
+        The password is pinned empty: RetroArch logs in with the token alone.
+        """
+        login = RetroAchievementsLogin(username="alice", token="tok123")
+
+        cfg = retroarch._write_broker_cfg(login).read_text()
+
+        assert 'cheevos_username = "alice"' in cfg
+        assert 'cheevos_token = "tok123"' in cfg
+        assert 'cheevos_password = ""' in cfg
+
+    def test_no_login_pins_the_credentials_empty(self) -> None:
+        """Without a login the overlay pins every credential empty.
+
+        A login some earlier player left in the shared config must never be
+        the one this session plays under.
+        """
+        cfg = retroarch._write_broker_cfg().read_text()
+
+        assert 'cheevos_username = ""' in cfg
+        assert 'cheevos_token = ""' in cfg
+        assert 'cheevos_password = ""' in cfg
+
+    def test_cheevos_enable_is_left_to_the_user(self) -> None:
+        """The overlay leaves `cheevos_enable` alone, so a first login from the menu still works."""
+        cfg = retroarch._write_broker_cfg(RetroAchievementsLogin(username="alice", token="t")).read_text()
+
+        assert not re.search(r"^cheevos_enable\b", cfg, re.M)
+
+    def test_the_overlay_is_owner_only(self) -> None:
+        """The overlay holds a live token while RetroArch runs, so only its owner may read it."""
+        path = retroarch._write_broker_cfg(RetroAchievementsLogin(username="alice", token="tok123"))
+
+        assert path.stat().st_mode & 0o777 == 0o600
+
+    def test_a_failed_write_leaves_no_temp_file_behind(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A write that fails midway takes its temp file, which can hold the token, with it.
+
+        Args:
+            monkeypatch: The pytest monkeypatch fixture.
+        """
+
+        def _fail(*_args: object) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(retroarch.os, "replace", _fail)
+
+        with pytest.raises(OSError, match="disk full"):
+            retroarch._write_broker_cfg(RetroAchievementsLogin(username="alice", token="tok123"))
+
+        assert not list(retroarch.BROKER_CFG.parent.glob(".broker.cfg.*"))
+
+    def test_a_world_readable_overlay_is_tightened(self) -> None:
+        """An overlay an older broker left world-readable comes back owner-only."""
+        retroarch.BROKER_CFG.parent.mkdir(parents=True, exist_ok=True)
+        retroarch.BROKER_CFG.write_text("old\n")
+        retroarch.BROKER_CFG.chmod(0o644)
+
+        assert retroarch._write_broker_cfg().stat().st_mode & 0o777 == 0o600
+
+
+def _ra_cfg(path: Path, text: str, mode: int = 0o644) -> Path:
+    """Write a RetroArch config file with the given content and permissions.
+
+    Args:
+        path: Where to write it; its parent is created.
+        text: The file content.
+        mode: The permission bits to leave on it.
+
+    Returns:
+        `path`.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    path.chmod(mode)
+    return path
+
+
+class TestScrubRaCredentials:
+    """Removing RetroAchievements credentials RetroArch saved into the shared config files."""
+
+    def test_the_credentials_leave_retroarch_cfg_and_nothing_else_does(self) -> None:
+        """The three credential lines go; every other line stays byte for byte.
+
+        This is the user's own config, so an unrelated key moving, losing its
+        quoting, or losing the trailing newline is a regression.
+        """
+        cfg = _ra_cfg(
+            retroarch.RA_CONFIG_PATH,
+            'video_fullscreen = "true"\n'
+            'cheevos_enable = "true"\n'
+            'cheevos_username = "alice"\n'
+            'cheevos_password = ""\n'
+            'cheevos_token = "tok123"\n'
+            'cheevos_hardcore_mode_enable = "false"\n'
+            "menu_driver = ozone\n",
+        )
+
+        retroarch._scrub_ra_credentials()
+
+        assert cfg.read_text() == (
+            'video_fullscreen = "true"\n'
+            'cheevos_enable = "true"\n'
+            'cheevos_hardcore_mode_enable = "false"\n'
+            "menu_driver = ozone\n"
+        )
+
+    def test_a_symlinked_config_is_scrubbed_at_its_target(self, tmp_path: Path) -> None:
+        """A retroarch.cfg that is a symlink stays one; the file it points at loses the login.
+
+        RetroArch writes through the link, so replacing the link with a plain
+        file would leave the user's real config behind from then on.
+
+        Args:
+            tmp_path: The per-test temporary directory.
+        """
+        target = _ra_cfg(
+            tmp_path / "real" / "retroarch.cfg", 'cheevos_token = "tok123"\nmenu_driver = ozone\n'
+        )
+        retroarch.RA_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        retroarch.RA_CONFIG_PATH.symlink_to(target)
+
+        retroarch._scrub_ra_credentials()
+
+        assert retroarch.RA_CONFIG_PATH.is_symlink()
+        assert target.read_text() == "menu_driver = ozone\n"
+
+    def test_sealed_values_leave_the_keychain_file(self) -> None:
+        """RetroArch's keychain file loses its credential lines without the key being needed.
+
+        From the release after 1.22.2, RetroArch saves credentials there,
+        sealed. Deleting a line works whatever its value is.
+        """
+        keychain = _ra_cfg(
+            retroarch.RA_CONFIG_PATH.parent / "retroarch-keychain.cfg",
+            "keychain_version = 1\n"
+            'cheevos_username = "$kc1$AAAA"\n'
+            'cheevos_token = "$kc1$BBBB"\n'
+            'webdav_password = "$kc1$CCCC"\n',
+            mode=0o600,
+        )
+
+        retroarch._scrub_ra_credentials()
+
+        assert keychain.read_text() == 'keychain_version = 1\nwebdav_password = "$kc1$CCCC"\n'
+
+    def test_the_file_keeps_its_permissions(self) -> None:
+        """The rewritten keychain file stays owner-only, as RetroArch made it."""
+        keychain = _ra_cfg(
+            retroarch.RA_CONFIG_PATH.parent / "retroarch-keychain.cfg",
+            'cheevos_token = "$kc1$BBBB"\n',
+            mode=0o600,
+        )
+
+        retroarch._scrub_ra_credentials()
+
+        assert keychain.stat().st_mode & 0o777 == 0o600
+
+    def test_a_file_with_no_credentials_is_not_rewritten(self) -> None:
+        """A config with nothing to remove is left as the same file, untouched."""
+        cfg = _ra_cfg(retroarch.RA_CONFIG_PATH, 'video_fullscreen = "true"\n')
+        before = cfg.stat()
+
+        retroarch._scrub_ra_credentials()
+
+        after = cfg.stat()
+        assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+
+    def test_missing_files_are_fine(self) -> None:
+        """A fresh container has neither file yet; scrubbing it is a no-op."""
+        retroarch._scrub_ra_credentials()
+
+        assert not retroarch.RA_CONFIG_PATH.exists()
+
+    def test_a_last_line_without_a_newline_is_still_removed(self) -> None:
+        """A credential on an unterminated last line goes, and the file still ends in a newline."""
+        cfg = _ra_cfg(retroarch.RA_CONFIG_PATH, 'video_fullscreen = "true"\ncheevos_token = "tok123"')
+
+        retroarch._scrub_ra_credentials()
+
+        assert cfg.read_text() == 'video_fullscreen = "true"\n'
+
+    def test_indented_and_unspaced_keys_are_removed(self) -> None:
+        """RetroArch's parser accepts leading spaces and no spaces around `=`; so does the scrub."""
+        cfg = _ra_cfg(retroarch.RA_CONFIG_PATH, '  cheevos_token="tok123"\ncheevos_username =alice\n')
+
+        retroarch._scrub_ra_credentials()
+
+        assert cfg.read_text() == ""
+
+    def test_a_failed_rewrite_is_logged_and_does_not_raise(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A scrub that cannot write logs a warning and leaves the launch or exit to carry on.
+
+        The overlay still pins this session's own credentials, so a token left
+        on disk is a leak at rest, not a wrong login.
+
+        Args:
+            monkeypatch: The pytest monkeypatch fixture.
+            caplog: The pytest log capture fixture.
+        """
+        cfg = _ra_cfg(retroarch.RA_CONFIG_PATH, 'cheevos_token = "tok123"\n')
+
+        def _fail(*args: object, **kwargs: object) -> None:
+            """Refuse the atomic replace."""
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr(retroarch.os, "replace", _fail)
+
+        with caplog.at_level(logging.WARNING):
+            retroarch._scrub_ra_credentials()
+
+        assert "tok123" in cfg.read_text()
+        assert "read-only file system" in caplog.text
+        assert "tok123" not in caplog.text
+        assert [p.name for p in cfg.parent.iterdir()] == ["retroarch.cfg"]
+
+    def test_keys_that_only_start_like_a_credential_are_kept(self) -> None:
+        """Only the three credential keys go; a longer key sharing their prefix is someone else's."""
+        text = 'cheevos_username_hint = "x"\ncheevos_tokens = "y"\n#cheevos_token = "z"\n'
+        cfg = _ra_cfg(retroarch.RA_CONFIG_PATH, text)
+
+        retroarch._scrub_ra_credentials()
+
+        assert cfg.read_text() == text
+
 
 class TestCoreOptions:
     """The per-launch core options file a platform's `core_options` pins into."""
@@ -831,15 +1066,8 @@ class TestResumeGate:
         Returns:
             The args tuple of every deferred-load thread launch() started, in order.
         """
-        monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
-        monkeypatch.setattr(retroarch, "_ensure_core_info", lambda *a, **k: None)
-        monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
-        monkeypatch.setattr(retroarch, "_ensure_save_links", lambda links: None)
-        monkeypatch.setattr(retroarch, "_write_core_options", lambda options: tmp_path / "core-options.cfg")
+        _stub_launch_deps(monkeypatch, tmp_path)
         monkeypatch.setattr(retroarch, "_write_broker_cfg", lambda *a: tmp_path / "broker.cfg")
-        monkeypatch.setattr(
-            retroarch.shutil, "which", lambda binary, path=None: "/usr/bin/retroarch"
-        )
         monkeypatch.setattr(retroarch.Retroarch, "stop", lambda self: None)
         monkeypatch.setattr(retroarch.Retroarch, "_spawn_ra", lambda self, cmd, env: None)
 
@@ -5354,3 +5582,388 @@ class TestStateCoreHeader:
             content=b"state",
         )
         assert r.status_code != 409
+
+
+def _stub_launch_deps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, binary: Optional[str] = "/usr/bin/retroarch"
+) -> None:
+    """Stub the core, asset and binary lookups launch() makes before it pins and spawns.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        tmp_path: The per-test temporary directory.
+        binary: What the PATH lookup for RetroArch finds, or None for nothing.
+    """
+    monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
+    monkeypatch.setattr(retroarch, "_ensure_core_info", lambda *a, **k: None)
+    monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
+    monkeypatch.setattr(retroarch, "_ensure_save_links", lambda links: None)
+    monkeypatch.setattr(retroarch, "_write_core_options", lambda options: tmp_path / "core-options.cfg")
+    monkeypatch.setattr(retroarch.shutil, "which", lambda name, path=None: binary)
+
+
+class _QuitsCleanly:
+    """A RetroArch process handle that exits as soon as it is asked to."""
+
+    pid = 4242
+
+    def __init__(self) -> None:
+        """Give the handle a stdin to take the QUIT command."""
+        self.stdin = io.BytesIO()
+
+    def poll(self) -> None:
+        """Report the process as running until it is waited on."""
+        return None
+
+    def wait(self, timeout: float) -> int:
+        """Exit cleanly."""
+        return 0
+
+
+class TestRaLoginLifecycle:
+    """When the RetroAchievements credentials are scrubbed and pinned around a session."""
+
+    @pytest.fixture
+    def ra_calls(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[object]:
+        """Record every scrub and overlay write, in order, instead of doing them.
+
+        Args:
+            tmp_path: The per-test temporary directory.
+            monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            `"scrub"` for each scrub and `("cfg", login)` for each overlay write.
+        """
+        calls: list[object] = []
+
+        def _write(login: Optional[RetroAchievementsLogin] = None) -> Path:
+            """Record the login the overlay was written with."""
+            calls.append(("cfg", login))
+            return tmp_path / "broker.cfg"
+
+        monkeypatch.setattr(retroarch, "_scrub_ra_credentials", lambda: calls.append("scrub"))
+        monkeypatch.setattr(retroarch, "_write_broker_cfg", _write)
+        return calls
+
+    def test_a_launch_scrubs_before_pinning_the_player_s_login(
+        self, ra_calls: list[object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Launch's opening stop clears saved credentials, then this player's login is pinned.
+
+        That scrub catches what an exit-time one could not: a crash, a broker
+        restart, or a login an existing install already had.
+
+        Args:
+            ra_calls: The recorded scrubs and overlay writes.
+            tmp_path: The per-test temporary directory.
+            monkeypatch: The pytest monkeypatch fixture.
+        """
+
+        class _NullThread:
+            """A threading.Thread stand-in whose target is never run."""
+
+            def __init__(self, **kwargs: Any) -> None:
+                """Accept and discard whatever launch() builds the thread with."""
+
+            def start(self) -> None:
+                """Start nothing."""
+
+        _stub_launch_deps(monkeypatch, tmp_path)
+        monkeypatch.setattr(retroarch.Retroarch, "_spawn_ra", lambda self, cmd, env: None)
+        monkeypatch.setattr(retroarch.threading, "Thread", _NullThread)
+        login = RetroAchievementsLogin(username="alice", token="tok123")
+        emu = retroarch.Retroarch()
+        emu.platform = "snes"
+        emu.retroachievements = login
+
+        emu.launch(tmp_path / "game.sfc", None)
+
+        assert ra_calls == ["scrub", ("cfg", None), ("cfg", login)]
+
+    @pytest.mark.parametrize("failure", ["no binary", "spawn"])
+    def test_a_launch_that_fails_after_pinning_leaves_no_token_behind(
+        self, failure: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A launch that raises once the login is pinned blanks the overlay again before raising.
+
+        Activate only retires the session when launch raises; nothing stops
+        the emulator, so no exit would ever take the token back off disk.
+
+        Args:
+            failure: What goes wrong after the pin: the binary is missing, or the spawn fails.
+            tmp_path: The per-test temporary directory.
+            monkeypatch: The pytest monkeypatch fixture.
+        """
+
+        def _no_spawn(self: retroarch.Retroarch, cmd: list[str], env: dict[str, str]) -> None:
+            """Fail the way Popen does on a binary it cannot run."""
+            raise PermissionError("not executable")
+
+        _stub_launch_deps(monkeypatch, tmp_path, None if failure == "no binary" else "/usr/bin/retroarch")
+        monkeypatch.setattr(retroarch.Retroarch, "_spawn_ra", _no_spawn)
+        emu = retroarch.Retroarch()
+        emu.platform = "snes"
+        emu.retroachievements = RetroAchievementsLogin(username="alice", token="tok123secret")
+
+        with pytest.raises((RuntimeError, PermissionError)):
+            emu.launch(tmp_path / "game.sfc", None)
+
+        assert "tok123secret" not in retroarch.BROKER_CFG.read_text()
+
+    def test_a_pid_record_that_cannot_be_written_stops_retroarch(
+        self, ra_calls: list[object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A spawn whose pid record fails takes RetroArch down and scrubs before raising.
+
+        Nothing else could find that process again, and on its own exit it
+        would save this player's login over the next session's scrub.
+
+        Args:
+            ra_calls: The recorded scrubs and overlay writes.
+            tmp_path: The per-test temporary directory.
+            monkeypatch: The pytest monkeypatch fixture.
+        """
+
+        def _no_record(*args: Any, **kwargs: Any) -> None:
+            """Fail the way a full disk does."""
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(retroarch, "_record_pid", _no_record)
+        emu = retroarch.Retroarch()
+        emu.log_path = tmp_path / "retroarch.log"
+
+        with pytest.raises(OSError, match="no space"):
+            emu._spawn_ra(["sleep", "60"], dict(os.environ))
+
+        assert emu._proc is None
+        assert ra_calls == ["scrub", ("cfg", None)]
+
+    def test_stop_scrubs_and_blanks_the_overlay_once_retroarch_is_gone(self, ra_calls: list[object]) -> None:
+        """Once RetroArch is gone, the shared files lose the login and the overlay loses the token.
+
+        RetroArch saves its whole config on the way out, the injected token
+        included, so this is what keeps the next player from inheriting it.
+
+        Args:
+            ra_calls: The recorded scrubs and overlay writes.
+        """
+        emu = retroarch.Retroarch()
+        emu.retroachievements = RetroAchievementsLogin(username="alice", token="tok123")
+
+        emu.stop()
+
+        assert ra_calls == ["scrub", ("cfg", None)]
+
+    def test_stop_leaves_the_files_alone_while_retroarch_survives(
+        self, ra_calls: list[object], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A RetroArch that outlived its stop would save over a scrub, so none is attempted.
+
+        Args:
+            ra_calls: The recorded scrubs and overlay writes.
+            monkeypatch: The pytest monkeypatch fixture.
+        """
+
+        class _Alive:
+            """A process handle that never exits."""
+
+            pid = 4242
+
+            def poll(self) -> None:
+                """Report the process as still running."""
+                return None
+
+        monkeypatch.setattr(retroarch.Emulator, "stop", lambda self: None)
+        emu = retroarch.Retroarch()
+        emu._proc = _Alive()  # type: ignore[assignment]
+
+        emu.stop()
+
+        assert ra_calls == []
+
+    def test_a_graceful_quit_scrubs_too(self, ra_calls: list[object]) -> None:
+        """The usual exit is RetroArch quitting on its own over stdin, which never reaches `stop`.
+
+        Args:
+            ra_calls: The recorded scrubs and overlay writes.
+        """
+        emu = retroarch.Retroarch()
+        emu._proc = _QuitsCleanly()  # type: ignore[assignment]
+
+        emu._quit()
+
+        assert emu._proc is None
+        assert ra_calls == ["scrub", ("cfg", None)]
+
+    def test_an_exit_leaves_no_token_on_disk(self) -> None:
+        """End to end: after a stop, neither RetroArch's config nor the overlay holds the token."""
+        user_cfg = _ra_cfg(
+            retroarch.RA_CONFIG_PATH, 'video_fullscreen = "true"\ncheevos_token = "tok123"\n'
+        )
+        retroarch._write_broker_cfg(RetroAchievementsLogin(username="alice", token="tok123"))
+        emu = retroarch.Retroarch()
+
+        emu.stop()
+
+        assert user_cfg.read_text() == 'video_fullscreen = "true"\n'
+        assert "tok123" not in retroarch.BROKER_CFG.read_text()
+        assert 'cheevos_username = ""' in retroarch.BROKER_CFG.read_text()
+
+    def test_a_failed_blank_is_logged_and_does_not_raise(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An exit that cannot rewrite the overlay still finishes; the next launch rewrites it anyway.
+
+        Args:
+            monkeypatch: The pytest monkeypatch fixture.
+            caplog: The pytest log capture fixture.
+        """
+
+        def _fail(login: Optional[RetroAchievementsLogin] = None) -> Path:
+            """Refuse the write."""
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(retroarch, "_write_broker_cfg", _fail)
+        emu = retroarch.Retroarch()
+
+        with caplog.at_level(logging.WARNING):
+            emu.stop()
+
+        assert "no space left on device" in caplog.text
+
+    def test_the_login_never_shows_its_token_in_a_repr(self) -> None:
+        """The token stays out of any log line that formats the login."""
+        login = RetroAchievementsLogin(username="alice", token="tok123")
+
+        assert "tok123" not in repr(login)
+        assert "alice" in repr(login)
+
+
+class TestRaLoginCapture:
+    """Reading back, on exit, how the player's RetroAchievements login changed."""
+
+    PINNED = RetroAchievementsLogin(username="alice", token="tok123")
+
+    def _end_session(
+        self, saved: Optional[str], pinned: Optional[RetroAchievementsLogin]
+    ) -> retroarch.Retroarch:
+        """Run a session that pinned `pinned` and ended with `saved` in `retroarch.cfg`.
+
+        Args:
+            saved: What RetroArch saved on its way out, or None for no config at all.
+            pinned: The login the launch pinned.
+
+        Returns:
+            The emulator, after its graceful quit.
+        """
+        if saved is not None:
+            _ra_cfg(retroarch.RA_CONFIG_PATH, saved)
+        emu = retroarch.Retroarch()
+        emu.retroachievements = pinned
+        emu._proc = _QuitsCleanly()  # type: ignore[assignment]
+        emu._quit()
+        return emu
+
+    def test_a_new_login_is_captured_and_still_scrubbed(self) -> None:
+        """A player who logged in during the session is reported, and the file loses it anyway."""
+        emu = self._end_session(
+            'video_fullscreen = "true"\ncheevos_username = "alice"\ncheevos_token = "tok123"\n',
+            None,
+        )
+
+        assert emu.retroachievements_change == RetroAchievementsChange(login=self.PINNED)
+        assert retroarch.RA_CONFIG_PATH.read_text() == 'video_fullscreen = "true"\n'
+
+    def test_a_refreshed_token_is_captured(self) -> None:
+        """A token RetroArch replaced during the session is a change."""
+        emu = self._end_session('cheevos_username = "alice"\ncheevos_token = "tok456"\n', self.PINNED)
+
+        assert emu.retroachievements_change == RetroAchievementsChange(
+            login=RetroAchievementsLogin(username="alice", token="tok456")
+        )
+
+    def test_an_unchanged_login_is_not_a_change(self) -> None:
+        """The pinned login saved back as-is reports nothing."""
+        emu = self._end_session('cheevos_username = "alice"\ncheevos_token = "tok123"\n', self.PINNED)
+
+        assert emu.retroachievements_change is None
+
+    def test_a_logout_is_captured_as_cleared(self) -> None:
+        """An empty saved token, after a pinned one, is a change to no login."""
+        emu = self._end_session('cheevos_username = "alice"\ncheevos_token = ""\n', self.PINNED)
+
+        assert emu.retroachievements_change == RetroAchievementsChange(login=None)
+
+    def test_staying_logged_out_is_not_a_change(self) -> None:
+        """No login pinned and none saved reports nothing."""
+        emu = self._end_session('cheevos_username = ""\ncheevos_token = ""\n', None)
+
+        assert emu.retroachievements_change is None
+
+    def test_nothing_saved_is_unknown_not_a_logout(self) -> None:
+        """RetroArch that saved no login (config_save_on_exit off, say) reports nothing."""
+        emu = self._end_session('video_fullscreen = "true"\n', self.PINNED)
+
+        assert emu.retroachievements_change is None
+
+    def test_a_login_the_broker_could_not_pin_again_is_not_reported(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A saved login activate would refuse is dropped, so RomM never stores one that breaks launches.
+
+        Args:
+            caplog: The pytest log capture fixture.
+        """
+        with caplog.at_level(logging.WARNING):
+            emu = self._end_session(
+                'cheevos_username = "alice"\ncheevos_token = "tok 456"\n', self.PINNED
+            )
+
+        assert emu.retroachievements_change is None
+        assert "cannot pin" in caplog.text
+        assert "tok 456" not in caplog.text
+
+    def test_the_stop_before_a_launch_captures_nothing(self) -> None:
+        """With no RetroArch of this session's, a leftover login is the last player's, not this one's."""
+        _ra_cfg(retroarch.RA_CONFIG_PATH, 'cheevos_username = "bob"\ncheevos_token = "bobtok"\n')
+        emu = retroarch.Retroarch()
+        emu.retroachievements = self.PINNED
+
+        emu.stop()
+
+        assert emu.retroachievements_change is None
+        assert retroarch.RA_CONFIG_PATH.read_text() == ""
+
+    def test_a_failed_read_still_scrubs(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A bug in the capture must not leave the login on disk for the next player.
+
+        Args:
+            monkeypatch: The pytest monkeypatch fixture.
+            caplog: The pytest log capture fixture.
+        """
+
+        def _boom(config_path: Path) -> None:
+            """Fail the read."""
+            raise RuntimeError("reader bug")
+
+        monkeypatch.setattr(retroarch.retroarch_credentials, "read_saved_login", _boom)
+        with caplog.at_level(logging.ERROR):
+            emu = self._end_session('cheevos_username = "alice"\ncheevos_token = "tok456"\n', self.PINNED)
+
+        assert emu.retroachievements_change is None
+        assert "tok456" not in retroarch.RA_CONFIG_PATH.read_text()
+        assert "reader bug" in caplog.text
+
+    def test_the_captured_token_is_never_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The capture logs the username it saw, never the token.
+
+        Args:
+            caplog: The pytest log capture fixture.
+        """
+        with caplog.at_level(logging.DEBUG):
+            self._end_session('cheevos_username = "alice"\ncheevos_token = "tok456"\n', self.PINNED)
+
+        assert "alice" in caplog.text
+        assert "tok456" not in caplog.text
