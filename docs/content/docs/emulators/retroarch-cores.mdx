@@ -41,7 +41,7 @@ that platform," not as settled fact.
 | Game Boy Advance | `mgba` | Optional | `gba_bios.bin` fixes a handful of titles that rely on exact BIOS timing; HLE covers the rest. |
 | Virtual Boy | `mednafen_vb` | None | |
 | Nintendo DS | `melondsds` | Optional | Real firmware plus `bios7.bin`/`bios9.bin` is recommended; the core falls back to a built-in HLE BIOS. The original `melonds` core is unmaintained and crashes on launch on current buildbot builds, so don't switch back to it. |
-| Nintendo DSi | `melondsds` | Required | DSi mode has no built-in fallback BIOS, so it needs `dsi_bios7.bin`, `dsi_bios9.bin`, `dsi_firmware.bin` and `dsi_nand.bin`. The core's firmware list marks them optional only because plain DS games run without them. |
+| Nintendo DSi | `melondsds` | Required | Only for games that need a DSi. The core picks DSi mode for a DSi-exclusive card or DSiWare and boots anything that also runs on a DS in DS mode, which needs none of these. DSi mode has no built-in fallback and refuses to boot without `dsi_bios7.bin`, `dsi_bios9.bin`, `bios7.bin` and `bios9.bin`, plus a DSi firmware dump and a DSi NAND dump. The core finds those two by size, not by name, and lists them in its core options. Everything goes in the system dir or a `melonDS DS/` folder inside it. |
 
 ## Nintendo, disc and 3D
 
