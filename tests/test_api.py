@@ -428,6 +428,30 @@ def test_dev_mode_reports_an_ra_login_change_without_sending_it(
     assert "tok456secret" not in str(body)
 
 
+def _mock_romm(
+    monkeypatch: pytest.MonkeyPatch, handler: Callable[[httpx.Request], httpx.Response]
+) -> list[dict[str, Any]]:
+    """Answer every callback push with `handler` instead of the network.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher, undone when the test ends.
+        handler: Answers each request the push makes.
+
+    Returns:
+        The keyword arguments each push built its client with, in order.
+    """
+    clients: list[dict[str, Any]] = []
+    real_client = httpx.AsyncClient
+
+    def _client(**kw: Any) -> httpx.AsyncClient:  # noqa: ANN401
+        """Build the real client over the mock transport, keeping its arguments."""
+        clients.append(kw)
+        return real_client(transport=httpx.MockTransport(handler), **kw)
+
+    monkeypatch.setattr(callback.httpx, "AsyncClient", _client)
+    return clients
+
+
 def test_a_failed_ra_login_push_does_not_stop_the_exit(
     client: TestClient,
     broker_dirs: dict[str, Path],
@@ -447,10 +471,7 @@ def test_a_failed_ra_login_push_does_not_stop_the_exit(
         """Answer as a RomM without the endpoint would."""
         return httpx.Response(404)
 
-    real_client = httpx.AsyncClient
-    monkeypatch.setattr(
-        callback.httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(_refuse), **kw)
-    )
+    _mock_romm(monkeypatch, _refuse)
     _activate(client, broker_dirs)
     fake_emulator[0].retroachievements_change = base.RetroAchievementsChange(login=None)
 
@@ -3846,10 +3867,7 @@ async def test_the_save_upload_log_hides_callback_credentials(
     def refuse(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500)
 
-    real_client = httpx.AsyncClient
-    monkeypatch.setattr(
-        callback.httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(refuse), **kw)
-    )
+    _mock_romm(monkeypatch, refuse)
     caplog.set_level(logging.INFO, logger="webstation_broker.callback")
 
     report = await callback.push_save_archive(
@@ -3877,10 +3895,7 @@ async def test_the_ra_login_push_sends_romm_the_player_and_their_login(
         seen.append(request)
         return httpx.Response(204)
 
-    real_client = httpx.AsyncClient
-    monkeypatch.setattr(
-        callback.httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(_take), **kw)
-    )
+    _mock_romm(monkeypatch, _take)
     caplog.set_level(logging.DEBUG, logger="webstation_broker.callback")
     change = base.RetroAchievementsChange(
         login=base.RetroAchievementsLogin(username="alice", token="tok456secret")
@@ -3917,19 +3932,12 @@ async def test_the_ra_login_push_has_its_own_timeout(monkeypatch: pytest.MonkeyP
     Args:
         monkeypatch: Pytest's attribute patcher, undone when the test ends.
     """
-    timeouts: list[Any] = []
 
     def _take(request: httpx.Request) -> httpx.Response:
         """Accept the push."""
         return httpx.Response(204)
 
-    def _client(**kw: Any) -> httpx.AsyncClient:  # noqa: ANN401
-        """Keep the timeout the push asked for."""
-        timeouts.append(kw.get("timeout"))
-        return real_client(transport=httpx.MockTransport(_take), **kw)
-
-    real_client = httpx.AsyncClient
-    monkeypatch.setattr(callback.httpx, "AsyncClient", _client)
+    clients = _mock_romm(monkeypatch, _take)
     monkeypatch.setattr(settings, "SAVE_UPLOAD_TIMEOUT", 30.0)
     monkeypatch.setattr(settings, "RA_LOGIN_TIMEOUT", 4.0)
     change = base.RetroAchievementsChange(login=None)
@@ -3937,7 +3945,7 @@ async def test_the_ra_login_push_has_its_own_timeout(monkeypatch: pytest.MonkeyP
     sess = {"id": "s", "emulator": "retroarch"}
     await callback.push_ra_login({"base_url": "https://romm.example/", "token": "cb-token"}, sess, change)
 
-    assert timeouts == [4.0]
+    assert [kw.get("timeout") for kw in clients] == [4.0]
 
 
 async def test_the_ra_login_push_sends_null_for_a_logout(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3953,10 +3961,7 @@ async def test_the_ra_login_push_sends_null_for_a_logout(monkeypatch: pytest.Mon
         seen.append(request)
         return httpx.Response(200)
 
-    real_client = httpx.AsyncClient
-    monkeypatch.setattr(
-        callback.httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(_take), **kw)
-    )
+    _mock_romm(monkeypatch, _take)
 
     report = await callback.push_ra_login(
         {"base_url": "https://romm.example"},
@@ -3985,10 +3990,7 @@ async def test_an_unreachable_romm_fails_the_ra_login_push_without_raising(
         """Fail the connection."""
         raise httpx.ConnectError("connection refused", request=request)
 
-    real_client = httpx.AsyncClient
-    monkeypatch.setattr(
-        callback.httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(_drop), **kw)
-    )
+    _mock_romm(monkeypatch, _drop)
     caplog.set_level(logging.DEBUG, logger="webstation_broker.callback")
 
     report = await callback.push_ra_login(
