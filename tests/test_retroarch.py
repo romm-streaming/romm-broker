@@ -625,19 +625,6 @@ class TestBrokerConfig:
 
         assert path.stat().st_mode & 0o777 == 0o600
 
-    def test_a_temp_file_left_by_a_crash_does_not_block_the_write(self) -> None:
-        """A `broker.tmp` left behind by a write that died midway is replaced, not tripped over."""
-        stale = retroarch.BROKER_CFG.with_suffix(".tmp")
-        stale.parent.mkdir(parents=True, exist_ok=True)
-        stale.write_text("half a config")
-        stale.chmod(0o644)
-
-        cfg = retroarch._write_broker_cfg(RetroAchievementsLogin(username="alice", token="tok123"))
-
-        assert 'cheevos_token = "tok123"' in cfg.read_text()
-        assert cfg.stat().st_mode & 0o777 == 0o600
-        assert not stale.exists()
-
     def test_a_failed_write_leaves_no_temp_file_behind(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A write that fails midway takes its temp file, which can hold the token, with it.
 
@@ -653,7 +640,7 @@ class TestBrokerConfig:
         with pytest.raises(OSError, match="disk full"):
             retroarch._write_broker_cfg(RetroAchievementsLogin(username="alice", token="tok123"))
 
-        assert not retroarch.BROKER_CFG.with_suffix(".tmp").exists()
+        assert not list(retroarch.BROKER_CFG.parent.glob(".broker.cfg.*"))
 
     def test_a_world_readable_overlay_is_tightened(self) -> None:
         """An overlay an older broker left world-readable comes back owner-only."""
@@ -683,16 +670,6 @@ def _ra_cfg(path: Path, text: str, mode: int = 0o644) -> Path:
 
 class TestScrubRaCredentials:
     """Removing RetroAchievements credentials RetroArch saved into the shared config files."""
-
-    @pytest.fixture(autouse=True)
-    def _paths(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Point the user's retroarch.cfg at tmp_path; the keychain file sits beside it.
-
-        Args:
-            tmp_path: The per-test temporary directory.
-            monkeypatch: The pytest monkeypatch fixture.
-        """
-        monkeypatch.setattr(retroarch, "RA_CONFIG_PATH", tmp_path / "ra" / "retroarch.cfg")
 
     def test_the_credentials_leave_retroarch_cfg_and_nothing_else_does(self) -> None:
         """The three credential lines go; every other line stays byte for byte.
@@ -1089,15 +1066,8 @@ class TestResumeGate:
         Returns:
             The args tuple of every deferred-load thread launch() started, in order.
         """
-        monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
-        monkeypatch.setattr(retroarch, "_ensure_core_info", lambda *a, **k: None)
-        monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
-        monkeypatch.setattr(retroarch, "_ensure_save_links", lambda links: None)
-        monkeypatch.setattr(retroarch, "_write_core_options", lambda options: tmp_path / "core-options.cfg")
+        _stub_launch_deps(monkeypatch, tmp_path)
         monkeypatch.setattr(retroarch, "_write_broker_cfg", lambda *a: tmp_path / "broker.cfg")
-        monkeypatch.setattr(
-            retroarch.shutil, "which", lambda binary, path=None: "/usr/bin/retroarch"
-        )
         monkeypatch.setattr(retroarch.Retroarch, "stop", lambda self: None)
         monkeypatch.setattr(retroarch.Retroarch, "_spawn_ra", lambda self, cmd, env: None)
 
@@ -5614,22 +5584,80 @@ class TestStateCoreHeader:
         assert r.status_code != 409
 
 
+def _stub_launch_deps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, binary: Optional[str] = "/usr/bin/retroarch"
+) -> None:
+    """Stub the core, asset and binary lookups launch() makes before it pins and spawns.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        tmp_path: The per-test temporary directory.
+        binary: What the PATH lookup for RetroArch finds, or None for nothing.
+    """
+    monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
+    monkeypatch.setattr(retroarch, "_ensure_core_info", lambda *a, **k: None)
+    monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
+    monkeypatch.setattr(retroarch, "_ensure_save_links", lambda links: None)
+    monkeypatch.setattr(retroarch, "_write_core_options", lambda options: tmp_path / "core-options.cfg")
+    monkeypatch.setattr(retroarch.shutil, "which", lambda name, path=None: binary)
+
+
+class _QuitsCleanly:
+    """A RetroArch process handle that exits as soon as it is asked to."""
+
+    pid = 4242
+
+    def __init__(self) -> None:
+        """Give the handle a stdin to take the QUIT command."""
+        self.stdin = io.BytesIO()
+
+    def poll(self) -> None:
+        """Report the process as running until it is waited on."""
+        return None
+
+    def wait(self, timeout: float) -> int:
+        """Exit cleanly."""
+        return 0
+
+
 class TestRaLoginLifecycle:
     """When the RetroAchievements credentials are scrubbed and pinned around a session."""
 
-    def test_a_launch_scrubs_before_pinning_the_player_s_login(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Launch clears saved credentials first, then writes this player's login into the overlay.
-
-        The launch-time scrub catches what the exit-time one could not: a
-        crash, a broker restart, or a login an existing install already had.
+    @pytest.fixture
+    def ra_calls(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[object]:
+        """Record every scrub and overlay write, in order, instead of doing them.
 
         Args:
             tmp_path: The per-test temporary directory.
             monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            `"scrub"` for each scrub and `("cfg", login)` for each overlay write.
         """
         calls: list[object] = []
+
+        def _write(login: Optional[RetroAchievementsLogin] = None) -> Path:
+            """Record the login the overlay was written with."""
+            calls.append(("cfg", login))
+            return tmp_path / "broker.cfg"
+
+        monkeypatch.setattr(retroarch, "_scrub_ra_credentials", lambda: calls.append("scrub"))
+        monkeypatch.setattr(retroarch, "_write_broker_cfg", _write)
+        return calls
+
+    def test_a_launch_scrubs_before_pinning_the_player_s_login(
+        self, ra_calls: list[object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Launch's opening stop clears saved credentials, then this player's login is pinned.
+
+        That scrub catches what an exit-time one could not: a crash, a broker
+        restart, or a login an existing install already had.
+
+        Args:
+            ra_calls: The recorded scrubs and overlay writes.
+            tmp_path: The per-test temporary directory.
+            monkeypatch: The pytest monkeypatch fixture.
+        """
 
         class _NullThread:
             """A threading.Thread stand-in whose target is never run."""
@@ -5640,21 +5668,7 @@ class TestRaLoginLifecycle:
             def start(self) -> None:
                 """Start nothing."""
 
-        def _write(login: Optional[RetroAchievementsLogin] = None) -> Path:
-            """Record the login the overlay was written with."""
-            calls.append(("cfg", login))
-            return tmp_path / "broker.cfg"
-
-        monkeypatch.setattr(retroarch, "RA_CONFIG_PATH", tmp_path / "ra" / "retroarch.cfg")
-        monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
-        monkeypatch.setattr(retroarch, "_ensure_core_info", lambda *a, **k: None)
-        monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
-        monkeypatch.setattr(retroarch, "_ensure_save_links", lambda links: None)
-        monkeypatch.setattr(retroarch, "_write_core_options", lambda options: tmp_path / "core-options.cfg")
-        monkeypatch.setattr(retroarch, "_scrub_ra_credentials", lambda: calls.append("scrub"))
-        monkeypatch.setattr(retroarch, "_write_broker_cfg", _write)
-        monkeypatch.setattr(retroarch.shutil, "which", lambda binary, path=None: "/usr/bin/retroarch")
-        monkeypatch.setattr(retroarch.Retroarch, "stop", lambda self: None)
+        _stub_launch_deps(monkeypatch, tmp_path)
         monkeypatch.setattr(retroarch.Retroarch, "_spawn_ra", lambda self, cmd, env: None)
         monkeypatch.setattr(retroarch.threading, "Thread", _NullThread)
         login = RetroAchievementsLogin(username="alice", token="tok123")
@@ -5664,7 +5678,7 @@ class TestRaLoginLifecycle:
 
         emu.launch(tmp_path / "game.sfc", None)
 
-        assert calls == ["scrub", ("cfg", login)]
+        assert ra_calls == ["scrub", ("cfg", None), ("cfg", login)]
 
     @pytest.mark.parametrize("failure", ["no binary", "spawn"])
     def test_a_launch_that_fails_after_pinning_leaves_no_token_behind(
@@ -5685,13 +5699,7 @@ class TestRaLoginLifecycle:
             """Fail the way Popen does on a binary it cannot run."""
             raise PermissionError("not executable")
 
-        monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
-        monkeypatch.setattr(retroarch, "_ensure_core_info", lambda *a, **k: None)
-        monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
-        monkeypatch.setattr(retroarch, "_ensure_save_links", lambda links: None)
-        monkeypatch.setattr(retroarch, "_write_core_options", lambda options: tmp_path / "core-options.cfg")
-        found = None if failure == "no binary" else "/usr/bin/retroarch"
-        monkeypatch.setattr(retroarch.shutil, "which", lambda binary, path=None: found)
+        _stub_launch_deps(monkeypatch, tmp_path, None if failure == "no binary" else "/usr/bin/retroarch")
         monkeypatch.setattr(retroarch.Retroarch, "_spawn_ra", _no_spawn)
         emu = retroarch.Retroarch()
         emu.platform = "snes"
@@ -5702,36 +5710,31 @@ class TestRaLoginLifecycle:
 
         assert "tok123secret" not in retroarch.BROKER_CFG.read_text()
 
-    def test_stop_scrubs_and_blanks_the_overlay_once_retroarch_is_gone(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_stop_scrubs_and_blanks_the_overlay_once_retroarch_is_gone(self, ra_calls: list[object]) -> None:
         """Once RetroArch is gone, the shared files lose the login and the overlay loses the token.
 
         RetroArch saves its whole config on the way out, the injected token
         included, so this is what keeps the next player from inheriting it.
 
         Args:
-            monkeypatch: The pytest monkeypatch fixture.
+            ra_calls: The recorded scrubs and overlay writes.
         """
-        calls: list[object] = []
-        monkeypatch.setattr(retroarch, "_scrub_ra_credentials", lambda: calls.append("scrub"))
-        monkeypatch.setattr(retroarch, "_write_broker_cfg", lambda login=None: calls.append(("cfg", login)))
         emu = retroarch.Retroarch()
         emu.retroachievements = RetroAchievementsLogin(username="alice", token="tok123")
 
         emu.stop()
 
-        assert calls == ["scrub", ("cfg", None)]
+        assert ra_calls == ["scrub", ("cfg", None)]
 
     def test_stop_leaves_the_files_alone_while_retroarch_survives(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, ra_calls: list[object], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A RetroArch that outlived its stop would save over a scrub, so none is attempted.
 
         Args:
+            ra_calls: The recorded scrubs and overlay writes.
             monkeypatch: The pytest monkeypatch fixture.
         """
-        calls: list[object] = []
 
         class _Alive:
             """A process handle that never exits."""
@@ -5742,47 +5745,27 @@ class TestRaLoginLifecycle:
                 """Report the process as still running."""
                 return None
 
-        monkeypatch.setattr(retroarch, "_scrub_ra_credentials", lambda: calls.append("scrub"))
-        monkeypatch.setattr(retroarch, "_write_broker_cfg", lambda login=None: calls.append(("cfg", login)))
         monkeypatch.setattr(retroarch.Emulator, "stop", lambda self: None)
         emu = retroarch.Retroarch()
         emu._proc = _Alive()  # type: ignore[assignment]
 
         emu.stop()
 
-        assert calls == []
+        assert ra_calls == []
 
-    def test_a_graceful_quit_scrubs_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_a_graceful_quit_scrubs_too(self, ra_calls: list[object]) -> None:
         """The usual exit is RetroArch quitting on its own over stdin, which never reaches `stop`.
 
         Args:
-            monkeypatch: The pytest monkeypatch fixture.
+            ra_calls: The recorded scrubs and overlay writes.
         """
-        calls: list[object] = []
-
-        class _Quits:
-            """A process handle that exits as soon as it is asked to."""
-
-            pid = 4242
-            stdin = io.BytesIO()
-
-            def poll(self) -> None:
-                """Report the process as running until it is waited on."""
-                return None
-
-            def wait(self, timeout: float) -> int:
-                """Exit cleanly."""
-                return 0
-
-        monkeypatch.setattr(retroarch, "_scrub_ra_credentials", lambda: calls.append("scrub"))
-        monkeypatch.setattr(retroarch, "_write_broker_cfg", lambda login=None: calls.append(("cfg", login)))
         emu = retroarch.Retroarch()
-        emu._proc = _Quits()  # type: ignore[assignment]
+        emu._proc = _QuitsCleanly()  # type: ignore[assignment]
 
         emu._quit()
 
         assert emu._proc is None
-        assert calls == ["scrub", ("cfg", None)]
+        assert ra_calls == ["scrub", ("cfg", None)]
 
     def test_an_exit_leaves_no_token_on_disk(self) -> None:
         """End to end: after a stop, neither RetroArch's config nor the overlay holds the token."""
@@ -5826,24 +5809,6 @@ class TestRaLoginLifecycle:
 
         assert "tok123" not in repr(login)
         assert "alice" in repr(login)
-
-
-class _QuitsCleanly:
-    """A RetroArch process handle that exits as soon as it is asked to."""
-
-    pid = 4242
-
-    def __init__(self) -> None:
-        """Give the handle a stdin to take the QUIT command."""
-        self.stdin = io.BytesIO()
-
-    def poll(self) -> None:
-        """Report the process as running until it is waited on."""
-        return None
-
-    def wait(self, timeout: float) -> int:
-        """Exit cleanly."""
-        return 0
 
 
 class TestRaLoginCapture:

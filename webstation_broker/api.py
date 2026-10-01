@@ -1390,13 +1390,8 @@ async def _report_ra_login(
         return None
     kind = change.kind
     if settings.DEV_MODE or not cb:
-        log.info(
-            "session %s: ra login %s, not reported (%s)",
-            sess["id"],
-            kind,
-            "dev mode" if settings.DEV_MODE else "no callback",
-        )
         note = "dev mode: nothing was sent" if settings.DEV_MODE else "no callback to report to"
+        log.info("session %s: ra login %s, not reported (%s)", sess["id"], kind, note)
         return {"mode": "report-only", "change": kind, "note": note}
     return await callback.push_ra_login(cb, sess, change)
 

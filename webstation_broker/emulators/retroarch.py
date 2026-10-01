@@ -983,19 +983,33 @@ def _write_broker_cfg(login: Optional[RetroAchievementsLogin] = None) -> Path:
         f'cheevos_token = "{token}"\n'
         'cheevos_password = ""\n'
     )
-    tmp = BROKER_CFG.with_suffix(".tmp")
-    tmp.unlink(missing_ok=True)
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    _write_with_mode(BROKER_CFG, cfg.encode(), 0o600)
+    return BROKER_CFG
+
+
+def _write_with_mode(path: Path, data: bytes, mode: int) -> None:
+    """Replace `path` atomically with `data`, at `mode` from the first byte written.
+
+    The temp file is created owner-only and widened to `mode` only once it is
+    complete, and it is removed if anything fails, since it can hold a token.
+
+    Args:
+        path: The file to replace.
+        data: Its new contents.
+        mode: The permission bits it ends with.
+
+    Raises:
+        OSError: When the write or the replace fails.
+    """
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", delete=False) as fh:
+        tmp = Path(fh.name)
     try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write(cfg)
-        os.replace(tmp, BROKER_CFG)
+        tmp.write_bytes(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
     except BaseException:
-        # A half-written temp file can hold the token; nothing reads it, but
-        # it has no business staying on disk until the next write.
         tmp.unlink(missing_ok=True)
         raise
-    return BROKER_CFG
 
 
 def _ra_login_change(
@@ -1066,20 +1080,10 @@ def _scrub_ra_credentials() -> None:
             continue
         if kept and not kept[-1].endswith(b"\n"):
             kept[-1] += b"\n"
-        tmp_name = None
         try:
-            mode = path.stat().st_mode & 0o7777
-            with tempfile.NamedTemporaryFile(
-                dir=path.parent, prefix=f".{path.name}.", delete=False
-            ) as fh:
-                tmp_name = fh.name
-                fh.write(b"".join(kept))
-            os.chmod(tmp_name, mode)
-            os.replace(tmp_name, path)
+            _write_with_mode(path, b"".join(kept), path.stat().st_mode & 0o7777)
         except OSError as exc:
             log.warning("ra credentials: could not scrub %s: %s", path, exc)
-            if tmp_name is not None:
-                Path(tmp_name).unlink(missing_ok=True)
             continue
         log.info("ra credentials: removed %d line(s) from %s", removed, path)
 
@@ -2888,7 +2892,7 @@ class Retroarch(Emulator):
         launch_path = env.get("PATH")
         if "/" not in binary and shutil.which(binary, path=launch_path) is None:
             raise RuntimeError(f"retroarch binary not found in PATH ({launch_path}): {binary}")
-        _scrub_ra_credentials()
+        # The opening stop() has already scrubbed the saved login through _forget.
         cfg_path = _write_broker_cfg(self.retroachievements)
 
         self._rom_base = rom_path.stem
