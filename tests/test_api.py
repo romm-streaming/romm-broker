@@ -771,7 +771,7 @@ def test_context_resolves_the_controller_token(
     assert body["userRole"] == "controller"
     assert body["username"] == "Ana"
     assert body["gameName"] == "Game"
-    assert body["iframeSrc"] == f"stream/?token={token}"
+    assert body["iframeSrc"] == f"stream/#token={token}"
 
 
 def test_context_resolves_a_viewer_token_to_their_permission(
