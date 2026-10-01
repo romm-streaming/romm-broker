@@ -5710,6 +5710,34 @@ class TestRaLoginLifecycle:
 
         assert "tok123secret" not in retroarch.BROKER_CFG.read_text()
 
+    def test_a_pid_record_that_cannot_be_written_stops_retroarch(
+        self, ra_calls: list[object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A spawn whose pid record fails takes RetroArch down and scrubs before raising.
+
+        Nothing else could find that process again, and on its own exit it
+        would save this player's login over the next session's scrub.
+
+        Args:
+            ra_calls: The recorded scrubs and overlay writes.
+            tmp_path: The per-test temporary directory.
+            monkeypatch: The pytest monkeypatch fixture.
+        """
+
+        def _no_record(*args: Any, **kwargs: Any) -> None:
+            """Fail the way a full disk does."""
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(retroarch, "_record_pid", _no_record)
+        emu = retroarch.Retroarch()
+        emu.log_path = tmp_path / "retroarch.log"
+
+        with pytest.raises(OSError, match="no space"):
+            emu._spawn_ra(["sleep", "60"], dict(os.environ))
+
+        assert emu._proc is None
+        assert ra_calls == ["scrub", ("cfg", None)]
+
     def test_stop_scrubs_and_blanks_the_overlay_once_retroarch_is_gone(self, ra_calls: list[object]) -> None:
         """Once RetroArch is gone, the shared files lose the login and the overlay loses the token.
 

@@ -2734,7 +2734,12 @@ class Retroarch(Emulator):
         finally:
             if log_fh:
                 log_fh.close()
-        _record_pid(self.name, self._proc.pid, cmd)
+        try:
+            _record_pid(self.name, self._proc.pid, cmd)
+        except OSError:
+            # Without a record nothing could find this RetroArch again.
+            self.stop()
+            raise
         self._stdout_buf = bytearray()
         self._reader = threading.Thread(target=self._read_stdout, daemon=True)
         self._reader.start()
