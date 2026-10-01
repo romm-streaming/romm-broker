@@ -638,6 +638,23 @@ class TestBrokerConfig:
         assert cfg.stat().st_mode & 0o777 == 0o600
         assert not stale.exists()
 
+    def test_a_failed_write_leaves_no_temp_file_behind(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A write that fails midway takes its temp file, which can hold the token, with it.
+
+        Args:
+            monkeypatch: The pytest monkeypatch fixture.
+        """
+
+        def _fail(*_args: object) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(retroarch.os, "replace", _fail)
+
+        with pytest.raises(OSError, match="disk full"):
+            retroarch._write_broker_cfg(RetroAchievementsLogin(username="alice", token="tok123"))
+
+        assert not retroarch.BROKER_CFG.with_suffix(".tmp").exists()
+
     def test_a_world_readable_overlay_is_tightened(self) -> None:
         """An overlay an older broker left world-readable comes back owner-only."""
         retroarch.BROKER_CFG.parent.mkdir(parents=True, exist_ok=True)
@@ -702,6 +719,26 @@ class TestScrubRaCredentials:
             'cheevos_hardcore_mode_enable = "false"\n'
             "menu_driver = ozone\n"
         )
+
+    def test_a_symlinked_config_is_scrubbed_at_its_target(self, tmp_path: Path) -> None:
+        """A retroarch.cfg that is a symlink stays one; the file it points at loses the login.
+
+        RetroArch writes through the link, so replacing the link with a plain
+        file would leave the user's real config behind from then on.
+
+        Args:
+            tmp_path: The per-test temporary directory.
+        """
+        target = _ra_cfg(
+            tmp_path / "real" / "retroarch.cfg", 'cheevos_token = "tok123"\nmenu_driver = ozone\n'
+        )
+        retroarch.RA_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        retroarch.RA_CONFIG_PATH.symlink_to(target)
+
+        retroarch._scrub_ra_credentials()
+
+        assert retroarch.RA_CONFIG_PATH.is_symlink()
+        assert target.read_text() == "menu_driver = ozone\n"
 
     def test_sealed_values_leave_the_keychain_file(self) -> None:
         """RetroArch's keychain file loses its credential lines without the key being needed.

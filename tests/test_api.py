@@ -217,6 +217,8 @@ def test_activate_without_an_ra_login_leaves_it_unset(
         {"username": 'al"ice', "token": "SEKRIT123"},
         {"username": "", "token": "SEKRIT123"},
         {"username": "alice", "token": ""},
+        {"username": "alice\n", "token": "SEKRIT123"},
+        {"username": "alice", "token": "SEKRIT123\n"},
         {"username": "alice"},
         {"token": "SEKRIT123"},
     ],

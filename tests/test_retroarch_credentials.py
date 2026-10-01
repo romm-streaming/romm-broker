@@ -169,6 +169,13 @@ class TestPlaintextLayout:
         config_path.write_text("cheevos_username = alice\ncheevos_token = tok123\n")
         assert retroarch_credentials.read_saved_login(config_path) == ALICE
 
+    def test_a_bare_empty_value_does_not_reach_the_next_line(self, config_path: Path) -> None:
+        """`cheevos_token =` with nothing after it is an empty token, not the next line's key."""
+        config_path.write_text("cheevos_token =\ncheevos_username = alice\n")
+        assert retroarch_credentials.read_saved_login(config_path) == RetroAchievementsLogin(
+            username="alice", token=""
+        )
+
     def test_a_commented_key_is_not_read(self, config_path: Path) -> None:
         """Only a real setting line counts."""
         config_path.write_text('# cheevos_username = "alice"\n')

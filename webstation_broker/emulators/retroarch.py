@@ -986,9 +986,15 @@ def _write_broker_cfg(login: Optional[RetroAchievementsLogin] = None) -> Path:
     tmp = BROKER_CFG.with_suffix(".tmp")
     tmp.unlink(missing_ok=True)
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(cfg)
-    os.replace(tmp, BROKER_CFG)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(cfg)
+        os.replace(tmp, BROKER_CFG)
+    except BaseException:
+        # A half-written temp file can hold the token; nothing reads it, but
+        # it has no business staying on disk until the next write.
+        tmp.unlink(missing_ok=True)
+        raise
     return BROKER_CFG
 
 
@@ -1039,11 +1045,13 @@ def _scrub_ra_credentials() -> None:
     works whether the value is plaintext or sealed, so no key is needed.
 
     Every other line is kept byte for byte, as are the file's permissions. A
-    file with nothing to remove is not rewritten. A failure is logged and
-    swallowed: the empty pins in `broker.cfg` still keep a leftover login
-    from being used.
+    file with nothing to remove is not rewritten. A symlinked config is
+    rewritten at its target, as RetroArch itself writes it, so the link
+    survives. A failure is logged and swallowed: the empty pins in
+    `broker.cfg` still keep a leftover login from being used.
     """
-    for path in (RA_CONFIG_PATH, RA_CONFIG_PATH.parent / retroarch_credentials.KEYCHAIN_CFG):
+    for name in (RA_CONFIG_PATH, RA_CONFIG_PATH.parent / retroarch_credentials.KEYCHAIN_CFG):
+        path = Path(os.path.realpath(name))
         try:
             data = path.read_bytes()
         except FileNotFoundError:

@@ -142,7 +142,8 @@ live token while RetroArch runs. The token never appears in the broker's
 logs or in `/session/status`.
 
 If your container already has a RetroAchievements login saved in
-RetroArch, the first launch after upgrading removes it. Each player then
+RetroArch, the broker removes it when it first starts after the upgrade,
+before any session runs. Each player then
 logs in once from RetroArch's Achievements menu. The broker reports that
 login to RomM when the session ends, but RomM doesn't store it yet
 ([#110](https://github.com/romm-streaming/romm-broker/issues/110)). Until it

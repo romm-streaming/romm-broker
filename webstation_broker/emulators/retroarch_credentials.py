@@ -76,8 +76,9 @@ TAG_SIZE = 16
 """Poly1305 tag length, in bytes."""
 
 _CREDENTIAL_LINE = re.compile(
-    r'^\s*(cheevos_username|cheevos_token)\s*=\s*(?:"([^"]*)"|(\S*))', re.MULTILINE
+    r'^[ \t]*(cheevos_username|cheevos_token)[ \t]*=[ \t]*(?:"([^"\n]*)"|(\S*))', re.MULTILINE
 )
+"""A credential line and its value; the spacing never crosses a line, so a bare empty value stays empty."""
 
 
 class KeychainError(Exception):

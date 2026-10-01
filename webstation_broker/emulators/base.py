@@ -40,11 +40,13 @@ class RetroAchievementsLogin:
     token: str = field(repr=False)
 
 
-RA_CREDENTIAL_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,128}$")
+RA_CREDENTIAL_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,128}\Z")
 """What a RetroAchievements username or token may contain to be written into a config line.
 
 Both are written into a quoted RetroArch config line, so a quote or a newline
 would let them add config keys of their own. Real ones are plain alphanumerics.
+It is anchored at the very end of the string: `$` would also match before
+one trailing newline and let it through.
 """
 
 
