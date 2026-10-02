@@ -70,7 +70,14 @@ own `libretro_directory`. That's also where RetroArch keeps the matching
 info file, and checking its status (`GET_STATUS`) then crashes RetroArch
 mid-session (a segfault, a crash from the program touching memory it isn't
 allowed to). The broker never edits your RetroArch config directly; it only
-layers extra settings on top with `--appendconfig`.
+layers extra settings on top with `--appendconfig`. That layer also turns off
+`config_save_on_exit`. Left on (RetroArch's default), a clean quit writes the
+merged config, broker settings included, back over your `retroarch.cfg`.
+Earlier broker versions left it on and could leave keys such as
+`savestate_directory = "~/.retroarch/states"` or
+`core_options_path = "~/.retroarch/broker-core-options.cfg"` in that file. They
+don't affect streamed sessions, but if you also run RetroArch on the desktop,
+check your config for them.
 
 Save states work, but RetroArch has no direct "save to slot number n"
 command. Instead, the broker steps the slot counter all the way down to -1
@@ -86,6 +93,16 @@ need the same trick. Two settings control the timing:
 seconds between presses, by default) and
 [`RETROARCH_SLOT_HOME_STEPS`](/docs/configuration/emulators#retroarch) (24
 presses to reach the floor, by default).
+
+RetroArch's menu ignores stdin save commands while it's open, so a save sent
+with the Quick Menu up writes nothing. When a save writes nothing to any
+slot, the broker sends `MENU_TOGGLE` to close the menu, parks the slot again
+(the menu has its own State Slot setting), and retries. If the retry writes
+nothing either, it toggles the menu back, so a menu the player opened stays
+open and one the broker opened is closed again. A save that lands in a
+different slot is a slot change, not a menu, and only gets the re-park.
+[`RETROARCH_MENU_SETTLE`](/docs/configuration/emulators#retroarch) (0.5
+seconds, by default) is the pause after the toggle.
 
 Not every core can save a state (some can't turn their memory into a save
 file, i.e. "serialize" it). A platform whose core can't do this can be marked

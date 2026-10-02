@@ -567,6 +567,17 @@ class TestBrokerConfig:
 
         assert 'savestate_thumbnail_enable = "false"' in cfg
 
+    def test_a_clean_quit_does_not_write_the_overlay_into_the_user_config(self) -> None:
+        """The overlay turns `config_save_on_exit` off.
+
+        RetroArch defaults it on, and a clean `QUIT` then saves the merged
+        config, every key of this overlay included, over the user's own
+        `retroarch.cfg`.
+        """
+        cfg = retroarch._write_broker_cfg().read_text()
+
+        assert 'config_save_on_exit = "false"' in cfg
+
     def test_the_broker_s_core_options_file_always_wins(self) -> None:
         """The overlay always points at the broker's core options file and forces it to apply.
 
@@ -2775,6 +2786,193 @@ class TestSaveStateAgainstResume:
         assert emulator.events == ["save", "save"]
 
 
+class FakeMenuRetroarch:
+    """A stand-in for RetroArch's stdin handling, as far as saves and the menu go.
+
+    While the menu is open it swallows the hotkey-style commands
+    (`SAVE_STATE` and the slot presses) and acts only on `MENU_TOGGLE`, the
+    way RetroArch 1.22.2 did when a save was sent with the Quick Menu up.
+    """
+
+    def __init__(self, state_dir: Path, *, menu_open: bool = False, slot: int = 0) -> None:
+        """Start with the menu and slot as given.
+
+        Args:
+            state_dir: Where `SAVE_STATE` writes, sorted under a core subdir.
+            menu_open: Whether the menu is up at the start.
+            slot: The current state slot at the start.
+        """
+        self.dir = state_dir / "Gambatte"
+        self.menu_open = menu_open
+        self.slot = slot
+        self.refuses_saves = False
+        self.sent: list[str] = []
+        self.writes = 0
+
+    def write_cmd(self, cmd: str) -> bool:
+        """Record and act on one stdin command.
+
+        Args:
+            cmd: The command line, without its newline.
+
+        Returns:
+            True, like a command that reached the pipe.
+        """
+        self.sent.append(cmd)
+        if cmd == "MENU_TOGGLE":
+            self.menu_open = not self.menu_open
+        elif self.menu_open:
+            pass
+        elif cmd == "STATE_SLOT_MINUS":
+            self.slot = max(-1, self.slot - 1)
+        elif cmd == "STATE_SLOT_PLUS":
+            self.slot += 1
+        elif cmd == "SAVE_STATE" and not self.refuses_saves:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            self.writes += 1
+            target = self.dir / retroarch._state_name("Game", self.slot)
+            target.write_bytes(b"s" * self.writes)
+            os.utime(target, (time.time() + self.writes, time.time() + self.writes))
+        return True
+
+    @property
+    def toggles(self) -> int:
+        """How many `MENU_TOGGLE` commands were sent."""
+        return self.sent.count("MENU_TOGGLE")
+
+
+class TestSaveWithTheMenuOpen:
+    """A save sent while RetroArch's menu is up, which the menu swallows."""
+
+    @pytest.fixture
+    def make(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]:
+        """Build a live, homed Retroarch wired to a `FakeMenuRetroarch`.
+
+        Args:
+            tmp_path: Backs the state directory.
+            monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            A factory taking `FakeMenuRetroarch`'s keyword arguments and
+            returning the emulator and its fake.
+        """
+        state_dir = tmp_path / "states"
+        monkeypatch.setattr(retroarch, "STATE_DIR", state_dir)
+        monkeypatch.setattr(retroarch, "SLOT_STEP_DELAY", 0)
+        monkeypatch.setattr(retroarch, "SLOT_HOME_STEPS", 4)
+        monkeypatch.setattr(retroarch, "MENU_SETTLE", 0)
+
+        def build(**kwargs: Any) -> tuple[retroarch.Retroarch, FakeMenuRetroarch]:
+            fake = FakeMenuRetroarch(state_dir, **kwargs)
+            emu = retroarch.Retroarch()
+            emu.platform = "gb"
+            emu._rom_base = "Game"
+            emu._slot_homed = True
+            emu._state_confirm_wait = 0.8
+            monkeypatch.setattr(emu, "alive", lambda: True)
+            monkeypatch.setattr(emu, "_write_cmd", fake.write_cmd)
+            monkeypatch.setattr(emu, "_observe_library_name", lambda: None)
+            return emu, fake
+
+        return build
+
+    def test_a_save_with_the_menu_open_closes_it_and_lands(
+        self, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]
+    ) -> None:
+        """The save the menu swallowed is retried with the menu closed, and stays closed."""
+        emu, fake = make(menu_open=True)
+
+        assert emu.save_state(0) is True
+        assert fake.toggles == 1
+        assert fake.menu_open is False
+        assert (fake.dir / "Game.state").exists()
+
+    def test_a_save_during_play_never_touches_the_menu(
+        self, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]
+    ) -> None:
+        """A save that lands first time sends no `MENU_TOGGLE` and no slot presses."""
+        emu, fake = make()
+
+        assert emu.save_state(0) is True
+        assert fake.sent == ["SAVE_STATE"]
+
+    def test_slot_drift_is_re_homed_without_opening_the_menu(
+        self, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]
+    ) -> None:
+        """A save that landed on another slot is re-homed, never taken for an open menu.
+
+        Toggling there would open the menu on a player who had none up, and
+        the retry would then be swallowed.
+        """
+        emu, fake = make(slot=3)
+
+        assert emu.save_state(0) is True
+        assert fake.toggles == 0
+        assert fake.menu_open is False
+        assert (fake.dir / "Game.state").exists()
+
+    def test_a_slot_moved_inside_the_menu_is_re_homed_after_closing_it(
+        self, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]
+    ) -> None:
+        """The menu's own State Slot entry can move the slot, so the retry homes first."""
+        emu, fake = make(menu_open=True, slot=2)
+
+        assert emu.save_state(0) is True
+        assert fake.menu_open is False
+        assert (fake.dir / "Game.state").exists()
+        assert not (fake.dir / "Game.state2").exists()
+
+    def test_a_core_that_writes_nothing_is_left_with_the_menu_closed(
+        self, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]
+    ) -> None:
+        """A miss with no menu up toggles twice, so the menu this opened is closed again."""
+        emu, fake = make()
+        fake.refuses_saves = True
+
+        assert emu.save_state(0) is False
+        assert fake.toggles == 2
+        assert fake.menu_open is False
+
+    def test_a_player_s_menu_is_left_open_when_the_save_still_fails(
+        self, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]
+    ) -> None:
+        """A failed retry puts back the menu the player had up."""
+        emu, fake = make(menu_open=True)
+        fake.refuses_saves = True
+
+        assert emu.save_state(0) is False
+        assert fake.menu_open is True
+
+    def test_a_lost_toggle_gives_up_without_saving(
+        self, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A `MENU_TOGGLE` that never reaches the pipe ends the save; nothing else is sent."""
+        emu, fake = make(menu_open=True)
+        monkeypatch.setattr(
+            emu, "_write_cmd", lambda cmd: False if cmd == "MENU_TOGGLE" else fake.write_cmd(cmd)
+        )
+
+        assert emu.save_state(0) is False
+        assert fake.sent == ["SAVE_STATE"]
+
+    def test_the_exit_save_gets_past_the_menu(
+        self, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Exiting with the menu up ships a new state instead of the launch-time one."""
+        emu, fake = make(menu_open=True)
+        monkeypatch.setattr(emu, "_flush_sram", lambda: True)
+        monkeypatch.setattr(emu, "_quit", lambda: None)
+
+        result = emu.save_and_exit(0)
+
+        assert result["state_saved"] is True
+        assert fake.toggles == 1
+
+
 class TestResumeLoadRetry:
     """The deferred resume load's bounded retry and its failure escalation."""
 
@@ -4897,6 +5095,26 @@ class TestObserverWiring:
         monkeypatch.setattr(emu, "_home_state_slot", lambda: True)
         attempts = iter([False, True])
         monkeypatch.setattr(emu, "_try_save", lambda: next(attempts))
+        snapshots = iter([{}, {Path("Game.state3"): (1, 1.0)}])
+        monkeypatch.setattr(retroarch, "_state_snapshot", lambda *a: next(snapshots))
+
+        assert emu._save_into_slot(1.0) is True
+        assert calls == [1]
+
+    def test_save_into_slot_calls_the_observer_after_a_retry_past_the_menu(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A save that got past an open menu also triggers the observer."""
+        emu = retroarch.Retroarch()
+        emu.platform = "snes"
+        emu._rom_base = "Game"
+        emu._slot_homed = True
+        calls: list[int] = []
+        monkeypatch.setattr(emu, "alive", lambda: True)
+        monkeypatch.setattr(emu, "_observe_library_name", lambda: calls.append(1))
+        monkeypatch.setattr(emu, "_try_save", lambda: False)
+        monkeypatch.setattr(retroarch, "_state_snapshot", lambda *a: {})
+        monkeypatch.setattr(emu, "_save_past_menu", lambda: True)
 
         assert emu._save_into_slot(1.0) is True
         assert calls == [1]

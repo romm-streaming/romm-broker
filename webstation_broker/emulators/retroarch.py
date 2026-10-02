@@ -331,6 +331,12 @@ SLOT_STEP_DELAY = float(os.environ.get("RETROARCH_SLOT_STEP_DELAY", "0.1"))
 
 The pause is what keeps RetroArch from dropping presses.
 """
+MENU_SETTLE = float(os.environ.get("RETROARCH_MENU_SETTLE", "0.5"))
+"""Seconds after a `MENU_TOGGLE` before the next command, from `RETROARCH_MENU_SETTLE` (default 0.5).
+
+The menu swallows the hotkey-style commands (`SAVE_STATE`, the slot presses),
+so one sent before the toggle has taken effect is lost the same way.
+"""
 SLOT_HOME_STEPS = int(os.environ.get("RETROARCH_SLOT_HOME_STEPS", "24"))
 """`STATE_SLOT_MINUS` presses used to home the slot, from `RETROARCH_SLOT_HOME_STEPS` (default 24).
 
@@ -949,6 +955,9 @@ def _write_broker_cfg() -> Path:
         # confirmation.
         'confirm_quit = "false"\n'
         'quit_press_twice = "false"\n'
+        # A clean quit otherwise writes the merged config, this file's keys
+        # included, over the user's retroarch.cfg.
+        'config_save_on_exit = "false"\n'
         # core_options_path alone is not enough: RetroArch prefers a
         # pre-existing per-game or per-core options file over it unless
         # game_specific_options is off and global_core_options is on. All
@@ -3199,8 +3208,7 @@ class Retroarch(Emulator):
         Returns:
             True once the state file is confirmed on disk; False when the core
             is not running, a resume load or disc swap still holds the tray
-            after `SAVE_LOCK_WAIT`, or both the save and the re-homed retry
-            miss.
+            after `SAVE_LOCK_WAIT`, or both the save and its retry miss.
         """
         return self._save_into_slot(SAVE_LOCK_WAIT)
 
@@ -3212,13 +3220,18 @@ class Retroarch(Emulator):
         save holds the API's process-wide session lock for as long as it sits
         here.
 
+        A miss is retried once, and which retry depends on what the miss left
+        behind: a state written to another slot means the player moved the
+        slot, so it is re-homed; nothing written anywhere means a menu is
+        swallowing the command, so `_save_past_menu` closes it first.
+
         Args:
             lock_wait: Seconds to wait for `_disc_lock` before giving up.
 
         Returns:
             True once the state file is confirmed on disk; False when the core
             is not running, the tray is still held after `lock_wait`, or both
-            the save and the re-homed retry miss.
+            the save and its retry miss.
         """
         if not self.alive():
             return False
@@ -3245,19 +3258,60 @@ class Retroarch(Emulator):
                     "(platform=%s, rom=%s)",
                     STATE_SLOT, self.platform, self._rom_base,
                 )
+            before = _state_snapshot(STATE_DIR, self._rom_base)
             if self._try_save():
                 self._observe_library_name()
                 return True
             if not self.alive():
                 return False
-            log.info("retroarch: save missed slot %d, re-homing and retrying", STATE_SLOT)
-            self._home_state_slot()
-            saved = self._try_save()
+            if _state_snapshot(STATE_DIR, self._rom_base) == before:
+                saved = self._save_past_menu()
+            else:
+                log.info("retroarch: save missed slot %d, re-homing and retrying", STATE_SLOT)
+                self._home_state_slot()
+                saved = self._try_save()
             if saved:
                 self._observe_library_name()
             return saved
         finally:
             self._disc_lock.release()
+
+    def _save_past_menu(self) -> bool:
+        """Close the menu a save could not get past, retry, and reopen it if that missed too.
+
+        Called when a `SAVE_STATE` wrote nothing to any slot. That is what an
+        open menu does: it swallows the command, and nothing over stdin reports
+        whether the menu is up. A save that landed on another slot means the
+        player moved the slot instead, which `_save_into_slot` re-homes without
+        coming here. The slot is re-homed after the toggle because the menu
+        swallows slot presses too, and its own State Slot entry can move it.
+
+        Returns:
+            True once the retried save is confirmed on disk. False when the
+            toggle or the retry fails; a retry that wrote nothing anywhere
+            toggles the menu back, so a menu the player had open is left
+            open, and one this opened (the miss had another cause) is closed.
+        """
+        log.info(
+            "retroarch: save wrote nothing to any slot, closing the menu and retrying "
+            "(platform=%s, rom=%s)",
+            self.platform, self._rom_base,
+        )
+        if not self._write_cmd("MENU_TOGGLE"):
+            return False
+        time.sleep(MENU_SETTLE)
+        self._home_state_slot()
+        before = _state_snapshot(STATE_DIR, self._rom_base)
+        if self._try_save():
+            return True
+        if self.alive() and _state_snapshot(STATE_DIR, self._rom_base) == before:
+            log.warning(
+                "retroarch: save still wrote nothing with the menu toggled, toggling it back "
+                "(platform=%s, rom=%s)",
+                self.platform, self._rom_base,
+            )
+            self._write_cmd("MENU_TOGGLE")
+        return False
 
     def load_state(self, slot: int) -> bool:
         """Take `_disc_lock` and load `STATE_SLOT`, confirming the state was read.
