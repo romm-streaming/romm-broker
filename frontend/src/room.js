@@ -7,6 +7,7 @@ import {
     applyTouchOpacity,
     parseTouchOpacity,
 } from './touchOpacity.js';
+import { showsMenuButton, toggleEmulatorMenu } from './emulatorMenu.js';
 
 // ---------------------------------------------------------------------------
 // WebCodecs track plumbing: capture (MediaStreamTrack -> VideoFrame/AudioData for
@@ -1386,6 +1387,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const audioInputSelect = document.getElementById('audio-input-select');
     const videoInputSelect = document.getElementById('video-input-select');
     const reloadStreamBtn = document.getElementById('reload-stream-btn');
+    const emulatorMenuBtn = document.getElementById('emulator-menu-btn');
     // Stays hidden as it ships until the first state_update says who holds
     // mouse and keyboard; nobody can be offered the mode before that is known.
     const gamingModeBtn = document.getElementById('gaming-mode-btn');
@@ -2984,6 +2986,18 @@ document.addEventListener('DOMContentLoaded', async () => {
                     iframe.src = currentSrc.toString();
                 }
             }
+        });
+
+        emulatorMenuBtn.classList.toggle('hidden', !showsMenuButton(COLLAB_DATA));
+        emulatorMenuBtn.addEventListener('click', async () => {
+            // One press in flight at a time: a double tap would open and
+            // close the menu before the player saw it.
+            if (emulatorMenuBtn.disabled) return;
+            emulatorMenuBtn.disabled = true;
+            if (!await toggleEmulatorMenu(fetch, COLLAB_DATA.userToken)) {
+                console.warn('Emulator menu toggle was refused.');
+            }
+            emulatorMenuBtn.disabled = false;
         });
 
         gamingModeBtn.addEventListener('click', () => gamingMode.toggle());

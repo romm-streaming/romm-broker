@@ -104,6 +104,55 @@ different slot is a slot change, not a menu, and only gets the re-park.
 [`RETROARCH_MENU_SETTLE`](/docs/configuration/emulators#retroarch) (0.5
 seconds, by default) is the pause after the toggle.
 
+The menu can also be opened on purpose. Players on a phone have no F1 key
+and often no stick buttons, so the room shows the host an Emulator menu
+button that sends `MENU_TOGGLE` (the
+[menu route](/docs/api/join#emulator-menu) is what it calls). For a
+physical gamepad, the layer sets RetroArch's menu combo to L3 + R3 (both
+sticks pressed in), but only when your `retroarch.cfg` has no combo of its
+own. [`RETROARCH_MENU_COMBO`](/docs/configuration/emulators#retroarch)
+changes which combo that is, and `0` turns it off. The layer also hides the
+menu entries that don't belong in a streamed session: Save Configuration,
+the core, game and content-directory override saves, Close Content, Load
+Content, Load Disc, Dump Disc, Restart RetroArch and Quit RetroArch. Add to
+Favorites, the Favorites tab, the Online Updater and Load Core's Download a
+Core are hidden as well, since what they write outlives the session: a
+favorite is a game the next host could launch in place of their own, and
+the updater replaces the cores every later session runs. It hides four
+Settings pages too: Configuration (where Save Configuration on Quit lives), Directory and Saving (both can move states away from where the
+broker looks for them), and User Interface (which could un-hide all of
+this). Save states, shaders, cheats, core options, controls and Disc
+Control stay visible. A remap file saved under Controls, or a shader preset
+saved under Shaders, goes into the container's RetroArch config and is
+loaded again in later sessions of that core or game, whoever hosts them,
+while `auto_remaps_enable` and `auto_shaders_enable` are on (RetroArch's
+default). To undo one, delete it from the RetroArch config directory:
+remaps live under `config/remaps/<core>/`, shader presets under
+`config/<core>/`.
+
+Only the player on gamepad 1 can steer the menu, unless your
+`retroarch.cfg` turns on `all_users_control_menu`. A keyboard works too,
+since its keys belong to player 1. Opening it is different: during play,
+RetroArch reads the combo from every gamepad, so any player can open the
+menu, and with RetroArch's default `menu_pause_libretro` the game pauses
+for everyone while it's open. Once it's open only gamepad 1 is read, so
+gamepad 1, the keyboard or the host's button has to close it.
+
+The menu drops disc commands the same way it drops saves, and RetroArch's
+status still reports the game as playing. So before a
+[disc swap](/docs/api/activate#swap-discs) moves the tray, the broker makes
+a check save: if it lands, the menu is closed; if it writes nothing, the
+broker closes the menu and checks again, this time with two saves in a row.
+The second one is there for a core that was only slow: its first save can
+land late, after the toggle has opened a menu, and look like the menu
+closing. When the checks don't land, it toggles the menu back and refuses
+the swap rather than record a disc change that never happened. The check
+saves are undone afterwards, file bytes and timestamps included, so the
+exit upload never sees them. If a file can't be put back, the broker logs
+an error naming it, and that file goes to RomM with the session's other
+states. Loading a state doesn't
+need any of this: `LOAD_STATE_SLOT` works with the menu open.
+
 Not every core can save a state (some can't turn their memory into a save
 file, i.e. "serialize" it). A platform whose core can't do this can be marked
 `"savestate": false` in the table. When that's set, `supports_states` reports

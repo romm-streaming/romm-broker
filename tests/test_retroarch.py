@@ -491,6 +491,7 @@ class TestBrokerConfig:
         monkeypatch.setattr(retroarch, "SAVE_DIR", tmp_path / "saves")
         monkeypatch.setattr(retroarch, "BROKER_CFG", tmp_path / "broker.cfg")
         monkeypatch.setattr(retroarch, "CORE_OPTIONS_CFG", tmp_path / "broker-core-options.cfg")
+        monkeypatch.setattr(retroarch, "RA_CONFIG_PATH", tmp_path / "retroarch.cfg")
 
     def test_the_joypad_driver_is_pinned_off_udev(self) -> None:
         """The overlay pins the joypad driver to linuxraw by default.
@@ -577,6 +578,80 @@ class TestBrokerConfig:
         cfg = retroarch._write_broker_cfg().read_text()
 
         assert 'config_save_on_exit = "false"' in cfg
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "menu_show_configurations",
+            "quick_menu_show_save_core_overrides",
+            "quick_menu_show_save_game_overrides",
+            "quick_menu_show_save_content_dir_overrides",
+            "quick_menu_show_close_content",
+            "menu_show_load_content",
+            "menu_show_load_disc",
+            "menu_show_dump_disc",
+            "menu_show_restart_retroarch",
+            "menu_show_quit_retroarch",
+            "settings_show_configuration",
+            "settings_show_directory",
+            "settings_show_saving",
+            "settings_show_user_interface",
+            "quick_menu_show_add_to_favorites",
+            "content_show_favorites",
+            "menu_show_online_updater",
+            "menu_show_core_updater",
+        ],
+    )
+    def test_menu_entries_that_write_config_or_swap_content_are_hidden(self, key: str) -> None:
+        """The menu the room opens cannot rewrite the user's config or end the session's game.
+
+        Args:
+            key: The menu visibility key.
+        """
+        cfg = retroarch._write_broker_cfg().read_text()
+
+        assert f'{key} = "false"' in cfg
+
+    @pytest.mark.parametrize("user_line", [None, "", 'input_menu_toggle_gamepad_combo = "0"\n'])
+    def test_pads_get_l3_r3_when_the_user_set_no_combo(
+        self, tmp_path: Path, user_line: Optional[str]
+    ) -> None:
+        """No combo in the user's config, or combo 0, gets the L3+R3 default.
+
+        Args:
+            tmp_path: Where the user's retroarch.cfg is written.
+            user_line: The user's config, or None for no file at all.
+        """
+        if user_line is not None:
+            (tmp_path / "retroarch.cfg").write_text(user_line)
+
+        cfg = retroarch._write_broker_cfg().read_text()
+
+        assert 'input_menu_toggle_gamepad_combo = "2"' in cfg
+
+    def test_a_user_s_own_combo_is_left_alone(self, tmp_path: Path) -> None:
+        """An appended key outranks the user's, so writing one would silently replace theirs."""
+        (tmp_path / "retroarch.cfg").write_text('input_menu_toggle_gamepad_combo = "4"\n')
+
+        cfg = retroarch._write_broker_cfg().read_text()
+
+        assert "input_menu_toggle_gamepad_combo" not in cfg
+
+    def test_the_default_combo_is_configurable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`RETROARCH_MENU_COMBO` picks another entry of RetroArch's combo list."""
+        monkeypatch.setattr(retroarch, "MENU_COMBO", 7)
+
+        cfg = retroarch._write_broker_cfg().read_text()
+
+        assert 'input_menu_toggle_gamepad_combo = "7"' in cfg
+
+    def test_the_default_combo_can_be_turned_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`RETROARCH_MENU_COMBO=0` writes no combo, for a game that binds both stick clicks."""
+        monkeypatch.setattr(retroarch, "MENU_COMBO", 0)
+
+        cfg = retroarch._write_broker_cfg().read_text()
+
+        assert "input_menu_toggle_gamepad_combo" not in cfg
 
     def test_the_broker_s_core_options_file_always_wins(self) -> None:
         """The overlay always points at the broker's core options file and forces it to apply.
@@ -1327,6 +1402,8 @@ class TestSwapDisc:
         monkeypatch.setattr(emulator, "_send", fake_send)
         monkeypatch.setattr(emulator, "_write_cmd", fake_write_cmd)
         monkeypatch.setattr(emulator, "alive", lambda: True)
+        # The open-menu check has its own class, TestDiscSwapWithTheMenuOpen.
+        monkeypatch.setattr(emulator, "_close_menu_before_tray", lambda: True)
 
         playlist = tmp_path / "Game.m3u"
         playlist.write_text(
@@ -2790,8 +2867,9 @@ class FakeMenuRetroarch:
     """A stand-in for RetroArch's stdin handling, as far as saves and the menu go.
 
     While the menu is open it swallows the hotkey-style commands
-    (`SAVE_STATE` and the slot presses) and acts only on `MENU_TOGGLE`, the
-    way RetroArch 1.22.2 did when a save was sent with the Quick Menu up.
+    (`SAVE_STATE`, the slot presses and the `DISK_*` tray commands) and acts
+    only on `MENU_TOGGLE`, the way RetroArch 1.22.2 did with the Quick Menu
+    up. Swallowed commands are dropped, not replayed once the menu closes.
     """
 
     def __init__(self, state_dir: Path, *, menu_open: bool = False, slot: int = 0) -> None:
@@ -2807,6 +2885,7 @@ class FakeMenuRetroarch:
         self.slot = slot
         self.refuses_saves = False
         self.sent: list[str] = []
+        self.tray: list[str] = []
         self.writes = 0
 
     def write_cmd(self, cmd: str) -> bool:
@@ -2833,12 +2912,241 @@ class FakeMenuRetroarch:
             target = self.dir / retroarch._state_name("Game", self.slot)
             target.write_bytes(b"s" * self.writes)
             os.utime(target, (time.time() + self.writes, time.time() + self.writes))
+        elif cmd.startswith("DISK_"):
+            self.tray.append(cmd)
         return True
 
     @property
     def toggles(self) -> int:
         """How many `MENU_TOGGLE` commands were sent."""
         return self.sent.count("MENU_TOGGLE")
+
+
+class TestDiscSwapWithTheMenuOpen:
+    """A disc swap sent while RetroArch's menu is up, which drops the tray commands."""
+
+    @pytest.fixture
+    def make(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]:
+        """Build a live Retroarch on disc 1 of 2, wired to a `FakeMenuRetroarch`.
+
+        Args:
+            tmp_path: Backs the state directory and the playlist.
+            monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            A factory taking `FakeMenuRetroarch`'s keyword arguments and
+            returning the emulator and its fake.
+        """
+        state_dir = tmp_path / "states"
+        monkeypatch.setattr(retroarch, "STATE_DIR", state_dir)
+        monkeypatch.setattr(retroarch, "MENU_SETTLE", 0)
+        monkeypatch.setattr(retroarch, "DISC_TRAY_SETTLE", 0)
+        monkeypatch.setattr(retroarch, "DISC_STEP_DELAY", 0)
+        playlist = tmp_path / "Game.m3u"
+        playlist.write_text("Game (Disc 1).chd\nGame (Disc 2).chd\n")
+
+        def build(**kwargs: Any) -> tuple[retroarch.Retroarch, FakeMenuRetroarch]:
+            fake = FakeMenuRetroarch(state_dir, **kwargs)
+            emu = retroarch.Retroarch()
+            emu.platform = "psx"
+            emu._rom_base = "Game"
+            emu._state_confirm_wait = 0.8
+            emu._playing_monotonic = time.monotonic() - 3600
+            emu._playlist = playlist
+            emu._disc_index = 0
+            monkeypatch.setattr(emu, "alive", lambda: True)
+            monkeypatch.setattr(emu, "_write_cmd", fake.write_cmd)
+            monkeypatch.setattr(
+                emu, "_send", lambda cmd, wait_prefix=None, timeout=5.0: "GET_STATUS PLAYING psx,Game,0"
+            )
+            return emu, fake
+
+        return build
+
+    def test_a_swap_with_the_menu_open_closes_it_and_lands(
+        self, tmp_path: Path, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]
+    ) -> None:
+        """The menu is closed before the tray moves, so the swap is real and stays closed."""
+        emu, fake = make(menu_open=True)
+
+        assert emu.swap_disc(tmp_path / "Game (Disc 2).chd") is True
+        assert fake.toggles == 1
+        assert fake.menu_open is False
+        assert fake.tray == ["DISK_EJECT_TOGGLE", "DISK_NEXT", "DISK_EJECT_TOGGLE"]
+        assert emu._disc_index == 1
+
+    def test_a_swap_during_play_sends_no_toggle(
+        self, tmp_path: Path, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]
+    ) -> None:
+        """With the menu closed, the check's save lands at once and the menu is left alone."""
+        emu, fake = make()
+
+        assert emu.swap_disc(tmp_path / "Game (Disc 2).chd") is True
+        assert fake.toggles == 0
+        assert fake.tray == ["DISK_EJECT_TOGGLE", "DISK_NEXT", "DISK_EJECT_TOGGLE"]
+
+    def test_a_core_that_saves_nothing_refuses_the_swap_and_restores_the_menu(
+        self, tmp_path: Path, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]
+    ) -> None:
+        """No save either side of a toggle tells nothing about the menu, so the tray is not touched.
+
+        Recording a swap whose commands may have been dropped is what leaves
+        every later swap counting from the wrong disc.
+        """
+        emu, fake = make(menu_open=True)
+        fake.refuses_saves = True
+
+        assert emu.swap_disc(tmp_path / "Game (Disc 2).chd") is False
+        assert fake.toggles == 2
+        assert fake.menu_open is True
+        assert fake.tray == []
+        assert emu._disc_index == 0
+
+    def test_a_first_check_save_that_lands_late_is_not_read_as_the_menu_closing(
+        self,
+        tmp_path: Path,
+        make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A slow save, not a menu, made the first check miss; the toggle then opened the menu.
+
+        Taking the late write for the second check's would send the tray
+        commands into that menu and record a disc that never changed.
+        """
+        emu, fake = make()
+        late: list[threading.Timer] = []
+        write_now = fake.write_cmd
+
+        def land() -> None:
+            # Already taken before the menu opened, so it lands whatever the menu does now.
+            fake.dir.mkdir(parents=True, exist_ok=True)
+            (fake.dir / retroarch._state_name("Game", fake.slot)).write_bytes(b"late")
+
+        def slow_first_save(cmd: str) -> bool:
+            if cmd != "SAVE_STATE" or late or fake.menu_open:
+                return write_now(cmd)
+            fake.sent.append(cmd)
+            timer = threading.Timer(1.0, land)
+            late.append(timer)
+            timer.start()
+            return True
+
+        monkeypatch.setattr(emu, "_write_cmd", slow_first_save)
+
+        assert emu.swap_disc(tmp_path / "Game (Disc 2).chd") is False
+        late[0].join()
+        assert fake.tray == []
+        assert fake.menu_open is False
+        assert emu._disc_index == 0
+
+    def test_the_check_leaves_existing_states_byte_and_time_identical(
+        self, tmp_path: Path, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]
+    ) -> None:
+        """The check's save is undone, so the exit dump ships the player's states, not a swap-time one."""
+        emu, fake = make(menu_open=True)
+        core_dir = tmp_path / "states" / "Gambatte"
+        core_dir.mkdir(parents=True)
+        slot0 = core_dir / retroarch._state_name("Game", 0)
+        slot0.write_bytes(b"players-own-state")
+        os.utime(slot0, ns=(1_000_000_000_123, 2_000_000_000_456))
+
+        assert emu.swap_disc(tmp_path / "Game (Disc 2).chd") is True
+        assert fake.writes == 2
+        assert slot0.read_bytes() == b"players-own-state"
+        assert slot0.stat().st_mtime_ns == 2_000_000_000_456
+
+    def test_a_state_the_check_created_is_removed(
+        self, tmp_path: Path, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]
+    ) -> None:
+        """A slot that was empty before the check is empty after it, even in a slot the player moved to."""
+        emu, fake = make(slot=3)
+
+        assert emu.swap_disc(tmp_path / "Game (Disc 2).chd") is True
+        assert fake.writes == 1
+        assert retroarch._state_snapshot(tmp_path / "states", "Game") == {}
+
+    def test_states_that_cannot_be_copied_aside_refuse_the_swap_before_any_save(
+        self,
+        tmp_path: Path,
+        make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Without a copy to restore from, the check's save could not be undone, so none is sent."""
+        emu, fake = make()
+        core_dir = tmp_path / "states" / "Gambatte"
+        core_dir.mkdir(parents=True)
+        (core_dir / retroarch._state_name("Game", 0)).write_bytes(b"players-own-state")
+
+        def unreadable(src: Path, dst: Path) -> None:
+            raise PermissionError(13, "Permission denied", str(src))
+
+        monkeypatch.setattr(retroarch.shutil, "copyfile", unreadable)
+
+        assert emu.swap_disc(tmp_path / "Game (Disc 2).chd") is False
+        assert "SAVE_STATE" not in fake.sent
+        assert fake.tray == []
+        assert emu._disc_index == 0
+
+    def test_a_platform_without_states_swaps_unchecked(
+        self,
+        tmp_path: Path,
+        make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A core that cannot save gives no signal to read, so the swap goes ahead as before."""
+        monkeypatch.setattr(retroarch.Retroarch, "supports_states", property(lambda self: False))
+        emu, fake = make()
+
+        assert emu.swap_disc(tmp_path / "Game (Disc 2).chd") is True
+        assert "SAVE_STATE" not in fake.sent
+        assert fake.tray == ["DISK_EJECT_TOGGLE", "DISK_NEXT", "DISK_EJECT_TOGGLE"]
+
+
+class TestToggleMenu:
+    """`toggle_menu`, the room's button into RetroArch's Quick Menu."""
+
+    def test_retroarch_opts_in(self) -> None:
+        """RetroArch advertises the menu; the base class does not."""
+        assert retroarch.Retroarch.supports_menu is True
+        assert retroarch.Emulator.supports_menu is False
+
+    def test_a_toggle_sends_menu_toggle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """One press is one `MENU_TOGGLE` on stdin."""
+        emu = retroarch.Retroarch()
+        sent: list[str] = []
+        monkeypatch.setattr(emu, "_write_cmd", lambda cmd: sent.append(cmd) or True)
+
+        assert emu.toggle_menu() is True
+        assert sent == ["MENU_TOGGLE"]
+
+    def test_a_toggle_during_a_save_is_refused_rather_than_queued(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A press while a save, resume load or disc swap holds the tray sends nothing.
+
+        A toggle landing inside a save's retry would flip the menu the retry
+        just closed, and the save would be swallowed again.
+        """
+        emu = retroarch.Retroarch()
+        sent: list[str] = []
+        monkeypatch.setattr(emu, "_write_cmd", lambda cmd: sent.append(cmd) or True)
+
+        emu._disc_lock.acquire()
+        try:
+            assert emu.toggle_menu() is False
+        finally:
+            emu._disc_lock.release()
+
+        assert sent == []
+
+    def test_a_dropped_toggle_is_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A `MENU_TOGGLE` that never reached the pipe is a failed toggle."""
+        emu = retroarch.Retroarch()
+        monkeypatch.setattr(emu, "_write_cmd", lambda cmd: False)
+
+        assert emu.toggle_menu() is False
 
 
 class TestSaveWithTheMenuOpen:

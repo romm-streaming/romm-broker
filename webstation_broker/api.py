@@ -1534,6 +1534,72 @@ async def exit_session(
         return await _do_exit(slot if save else None)
 
 
+@router.post("/api/session/menu")
+async def toggle_menu(
+    x_broker_secret: Optional[str] = Header(default=None),
+    token: Optional[str] = Query(default=None),
+) -> dict[str, str]:
+    """Open or close the running emulator's own menu, for the controller or RomM.
+
+    A player in the room may have no key or pad combo that reaches the menu (a
+    phone has neither), so the room's button comes through here. Viewers are
+    refused even with input permission: the menu changes the session for
+    everyone in it.
+
+    Args:
+        x_broker_secret: The shared secret RomM sends; checked only when no controller token matches.
+        token: The controller token, which lets the room toggle the menu without the secret.
+
+    Returns:
+        A dict with `status` `ok`.
+
+    Raises:
+        HTTPException: 403 when neither credential is accepted; 409 when no
+            session is active, the emulator is not running, or another session
+            operation is in flight; 400 when the emulator has no menu to reach;
+            502 when the emulator did not take the toggle.
+    """
+    sess = session.SESSION
+    is_controller = bool(sess and token and _ct_eq(token, sess["controller_token"]))
+    if not is_controller:
+        _check_secret(x_broker_secret)
+    with _session_operation("menu"):
+        emulator = _menu_emulator()
+        toggled = await anyio.to_thread.run_sync(emulator.toggle_menu)
+    if not toggled:
+        log.error("menu: %s did not take the toggle", emulator.display_name)
+        raise HTTPException(status_code=502, detail="emulator did not take the menu toggle")
+    log.info("menu toggled on %s", emulator.display_name)
+    return {"status": "ok"}
+
+
+def _menu_emulator() -> Emulator:
+    """Return the running emulator, if it is in a position to toggle its menu.
+
+    Returns:
+        The live session's emulator.
+
+    Raises:
+        HTTPException: 409 when no session is active or the emulator is not
+            running; 400 when the emulator has no menu to reach.
+    """
+    sess = session.SESSION
+    if sess is None or not sess.get("active"):
+        log.debug("menu refused: no active session")
+        raise HTTPException(status_code=409, detail="no active session")
+    emulator = sess["emulator_obj"]
+    if not emulator.supports_menu:
+        log.debug("menu refused: %s has no menu to reach", emulator.display_name)
+        raise HTTPException(
+            status_code=400,
+            detail=f"{emulator.display_name} has no menu to reach",
+        )
+    if not emulator.alive():
+        log.warning("menu refused: %s is not running (session %s)", emulator.name, sess["id"])
+        raise HTTPException(status_code=409, detail="emulator is not running")
+    return emulator
+
+
 def _state_emulator() -> Emulator:
     """Return the running emulator, if it is in a position to take a state command.
 
@@ -2583,7 +2649,8 @@ async def context(
         `viewer`), `userToken`, `userPublicId` (the caller's own non-sensitive
         id, for cross-referencing itself in `state_update` broadcasts),
         `userPermission`, `username`, `gameName`, `controllerName`,
-        `multiplayer` and the stream `iframeSrc`.
+        `multiplayer`, `emulator` (the running emulator's name; the room shows
+        its menu button for `retroarch` only) and the stream `iframeSrc`.
 
     Raises:
         HTTPException: 409 when no session is active, or when an invite arrival
@@ -2639,6 +2706,7 @@ async def context(
         or sess["emulator_obj"].display_name,
         "controllerName": (sess.get("user") or {}).get("display_name") or "Controller",
         "multiplayer": bool(sess.get("multiplayer")),
+        "emulator": sess["emulator_obj"].name,
         # Relative to the page base; the selkies client reads the token from
         # its query string.
         "iframeSrc": f"stream/?token={token}",

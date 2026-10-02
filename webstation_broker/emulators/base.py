@@ -705,6 +705,7 @@ class Emulator:
       produce: the broker captures the streamed desktop on the way into a
       save and keeps it on `state_screenshot`.
     * `swap_disc` is only called when `supports_disc_swap` is on.
+    * `toggle_menu` is only called when `supports_menu` is on.
     * `memory_card_path` pairs with `memory_card_subtree` for emulators whose
       whole memory card travels on its own routes.
     * `clear_working_slot` and `prepare_restore` both run at every activate.
@@ -751,6 +752,8 @@ class Emulator:
             mid-session.
         supports_disc_swap: Whether the emulator can change the mounted disc
             without restarting.
+        supports_menu: Whether the room can open and close the emulator's
+            own menu.
         state_slot: The one slot the broker saves into.
         state_dir: Where that slot's file lives.
         log_path: Where the emulator's stdout and stderr are appended.
@@ -846,6 +849,12 @@ class Emulator:
 
     Off by default so the swap route refuses instead of silently doing nothing on
     an emulator that has no tray.
+    """
+    supports_menu: bool = False
+    """Whether the room can open and close the emulator's own menu.
+
+    Off by default so the menu route refuses, and the room hides its button, on
+    an emulator with no way to reach its menu but a key the player may not have.
     """
     state_slot: int = 0
     """The one slot the broker saves into.
@@ -1629,5 +1638,18 @@ class Emulator:
 
         Raises:
             NotImplementedError: When the emulator has no tray.
+        """
+        raise NotImplementedError
+
+    def toggle_menu(self) -> bool:
+        """Open the emulator's menu, or close it when it is already open.
+
+        Only called when `supports_menu`.
+
+        Returns:
+            True once the toggle reached the emulator.
+
+        Raises:
+            NotImplementedError: When the emulator has no menu to reach.
         """
         raise NotImplementedError

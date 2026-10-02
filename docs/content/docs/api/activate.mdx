@@ -121,7 +121,10 @@ path. Returns `{"status": "ok", "path": "<path to the disc>"}`. You get `400` if
 emulator has no disc tray to swap into, `404` if the disc path doesn't exist,
 `409` if there's no active session, and `502` if the emulator refused the swap. Disc swaps can't happen at the same time as each other, or at the
 same time as a deferred resume load that's already running. A swap only
-counts as finished once the core confirms it's running a game again.
+counts as finished once the core confirms it's running a game again. On
+RetroArch, a swap also makes sure the emulator's menu is closed first, since
+an open menu drops the tray commands. See
+[RetroArch](/docs/emulators#retroarch) for how.
 
 ## What activate does
 

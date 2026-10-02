@@ -55,6 +55,7 @@ a real stdout pipe drained by a reader thread, unlike the shared `_spawn`
 which merges stderr into stdout (that would corrupt the reply stream).
 """
 
+import contextlib
 import dataclasses
 import glob
 import io
@@ -65,10 +66,11 @@ import re
 import secrets
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import zipfile
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Optional, Union
 
@@ -140,15 +142,15 @@ loading the one its own search order found.
 """
 
 
-def _configured_dir(setting: str) -> Optional[Path]:
-    """A directory setting read out of the user's RetroArch config.
+def _user_setting(setting: str) -> Optional[str]:
+    """A setting's raw value read out of the user's RetroArch config.
 
     Args:
         setting: The config key to look up, such as `libretro_directory`.
 
     Returns:
-        The configured path with `~` expanded, or None when the config is
-        unreadable, the key is absent, or it is set to `default`.
+        The value with its quotes stripped, or None when the config is
+        unreadable or the key is absent.
     """
     try:
         text = RA_CONFIG_PATH.read_text(errors="replace")
@@ -160,9 +162,23 @@ def _configured_dir(setting: str) -> Optional[Path]:
     for line in text.splitlines():
         key, sep, value = line.partition("=")
         if sep and key.strip() == setting:
-            raw = value.strip().strip('"').strip()
-            if raw and raw != "default":
-                return Path(os.path.expanduser(raw))
+            return value.strip().strip('"').strip()
+    return None
+
+
+def _configured_dir(setting: str) -> Optional[Path]:
+    """A directory setting read out of the user's RetroArch config.
+
+    Args:
+        setting: The config key to look up, such as `libretro_directory`.
+
+    Returns:
+        The configured path with `~` expanded, or None when the config is
+        unreadable, the key is absent, or it is set to `default`.
+    """
+    raw = _user_setting(setting)
+    if raw and raw != "default":
+        return Path(os.path.expanduser(raw))
     return None
 
 
@@ -336,6 +352,16 @@ MENU_SETTLE = float(os.environ.get("RETROARCH_MENU_SETTLE", "0.5"))
 
 The menu swallows the hotkey-style commands (`SAVE_STATE`, the slot presses),
 so one sent before the toggle has taken effect is lost the same way.
+"""
+MENU_COMBO = int(os.environ.get("RETROARCH_MENU_COMBO", "2"))
+"""Pad combo that opens the menu, from `RETROARCH_MENU_COMBO` (default 2, L3 + R3).
+
+An index into RetroArch's `input_menu_toggle_gamepad_combo` list, applied only
+when the user's own config sets no combo; 0 writes none. Without one, a player
+on a pad has no way into the menu: the room's pads have no F1 key. RetroArch
+reads the combo from every pad during play but only port 0 once the menu is
+up, so any player can open the menu but only player 1 or the room's button
+can close it.
 """
 SLOT_HOME_STEPS = int(os.environ.get("RETROARCH_SLOT_HOME_STEPS", "24"))
 """`STATE_SLOT_MINUS` presses used to home the slot, from `RETROARCH_SLOT_HOME_STEPS` (default 24).
@@ -958,6 +984,34 @@ def _write_broker_cfg() -> Path:
         # A clean quit otherwise writes the merged config, this file's keys
         # included, over the user's retroarch.cfg.
         'config_save_on_exit = "false"\n'
+        # The room can open the menu, so its entries that write the user's
+        # config or overrides, or swap or end the session's game, are hidden.
+        'menu_show_configurations = "false"\n'
+        'quick_menu_show_save_core_overrides = "false"\n'
+        'quick_menu_show_save_game_overrides = "false"\n'
+        'quick_menu_show_save_content_dir_overrides = "false"\n'
+        'quick_menu_show_close_content = "false"\n'
+        'menu_show_load_content = "false"\n'
+        'menu_show_load_disc = "false"\n'
+        'menu_show_dump_disc = "false"\n'
+        'menu_show_restart_retroarch = "false"\n'
+        'menu_show_quit_retroarch = "false"\n'
+        # Settings pages that would undo the above: Configuration turns
+        # config_save_on_exit back on, Directory and Saving move states away
+        # from where the broker looks for them, and User Interface holds the
+        # visibility toggles for everything hidden here.
+        'settings_show_configuration = "false"\n'
+        'settings_show_directory = "false"\n'
+        'settings_show_saving = "false"\n'
+        'settings_show_user_interface = "false"\n'
+        # Writes that outlive the session: a favourite is a launch entry the
+        # next host could start in place of their own game, and the Online
+        # Updater (and Load Core's Download a Core, its other door) overwrites
+        # the cores every later session loads.
+        'quick_menu_show_add_to_favorites = "false"\n'
+        'content_show_favorites = "false"\n'
+        'menu_show_online_updater = "false"\n'
+        'menu_show_core_updater = "false"\n'
         # core_options_path alone is not enough: RetroArch prefers a
         # pre-existing per-game or per-core options file over it unless
         # game_specific_options is off and global_core_options is on. All
@@ -969,6 +1023,9 @@ def _write_broker_cfg() -> Path:
     )
     if JOYPAD_DRIVER:
         cfg += f'input_joypad_driver = "{JOYPAD_DRIVER}"\n'
+    # Only into a gap: an appended key outranks the user's own combo.
+    if MENU_COMBO and _user_setting("input_menu_toggle_gamepad_combo") in (None, "", "0"):
+        cfg += f'input_menu_toggle_gamepad_combo = "{MENU_COMBO}"\n'
     tmp = BROKER_CFG.with_suffix(".tmp")
     tmp.write_text(cfg)
     os.replace(tmp, BROKER_CFG)
@@ -1072,6 +1129,84 @@ def _state_snapshot(dir_path: Path, base: str) -> dict[Path, tuple[int, float]]:
     except OSError as exc:
         log.warning("retroarch: could not walk %s while snapshotting state files: %s", dir_path, exc)
     return snap
+
+
+def _wait_for_any_state_write(
+    before: dict[Path, tuple[int, float]], dir_path: Path, base: str, timeout: float
+) -> bool:
+    """Poll until any of `base`'s state files changes since `before`, then let it settle.
+
+    Any slot counts, unlike `_wait_for_state_file`: the question is only
+    whether a save got through at all, not where it landed.
+
+    Args:
+        before: The `_state_snapshot` taken before the save was sent.
+        dir_path: The savestate directory to watch.
+        base: The content basename of the loaded game.
+        timeout: Seconds to keep polling.
+
+    Returns:
+        True once a change was seen, after it held still for half a second
+        or the timeout ran out; False when nothing changed in time.
+    """
+    STABLE = 0.5
+    POLL = 0.1
+    deadline = time.monotonic() + timeout
+    last: Optional[dict[Path, tuple[int, float]]] = None
+    since = 0.0
+    while time.monotonic() < deadline:
+        cur = _state_snapshot(dir_path, base)
+        if cur != before:
+            if cur != last:
+                last, since = cur, time.monotonic()
+            elif time.monotonic() - since >= STABLE:
+                return True
+        time.sleep(POLL)
+    return last is not None
+
+
+@contextlib.contextmanager
+def _undo_state_writes(dir_path: Path, base: str) -> Iterator[None]:
+    """Put `base`'s state files back the way they were once the block ends.
+
+    For a save that is only asked a question. The exit dump ships every state
+    file that changed in the session, so a save left in place would reach
+    RomM as a state the player never made. Each file is restored with its
+    bytes and timestamps, and one the block created is deleted.
+
+    Args:
+        dir_path: The savestate directory.
+        base: The content basename of the loaded game.
+
+    Yields:
+        Nothing; the files are copied aside before and restored after.
+
+    Raises:
+        OSError: When a file cannot be copied aside, before the block runs.
+    """
+    before = _state_snapshot(dir_path, base)
+    with tempfile.TemporaryDirectory(prefix="retroarch-state-undo-") as tmp:
+        kept: dict[Path, tuple[Path, int, int]] = {}
+        for i, path in enumerate(before):
+            copy = Path(tmp) / str(i)
+            shutil.copyfile(path, copy)
+            st = path.stat()
+            kept[path] = (copy, st.st_atime_ns, st.st_mtime_ns)
+        try:
+            yield
+        finally:
+            for path, stamp in _state_snapshot(dir_path, base).items():
+                if before.get(path) == stamp:
+                    continue
+                try:
+                    if path in kept:
+                        copy, atime, mtime = kept[path]
+                        shutil.copyfile(copy, path)
+                        os.utime(path, ns=(atime, mtime))
+                    else:
+                        path.unlink()
+                except OSError as exc:
+                    log.error("retroarch: could not undo the check save over %s: %s", path, exc)
 
 
 def _stable_file_wait(
@@ -2065,6 +2200,7 @@ class Retroarch(Emulator):
         supports_states: Whether the loaded platform's core can save states.
         state_subtrees: `states`, where savestates land.
         supports_disc_swap: On; discs are swapped through the virtual tray.
+        supports_menu: On; the Quick Menu is toggled over stdin.
         state_slot: `STATE_SLOT`, the one slot the broker works in.
         state_dir: `STATE_DIR`, the broker-managed savestate directory.
         clears_stale_saves: On; activate empties the platform's save subtrees.
@@ -2085,6 +2221,8 @@ class Retroarch(Emulator):
     """Where RetroArch's stderr is appended."""
     supports_disc_swap = True
     """Discs are swapped through RetroArch's virtual tray."""
+    supports_menu = True
+    """The Quick Menu is toggled over stdin with `MENU_TOGGLE`."""
     state_slot = STATE_SLOT
     """The one slot the broker works in."""
     state_dir = STATE_DIR
@@ -3019,7 +3157,8 @@ class Retroarch(Emulator):
         `DISK_NEXT` but no way to set an index or read the current one back.
         The tray is opened, stepped the needed number of times, and closed;
         the tracked index only moves once the session is confirmed to have
-        outlived the sequence.
+        outlived the sequence. An open menu would drop those commands, so
+        `_close_menu_before_tray` closes one first.
 
         Args:
             path: The disc image to mount; it must be listed in the session's
@@ -3028,8 +3167,8 @@ class Retroarch(Emulator):
         Returns:
             True once the new disc is in the tray (or was already mounted);
             False when no playlist is loaded, the core is not running, the
-            disc is unlisted, another swap or resume holds the tray, or the
-            session ended mid-swap.
+            disc is unlisted, another swap or resume holds the tray, a menu
+            could not be ruled out, or the session ended mid-swap.
         """
         playlist = self._playlist
         if playlist is None:
@@ -3059,6 +3198,8 @@ class Retroarch(Emulator):
                 return False
             if self._launch_seq != seq:
                 log.warning("disc swap: session ended mid-swap, index %d not committed", index)
+                return False
+            if not self._close_menu_before_tray():
                 return False
 
             steps = (index - self._disc_index) % len(entries)
@@ -3312,6 +3453,97 @@ class Retroarch(Emulator):
             )
             self._write_cmd("MENU_TOGGLE")
         return False
+
+    def _close_menu_before_tray(self) -> bool:
+        """Make sure no menu is up to drop a swap's tray commands, closing one that is.
+
+        The menu drops `DISK_*` the way it drops `SAVE_STATE`, and `GET_STATUS`
+        still says PLAYING with it open, so a save is the only probe: one that
+        writes nothing means a menu took it. The probe's writes are undone, so
+        the exit dump never ships them. Called with `_disc_lock` held.
+
+        Returns:
+            True when the menu is closed (or was closed here), and when the
+            platform cannot save a state to probe with. False when a save
+            writes nothing with the menu either way, which toggles it back, or
+            when the states could not be copied aside first.
+        """
+        if not self.supports_states:
+            log.info(
+                "disc swap: platform %s cannot save a state, swapping without the menu check",
+                self.platform,
+            )
+            return True
+        self._wait_for_first_save_settle()
+        try:
+            with _undo_state_writes(STATE_DIR, self._rom_base):
+                if self._probe_save():
+                    return True
+                if not self.alive():
+                    return False
+                log.info(
+                    "disc swap: check save wrote nothing, closing the menu (platform=%s, rom=%s)",
+                    self.platform, self._rom_base,
+                )
+                if not self._write_cmd("MENU_TOGGLE"):
+                    return False
+                time.sleep(MENU_SETTLE)
+                # A first save that was only slow lands about now and would
+                # read as this one, with the toggle having opened a menu. A
+                # second save tells them apart: that menu would swallow it.
+                if self._probe_save() and self._probe_save():
+                    return True
+                log.warning(
+                    "disc swap: check save still wrote nothing with the menu toggled, toggling it "
+                    "back and refusing the swap (platform=%s, rom=%s)",
+                    self.platform, self._rom_base,
+                )
+                if self.alive():
+                    self._write_cmd("MENU_TOGGLE")
+                return False
+        except OSError as exc:
+            log.error(
+                "disc swap: could not copy the states aside for the menu check, refusing the "
+                "swap (platform=%s, rom=%s): %s",
+                self.platform, self._rom_base, exc,
+            )
+            return False
+
+    def _probe_save(self) -> bool:
+        """Send `SAVE_STATE` and report whether any state file changed.
+
+        Returns:
+            True once a write to any slot is seen within `_state_confirm_wait`.
+        """
+        before = _state_snapshot(STATE_DIR, self._rom_base)
+        if not self._write_cmd("SAVE_STATE"):
+            return False
+        return _wait_for_any_state_write(
+            before, STATE_DIR, self._rom_base, self._state_confirm_wait
+        )
+
+    def toggle_menu(self) -> bool:
+        """Send `MENU_TOGGLE`, which opens the Quick Menu or closes it.
+
+        Fails fast while a save, resume load or disc swap holds `_disc_lock`:
+        a toggle landing inside a save's retry would reopen the menu the retry
+        just closed, and the save would be swallowed again.
+
+        Returns:
+            True once the command reached RetroArch's stdin; False when the
+            tray is held or the command was dropped.
+        """
+        if not self._disc_lock.acquire(blocking=False):
+            log.warning(
+                "menu: refused while a save, resume load or disc swap is in progress "
+                "(platform=%s, rom=%s)",
+                self.platform, self._rom_base,
+            )
+            return False
+        try:
+            return self._write_cmd("MENU_TOGGLE")
+        finally:
+            self._disc_lock.release()
 
     def load_state(self, slot: int) -> bool:
         """Take `_disc_lock` and load `STATE_SLOT`, confirming the state was read.

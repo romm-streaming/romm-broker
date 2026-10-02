@@ -63,7 +63,8 @@ screen back). Left to right:
   game with a mute button under it, a **Reload Stream** button for the rare
   case the stream freezes, and **Gaming Mode**, described below. On a touch
   screen there's also a half-filled circle button for **touch controls
-  opacity**, described below.
+  opacity**, described below. The host also gets a three-line **Emulator
+  menu** button when the game runs in RetroArch.
 - **The controller tray** (host only), then **your own tile**, then a tile
   for everyone else in the room.
 - **The invite tile** (host only), described above.
@@ -94,6 +95,25 @@ The button only shows on a touch screen. It's there when you're playing
 alone too, in the corner controls that appear when you tap near the bottom
 right. Set it before you go fullscreen, since the bar isn't reachable from
 there.
+
+### Emulator menu
+
+RetroArch has its own menu, the Quick Menu, for things like save state
+slots, shaders, cheats, core options and changing discs. On a keyboard you
+open it with F1. On a gamepad it's usually both sticks pressed in (L3 and
+R3) together, though the server can set a different combo or none. A phone
+has neither, so the host gets a three-line button in the
+stream controls that opens the menu, and closes it again on a second tap.
+Once it's open, whoever holds gamepad 1, or the mouse and keyboard, moves
+around it. Other gamepads can't steer the menu, but any of them can open
+it with the combo, and the game pauses for everyone until gamepad 1, the
+keyboard or the host's button closes it again. Changing discs from RomM
+closes the menu first.
+
+The button only shows for the host, and only when the game runs in
+RetroArch. Other emulators don't have a menu the room can reach. Some
+entries are hidden from the menu while you're streaming, the ones that
+would quit the game or change the setup for everyone.
 
 ### Gaming mode
 

@@ -1751,6 +1751,148 @@ class TestSwapDisc:
         assert fake_emulator[0].swapped_discs == [disc.resolve()]
 
 
+class TestMenuToggle:
+    """POST /session/menu, the room's button into the emulator's own menu."""
+
+    def _session(self, secret_client: TestClient, broker_dirs: dict[str, Path]) -> str:
+        """Activate a session on the secret-guarded client, then drop the secret.
+
+        Args:
+            secret_client: The client guarded by the broker secret.
+            broker_dirs: The redirected ROM root and archive directories.
+
+        Returns:
+            The controller token.
+        """
+        secret_client.headers["X-Broker-Secret"] = "s3cret"
+        token = _activate(secret_client, broker_dirs).json()["url"].split("token=")[1]
+        del secret_client.headers["X-Broker-Secret"]
+        return token
+
+    def test_the_controller_token_toggles_the_menu(
+        self, secret_client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+    ) -> None:
+        """The controller's own token is enough; the room never holds the secret."""
+        token = self._session(secret_client, broker_dirs)
+
+        r = secret_client.post(f"{API}/session/menu", params={"token": token})
+
+        assert r.status_code == 200
+        assert r.json()["status"] == "ok"
+        assert fake_emulator[0].menu_toggles == 1
+
+    def test_the_broker_secret_toggles_the_menu(
+        self, secret_client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+    ) -> None:
+        """RomM's secret is accepted the same way it is on exit."""
+        self._session(secret_client, broker_dirs)
+
+        r = secret_client.post(f"{API}/session/menu", headers={"X-Broker-Secret": "s3cret"})
+
+        assert r.status_code == 200
+        assert fake_emulator[0].menu_toggles == 1
+
+    @pytest.mark.parametrize("permission", ["participant", "readonly"])
+    def test_a_viewer_token_is_refused(
+        self,
+        secret_client: TestClient,
+        broker_dirs: dict[str, Path],
+        fake_emulator: list[FakeEmulator],
+        permission: str,
+    ) -> None:
+        """A viewer's seat token, even one with input, cannot reach the menu.
+
+        Args:
+            secret_client: The client guarded by the broker secret.
+            broker_dirs: The redirected ROM root and archive directories.
+            fake_emulator: The fake the session runs.
+            permission: The viewer's seat permission.
+        """
+        self._session(secret_client, broker_dirs)
+        url = secret_client.post(
+            f"{API}/session/join",
+            headers={"X-Broker-Secret": "s3cret"},
+            json={"user": {"id": 7, "username": "bo"}, "permission": permission},
+        ).json()["url"]
+
+        r = secret_client.post(f"{API}/session/menu", params={"token": url.split("token=")[1]})
+
+        assert r.status_code == 403
+        assert fake_emulator[0].menu_toggles == 0
+
+    @pytest.mark.parametrize("params", [{}, {"token": "made-up"}])
+    def test_no_credential_is_refused(
+        self,
+        secret_client: TestClient,
+        broker_dirs: dict[str, Path],
+        fake_emulator: list[FakeEmulator],
+        params: dict[str, str],
+    ) -> None:
+        """Neither a controller token nor the secret is a 403.
+
+        Args:
+            secret_client: The client guarded by the broker secret.
+            broker_dirs: The redirected ROM root and archive directories.
+            fake_emulator: The fake the session runs.
+            params: The query the request carries.
+        """
+        self._session(secret_client, broker_dirs)
+
+        assert secret_client.post(f"{API}/session/menu", params=params).status_code == 403
+        assert fake_emulator[0].menu_toggles == 0
+
+    def test_an_emulator_without_a_menu_is_refused(
+        self, secret_client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+    ) -> None:
+        """An emulator that never opted in is a 400, and nothing is sent to it."""
+        token = self._session(secret_client, broker_dirs)
+        fake_emulator[0].supports_menu = False
+
+        r = secret_client.post(f"{API}/session/menu", params={"token": token})
+
+        assert r.status_code == 400
+        assert fake_emulator[0].menu_toggles == 0
+
+    def test_a_dead_emulator_is_a_conflict(
+        self, secret_client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+    ) -> None:
+        """An emulator that is no longer running is a 409."""
+        token = self._session(secret_client, broker_dirs)
+        fake_emulator[0].running = False
+
+        r = secret_client.post(f"{API}/session/menu", params={"token": token})
+
+        assert r.status_code == 409
+
+    def test_no_session_means_no_menu(self, secret_client: TestClient) -> None:
+        """No session is a 409, once the secret is through."""
+        r = secret_client.post(f"{API}/session/menu", headers={"X-Broker-Secret": "s3cret"})
+
+        assert r.status_code == 409
+
+    def test_a_refused_toggle_is_a_bad_gateway(
+        self, secret_client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+    ) -> None:
+        """A toggle the emulator did not take is a 502."""
+        token = self._session(secret_client, broker_dirs)
+        fake_emulator[0].menu_ok = False
+
+        r = secret_client.post(f"{API}/session/menu", params={"token": token})
+
+        assert r.status_code == 502
+
+    def test_context_names_the_emulator_the_room_shows_the_button_for(
+        self, secret_client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+    ) -> None:
+        """`emulator` is the running emulator's name, which the room checks."""
+        token = self._session(secret_client, broker_dirs)
+
+        ctx = secret_client.get(f"{API}/session/context", params={"token": token}).json()
+
+        assert ctx["emulator"] == fake_emulator[0].name
+        assert "supportsMenu" not in ctx
+
+
 class _RoomSocket:
     """A stand-in for a seated member's room socket that records what it is sent.
 
@@ -3612,6 +3754,7 @@ _SECRET_GATED = [
     ("POST", "/session/activate"),
     ("POST", "/session/join"),
     ("POST", "/session/exit"),
+    ("POST", "/session/menu"),
     ("POST", "/session/save-state"),
     ("POST", "/session/load-state"),
     ("POST", "/session/swap-disc"),
@@ -3651,6 +3794,7 @@ _OPEN_ROUTES = {
     "/api/health",
     "/api/session/invite",
     "/api/session/exit",
+    "/api/session/menu",
     "/api/session/context",
     "/ws/room",
 }
