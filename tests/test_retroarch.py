@@ -619,6 +619,24 @@ class TestBrokerConfig:
 
         assert not re.search(r"^cheevos_enable\b", cfg, re.M)
 
+    def test_only_the_appendconfig_file_holds_the_login(self) -> None:
+        """The core options file and everything else under the data and config trees stay free of the token.
+
+        Only the `--appendconfig` overlay itself may hold the token or any `cheevos_` key.
+        """
+        login = RetroAchievementsLogin(username="alice", token="tok456secret")
+
+        retroarch._write_broker_cfg(login)
+        retroarch._write_core_options({"fake_option": "on"})
+
+        for root in (retroarch.RA_DATA_DIR, retroarch.RA_CONFIG_PATH.parent):
+            for path in root.rglob("*"):
+                if not path.is_file() or path == retroarch.BROKER_CFG:
+                    continue
+                data = path.read_bytes()
+                assert b"tok456secret" not in data, path
+                assert b"cheevos_" not in data, path
+
     def test_the_overlay_is_owner_only(self) -> None:
         """The overlay holds a live token while RetroArch runs, so only its owner may read it."""
         path = retroarch._write_broker_cfg(RetroAchievementsLogin(username="alice", token="tok123"))

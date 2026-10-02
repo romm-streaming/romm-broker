@@ -293,6 +293,38 @@ def test_the_ra_token_never_leaves_through_status_or_the_log(
     assert "tok123secret" not in repr(session.PENDING_RA_LOGIN)
 
 
+def test_a_non_retroarch_activate_accepts_and_ignores_the_ra_login(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    """RomM sends the block for every game session; an emulator with no reader launches and writes nothing.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+        caplog: The pytest log capture fixture.
+        tmp_path: The per-test directory every redirected path lives under.
+    """
+    login = {"username": "alice", "token": "tok123secret"}
+
+    with caplog.at_level(logging.DEBUG):
+        activated = _activate(client, broker_dirs, retroachievements=login)
+        exited = client.post(f"{API}/session/exit")
+
+    assert activated.status_code == 200
+    assert exited.status_code == 200
+    assert fake_emulator[0].launched is not None
+    assert "retroachievements" not in exited.json()
+    assert "tok123secret" not in caplog.text
+    for path in tmp_path.rglob("*"):
+        if path.is_file():
+            assert b"tok123secret" not in path.read_bytes(), path
+
+
 def test_exit_holds_a_changed_ra_login_for_collection(
     client: TestClient,
     broker_dirs: dict[str, Path],
