@@ -1358,36 +1358,6 @@ async def _keep_archive(zip_bytes: bytes, name: str, session_id: str) -> Optiona
         return None
 
 
-async def _report_ra_login(
-    emulator: Emulator, cb: Optional[dict[str, Any]], sess: dict[str, Any]
-) -> Optional[dict[str, Any]]:
-    """Send RomM the RetroAchievements login the player ended the session with, if it changed.
-
-    Runs after the emulator is gone, when it has read its saved login back.
-    The token never enters the returned block, which goes into the exit
-    report, the log and `/api/session/status`.
-
-    Args:
-        emulator: The session's emulator, already stopped.
-        cb: The session's callback dict, or None when there is nowhere to report.
-        sess: The session the login belongs to.
-
-    Returns:
-        None when the login did not change. Otherwise `{"mode", "change", ...}`:
-        `report-only` in dev mode or without a callback, else what
-        `callback.push_ra_login` returned.
-    """
-    change = emulator.retroachievements_change
-    if change is None:
-        return None
-    kind = change.kind
-    if settings.DEV_MODE or not cb:
-        note = "dev mode: nothing was sent" if settings.DEV_MODE else "no callback to report to"
-        log.info("session %s: ra login %s, not reported (%s)", sess["id"], kind, note)
-        return {"mode": "report-only", "change": kind, "note": note}
-    return await callback.push_ra_login(cb, sess, change)
-
-
 async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
     """Save state, stop the emulator, dump the save delta, and report.
 
@@ -1413,8 +1383,9 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
         The exit report: `status`, `session_id`, `rom`, the emulator's own exit
         fields, a `save_dump` block, an `upload` block describing what happened
         to the archive, and `selkies_tokens_cleared`. `exit_error` is added when
-        the emulator's own teardown raised, and `retroachievements` when the
-        player's RetroAchievements login changed.
+        the emulator's own teardown raised, and `retroachievements` as
+        `{"change": "set" | "cleared"}` when the player's login changed; the
+        login itself waits in `session.PENDING_RA_LOGIN` for the collect route.
 
     Raises:
         HTTPException: 409 when no session is active.
@@ -1494,7 +1465,15 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
             archive_path = await _keep_archive(dump["zip_bytes"], archive_name, sess["id"])
             upload["archive_path"] = archive_path
 
-    ra_report = await _report_ra_login(emulator, cb, sess)
+    change = emulator.retroachievements_change
+    if change is not None:
+        # Held for RomM to collect; the token goes nowhere else.
+        session.PENDING_RA_LOGIN = {
+            "session_id": sess["id"],
+            "change": change.kind,
+            "login": change.login,
+        }
+        log.info("session %s: ra login %s, waiting for collection", sess["id"], change.kind)
 
     report = {
         "status": "exited",
@@ -1511,8 +1490,8 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
         },
         "upload": upload,
     }
-    if ra_report is not None:
-        report["retroachievements"] = ra_report
+    if change is not None:
+        report["retroachievements"] = {"change": change.kind}
 
     outcome, detail = _exit_outcomes(upload, archive_path, cb, dump["error"])
     if exit_report.get("sram_flushed") is False:
@@ -1560,7 +1539,7 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
         "dump_error": dump["error"],
         "upload": upload["mode"],
         "archive_path": archive_path,
-        "retroachievements": ra_report["mode"] if ra_report is not None else None,
+        "retroachievements": change.kind if change is not None else None,
     }
     # One fixed-shape line per exit, so an alert can match `upload=failed`
     # without parsing the report dict above.

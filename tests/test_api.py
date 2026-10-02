@@ -290,49 +290,21 @@ def test_the_ra_token_never_leaves_through_status_or_the_log(
     assert "tok123secret" not in status.text
     assert "tok123secret" not in caplog.text
     assert "tok123secret" not in repr(session.SESSION)
+    assert "tok123secret" not in repr(session.PENDING_RA_LOGIN)
 
 
-_RaPushes = list[tuple[dict[str, Any], dict[str, Any], base.RetroAchievementsChange]]
-"""The callback, session and change of each RetroAchievements login push, in order."""
-
-
-@pytest.fixture
-def ra_pushes(monkeypatch: pytest.MonkeyPatch) -> _RaPushes:
-    """Record RetroAchievements login pushes instead of sending them.
-
-    Args:
-        monkeypatch: Pytest's attribute patcher, undone when the test ends.
-
-    Returns:
-        The pushes made during the test, in order.
-    """
-    pushes: _RaPushes = []
-
-    async def _accept(
-        cb: dict[str, Any], sess: dict[str, Any], change: base.RetroAchievementsChange
-    ) -> dict[str, Any]:
-        """Record the push and report it sent."""
-        pushes.append((cb, sess, change))
-        return {"mode": "reported", "ok": True, "url": cb["base_url"], "change": change.kind}
-
-    monkeypatch.setattr(callback, "push_ra_login", _accept)
-    return pushes
-
-
-def test_exit_reports_a_changed_ra_login_to_romm(
+def test_exit_holds_a_changed_ra_login_for_collection(
     client: TestClient,
     broker_dirs: dict[str, Path],
     fake_emulator: list[FakeEmulator],
-    ra_pushes: _RaPushes,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The login the player ended with goes to RomM, and only RomM sees the token.
+    """The login the player ended with waits in memory; the report and the log say only that it changed.
 
     Args:
         client: The test client.
         broker_dirs: The redirected ROM root and archive directories.
         fake_emulator: The registered fake emulator.
-        ra_pushes: The recorded pushes.
         caplog: The pytest log capture fixture.
     """
     _activate(client, broker_dirs)
@@ -343,89 +315,71 @@ def test_exit_reports_a_changed_ra_login_to_romm(
         body = client.post(f"{API}/session/exit").json()
         status = client.get(f"{API}/session/status")
 
-    assert [(sess["id"], change.login) for _, sess, change in ra_pushes] == [("sess-1", ended)]
-    assert body["retroachievements"]["mode"] == "reported"
-    assert body["retroachievements"]["change"] == "set"
-    assert status.json()["last_exit"]["retroachievements"] == "reported"
-    for text in (str(body), status.text, caplog.text):
+    assert body["retroachievements"] == {"change": "set"}
+    assert status.json()["last_exit"]["retroachievements"] == "set"
+    assert session.PENDING_RA_LOGIN == {"session_id": "sess-1", "change": "set", "login": ended}
+    for text in (str(body), status.text, caplog.text, repr(session.PENDING_RA_LOGIN)):
         assert "tok456secret" not in text
 
 
-def test_exit_reports_nothing_when_the_ra_login_did_not_change(
-    client: TestClient,
-    broker_dirs: dict[str, Path],
-    fake_emulator: list[FakeEmulator],
-    ra_pushes: _RaPushes,
+def test_exit_holds_nothing_when_the_ra_login_did_not_change(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
 ) -> None:
-    """An unchanged login is not pushed, and the exit report carries no block for it.
+    """An unchanged login leaves nothing pending, and the exit report carries no block for it.
 
     Args:
         client: The test client.
         broker_dirs: The redirected ROM root and archive directories.
         fake_emulator: The registered fake emulator.
-        ra_pushes: The recorded pushes.
     """
     assert _activate(client, broker_dirs).status_code == 200
     exited = client.post(f"{API}/session/exit")
     body = exited.json()
 
     assert exited.status_code == 200
-    assert ra_pushes == []
     assert "retroachievements" not in body
+    assert session.PENDING_RA_LOGIN is None
     assert session.LAST_OUTCOME is not None
     assert session.LAST_OUTCOME["retroachievements"] is None
 
 
-def test_a_cleared_ra_login_is_reported_too(
-    client: TestClient,
-    broker_dirs: dict[str, Path],
-    fake_emulator: list[FakeEmulator],
-    ra_pushes: _RaPushes,
+def test_a_cleared_ra_login_is_held_too(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
 ) -> None:
-    """A player who logged out is pushed as no login, so RomM can drop the stored one.
+    """A player who logged out leaves a cleared change pending, so RomM can drop the stored login.
 
     Args:
         client: The test client.
         broker_dirs: The redirected ROM root and archive directories.
         fake_emulator: The registered fake emulator.
-        ra_pushes: The recorded pushes.
     """
     _activate(client, broker_dirs)
     fake_emulator[0].retroachievements_change = base.RetroAchievementsChange(login=None)
 
     body = client.post(f"{API}/session/exit").json()
 
-    assert [change.login for _, _, change in ra_pushes] == [None]
-    assert body["retroachievements"]["change"] == "cleared"
+    assert body["retroachievements"] == {"change": "cleared"}
+    assert session.PENDING_RA_LOGIN == {"session_id": "sess-1", "change": "cleared", "login": None}
 
 
-def test_dev_mode_reports_an_ra_login_change_without_sending_it(
-    client: TestClient,
-    broker_dirs: dict[str, Path],
-    fake_emulator: list[FakeEmulator],
-    ra_pushes: _RaPushes,
-    monkeypatch: pytest.MonkeyPatch,
+def test_the_next_activate_discards_a_pending_ra_login(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
 ) -> None:
-    """Dev mode sends nothing anywhere, the login included.
+    """A change nobody collected is dropped when a new session starts, like `LAST_EXIT`.
 
     Args:
         client: The test client.
         broker_dirs: The redirected ROM root and archive directories.
         fake_emulator: The registered fake emulator.
-        ra_pushes: The recorded pushes.
-        monkeypatch: Pytest's attribute patcher, undone when the test ends.
     """
-    monkeypatch.setattr(settings, "DEV_MODE", True)
     _activate(client, broker_dirs)
-    fake_emulator[0].retroachievements_change = base.RetroAchievementsChange(
-        login=base.RetroAchievementsLogin(username="alice", token="tok456secret")
-    )
+    fake_emulator[0].retroachievements_change = base.RetroAchievementsChange(login=None)
+    client.post(f"{API}/session/exit")
+    assert session.PENDING_RA_LOGIN is not None
 
-    body = client.post(f"{API}/session/exit").json()
+    assert _activate(client, broker_dirs, session_id="sess-2").status_code == 200
 
-    assert ra_pushes == []
-    assert body["retroachievements"]["mode"] == "report-only"
-    assert "tok456secret" not in str(body)
+    assert session.PENDING_RA_LOGIN is None
 
 
 def _mock_romm(
@@ -450,37 +404,6 @@ def _mock_romm(
 
     monkeypatch.setattr(callback.httpx, "AsyncClient", _client)
     return clients
-
-
-def test_a_failed_ra_login_push_does_not_stop_the_exit(
-    client: TestClient,
-    broker_dirs: dict[str, Path],
-    fake_emulator: list[FakeEmulator],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """RomM refusing the login still ends the session and retires it.
-
-    Args:
-        client: The test client.
-        broker_dirs: The redirected ROM root and archive directories.
-        fake_emulator: The registered fake emulator.
-        monkeypatch: Pytest's attribute patcher, undone when the test ends.
-    """
-
-    def _refuse(request: httpx.Request) -> httpx.Response:
-        """Answer as a RomM without the endpoint would."""
-        return httpx.Response(404)
-
-    _mock_romm(monkeypatch, _refuse)
-    _activate(client, broker_dirs)
-    fake_emulator[0].retroachievements_change = base.RetroAchievementsChange(login=None)
-
-    response = client.post(f"{API}/session/exit")
-
-    assert response.status_code == 200
-    assert response.json()["retroachievements"]["mode"] == "failed"
-    assert response.json()["retroachievements"]["status_code"] == 404
-    assert session.SESSION is None or not session.SESSION.get("active")
 
 
 def test_activate_launches_the_rom_and_hands_back_a_landing_url(

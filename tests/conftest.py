@@ -308,6 +308,7 @@ def clean_session() -> Iterator[None]:
     session.SESSION = None
     session.LAST_EXIT = None
     session.LAST_OUTCOME = None
+    session.PENDING_RA_LOGIN = None
     session.ROOM["controller"] = None
     session.ROOM["viewers"] = {}
     session.ROOM["cooldowns"] = {}
@@ -315,6 +316,7 @@ def clean_session() -> Iterator[None]:
     session.SESSION = None
     session.LAST_EXIT = None
     session.LAST_OUTCOME = None
+    session.PENDING_RA_LOGIN = None
     session.ROOM["controller"] = None
     session.ROOM["viewers"] = {}
     session.ROOM["cooldowns"] = {}

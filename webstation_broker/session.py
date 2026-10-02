@@ -56,11 +56,21 @@ LAST_OUTCOME: Optional[dict[str, Any]] = None
 """How the last exit of this broker process ended.
 
 `{"session_id", "ended_at", "duration_s", "state_saved", "dump_error",
-"upload", "archive_path"}`, where `upload` is the exit report's upload mode.
+"upload", "archive_path", "retroachievements"}`, where `upload` is the exit
+report's upload mode and `retroachievements` is `"set"`, `"cleared"` or None.
 
 Unlike `LAST_EXIT` it survives the next activate, so a save archive that never
 reached RomM stays visible on the status route until another exit replaces it.
 None until the first exit of this broker process.
+"""
+
+PENDING_RA_LOGIN: Optional[dict[str, Any]] = None
+"""The RetroAchievements login change the last exit captured, until RomM collects it.
+
+`{"session_id": str, "change": "set" | "cleared", "login": RetroAchievementsLogin | None}`.
+Held in memory only, so a broker restart loses it, and dropped by the next
+activate like `LAST_EXIT`: the change belongs to the session that ended, and
+RomM collects it while that session's claim still holds the container.
 """
 
 SESSION_END_FLUSH_WAIT = 2.0
@@ -145,11 +155,14 @@ def new_session(
     Returns:
         The new session dict, which is also stored in `SESSION`.
     """
-    global SESSION, LAST_EXIT
+    global SESSION, LAST_EXIT, PENDING_RA_LOGIN
     # The previous session's state is about to be cleared off the working slot,
     # and serving it under this session's rom would file it against the wrong
     # game, so the record goes before the new one is built.
     LAST_EXIT = None
+    # Belongs to the session that ended; nothing can collect it once a new one
+    # has started, so it goes with LAST_EXIT.
+    PENDING_RA_LOGIN = None
     SESSION = {
         "id": _session_id(payload.get("session_id")),
         "active": True,
@@ -194,6 +207,24 @@ def retire_session() -> None:
             "emulator_obj": SESSION["emulator_obj"],
         }
     SESSION = None
+
+
+def take_pending_ra_login(session_id: str) -> Optional[dict[str, Any]]:
+    """Hand out the pending RetroAchievements login change once, if it belongs to `session_id`.
+
+    Args:
+        session_id: The id RomM is collecting for.
+
+    Returns:
+        The pending change, which is forgotten here, or None when nothing is
+        pending or it belongs to another session.
+    """
+    global PENDING_RA_LOGIN
+    pending = PENDING_RA_LOGIN
+    if pending is None or pending["session_id"] != session_id:
+        return None
+    PENDING_RA_LOGIN = None
+    return pending
 
 
 def find_viewer(token: str) -> Optional[dict[str, Any]]:
