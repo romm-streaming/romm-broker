@@ -982,6 +982,7 @@ class Dolphin(Emulator):
     Attributes:
         name: RomM platform key, `dolphin`.
         display_name: Human-readable name shown in the UI.
+        rom_cacheable: On; with the ROM cache enabled, launch boots a local copy of the ROM.
         save_root: Dolphin's user directory, which the save subtrees hang off.
         save_subtrees: `StateSaves`, `GC` and `Wii`, the directories the save archive carries.
         rom_extensions: Bootable disc formats, best first.
@@ -994,6 +995,7 @@ class Dolphin(Emulator):
     """
 
     name = "dolphin"
+    rom_cacheable = True
     display_name = "Dolphin"
     clears_stale_saves = True
     save_root = USER_DIR

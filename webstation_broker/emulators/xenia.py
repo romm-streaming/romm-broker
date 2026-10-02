@@ -475,6 +475,7 @@ class Xenia(Emulator):
     Attributes:
         name: Provider key, `xenia`.
         display_name: Human-readable name.
+        rom_cacheable: On; with the ROM cache enabled, launch boots a local copy of the ROM.
         save_root: The storage root the save subtrees hang off.
         save_subtrees: `content`, the save and profile tree.
         rom_extensions: Bootable formats, best first.
@@ -483,6 +484,7 @@ class Xenia(Emulator):
     """
 
     name = "xenia"
+    rom_cacheable = True
     display_name = "Xenia"
     save_root = DATA_DIR
     # The whole content tree: saves (<XUID>/<TITLE_ID>/00000001), their

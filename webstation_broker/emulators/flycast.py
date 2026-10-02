@@ -66,6 +66,7 @@ from pathlib import Path, PurePosixPath
 from typing import Optional, Union
 
 from .. import imports
+from . import rom_cache
 from .base import Emulator, base_launch_env, disc_number, xdg_data_dir
 
 log = logging.getLogger(__name__)
@@ -186,11 +187,12 @@ def _rom_identity(rom: Path) -> str:
         rom: The disc image or file the session booted.
 
     Returns:
-        The resolved absolute path as text, so the same disc matches across
+        The resolved absolute path as text, with a ROM cache copy mapped back
+        to its ROM_ROOT path, so the same disc matches across
         sessions while two discs sharing a basename stay distinct.
     """
     try:
-        return str(rom.resolve())
+        return str(rom_cache.logical(rom.resolve()))
     except OSError as exc:
         log.warning("could not resolve %s for its state marker: %s", rom, exc)
         return str(rom)
@@ -572,6 +574,7 @@ class Flycast(Emulator):
     """
 
     name = "flycast"
+    rom_cacheable = True
     display_name = "Flycast"
     save_root = DATA_DIR.parent
     # DATA_DIR itself: VMU saves and the savestate both sit loose at its

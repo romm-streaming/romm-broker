@@ -902,6 +902,7 @@ class Xemu(Emulator):
     Attributes:
         name: Provider key, `xemu`.
         display_name: Human-readable name.
+        rom_cacheable: On; with the ROM cache enabled, launch boots a local copy of the ROM.
         rom_extensions: Bootable disc formats, `.iso` only.
         log_path: The emulator log file.
         term_timeout: SIGTERM grace before SIGKILL (env `XEMU_STOP_WAIT`, default 15).
@@ -914,6 +915,7 @@ class Xemu(Emulator):
     """
 
     name = "xemu"
+    rom_cacheable = True
     display_name = "xemu"
     rom_extensions = ROM_EXTENSIONS
     log_path = XEMU_LOG_PATH

@@ -24,7 +24,16 @@ from starlette.websockets import WebSocketState
 
 from webstation_broker import api, callback, imports, room, saves, screenshot, selkies, session, settings
 from webstation_broker.app import create_app
-from webstation_broker.emulators import base, dolphin, extraction_cache, ppsspp, rpcs3, scummvm, shadps4
+from webstation_broker.emulators import (
+    base,
+    dolphin,
+    extraction_cache,
+    ppsspp,
+    rom_cache,
+    rpcs3,
+    scummvm,
+    shadps4,
+)
 from webstation_broker.outbox import Outbox
 
 from .conftest import PREFIX, SLEEPER_CMD, FakeEmulator, corrupt_zip_member, mangle_zip_member
@@ -226,6 +235,46 @@ def test_activate_retires_the_session_when_launch_fails(
 
     monkeypatch.setattr(FakeEmulator, "launch_fails", False)
     assert _activate(client, broker_dirs).status_code == 200
+
+
+def test_activate_boots_the_rom_cache_copy_and_reports_the_library_path(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the cache on, launch gets the local copy while everything else keeps the library path."""
+    monkeypatch.setattr(FakeEmulator, "rom_cacheable", True)
+    monkeypatch.setattr(settings, "ROM_CACHE_ENABLED", True)
+    monkeypatch.setattr(settings, "ROM_CACHE_MODE", "blocking")
+    original = broker_dirs["roms"] / "Game.iso"
+
+    response = _activate(client, broker_dirs)
+
+    assert response.status_code == 200
+    assert response.json()["rom_file"] == str(original)
+    assert session.SESSION is not None
+    assert session.SESSION["rom_file"] == str(original)
+    booted = fake_emulator[0].launched[0]
+    assert booted.is_relative_to(settings.ROM_CACHE_DIR)
+    assert booted.read_bytes() == b"iso"
+    assert rom_cache.logical(booted) == original.resolve()
+    assert fake_emulator[0].extraction_phase is None
+
+
+def test_activate_leaves_the_cache_alone_when_it_is_off(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cache is opt-in: off, launch gets the library path and nothing is written."""
+    monkeypatch.setattr(FakeEmulator, "rom_cacheable", True)
+
+    assert _activate(client, broker_dirs).status_code == 200
+
+    assert fake_emulator[0].launched == (broker_dirs["roms"] / "Game.iso", None)
+    assert not settings.ROM_CACHE_DIR.exists()
 
 
 def test_activate_refuses_an_emulator_that_is_not_installed(

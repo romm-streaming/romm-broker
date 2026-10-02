@@ -1,4 +1,4 @@
 {
   "title": "Configuration",
-  "pages": ["index", "emulators"]
+  "pages": ["index", "emulators", "rom-cache"]
 }

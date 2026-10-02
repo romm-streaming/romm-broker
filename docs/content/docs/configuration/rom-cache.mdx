@@ -1,0 +1,156 @@
+---
+title: "ROM cache"
+description: "Keep local copies of recently played games, so a library on a slow NFS or SMB mount stops stuttering and loading slowly."
+---
+
+When your ROM library lives on a network share (NFS or SMB), every read the
+emulator makes goes over the network. For a big disc image that can mean long
+load screens, audio crackle, or stutter whenever the game streams data. The ROM
+cache fixes that by booting games from a copy on the container's own disk.
+
+It's off by default. Turn it on only if your library is on a network mount and
+you can see the effects above. A library that's already on local disk gains
+nothing from it.
+
+## Turning it on
+
+Set `ROM_CACHE_ENABLED=true` on the webstation container:
+
+```yaml
+environment:
+  - ROM_CACHE_ENABLED=true
+  # Optional: put the copies on a fast local disk of your choice.
+  - ROM_CACHE_DIR=/cache/roms
+volumes:
+  - /mnt/fast-ssd/romm-cache:/cache/roms
+```
+
+The defaults keep up to 50 games, 100 GB in total, and drop a game nobody
+has launched for 30 days. Every setting is listed [at the end of this
+page](#settings).
+
+## Where the copies go
+
+Copies live in `ROM_CACHE_DIR`, which defaults to `/config/rom-cache`. Put it
+on local disk: a cache on the same network share as your library would just
+copy the slow disk onto itself.
+
+The broker refuses a `ROM_CACHE_DIR` that is `ROM_ROOT`, that sits inside
+`ROM_ROOT`, or that contains `ROM_ROOT`. When it does, it logs an error at
+startup and every game boots from the library as if the cache were off.
+
+The broker only ever deletes folders it made itself. Each cached game is a
+folder holding a small `.rom-cache.json` file, and eviction skips any folder
+without one. Even so, give the cache a folder of its own.
+
+## Copy modes
+
+`ROM_CACHE_MODE` decides what happens the first time you launch a game that
+isn't cached yet.
+
+**`background`** (the default). The game boots from the library straight
+away, like it would with the cache off, and the copy runs alongside it. The
+copy serves the next launch. To keep it from fighting the game you're playing
+for the network, it's capped at `ROM_CACHE_COPY_MBPS` (20 MB/s by default).
+If you end the session before the copy finishes, it keeps going in the
+background.
+
+**`blocking`**. The broker copies the game first and boots the copy, so even
+the first launch plays from local disk. The launch waits for the copy, at
+full speed. If the copy takes longer than `ROM_CACHE_COPY_TIMEOUT` (300 s by
+default), the broker gives up and boots from the library. Keep that timeout
+under RomM's `STREAMING_LAUNCH_TIMEOUT` (600 s by default), or RomM may give
+up on the launch while the copy is still running. While a blocking copy runs,
+RomM shows its usual "starting" screen.
+
+The game doesn't switch to the copy partway through a session. An emulator
+holds its ROM open the whole time it runs, and swapping it underneath would
+risk the save you're in the middle of.
+
+## How long games stay cached
+
+Three limits decide when a game is dropped. Each one is independent, and `0`
+turns it off:
+
+- `ROM_CACHE_MAX_AGE_DAYS` drops a game nobody has launched for that many days.
+- `ROM_CACHE_MAX_COUNT` caps how many games are kept. Past it, the least recently launched go first.
+- `ROM_CACHE_MAX_GB` caps the total size, again dropping the least recently launched first. A
+  single game bigger than the cap is never cached.
+
+The broker applies the limits at startup and before each copy, making room
+for the new game first. The game you're playing is never dropped, even if
+that briefly takes the cache over its size cap.
+
+Separately, a copy only starts if it leaves at least 5% of the cache disk
+free, so the cache can never fill that disk.
+
+## Which emulators use it
+
+| Uses the cache | Doesn't |
+| --- | --- |
+| Azahar, Cemu, Dolphin, DuckStation, Eden, Flycast, PCSX2, RetroArch, xemu, Xenia | RPCS3, shadPS4, PPSSPP and ScummVM already unpack their games to local disk before booting. The desktop session boots no game. |
+
+A multi-disc game handed over as a folder is cached whole, playlist included, so disc
+swaps work as usual and the next disc loads from the copy too.
+
+## What still reads the library
+
+- Before each launch, the broker compares every file's size and
+  modification time with what it copied, so a ROM you replace in the library
+  is copied again instead of serving a stale copy. This only reads file
+  details, not file contents. For a game made of thousands of files (an
+  unpacked Wii U or Xbox 360 game), it can still add a second or two over
+  NFS.
+- Some games aren't cached at all and boot from the library as usual: a
+  folder that holds a symlink, a lone `.cue` or `.m3u` file whose tracks sit
+  beside it, and a game that doesn't fit.
+
+## Saves and resume states
+
+Saves don't change. The cache only changes where the emulator reads the game
+from: the session, the activate response and every save archive still name
+the game's path under `ROM_ROOT`. DuckStation and Flycast tag a resume state
+with the game it belongs to, and they always record the `ROM_ROOT` path. A
+state saved while playing from the cache resumes from the library, the other
+way round works too, and turning the cache off later loses nothing.
+
+## When something goes wrong
+
+Nothing about the cache can stop a game from launching. A copy that fails
+partway, runs out of space, times out, or finds the game changed while it was
+being copied is thrown away, and the game boots from the library. A copy is
+only used once it's complete, so a broker restart mid-copy never leaves a
+half-copied game behind. The leftovers are cleaned up at the next startup.
+
+Look for `rom cache:` lines in the broker log to see what it did and why.
+
+## Turning it off
+
+Unset `ROM_CACHE_ENABLED` and restart the container. The broker leaves the
+copies where they are, so delete `ROM_CACHE_DIR` yourself to get the space
+back.
+
+## Caching on the host instead
+
+If you'd rather cache below the container, the host can do it for every app
+that reads the share:
+
+- For NFS, mount with the `fsc` option and run `cachefilesd`, which keeps a
+  local disk cache of everything read over NFS.
+- `rclone mount` with `--vfs-cache-mode full` keeps recently read files on
+  local disk, with its own size and age limits.
+
+Either works with the broker's cache off.
+
+## Settings
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `ROM_CACHE_ENABLED` | unset | Set to `true` to turn the cache on. |
+| `ROM_CACHE_DIR` | `/config/rom-cache` | Where the copies go. Must be local disk, and can't be `ROM_ROOT`, inside it, or above it. |
+| `ROM_CACHE_MODE` | `background` | `background` boots the first launch from the library and copies alongside it; `blocking` copies first and boots the copy. Any other value reads as `background`. |
+| `ROM_CACHE_MAX_GB` | `100` | Total size cap in GB. `0` is no cap. |
+| `ROM_CACHE_MAX_COUNT` | `50` | Most games kept. `0` is no cap. |
+| `ROM_CACHE_MAX_AGE_DAYS` | `30` | Days a game is kept without a launch. `0` keeps it until the other limits drop it. |
+| `ROM_CACHE_COPY_MBPS` | `20` | Speed cap on a background copy, in MB/s. `0` is uncapped. Blocking copies are never capped. |
+| `ROM_CACHE_COPY_TIMEOUT` | `300` | Seconds a blocking copy may take before the game boots from the library. `0` or less uses the default. Keep it under RomM's `STREAMING_LAUNCH_TIMEOUT`. |

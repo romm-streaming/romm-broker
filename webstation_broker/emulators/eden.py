@@ -459,6 +459,7 @@ class Eden(Emulator):
     Attributes:
         name: Provider key, `eden`.
         display_name: Human-readable name.
+        rom_cacheable: On; with the ROM cache enabled, launch boots a local copy of the ROM.
         save_root: The data directory the save subtrees hang off.
         save_subtrees: Game saves plus the profile store.
         clears_stale_saves: On; activate empties both save subtrees.
@@ -468,6 +469,7 @@ class Eden(Emulator):
     """
 
     name = "eden"
+    rom_cacheable = True
     display_name = "Eden"
     save_root = DATA_DIR
     save_subtrees = ("nand/user/save", "nand/system/save/8000000000000010")
