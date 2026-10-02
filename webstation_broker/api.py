@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 
 import anyio
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field, SecretStr, field_validator
 
 from . import callback, imports, memcard, saves, screenshot, selkies, session, settings
@@ -213,6 +213,16 @@ class CallbackIn(BaseModel):
 
     base_url: Optional[str] = None
     token: Optional[str] = None
+
+
+class CollectIn(BaseModel):
+    """RomM's request for the RetroAchievements login change a session ended with.
+
+    Attributes:
+        session_id: The id RomM gave the session on activate.
+    """
+
+    session_id: str
 
 
 class JoinIn(BaseModel):
@@ -1591,6 +1601,49 @@ async def exit_session(
         _check_secret(x_broker_secret)
     with _session_operation("exit"):
         return await _do_exit(slot if save else None)
+
+
+_NO_STORE = {"Cache-Control": "no-store"}
+"""Sent with every collect reply: the 200 carries a login token and nothing may cache it."""
+
+
+@secret_router.post("/api/session/retroachievements/collect")
+async def collect_ra_login(body: CollectIn) -> Response:
+    """Hand RomM the RetroAchievements login change the named session ended with, once.
+
+    The exit route leaves a changed login in `session.PENDING_RA_LOGIN`; this
+    is the only route that reads it, and reading it forgets it. The reply is
+    the one place the token leaves the broker, so it is never logged here.
+
+    Args:
+        body: The session RomM is collecting for.
+
+    Returns:
+        200 `{"session_id", "change", "retroachievements"}` where
+        `retroachievements` is `{"username", "token"}` or null for a logout,
+        or 204 when nothing is pending for that session.
+
+    Raises:
+        HTTPException: 403 on a bad secret, 409 while another session
+            operation holds the lock.
+    """
+    with _session_operation("ra login collect"):
+        pending = session.take_pending_ra_login(body.session_id)
+    if pending is None:
+        log.debug("session %s: no ra login change to collect", body.session_id)
+        return Response(status_code=204, headers=_NO_STORE)
+    login = pending["login"]
+    log.info("session %s: ra login %s collected", pending["session_id"], pending["change"])
+    return JSONResponse(
+        {
+            "session_id": pending["session_id"],
+            "change": pending["change"],
+            "retroachievements": (
+                {"username": login.username, "token": login.token} if login is not None else None
+            ),
+        },
+        headers=_NO_STORE,
+    )
 
 
 def _state_emulator() -> Emulator:

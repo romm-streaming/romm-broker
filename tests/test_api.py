@@ -382,6 +382,184 @@ def test_the_next_activate_discards_a_pending_ra_login(
     assert session.PENDING_RA_LOGIN is None
 
 
+COLLECT = f"{API}/session/retroachievements/collect"
+
+
+def _exit_with_ra_change(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    login: Optional[base.RetroAchievementsLogin],
+) -> None:
+    """Run a session whose emulator ends with `login`, leaving its change pending.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+        login: The login the player ended with, or None for a logout.
+    """
+    assert _activate(client, broker_dirs).status_code == 200
+    fake_emulator[0].retroachievements_change = base.RetroAchievementsChange(login=login)
+    assert client.post(f"{API}/session/exit").status_code == 200
+
+
+def test_collect_hands_the_login_out_once(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The first collect gets the login with no-store; the second finds nothing.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+        caplog: The pytest log capture fixture.
+    """
+    _exit_with_ra_change(
+        client,
+        broker_dirs,
+        fake_emulator,
+        base.RetroAchievementsLogin(username="alice", token="tok456secret"),
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        first = client.post(COLLECT, json={"session_id": "sess-1"})
+        second = client.post(COLLECT, json={"session_id": "sess-1"})
+
+    assert first.status_code == 200
+    assert first.headers["cache-control"] == "no-store"
+    assert first.json() == {
+        "session_id": "sess-1",
+        "change": "set",
+        "retroachievements": {"username": "alice", "token": "tok456secret"},
+    }
+    assert second.status_code == 204
+    assert second.headers["cache-control"] == "no-store"
+    assert session.PENDING_RA_LOGIN is None
+    assert "session sess-1: ra login set collected" in caplog.text
+    assert "tok456secret" not in caplog.text
+    assert "alice" not in caplog.text
+
+
+def test_collect_hands_out_a_logout_as_null(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A cleared login is `retroachievements: null`, so RomM knows to drop the one it holds.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+    """
+    _exit_with_ra_change(client, broker_dirs, fake_emulator, None)
+
+    response = client.post(COLLECT, json={"session_id": "sess-1"})
+
+    assert response.status_code == 200
+    assert response.json() == {"session_id": "sess-1", "change": "cleared", "retroachievements": None}
+
+
+def test_collect_is_204_when_the_login_did_not_change(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A session whose login stayed as activate pinned it leaves nothing to collect.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+    """
+    _activate(client, broker_dirs)
+    client.post(f"{API}/session/exit")
+
+    response = client.post(COLLECT, json={"session_id": "sess-1"})
+
+    assert response.status_code == 204
+    assert response.content == b""
+
+
+def test_collect_is_204_for_another_session_id(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A collect for a session other than the one that ended gets nothing, and the change stays.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+    """
+    _exit_with_ra_change(client, broker_dirs, fake_emulator, None)
+
+    response = client.post(COLLECT, json={"session_id": "sess-9"})
+
+    assert response.status_code == 204
+    assert session.PENDING_RA_LOGIN is not None
+
+
+def test_collect_is_204_after_the_next_activate(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """Once a new session has started, the earlier change is gone for good.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+    """
+    _exit_with_ra_change(client, broker_dirs, fake_emulator, None)
+    assert _activate(client, broker_dirs, session_id="sess-2").status_code == 200
+
+    assert client.post(COLLECT, json={"session_id": "sess-1"}).status_code == 204
+
+
+def test_collect_is_refused_while_another_session_operation_runs(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """The route takes the session lock like every other session route, so a collect during an exit is a 409.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+    """
+    _exit_with_ra_change(client, broker_dirs, fake_emulator, None)
+    assert api._SESSION_LOCK.acquire(blocking=False)
+    try:
+        response = client.post(COLLECT, json={"session_id": "sess-1"})
+    finally:
+        api._SESSION_LOCK.release()
+
+    assert response.status_code == 409
+    assert session.PENDING_RA_LOGIN is not None
+
+
+def test_collect_without_a_session_id_is_a_422_that_names_no_login(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A malformed collect is refused before anything is handed out.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+    """
+    _exit_with_ra_change(
+        client,
+        broker_dirs,
+        fake_emulator,
+        base.RetroAchievementsLogin(username="alice", token="tok456secret"),
+    )
+
+    response = client.post(COLLECT, json={})
+
+    assert response.status_code == 422
+    assert "tok456secret" not in response.text
+    assert session.PENDING_RA_LOGIN is not None
+
+
 def _mock_romm(
     monkeypatch: pytest.MonkeyPatch, handler: Callable[[httpx.Request], httpx.Response]
 ) -> list[dict[str, Any]]:
@@ -3813,6 +3991,7 @@ _SECRET_GATED = [
     ("POST", "/session/activate"),
     ("POST", "/session/join"),
     ("POST", "/session/exit"),
+    ("POST", "/session/retroachievements/collect"),
     ("POST", "/session/save-state"),
     ("POST", "/session/load-state"),
     ("POST", "/session/swap-disc"),
