@@ -2999,42 +2999,42 @@ class Retroarch(Emulator):
             raise RuntimeError(f"retroarch binary not found in PATH ({launch_path}): {binary}")
         # The opening stop() has already scrubbed the saved login through _forget.
         cfg_path = _write_broker_cfg(self.retroachievements)
-
-        self._rom_base = rom_path.stem
-        # A fresh process starts on whatever slot the config left it on.
-        self._slot_homed = False
-        self._launch_seq += 1
-        seq = self._launch_seq
-        self._playlist = rom_path if rom_path.suffix.lower() == ".m3u" else None
-        self._disc_index = 0
-
-        cmd = [
-            binary,
-            "-L",
-            str(core),
-            # --config, so the file the cores and system directories were read
-            # out of is the one this run loads; --appendconfig still outranks it.
-            "--config",
-            str(RA_CONFIG_PATH),
-            "--appendconfig",
-            str(cfg_path),
-            "--fullscreen",
-            str(rom_path),
-        ]
-        log.info(
-            "launching retroarch (core=%s, rom=%s, resume_slot=%s)",
-            core.name,
-            rom_path,
-            resume_slot,
-        )
-        self._prelaunch_mtimes = _sorted_dir_mtimes()
-        self._launch_wall = time.time()
+        # From here the pinned login is on disk, so any failure before the
+        # process is up must take it back off: activate only retires the
+        # session, and no exit would come along to do it.
         try:
+            self._rom_base = rom_path.stem
+            # A fresh process starts on whatever slot the config left it on.
+            self._slot_homed = False
+            self._launch_seq += 1
+            seq = self._launch_seq
+            self._playlist = rom_path if rom_path.suffix.lower() == ".m3u" else None
+            self._disc_index = 0
+
+            cmd = [
+                binary,
+                "-L",
+                str(core),
+                # --config, so the file the cores and system directories were read
+                # out of is the one this run loads; --appendconfig still outranks it.
+                "--config",
+                str(RA_CONFIG_PATH),
+                "--appendconfig",
+                str(cfg_path),
+                "--fullscreen",
+                str(rom_path),
+            ]
+            log.info(
+                "launching retroarch (core=%s, rom=%s, resume_slot=%s)",
+                core.name,
+                rom_path,
+                resume_slot,
+            )
+            self._prelaunch_mtimes = _sorted_dir_mtimes()
+            self._launch_wall = time.time()
             self._spawn_ra(cmd, env)
         except BaseException:
             if self._proc is None:
-                # Activate only retires the session, so no exit would come
-                # along to take the pinned login back off disk.
                 clear_ra_login()
             raise
         self._playing_monotonic = None

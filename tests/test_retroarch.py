@@ -5876,7 +5876,7 @@ class TestRaLoginLifecycle:
 
         assert ra_calls == ["scrub", ("cfg", None), ("cfg", login)]
 
-    @pytest.mark.parametrize("failure", ["no binary", "spawn"])
+    @pytest.mark.parametrize("failure", ["no binary", "dir scan", "spawn"])
     def test_a_launch_that_fails_after_pinning_leaves_no_token_behind(
         self, failure: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -5886,7 +5886,8 @@ class TestRaLoginLifecycle:
         the emulator, so no exit would ever take the token back off disk.
 
         Args:
-            failure: What goes wrong after the pin: the binary is missing, or the spawn fails.
+            failure: What goes wrong around the pin: the binary is missing, the
+                save directory scan before the spawn fails, or the spawn fails.
             tmp_path: The per-test temporary directory.
             monkeypatch: The pytest monkeypatch fixture.
         """
@@ -5895,8 +5896,14 @@ class TestRaLoginLifecycle:
             """Fail the way Popen does on a binary it cannot run."""
             raise PermissionError("not executable")
 
+        def _no_scan() -> dict[Path, float]:
+            """Fail the way an unreadable save directory does."""
+            raise PermissionError("cannot list saves")
+
         _stub_launch_deps(monkeypatch, tmp_path, None if failure == "no binary" else "/usr/bin/retroarch")
         monkeypatch.setattr(retroarch.Retroarch, "_spawn_ra", _no_spawn)
+        if failure == "dir scan":
+            monkeypatch.setattr(retroarch, "_sorted_dir_mtimes", _no_scan)
         emu = retroarch.Retroarch()
         emu.platform = "snes"
         emu.retroachievements = RetroAchievementsLogin(username="alice", token="tok123secret")
