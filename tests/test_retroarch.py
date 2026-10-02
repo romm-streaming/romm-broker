@@ -629,7 +629,7 @@ class TestBrokerConfig:
         retroarch._write_broker_cfg(login)
         retroarch._write_core_options({"fake_option": "on"})
 
-        for root in (retroarch.RA_DATA_DIR, retroarch.RA_CONFIG_PATH.parent):
+        for root in (retroarch.RA_DATA_DIR, retroarch.RA_CONFIG_PATH.parent, retroarch.RA_OVERRIDE_DIR):
             for path in root.rglob("*"):
                 if not path.is_file() or path == retroarch.BROKER_CFG:
                     continue
@@ -834,6 +834,184 @@ class TestScrubRaCredentials:
         retroarch._scrub_ra_credentials()
 
         assert cfg.read_text() == text
+
+
+OVERRIDE_WITH_LOGIN = (
+    'video_shader_enable = "true"\n'
+    'cheevos_username = "alice"\n'
+    'cheevos_hardcore_mode_enable = "true"\n'
+    'cheevos_token = "tok123secret"\n'
+    'cheevos_password = "hunter2"\n'
+    "input_overlay_opacity = 0.5\n"
+)
+"""An override carrying the whole login beside settings that must survive the scrub."""
+
+OVERRIDE_WITHOUT_LOGIN = (
+    'video_shader_enable = "true"\n'
+    'cheevos_hardcore_mode_enable = "true"\n'
+    "input_overlay_opacity = 0.5\n"
+)
+"""`OVERRIDE_WITH_LOGIN` once the three credential lines are gone."""
+
+
+class TestScrubRaOverrides:
+    """Removing RetroAchievements credentials from RetroArch's override files."""
+
+    @pytest.mark.parametrize(
+        "name", ["Snes9x/Snes9x.cfg", "Snes9x/roms.cfg", "Snes9x/Game (USA).cfg", "Snes9x.cfg"]
+    )
+    def test_an_override_loses_only_the_credentials(self, name: str) -> None:
+        """Core, content-directory and game overrides, and a saved config, lose the login and nothing else.
+
+        Args:
+            name: The file under the override directory: a core, content-dir
+                or game override, or a config the menu saved at the top.
+        """
+        override = _ra_cfg(retroarch.RA_OVERRIDE_DIR / name, OVERRIDE_WITH_LOGIN)
+
+        retroarch._scrub_ra_credentials()
+
+        assert override.read_text() == OVERRIDE_WITHOUT_LOGIN
+
+    def test_an_override_with_no_credentials_is_not_rewritten(self) -> None:
+        """An override with nothing to remove stays the same file, untouched."""
+        override = _ra_cfg(retroarch.RA_OVERRIDE_DIR / "Snes9x" / "Snes9x.cfg", OVERRIDE_WITHOUT_LOGIN)
+        before = override.stat()
+
+        retroarch._scrub_ra_credentials()
+
+        after = override.stat()
+        assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+
+    def test_an_override_keeps_its_permissions(self) -> None:
+        """A rewritten override keeps the mode RetroArch gave it."""
+        override = _ra_cfg(
+            retroarch.RA_OVERRIDE_DIR / "Snes9x" / "Snes9x.cfg", OVERRIDE_WITH_LOGIN, mode=0o640
+        )
+
+        retroarch._scrub_ra_credentials()
+
+        assert override.stat().st_mode & 0o777 == 0o640
+
+    def test_a_symlink_out_of_the_override_dir_is_not_followed(self, tmp_path: Path) -> None:
+        """Neither a linked file nor a linked core directory takes the scrub outside the tree.
+
+        Args:
+            tmp_path: The per-test temporary directory.
+        """
+        outside_file = _ra_cfg(tmp_path / "elsewhere" / "linked.cfg", OVERRIDE_WITH_LOGIN)
+        outside_dir = _ra_cfg(tmp_path / "elsewhere-core" / "Core.cfg", OVERRIDE_WITH_LOGIN).parent
+        (retroarch.RA_OVERRIDE_DIR / "Snes9x").mkdir(parents=True)
+        (retroarch.RA_OVERRIDE_DIR / "Snes9x" / "Game.cfg").symlink_to(outside_file)
+        (retroarch.RA_OVERRIDE_DIR / "Core").symlink_to(outside_dir, target_is_directory=True)
+
+        retroarch._scrub_ra_credentials()
+
+        assert outside_file.read_text() == OVERRIDE_WITH_LOGIN
+        assert (outside_dir / "Core.cfg").read_text() == OVERRIDE_WITH_LOGIN
+
+    def test_a_link_inside_the_override_dir_is_scrubbed_at_its_target(self) -> None:
+        """A link that stays inside the tree is followed, and stays a link."""
+        target = _ra_cfg(retroarch.RA_OVERRIDE_DIR / "Snes9x" / "Snes9x.cfg", OVERRIDE_WITH_LOGIN)
+        link = retroarch.RA_OVERRIDE_DIR / "Snes9x" / "Game.cfg"
+        link.symlink_to(target)
+
+        retroarch._scrub_ra_credentials()
+
+        assert link.is_symlink()
+        assert target.read_text() == OVERRIDE_WITHOUT_LOGIN
+
+    def test_deeper_files_are_left_alone(self) -> None:
+        """RetroArch writes overrides one level down; anything deeper is not its override."""
+        deep = _ra_cfg(retroarch.RA_OVERRIDE_DIR / "remaps" / "Snes9x" / "Game.cfg", OVERRIDE_WITH_LOGIN)
+
+        retroarch._scrub_ra_credentials()
+
+        assert deep.read_text() == OVERRIDE_WITH_LOGIN
+
+    def test_a_missing_override_dir_is_fine(self) -> None:
+        """A container that never saved an override has no override directory at all."""
+        retroarch._scrub_ra_credentials()
+
+        assert not retroarch.RA_OVERRIDE_DIR.exists()
+
+    def test_a_failed_override_rewrite_logs_the_path_and_never_a_value(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A scrub that cannot write an override names the file and keeps going.
+
+        Args:
+            monkeypatch: The pytest monkeypatch fixture.
+            caplog: The pytest log capture fixture.
+        """
+        override = _ra_cfg(retroarch.RA_OVERRIDE_DIR / "Snes9x" / "Snes9x.cfg", OVERRIDE_WITH_LOGIN)
+
+        def _fail(*args: object, **kwargs: object) -> None:
+            """Refuse the atomic replace."""
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr(retroarch.os, "replace", _fail)
+
+        with caplog.at_level(logging.DEBUG):
+            retroarch._scrub_ra_credentials()
+
+        assert str(override) in caplog.text
+        assert "read-only file system" in caplog.text
+        for value in ("alice", "tok123secret", "hunter2"):
+            assert value not in caplog.text
+
+    def test_the_startup_cleanup_sweeps_the_overrides(self) -> None:
+        """The cleanup the broker runs when it starts takes a login out of the overrides too."""
+        override = _ra_cfg(retroarch.RA_OVERRIDE_DIR / "Snes9x" / "Snes9x.cfg", OVERRIDE_WITH_LOGIN)
+
+        retroarch.clear_ra_login(only_if_pinned=True)
+
+        assert override.read_text() == OVERRIDE_WITHOUT_LOGIN
+
+
+class TestResolveOverrideDir:
+    """Where RetroArch keeps its overrides, read the way RetroArch 1.22.2 reads it."""
+
+    def test_the_configured_directory_wins(self, tmp_path: Path) -> None:
+        """An `rgui_config_directory` in the user's config is used as is.
+
+        Args:
+            tmp_path: The per-test temporary directory.
+        """
+        _ra_cfg(retroarch.RA_CONFIG_PATH, f'rgui_config_directory = "{tmp_path / "ovr"}"\n')
+
+        assert retroarch._resolve_override_dir() == tmp_path / "ovr"
+
+    def test_a_home_relative_directory_is_expanded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """RetroArch expands a leading `~`, so the broker does too.
+
+        Args:
+            monkeypatch: The pytest monkeypatch fixture.
+            tmp_path: The per-test temporary directory.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        _ra_cfg(retroarch.RA_CONFIG_PATH, 'rgui_config_directory = "~/.config/retroarch/config"\n')
+
+        assert retroarch._resolve_override_dir() == tmp_path / "home" / ".config" / "retroarch" / "config"
+
+    def test_an_absent_key_is_retroarch_s_default(self) -> None:
+        """With no key RetroArch uses `config` under its own base directory."""
+        _ra_cfg(retroarch.RA_CONFIG_PATH, 'video_fullscreen = "true"\n')
+
+        assert retroarch._resolve_override_dir() == retroarch.RA_BASE_DIR / "config"
+
+    @pytest.mark.parametrize("value", ['"default"', '""'])
+    def test_default_or_empty_falls_back_to_the_config_s_directory(self, value: str) -> None:
+        """RetroArch reads `default` and an empty value as unset and uses the loaded config's directory.
+
+        Args:
+            value: The setting as written in the config.
+        """
+        _ra_cfg(retroarch.RA_CONFIG_PATH, f"rgui_config_directory = {value}\n")
+
+        assert retroarch._resolve_override_dir() == retroarch.RA_CONFIG_PATH.parent
 
 
 class TestCoreOptions:
@@ -5826,6 +6004,29 @@ class TestRaLoginLifecycle:
         assert user_cfg.read_text() == 'video_fullscreen = "true"\n'
         assert "tok123" not in retroarch.BROKER_CFG.read_text()
         assert 'cheevos_username = ""' in retroarch.BROKER_CFG.read_text()
+
+    @pytest.mark.parametrize("graceful", [True, False])
+    def test_an_exit_takes_the_login_out_of_every_override(self, graceful: bool) -> None:
+        """Both exit paths leave no override able to log the next player in as this one.
+
+        Args:
+            graceful: Whether RetroArch quits over stdin, or goes through the
+                `_forget` a stop ends in once the process is gone.
+        """
+        overrides = [
+            _ra_cfg(retroarch.RA_OVERRIDE_DIR / name, OVERRIDE_WITH_LOGIN)
+            for name in ("Snes9x/Snes9x.cfg", "Snes9x/roms.cfg", "Snes9x/Game.cfg")
+        ]
+        emu = retroarch.Retroarch()
+        emu.retroachievements = RetroAchievementsLogin(username="alice", token="tok123secret")
+        emu._proc = _QuitsCleanly()  # type: ignore[assignment]
+
+        if graceful:
+            emu._quit()
+        else:
+            emu._forget()
+
+        assert [o.read_text() for o in overrides] == [OVERRIDE_WITHOUT_LOGIN] * 3
 
     def test_a_failed_blank_is_logged_and_does_not_raise(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture

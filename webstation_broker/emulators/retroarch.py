@@ -150,15 +150,15 @@ loading the one its own search order found.
 """
 
 
-def _configured_dir(setting: str) -> Optional[Path]:
-    """A directory setting read out of the user's RetroArch config.
+def _configured_value(setting: str) -> Optional[str]:
+    """A setting's raw value read out of the user's RetroArch config.
 
     Args:
         setting: The config key to look up, such as `libretro_directory`.
 
     Returns:
-        The configured path with `~` expanded, or None when the config is
-        unreadable, the key is absent, or it is set to `default`.
+        The value with its quotes and surrounding spaces stripped, which may
+        be empty, or None when the config is unreadable or the key is absent.
     """
     try:
         text = RA_CONFIG_PATH.read_text(errors="replace")
@@ -170,10 +170,55 @@ def _configured_dir(setting: str) -> Optional[Path]:
     for line in text.splitlines():
         key, sep, value = line.partition("=")
         if sep and key.strip() == setting:
-            raw = value.strip().strip('"').strip()
-            if raw and raw != "default":
-                return Path(os.path.expanduser(raw))
+            return value.strip().strip('"').strip()
     return None
+
+
+def _configured_dir(setting: str) -> Optional[Path]:
+    """A directory setting read out of the user's RetroArch config.
+
+    Args:
+        setting: The config key to look up, such as `libretro_directory`.
+
+    Returns:
+        The configured path with `~` expanded, or None when the config is
+        unreadable, the key is absent or empty, or it is set to `default`.
+    """
+    raw = _configured_value(setting)
+    if raw and raw != "default":
+        return Path(os.path.expanduser(raw))
+    return None
+
+
+def _resolve_override_dir() -> Path:
+    """Work out the directory RetroArch keeps its config overrides in.
+
+    Mirrors RetroArch 1.22.2: `rgui_config_directory` when the config sets
+    it; RetroArch's own default of `config` under `RA_BASE_DIR` when the key
+    is absent; and the directory holding `retroarch.cfg` when the key is
+    empty or `default`, which RetroArch reads as unset and falls back from.
+
+    Returns:
+        The override directory, which need not exist.
+    """
+    raw = _configured_value("rgui_config_directory")
+    if raw is None:
+        return RA_BASE_DIR / "config"
+    if not raw or raw == "default":
+        return RA_CONFIG_PATH.parent
+    return Path(os.path.expanduser(raw))
+
+
+RA_OVERRIDE_DIR = _resolve_override_dir()
+"""Where RetroArch keeps its core, content-directory and game overrides.
+
+Taken from the `rgui_config_directory` in the user's config, else RetroArch's
+default (see `_resolve_override_dir`). An override is
+`<core>/<core|content dir|game>.cfg` under it and loads after `--appendconfig`,
+so a login saved into one would outrank the one the broker pins. The menu's
+"Save New Configuration" also writes a whole config, login included, at its
+top level. `_scrub_ra_credentials` sweeps both levels.
+"""
 
 
 CORES_DIR = Path(
@@ -1047,6 +1092,71 @@ RA_CREDENTIAL_LINE = re.compile(rb"^\s*(?:cheevos_username|cheevos_password|chee
 """A config line holding a RetroAchievements credential, whatever its spacing or value."""
 
 
+def _override_cfgs() -> list[Path]:
+    """Every config file RetroArch's overrides or saved configs could live in.
+
+    That is each `*.cfg` at the top of `RA_OVERRIDE_DIR` and one directory
+    down (`<core>/<name>.cfg`), the only two levels RetroArch writes there.
+    Deeper trees are left alone: when the override directory falls back to
+    the one holding `retroarch.cfg`, it also holds cores, system files and
+    thumbnails, none of them RetroArch's to fill with a login. A path whose
+    target resolves outside the directory is skipped, so a symlink can never
+    take the scrub somewhere else.
+
+    Returns:
+        The resolved files, each once.
+    """
+    root = Path(os.path.realpath(RA_OVERRIDE_DIR))
+    try:
+        if not root.is_dir():
+            return []
+        candidates = sorted([*root.glob("*.cfg"), *root.glob("*/*.cfg")])
+    except OSError as exc:
+        log.warning("ra credentials: could not list overrides in %s: %s", root, exc)
+        return []
+    found: dict[Path, None] = {}
+    for candidate in candidates:
+        path = Path(os.path.realpath(candidate))
+        if not path.is_relative_to(root):
+            log.debug("ra credentials: skipping %s, it resolves outside %s", candidate, root)
+            continue
+        if path.is_file():
+            found[path] = None
+    return list(found)
+
+
+def _scrub_cfg(path: Path) -> None:
+    """Delete the RetroAchievements credential lines from one config file.
+
+    Every other line is kept byte for byte, as are the file's permissions. A
+    file with nothing to remove, or that does not exist, is not touched. A
+    failure is logged with the path, never a value, and swallowed.
+
+    Args:
+        path: The file, already resolved past any symlink.
+    """
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        log.warning("ra credentials: could not read %s: %s", path, exc)
+        return
+    lines = data.splitlines(keepends=True)
+    kept = [line for line in lines if not RA_CREDENTIAL_LINE.match(line)]
+    removed = len(lines) - len(kept)
+    if not removed:
+        return
+    if kept and not kept[-1].endswith(b"\n"):
+        kept[-1] += b"\n"
+    try:
+        _write_with_mode(path, b"".join(kept), path.stat().st_mode & 0o7777)
+    except OSError as exc:
+        log.warning("ra credentials: could not scrub %s: %s", path, exc)
+        return
+    log.info("ra credentials: removed %d line(s) from %s", removed, path)
+
+
 def _scrub_ra_credentials() -> None:
     """Delete every RetroAchievements credential line from RetroArch's own config files.
 
@@ -1055,34 +1165,27 @@ def _scrub_ra_credentials() -> None:
     `retroarch-keychain.cfg` beside it (later releases). Deleting the line
     works whether the value is plaintext or sealed, so no key is needed.
 
+    The override files under `RA_OVERRIDE_DIR` are swept too. RetroArch
+    1.22.2 leaves the credentials out of an override it saves, but one
+    written by another release or by hand would load after `--appendconfig`
+    and log the next player in as this one. Only the credential keys go;
+    every other `cheevos_` setting, hardcore mode included, stays.
+
     Every other line is kept byte for byte, as are the file's permissions. A
-    file with nothing to remove is not rewritten. A symlinked config is
-    rewritten at its target, as RetroArch itself writes it, so the link
-    survives. A failure is logged and swallowed: the empty pins in
-    `broker.cfg` still keep a leftover login from being used.
+    file with nothing to remove is not rewritten. A symlinked `retroarch.cfg`
+    or keychain is rewritten at its target, as RetroArch itself writes it, so
+    the link survives. A failure is logged and swallowed: the empty pins in
+    `broker.cfg` still keep a leftover login in `retroarch.cfg` from being
+    used.
     """
+    seen: set[Path] = set()
     for name in (RA_CONFIG_PATH, RA_CONFIG_PATH.parent / retroarch_credentials.KEYCHAIN_CFG):
         path = Path(os.path.realpath(name))
-        try:
-            data = path.read_bytes()
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            log.warning("ra credentials: could not read %s: %s", path, exc)
-            continue
-        lines = data.splitlines(keepends=True)
-        kept = [line for line in lines if not RA_CREDENTIAL_LINE.match(line)]
-        removed = len(lines) - len(kept)
-        if not removed:
-            continue
-        if kept and not kept[-1].endswith(b"\n"):
-            kept[-1] += b"\n"
-        try:
-            _write_with_mode(path, b"".join(kept), path.stat().st_mode & 0o7777)
-        except OSError as exc:
-            log.warning("ra credentials: could not scrub %s: %s", path, exc)
-            continue
-        log.info("ra credentials: removed %d line(s) from %s", removed, path)
+        seen.add(path)
+        _scrub_cfg(path)
+    for path in _override_cfgs():
+        if path not in seen:
+            _scrub_cfg(path)
 
 
 def clear_ra_login(only_if_pinned: bool = False) -> None:

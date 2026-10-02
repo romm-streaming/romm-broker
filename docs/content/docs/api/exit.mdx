@@ -105,10 +105,12 @@ one of the other cases applies. The broker also skips a saved login with
 characters [activate](/docs/api/activate#launch-a-game) would refuse, so
 the parent never stores one that breaks the player's next launch.
 
-The reply is the only place the token leaves the broker. It is not written
-anywhere outside the `--appendconfig` file, not logged, and never in
-`/session/status`. In dev mode the route works the same, since nothing is
-sent anywhere.
+The reply is the only place the token leaves the broker. It is not logged
+and never in `/session/status`. The broker itself writes it only into the
+`--appendconfig` file; RetroArch may save it into its own config, keychain or
+override files while it runs, and the broker deletes it from all of those
+when the session ends and when the broker starts. In dev mode the route works
+the same, since nothing is sent anywhere.
 
 ## The exit report
 

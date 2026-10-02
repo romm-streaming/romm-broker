@@ -130,14 +130,20 @@ The broker keeps the login tied to the player instead:
   then deletes the `cheevos_username`, `cheevos_password` and
   `cheevos_token` lines from `retroarch.cfg` and from
   `retroarch-keychain.cfg` beside it (newer RetroArch versions keep the
-  login there, encrypted), and blanks the token in its own
-  `--appendconfig` file. The same cleanup runs at the start of every launch
+  login there, encrypted), and from every core, content-directory and game
+  override and saved config in RetroArch's override directory
+  (`rgui_config_directory`), and blanks the token in its own
+  `--appendconfig` file. An override loads after the `--appendconfig` file,
+  so a login left in one would outrank the next player's. The same cleanup runs at the start of every launch
   and when the broker starts, which catches a crash or a broker restart.
-  Every other line in your config stays exactly as it was.
+  Every other line in your config and overrides stays exactly as it was,
+  including the other `cheevos_` settings such as hardcore mode.
 
 The collect reply is the only place the token leaves the broker. It is never
-written to disk outside the `--appendconfig` file, never logged, and never
-part of `/session/status` or the exit report. A changed login that nobody
+logged, and never part of `/session/status` or the exit report. The broker
+itself writes it only into the `--appendconfig` file. RetroArch may save it
+into its own config, keychain or override files while it runs; the broker
+deletes it from those when the session ends and when the broker starts. A changed login that nobody
 collects is dropped at the next launch, and a broker restart loses it; in
 both cases the player logs in again once, from the menu.
 

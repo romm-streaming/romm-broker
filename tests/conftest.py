@@ -383,9 +383,10 @@ def no_real_retroarch_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     """Keep every RetroArch exit away from the developer's own RetroArch config.
 
     Any RetroArch exit scrubs the RetroAchievements login from `RA_CONFIG_PATH`
-    and rewrites `BROKER_CFG` (creating the broker data directories), and all
-    of them resolve to real paths at import time. Without this, a test that
-    only stops an emulator would strip the login from whoever runs the suite.
+    and the override files under `RA_OVERRIDE_DIR`, and rewrites `BROKER_CFG`
+    (creating the broker data directories), and all of them resolve to real
+    paths at import time. Without this, a test that only stops an emulator
+    would strip the login from whoever runs the suite.
 
     Args:
         monkeypatch: Pytest's attribute patcher, undone when the test ends.
@@ -393,6 +394,7 @@ def no_real_retroarch_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     """
     data = tmp_path / "retroarch_data"
     monkeypatch.setattr(retroarch, "RA_CONFIG_PATH", tmp_path / "ra-user" / "retroarch.cfg")
+    monkeypatch.setattr(retroarch, "RA_OVERRIDE_DIR", tmp_path / "ra-user" / "config")
     monkeypatch.setattr(retroarch, "RA_DATA_DIR", data)
     monkeypatch.setattr(retroarch, "STATE_DIR", data / "states")
     monkeypatch.setattr(retroarch, "SAVE_DIR", data / "saves")
