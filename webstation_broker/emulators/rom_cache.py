@@ -29,7 +29,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import BinaryIO, NamedTuple, Optional
+from typing import BinaryIO, Callable, NamedTuple, Optional
 
 from .. import settings
 from .base import Emulator
@@ -139,11 +139,6 @@ class _Budget:
                 _sleep(ahead)
 
 
-def _root() -> Path:
-    """The configured cache dir, read live so a test redirect takes effect."""
-    return settings.ROM_CACHE_DIR
-
-
 def _misplaced() -> Optional[str]:
     """Why the cache dir cannot be used, or None when it can.
 
@@ -153,7 +148,7 @@ def _misplaced() -> Optional[str]:
     deleting folders the cache never made, so the cache stays off instead.
     """
     try:
-        root = _root().resolve()
+        root = settings.ROM_CACHE_DIR.resolve()
         lib = settings.rom_root()
     except OSError as exc:
         return f"it could not be resolved: {exc}"
@@ -193,7 +188,7 @@ def _split(path: Path) -> Optional[tuple[Path, Path]]:
     if _misplaced() is not None:
         return None
     try:
-        root = _root().resolve()
+        root = settings.ROM_CACHE_DIR.resolve()
         real = path.resolve()
     except OSError:
         return None
@@ -342,7 +337,7 @@ def boot_path(rom_path: Path, rom_file: Path, emulator: Emulator) -> Path:
         if problem is not None:
             log.warning(
                 "rom cache: ROM_CACHE_DIR %s is unusable, %s; booting %s from the library",
-                _root(),
+                settings.ROM_CACHE_DIR,
                 problem,
                 rom_path,
             )
@@ -357,13 +352,13 @@ def boot_path(rom_path: Path, rom_file: Path, emulator: Emulator) -> Path:
 
 def _boot_path(rom_path: Path, rom_file: Path, emulator: Emulator) -> Path:
     """`boot_path` without its catch-all, so every failure lands in one place."""
-    global _active, _background_thread
+    global _active
     plan = _plan(rom_path, rom_file)
     if plan is None:
         with _state_lock:
             _active = None
         return rom_file
-    entry = _root() / plan.key
+    entry = settings.ROM_CACHE_DIR / plan.key
     cached = entry / plan.rel_boot
     with _state_lock:
         manifest = _read_manifest(entry)
@@ -379,47 +374,31 @@ def _boot_path(rom_path: Path, rom_file: Path, emulator: Emulator) -> Path:
     if manifest is not None and manifest.get("fingerprint") != plan.fingerprint:
         log.info("rom cache: %s changed in the library since it was copied, copying it again", rom_path)
     if settings.ROM_CACHE_MODE != "blocking":
-        try:
-            thread = threading.Thread(
-                target=_copy_in_background, args=(rom_path, plan), name="rom-cache-copy", daemon=True
-            )
-            thread.start()
-        except BaseException:
-            _copy_slot.release()
-            raise
-        _background_thread = thread
+        _start_copy(_copy_in_background, rom_path, plan)
         return rom_file
     timeout = settings.ROM_CACHE_COPY_TIMEOUT
     if timeout <= 0:
         timeout = _FALLBACK_COPY_TIMEOUT
     outcome: list[bool] = []
-    done = threading.Event()
 
-    def copy() -> None:
+    def copy(rom_path: Path, plan: _Plan) -> None:
         try:
             outcome.append(_populate(rom_path, plan, mbps=0.0, timeout=timeout))
         except Exception:
             log.warning("rom cache: blocking copy of %s failed", rom_path, exc_info=True)
         finally:
             _copy_slot.release()
-            done.set()
 
     # The copy runs on its own thread because the budget only checks the
     # deadline between chunks: a read hung on a stalled NFS mount would
     # otherwise hold activate, and the session lock, until the mount recovers.
     emulator.extraction_phase = PHASE
     try:
-        try:
-            thread = threading.Thread(target=copy, name="rom-cache-copy", daemon=True)
-            thread.start()
-        except BaseException:
-            _copy_slot.release()
-            raise
-        _background_thread = thread
-        finished = done.wait(timeout)
+        thread = _start_copy(copy, rom_path, plan)
+        thread.join(timeout)
     finally:
         emulator.extraction_phase = None
-    if not finished:
+    if thread.is_alive():
         log.warning(
             "rom cache: copying %s timed out after %gs, booting it from the library", rom_path, timeout
         )
@@ -429,6 +408,28 @@ def _boot_path(rom_path: Path, rom_file: Path, emulator: Emulator) -> Path:
     with _state_lock:
         _active = plan.key
     return cached
+
+
+def _start_copy(target: Callable[[Path, _Plan], None], rom_path: Path, plan: _Plan) -> threading.Thread:
+    """Run `target` on a copy thread; it owns the copy slot `_boot_path` took and must free it.
+
+    Args:
+        target: The copy to run, called with `rom_path` and `plan`.
+        rom_path: The ROM file or folder.
+        plan: Its entry.
+
+    Returns:
+        The started thread, also kept in `_background_thread`.
+    """
+    global _background_thread
+    try:
+        thread = threading.Thread(target=target, args=(rom_path, plan), name="rom-cache-copy", daemon=True)
+        thread.start()
+    except BaseException:
+        _copy_slot.release()
+        raise
+    _background_thread = thread
+    return thread
 
 
 def _copy_in_background(rom_path: Path, plan: _Plan) -> None:
@@ -506,7 +507,7 @@ def _require_room(plan: _Plan) -> None:
     Raises:
         _NoRoom: When the copy would eat into the reserve.
     """
-    root = _root()
+    root = settings.ROM_CACHE_DIR
     usage = shutil.disk_usage(root)
     reserve = usage.total * _FREE_RESERVE_FRACTION
     if usage.free - plan.size < reserve:
@@ -532,7 +533,7 @@ def _populate(rom_path: Path, plan: _Plan, *, mbps: float, timeout: Optional[flo
     Returns:
         True when the entry is in place.
     """
-    root = _root()
+    root = settings.ROM_CACHE_DIR
     cap = settings.ROM_CACHE_MAX_GB
     if cap > 0 and plan.size > cap * _GB:
         log.warning(
@@ -619,7 +620,7 @@ def _discard(entry: Path) -> None:
     Raises:
         OSError: When the entry cannot be moved aside.
     """
-    aside = _root() / _SCRATCH_DIR_NAME / f"{entry.name}-{uuid.uuid4().hex[:8]}-discarded"
+    aside = settings.ROM_CACHE_DIR / _SCRATCH_DIR_NAME / f"{entry.name}-{uuid.uuid4().hex[:8]}-discarded"
     aside.parent.mkdir(parents=True, exist_ok=True)
     os.replace(entry, aside)
     try:
@@ -650,7 +651,7 @@ def _evict_locked(keep: Optional[str], incoming_bytes: int, incoming_count: int)
         incoming_bytes: Bytes a copy about to be made will add.
         incoming_count: Entries a copy about to be made will add (0 or 1).
     """
-    root = _root()
+    root = settings.ROM_CACHE_DIR
     if not root.is_dir():
         return
     protected = {k for k in (keep, _active) if k}
@@ -717,15 +718,18 @@ def startup() -> None:
         return
     problem = _misplaced()
     if problem is not None:
-        log.error("rom cache: ROM_CACHE_DIR %s is unusable, %s; the cache stays off", _root(), problem)
+        log.error(
+            "rom cache: ROM_CACHE_DIR %s is unusable, %s; the cache stays off",
+            settings.ROM_CACHE_DIR,
+            problem,
+        )
         return
-    scratch = _root() / _SCRATCH_DIR_NAME
+    scratch = settings.ROM_CACHE_DIR / _SCRATCH_DIR_NAME
     try:
-        with _state_lock:
-            if scratch.is_dir():
-                for orphan in scratch.iterdir():
-                    log.warning("rom cache: removing a copy cut short by a restart: %s", orphan.name)
-                    shutil.rmtree(orphan, ignore_errors=True)
-            _evict_locked(keep=None, incoming_bytes=0, incoming_count=0)
+        if scratch.is_dir():
+            for orphan in scratch.iterdir():
+                log.warning("rom cache: removing a copy cut short by a restart: %s", orphan.name)
+                shutil.rmtree(orphan, ignore_errors=True)
+        evict()
     except OSError as exc:
-        log.warning("rom cache: startup sweep of %s failed: %s", _root(), exc)
+        log.warning("rom cache: startup sweep of %s failed: %s", settings.ROM_CACHE_DIR, exc)
