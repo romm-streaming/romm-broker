@@ -185,8 +185,13 @@ def _split(path: Path) -> Optional[tuple[Path, Path]]:
 
     Returns:
         The entry directory and the path inside it, or None when `path` is not
-        inside a cache entry.
+        inside a cache entry, or when the cache dir is one `_misplaced` refuses.
     """
+    # A refused cache dir holds no entries. With ROM_CACHE_DIR at or above
+    # ROM_ROOT every library path would otherwise read as a cached one, and
+    # logical() would map it to a different game whether the cache is on or not.
+    if _misplaced() is not None:
+        return None
     try:
         root = _root().resolve()
         real = path.resolve()
@@ -330,18 +335,18 @@ def boot_path(rom_path: Path, rom_file: Path, emulator: Emulator) -> Path:
     Returns:
         The cached copy of `rom_file`, or `rom_file` itself.
     """
-    if not settings.ROM_CACHE_ENABLED or not emulator.rom_cacheable:
-        return rom_file
-    problem = _misplaced()
-    if problem is not None:
-        log.warning(
-            "rom cache: ROM_CACHE_DIR %s is unusable, %s; booting %s from the library",
-            _root(),
-            problem,
-            rom_path,
-        )
-        return rom_file
     try:
+        if not settings.ROM_CACHE_ENABLED or not emulator.rom_cacheable:
+            return rom_file
+        problem = _misplaced()
+        if problem is not None:
+            log.warning(
+                "rom cache: ROM_CACHE_DIR %s is unusable, %s; booting %s from the library",
+                _root(),
+                problem,
+                rom_path,
+            )
+            return rom_file
         return _boot_path(rom_path, rom_file, emulator)
     except Exception:
         log.warning(
@@ -368,11 +373,11 @@ def _boot_path(rom_path: Path, rom_file: Path, emulator: Emulator) -> Path:
             log.info("rom cache: booting %s from its local copy", rom_path)
             return cached
         _active = None
-    if manifest is not None:
-        log.info("rom cache: %s changed in the library since it was copied, copying it again", rom_path)
     if not _copy_slot.acquire(blocking=False):
         log.info("rom cache: another copy is running, booting %s from the library", rom_path)
         return rom_file
+    if manifest is not None and manifest.get("fingerprint") != plan.fingerprint:
+        log.info("rom cache: %s changed in the library since it was copied, copying it again", rom_path)
     if settings.ROM_CACHE_MODE != "blocking":
         try:
             thread = threading.Thread(
@@ -553,7 +558,7 @@ def _populate(rom_path: Path, plan: _Plan, *, mbps: float, timeout: Optional[flo
         with _state_lock:
             entry = root / plan.key
             if entry.exists():
-                shutil.rmtree(entry)
+                _discard(entry)
             os.replace(scratch, entry)
             _touch(entry)
     except TimeoutError as exc:
@@ -599,11 +604,35 @@ def _entry_size(entry: Path) -> int:
     return total
 
 
+def _discard(entry: Path) -> None:
+    """Delete an entry by renaming it into scratch first, so it is never seen half deleted.
+
+    `rmtree` deletes one file at a time. Cut short (a crash, a file it cannot
+    remove), it would leave an entry still holding its manifest and boot file
+    but missing a disc or a track, and the hit check would boot it. Renamed
+    into scratch, it stops being an entry at once, and the startup sweep
+    finishes whatever the delete leaves behind.
+
+    Args:
+        entry: The entry directory.
+
+    Raises:
+        OSError: When the entry cannot be moved aside.
+    """
+    aside = _root() / _SCRATCH_DIR_NAME / f"{entry.name}-{uuid.uuid4().hex[:8]}-discarded"
+    aside.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(entry, aside)
+    try:
+        shutil.rmtree(aside)
+    except OSError as exc:
+        log.warning("rom cache: could not delete %s, the next startup will: %s", aside.name, exc)
+
+
 def _remove(entry: Path, why: str) -> None:
     """Evict one entry, logging why."""
     log.info("rom cache: evicting %s (%s)", entry.name, why)
     try:
-        shutil.rmtree(entry)
+        _discard(entry)
     except OSError as exc:
         log.warning("rom cache: could not evict %s: %s", entry.name, exc)
 

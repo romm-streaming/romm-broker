@@ -88,7 +88,7 @@ free, so the cache can never fill that disk.
 
 | Uses the cache | Doesn't |
 | --- | --- |
-| Azahar, Cemu, Dolphin, DuckStation, Eden, Flycast, PCSX2, RetroArch, xemu, Xenia | RPCS3, shadPS4, PPSSPP and ScummVM already unpack their games to local disk before booting. The desktop session boots no game. |
+| Azahar, Cemu, Dolphin, DuckStation, Eden, Flycast, PCSX2, RetroArch, xemu, Xenia | RPCS3, shadPS4, PPSSPP and ScummVM already unpack their games to local disk before booting. RetroArch's arcade cores (FinalBurn Neo, MAME, Supermodel) load parent and BIOS sets such as `neogeo.zip` from beside the game, which a copy doesn't have, so arcade, CPS, Neo Geo and Model 3 games boot from the library. The desktop session boots no game. |
 
 A multi-disc game handed over as a folder is cached whole, playlist included, so disc
 swaps work as usual and the next disc loads from the copy too.

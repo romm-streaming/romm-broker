@@ -5,7 +5,6 @@ import os
 import shutil
 import threading
 import time
-from collections.abc import Iterator
 from pathlib import Path
 from typing import NoReturn, Optional
 
@@ -64,13 +63,6 @@ def roms(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
 def cache_root(roms: Path) -> Path:
     """The redirected cache directory the autouse conftest fixture set up."""
     return settings.ROM_CACHE_DIR
-
-
-@pytest.fixture(autouse=True)
-def join_background_copy() -> Iterator[None]:
-    """Wait out a background copy a test started, so it never runs into the next test."""
-    yield
-    rom_cache.join_background_copy(10.0)
 
 
 def _write(path: Path, content: bytes = b"rom", mtime: Optional[float] = None) -> Path:
@@ -153,7 +145,6 @@ class TestOffByDefault:
             "eden",
             "flycast",
             "pcsx2",
-            "retroarch",
             "xemu",
             "xenia",
         ],
@@ -163,6 +154,30 @@ class TestOffByDefault:
         from webstation_broker import emulators
 
         assert emulators.REGISTRY[module].rom_cacheable is True
+
+    @pytest.mark.parametrize("platform", [None, "snes", "psx", "n64"])
+    def test_retroarch_opts_in_for_cores_that_read_only_the_rom(self, platform: Optional[str]) -> None:
+        """RetroArch is cacheable for a core that boots the one file it is handed."""
+        ra = retroarch.Retroarch()
+        ra.platform = platform
+
+        assert ra.rom_cacheable is True
+
+    @pytest.mark.parametrize("platform", ["arcade", "cps2", "neogeoaes", "neogeomvs", "model3"])
+    def test_retroarch_stays_out_for_cores_that_load_romsets_beside_the_game(self, platform: str) -> None:
+        """FBNeo and Supermodel load parent and BIOS zips from the game's folder, which a copy lacks."""
+        ra = retroarch.Retroarch()
+        ra.platform = platform
+
+        assert ra.rom_cacheable is False
+
+    def test_retroarch_stays_out_for_an_arcade_core_override(self) -> None:
+        """A `core:` override to a MAME core is judged by the core, not the platform's default."""
+        ra = retroarch.Retroarch()
+        ra.platform = "arcade"
+        ra.core = "mame2003_plus"
+
+        assert ra.rom_cacheable is False
 
     @pytest.mark.parametrize("module", ["rpcs3", "shadps4", "ppsspp", "scummvm", "desktop"])
     def test_launchers_with_their_own_cache_stay_out(self, module: str) -> None:
@@ -552,6 +567,29 @@ class TestEviction:
 
         assert [c.exists() for c in cached] == [False, True, True]
 
+    def test_an_eviction_cut_short_leaves_no_entry_to_boot(
+        self, roms: Path, cache_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An entry is moved into scratch before it is deleted, so a delete cut short is never booted."""
+        stale = _cache(_write(roms / "old.iso"))
+        _set_last_launched(stale, time.time() - 60)
+        kept = rom_cache.entry_of(_cache(_write(roms / "new.iso")))
+        assert kept is not None
+        real_rmtree = shutil.rmtree
+
+        def fails(*_args: object, **_kwargs: object) -> NoReturn:
+            raise OSError("device or resource busy")
+
+        monkeypatch.setattr(shutil, "rmtree", fails)
+        monkeypatch.setattr(settings, "ROM_CACHE_MAX_COUNT", 1)
+
+        rom_cache.evict()
+
+        assert _entries(cache_root) == [kept.name]
+        monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+        rom_cache.startup()
+        assert list((cache_root / ".scratch").iterdir()) == []
+
     def test_size_evicts_least_recently_launched_until_under_the_cap(
         self, roms: Path, cache_root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -854,6 +892,19 @@ class TestLogicalPath:
         rom = _write(roms / "psx" / "game.chd")
 
         assert rom_cache.logical(rom) == rom
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    @pytest.mark.parametrize("where", ["library", "above"])
+    def test_a_refused_cache_dir_never_remaps_a_library_path(
+        self, roms: Path, monkeypatch: pytest.MonkeyPatch, enabled: bool, where: str
+    ) -> None:
+        """A cache dir at or above ROM_ROOT holds no entries, so a library path is never read as a copy."""
+        rom = _write(roms / "library" / "psx" / "game.chd")
+        monkeypatch.setattr(settings, "ROM_CACHE_ENABLED", enabled)
+        monkeypatch.setattr(settings, "ROM_CACHE_DIR", roms if where == "library" else roms.parent.parent)
+
+        assert rom_cache.logical(rom) == rom
+        assert rom_cache.entry_of(rom) is None
 
 
 class TestResumeIdentity:
