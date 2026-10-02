@@ -588,6 +588,10 @@ class TestBrokerConfig:
             "quick_menu_show_save_content_dir_overrides",
             "quick_menu_show_close_content",
             "menu_show_load_content",
+            "menu_show_load_core",
+            "content_show_history",
+            "content_show_playlists",
+            "content_show_explore",
             "menu_show_load_disc",
             "menu_show_dump_disc",
             "menu_show_restart_retroarch",
@@ -3054,8 +3058,42 @@ class TestDiscSwapWithTheMenuOpen:
 
         assert emu.swap_disc(tmp_path / "Game (Disc 2).chd") is True
         assert fake.writes == 2
-        assert slot0.read_bytes() == b"players-own-state"
+        # Read last: reading the file can itself move its access time.
+        assert slot0.stat().st_atime_ns == 1_000_000_000_123
         assert slot0.stat().st_mtime_ns == 2_000_000_000_456
+        assert slot0.read_bytes() == b"players-own-state"
+
+    def test_a_rewrite_that_keeps_size_and_mtime_is_still_undone(self, tmp_path: Path) -> None:
+        """A same-size write inside one coarse mtime tick snapshots unchanged, and is undone anyway."""
+        state = tmp_path / "Gambatte" / retroarch._state_name("Game", 0)
+        state.parent.mkdir()
+        state.write_bytes(b"players")
+        os.utime(state, ns=(1_000_000_000_000, 2_000_000_000_000))
+
+        with retroarch._undo_state_writes(tmp_path, "Game"):
+            state.write_bytes(b"probe!!")
+            os.utime(state, ns=(1_000_000_000_000, 2_000_000_000_000))
+
+        assert state.read_bytes() == b"players"
+
+    def test_a_relaunch_during_the_check_sends_no_tray_commands(
+        self,
+        tmp_path: Path,
+        make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The check can outlast the session; the tray commands would reach the new process."""
+        emu, fake = make()
+
+        def relaunched() -> bool:
+            emu._launch_seq += 1
+            return True
+
+        monkeypatch.setattr(emu, "_close_menu_before_tray", relaunched)
+
+        assert emu.swap_disc(tmp_path / "Game (Disc 2).chd") is False
+        assert fake.tray == []
+        assert emu._disc_index == 0
 
     def test_a_state_the_check_created_is_removed(
         self, tmp_path: Path, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]
@@ -3231,6 +3269,42 @@ class TestSaveWithTheMenuOpen:
         assert fake.menu_open is False
         assert (fake.dir / "Game.state").exists()
         assert not (fake.dir / "Game.state2").exists()
+
+    def test_a_first_save_that_lands_late_does_not_leave_the_menu_open(
+        self,
+        make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A slow save, not a menu, made the first save miss; the toggle then opened the menu.
+
+        The late write confirms the retry, and the menu the toggle opened is
+        closed again rather than left up on everyone's stream.
+        """
+        emu, fake = make()
+        late: list[threading.Timer] = []
+        write_now = fake.write_cmd
+
+        def land() -> None:
+            # Already taken before the menu opened, so it lands whatever the menu does now.
+            fake.dir.mkdir(parents=True, exist_ok=True)
+            (fake.dir / retroarch._state_name("Game", fake.slot)).write_bytes(b"late")
+
+        def slow_first_save(cmd: str) -> bool:
+            if cmd != "SAVE_STATE" or late or fake.menu_open:
+                return write_now(cmd)
+            fake.sent.append(cmd)
+            timer = threading.Timer(1.0, land)
+            late.append(timer)
+            timer.start()
+            return True
+
+        monkeypatch.setattr(emu, "_write_cmd", slow_first_save)
+
+        assert emu.save_state(0) is True
+        late[0].join()
+        assert (fake.dir / "Game.state").read_bytes() == b"late"
+        assert fake.toggles == 2
+        assert fake.menu_open is False
 
     def test_a_core_that_writes_nothing_is_left_with_the_menu_closed(
         self, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]

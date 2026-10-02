@@ -166,7 +166,7 @@ written) sits at the root of that folder, and saves live under
 | `RETROARCH_JOYPAD_DRIVER` | `linuxraw` | Joypad driver forced at launch; the udev driver sees the selkies pads as one device plugged eight times. Set empty to leave the user's own driver alone. |
 | `RETROARCH_STATE_SLOT` | `0` | The slot RetroArch works in; 0 is its default, so the player's own load hotkey reaches the same file. |
 | `RETROARCH_SLOT_STEP_DELAY` | `0.1` | Pause between slot presses while parking the slot. |
-| `RETROARCH_MENU_SETTLE` | `0.5` | Pause after the `MENU_TOGGLE` that closes an open menu before a save is retried. |
+| `RETROARCH_MENU_SETTLE` | `0.5` | Pause after a `MENU_TOGGLE` the broker sends to close an open menu, before the retried save or a disc swap's check save. |
 | `RETROARCH_MENU_COMBO` | `2` | RetroArch's gamepad combo for opening the menu, as its index in RetroArch's list (2 is L3 + R3). Only written when `retroarch.cfg` sets no combo of its own; `0` writes none. RetroArch reads it from every player's gamepad, so any player can open the menu. |
 | `RETROARCH_SLOT_HOME_STEPS` | `24` | Slot-down presses to reach the -1 floor from anywhere the player could have cycled to. |
 | `RETROARCH_STATE_CONFIRM_WAIT` | `10.0` | How long a save state has to land on disk after `SAVE_STATE`. |

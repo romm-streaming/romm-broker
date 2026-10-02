@@ -2998,6 +2998,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                 console.warn('Emulator menu toggle was refused.');
             }
             emulatorMenuBtn.disabled = false;
+            // Back to the stream, so the keyboard steers the menu instead of
+            // Enter or Space pressing this button again and closing it.
+            const frame = document.getElementById('session-frame');
+            if (frame) frame.focus();
         });
 
         gamingModeBtn.addEventListener('click', () => gamingMode.toggle());

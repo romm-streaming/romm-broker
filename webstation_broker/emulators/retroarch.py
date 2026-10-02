@@ -992,6 +992,12 @@ def _write_broker_cfg() -> Path:
         'quick_menu_show_save_content_dir_overrides = "false"\n'
         'quick_menu_show_close_content = "false"\n'
         'menu_show_load_content = "false"\n'
+        # Each of these starts something else in place of the session's game:
+        # Load Core unloads it, and the tabs list other games to launch.
+        'menu_show_load_core = "false"\n'
+        'content_show_history = "false"\n'
+        'content_show_playlists = "false"\n'
+        'content_show_explore = "false"\n'
         'menu_show_load_disc = "false"\n'
         'menu_show_dump_disc = "false"\n'
         'menu_show_restart_retroarch = "false"\n'
@@ -1188,25 +1194,30 @@ def _undo_state_writes(dir_path: Path, base: str) -> Iterator[None]:
     with tempfile.TemporaryDirectory(prefix="retroarch-state-undo-") as tmp:
         kept: dict[Path, tuple[Path, int, int]] = {}
         for i, path in enumerate(before):
+            # Stamped before the copy, whose read can move the access time.
+            st = path.stat()
             copy = Path(tmp) / str(i)
             shutil.copyfile(path, copy)
-            st = path.stat()
             kept[path] = (copy, st.st_atime_ns, st.st_mtime_ns)
         try:
             yield
         finally:
-            for path, stamp in _state_snapshot(dir_path, base).items():
-                if before.get(path) == stamp:
-                    continue
+            # Every kept file goes back, not only the ones a snapshot sees
+            # change: states are usually one fixed size, so a rewrite inside
+            # a coarse mtime tick snapshots the same as the original.
+            for path, (copy, atime, mtime) in kept.items():
                 try:
-                    if path in kept:
-                        copy, atime, mtime = kept[path]
-                        shutil.copyfile(copy, path)
-                        os.utime(path, ns=(atime, mtime))
-                    else:
-                        path.unlink()
+                    shutil.copyfile(copy, path)
+                    os.utime(path, ns=(atime, mtime))
                 except OSError as exc:
                     log.error("retroarch: could not undo the check save over %s: %s", path, exc)
+            for path in _state_snapshot(dir_path, base):
+                if path in kept:
+                    continue
+                try:
+                    path.unlink()
+                except OSError as exc:
+                    log.error("retroarch: could not remove the check save %s: %s", path, exc)
 
 
 def _stable_file_wait(
@@ -3201,6 +3212,11 @@ class Retroarch(Emulator):
                 return False
             if not self._close_menu_before_tray():
                 return False
+            # The check can take several confirm waits, long enough for a
+            # relaunch to land and take the tray commands below.
+            if self._launch_seq != seq:
+                log.warning("disc swap: session ended mid-swap, index %d not committed", index)
+                return False
 
             steps = (index - self._disc_index) % len(entries)
             # A command that never reached the emulator leaves the tray
@@ -3432,6 +3448,9 @@ class Retroarch(Emulator):
             toggle or the retry fails; a retry that wrote nothing anywhere
             toggles the menu back, so a menu the player had open is left
             open, and one this opened (the miss had another cause) is closed.
+            A confirmed retry is followed by one more save, and one that
+            writes nothing means the confirmed write was the first save
+            landing late into a menu the toggle opened, which is closed again.
         """
         log.info(
             "retroarch: save wrote nothing to any slot, closing the menu and retrying "
@@ -3444,6 +3463,21 @@ class Retroarch(Emulator):
         self._home_state_slot()
         before = _state_snapshot(STATE_DIR, self._rom_base)
         if self._try_save():
+            # A first save that was only slow lands about now and would read
+            # as this one, with the toggle having opened a menu. A second save
+            # tells them apart: that menu would swallow it.
+            before = _state_snapshot(STATE_DIR, self._rom_base)
+            if (
+                not self._try_save()
+                and self.alive()
+                and _state_snapshot(STATE_DIR, self._rom_base) == before
+            ):
+                log.warning(
+                    "retroarch: the first save landed late, toggling back the menu the retry "
+                    "opened (platform=%s, rom=%s)",
+                    self.platform, self._rom_base,
+                )
+                self._write_cmd("MENU_TOGGLE")
             return True
         if self.alive() and _state_snapshot(STATE_DIR, self._rom_base) == before:
             log.warning(

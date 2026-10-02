@@ -99,8 +99,11 @@ with the Quick Menu up writes nothing. When a save writes nothing to any
 slot, the broker sends `MENU_TOGGLE` to close the menu, parks the slot again
 (the menu has its own State Slot setting), and retries. If the retry writes
 nothing either, it toggles the menu back, so a menu the player opened stays
-open and one the broker opened is closed again. A save that lands in a
-different slot is a slot change, not a menu, and only gets the re-park.
+open and one the broker opened is closed again. A retry that lands is
+followed by one more save: if that one writes nothing, the first save was
+only slow and the toggle opened a menu, so it's toggled closed. A save
+that lands in a different slot is a slot change, not a menu, and only gets
+the re-park.
 [`RETROARCH_MENU_SETTLE`](/docs/configuration/emulators#retroarch) (0.5
 seconds, by default) is the pause after the toggle.
 
@@ -114,9 +117,10 @@ own. [`RETROARCH_MENU_COMBO`](/docs/configuration/emulators#retroarch)
 changes which combo that is, and `0` turns it off. The layer also hides the
 menu entries that don't belong in a streamed session: Save Configuration,
 the core, game and content-directory override saves, Close Content, Load
-Content, Load Disc, Dump Disc, Restart RetroArch and Quit RetroArch. Add to
-Favorites, the Favorites tab, the Online Updater and Load Core's Download a
-Core are hidden as well, since what they write outlives the session: a
+Content, Load Core, Load Disc, Dump Disc, the History, Playlists and Explore
+tabs, Restart RetroArch and Quit RetroArch. Add to Favorites, the
+Favorites tab, the Online Updater and Download a Core are hidden as well,
+since what they write outlives the session: a
 favorite is a game the next host could launch in place of their own, and
 the updater replaces the cores every later session runs. It hides four
 Settings pages too: Configuration (where Save Configuration on Quit lives), Directory and Saving (both can move states away from where the
