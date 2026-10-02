@@ -69,37 +69,46 @@ carries `mode: "failed"` with the error. Either way, the [export
 routes](/docs/api/archives) can hand the archive back to you. The room chat
 gets a summary message before the room is torn down.
 
-## The RetroAchievements login
+## Collecting the RetroAchievements login
 
 RetroArch is the only place a player logs in to RetroAchievements (see
 [RetroAchievements](/docs/emulators#retroachievements)). When a RetroArch
-session ends with a different login from the one activate pinned, the broker
-tells the callback origin, so it can pin the new one next time:
+session ends with a different login from the one activate pinned, the exit
+report carries `retroachievements: {"change": "set" | "cleared"}` and the
+broker keeps the login in memory. The parent collects it while the session's
+claim still holds the container:
 
 ```http
-PUT {base_url}{BROKER_RA_LOGIN_PATH}
-Authorization: Bearer <callback.token>
+POST /streaming/api/session/retroachievements/collect
+X-Broker-Secret: <secret>
 Content-Type: application/json
 
+{ "session_id": "sess-1" }
+```
+
+A `200` answers once, with `Cache-Control: no-store`:
+
+```json
 {
   "session_id": "sess-1",
-  "emulator": "retroarch",
-  "user": { "id": 1, "username": "ana" },
+  "change": "set",
   "retroachievements": { "username": "alice", "token": "<token>" }
 }
 ```
 
-`user` is the `id` and `username` activate was given for the controlling
-player, either of which can be `null`. `retroachievements` is `null` when
-the player logged out. Nothing is sent when the login didn't change, or when
-the broker couldn't tell what RetroArch saved. The broker also skips a saved
-login with characters [activate](/docs/api/activate#launch-a-game) would
-refuse, so the parent never stores one that breaks the player's next launch.
+`retroachievements` is `null` when `change` is `cleared`, meaning the player
+logged out. A `204` means nothing is pending: the login didn't change, the
+broker couldn't tell what RetroArch saved, it was collected already, the
+`session_id` is another session's, or a new session has started since. A
+`409` means an activate or exit is running right now; the change stays until
+one of the other cases applies. The broker also skips a saved login with
+characters [activate](/docs/api/activate#launch-a-game) would refuse, so
+the parent never stores one that breaks the player's next launch.
 
-The push runs after the save upload and fails on its own: a parent that
-answers with an error, or has no such route yet, gets a warning in the log
-and a `failed` block in the report, and the exit finishes as usual. In dev
-mode nothing is sent.
+The reply is the only place the token leaves the broker. It is not written
+anywhere outside the `--appendconfig` file, not logged, and never in
+`/session/status`. In dev mode the route works the same, since nothing is
+sent anywhere.
 
 ## The exit report
 
@@ -114,7 +123,7 @@ The response carries everything the parent needs to file the session:
 | `exit_error` | Only present when the emulator's own shutdown raised. The broker stops it anyway and still dumps the saves. |
 | `save_dump` | What got zipped up: `files` (each `{path, size, mtime}`, path relative to the save root), `skipped` and `skipped_files` (the count and paths of files that could not be read into the archive; a partial skip still ships the rest), `total_bytes`, `archive_path` (set only when the archive was kept on disk), and `error` when the dump itself failed. |
 | `upload` | The `mode` (`uploaded`, `failed`, `report-only`, or `skipped` when the save dump succeeded but found no save changes to upload), the target `url`, the HTTP `status_code`, and, if it failed, the `error` message and the `archive_path` the archive was written to. A failed save dump also reports `mode: "failed"`, with no archive to keep. |
-| `retroachievements` | Only present when the player's RetroAchievements login changed during the session. The `mode` (`reported`, `failed`, or `report-only` in dev mode or without a callback), `change` (`set` or `cleared`), and, as for `upload`, the `url`, `status_code` and `error`. It never carries the token. |
+| `retroachievements` | Only present when the player's RetroAchievements login changed during the session: `{"change": "set"}` or `{"change": "cleared"}`. The login itself waits for the [collect route](#collecting-the-retroachievements-login). It never carries the username or the token. |
 | `selkies_tokens_cleared` | Whether selkies (the streaming layer) accepted the emptied token map. |
 
 The route tears the session down before it answers. It tells the room the

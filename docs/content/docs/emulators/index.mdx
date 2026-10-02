@@ -121,39 +121,44 @@ The broker keeps the login tied to the player instead:
   RomM sends none, the broker writes the login fields empty, so the player
   starts logged out and can log in from the menu. `cheevos_enable` is left
   to you.
-- **After RetroArch exits**, the broker first reads back the login
-  RetroArch saved. If the player logged in, logged out, or RetroArch
-  refreshed the token during the session, the broker sends the new login to
-  RomM on exit (see [The RetroAchievements login](/docs/api/exit#the-retroachievements-login)),
-  so RomM can hand it back at the player's next launch. Then it deletes the `cheevos_username`,
-  `cheevos_password` and `cheevos_token` lines from `retroarch.cfg` and from
+- **After RetroArch exits**, the broker reads back the login RetroArch
+  saved. If the player logged in, logged out, or RetroArch refreshed the
+  token during the session, the broker keeps the new login in memory and
+  tells RomM in the exit report that it changed. RomM then collects it
+  (see [Collecting the RetroAchievements login](/docs/api/exit#collecting-the-retroachievements-login))
+  and stores it for the player's next launch, on any container. The broker
+  then deletes the `cheevos_username`, `cheevos_password` and
+  `cheevos_token` lines from `retroarch.cfg` and from
   `retroarch-keychain.cfg` beside it (newer RetroArch versions keep the
-  login there, encrypted). It also blanks the token in its own
+  login there, encrypted), and blanks the token in its own
   `--appendconfig` file. The same cleanup runs at the start of every launch
   and when the broker starts, which catches a crash or a broker restart.
   Every other line in your config stays exactly as it was.
+
+The collect reply is the only place the token leaves the broker. It is never
+written to disk outside the `--appendconfig` file, never logged, and never
+part of `/session/status` or the exit report. A changed login that nobody
+collects is dropped at the next launch, and a broker restart loses it; in
+both cases the player logs in again once, from the menu.
 
 If RetroArch closes or crashes on its own mid-session, the login stays on
 disk until the session ends. No other session can start in the meantime, so
 nobody else can reach it.
 
 The `--appendconfig` file is only readable by its owner, since it holds a
-live token while RetroArch runs. The token never appears in the broker's
-logs or in `/session/status`.
+live token while RetroArch runs.
 
 If your container already has a RetroAchievements login saved in
 RetroArch, the broker removes it when it first starts after the upgrade,
 before any session runs. Each player then logs in once from RetroArch's
-Achievements menu. The broker reports that login to RomM when the session ends, but RomM doesn't store it yet
-([#110](https://github.com/romm-streaming/romm-broker/issues/110)). Until it
-does, a player logs in again in each session.
+Achievements menu.
 
 The broker reads the login back from either place RetroArch keeps it. The
 encrypted keychain in newer RetroArch versions opens with this container's
 machine ID. A keychain protected with a passphrase on a different machine
 can't be opened without that passphrase, which the broker never has. In that
 case, and whenever RetroArch didn't save its config on the way out
-(`config_save_on_exit` off), the broker reports nothing and RomM keeps
+(`config_save_on_exit` off), the broker reports no change and RomM keeps
 whatever it had.
 
 The full list matching each platform to its core lives in
