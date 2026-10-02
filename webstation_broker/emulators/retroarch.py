@@ -3022,9 +3022,8 @@ class Retroarch(Emulator):
             raise RuntimeError(f"retroarch binary not found in PATH ({launch_path}): {binary}")
         # The opening stop() has already scrubbed the saved login through _forget.
         cfg_path = _write_broker_cfg(self.retroachievements)
-        # From here the pinned login is on disk, so any failure before the
-        # process is up must take it back off: activate only retires the
-        # session, and no exit would come along to do it.
+        # The login is on disk from here, and a failed launch gets no exit to
+        # take it back off, only a retired session.
         try:
             self._rom_base = rom_path.stem
             # A fresh process starts on whatever slot the config left it on.

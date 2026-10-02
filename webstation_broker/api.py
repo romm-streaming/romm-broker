@@ -713,9 +713,8 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     # killed: nothing else holds a handle on it, and launching over the top
     # would leave two emulators sharing the screen and the audio sink.
     await anyio.to_thread.run_sync(reap_orphan)
-    # A RetroArch that outlived its exit never reached `_forget`, so the last
-    # player's login is still on disk. Only a RetroArch launch would scrub it
-    # otherwise, and a desktop session in between could read it straight off.
+    # A RetroArch that outlived its exit never reached `_forget`; without this,
+    # a desktop session could read the last player's login straight off disk.
     await anyio.to_thread.run_sync(lambda: retroarch.clear_ra_login(only_if_pinned=True))
 
     emulator = get_emulator(body.emulator)
