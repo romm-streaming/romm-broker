@@ -1034,10 +1034,7 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
         # Otherwise the session stays marked active with no emulator behind
         # it, and every retry 409s instead of reaching launch again.
         log.error("session %s: launch failed, retiring the session", sess["id"], exc_info=True)
-        # The retired emulator lives on in `session.LAST_EXIT`, and nothing
-        # will ever need this player's login from it, as with exit.
-        emulator.retroachievements = None
-        emulator.retroachievements_change = None
+        emulator.drop_ra_login()
         session.retire_session()
         raise
     # Baseline after launch: the exit dump only ships files this session wrote.
@@ -1504,10 +1501,7 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
             "login": change.login,
         }
         log.info("session %s: ra login %s, waiting for collection", sess["id"], change.kind)
-    # The emulator object outlives the session in `session.LAST_EXIT`, so it
-    # gives up both logins now that the pending one is the only copy needed.
-    emulator.retroachievements = None
-    emulator.retroachievements_change = None
+    emulator.drop_ra_login()
 
     report = {
         "status": "exited",

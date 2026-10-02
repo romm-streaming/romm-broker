@@ -1056,6 +1056,15 @@ class Emulator:
         """
         return self._proc.returncode if self._proc is not None else None
 
+    def drop_ra_login(self) -> None:
+        """Let go of the player's RetroAchievements login and any change to it.
+
+        The emulator object outlives its session in `session.LAST_EXIT`, so
+        once the session is over it must stop holding a token.
+        """
+        self.retroachievements = None
+        self.retroachievements_change = None
+
     def _forget(self) -> None:
         """Drop the handle on the emulator and the record of it on disk.
 
