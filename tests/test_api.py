@@ -694,6 +694,43 @@ def test_activate_retires_the_session_when_launch_fails(
     assert _activate(client, broker_dirs).status_code == 200
 
 
+def test_a_failed_launch_leaves_no_ra_login_on_the_retired_emulator(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The emulator a failed activate retires into `LAST_EXIT` gives up the pinned login.
+
+    The token stays out of `repr`, so the check reads the attributes
+    themselves as well as the object's `repr`.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+        monkeypatch: The pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(FakeEmulator, "launch_fails", True)
+
+    with pytest.raises(RuntimeError):
+        _activate(
+            client, broker_dirs, retroachievements={"username": "alice", "token": "tok123secret"}
+        )
+
+    assert session.SESSION is None
+    assert session.LAST_EXIT is not None
+    retired = session.LAST_EXIT["emulator_obj"]
+    assert retired is fake_emulator[0]
+    assert retired.retroachievements is None
+    assert retired.retroachievements_change is None
+    held = [repr(retired), repr(vars(retired))]
+    for value in vars(retired).values():
+        held.append(str(getattr(value, "token", "")))
+        held.append(str(getattr(getattr(value, "login", None), "token", "")))
+    assert all("tok123secret" not in text for text in held)
+
+
 def test_activate_refuses_an_emulator_that_is_not_installed(
     client: TestClient, broker_dirs: dict[str, Path]
 ) -> None:
