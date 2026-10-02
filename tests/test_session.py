@@ -602,6 +602,58 @@ async def test_an_mk_handover_selkies_refused_is_logged(
     assert any(r.levelname == "ERROR" for r in caplog.records)
 
 
+async def test_input_is_shared_once_a_viewer_gets_a_gamepad(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A viewer on a gamepad can reach the emulator's menu; the controller moving slots shares nothing."""
+
+    async def _accept(_session: dict[str, Any]) -> bool:
+        """Take the push.
+
+        Args:
+            _session: The session whose tokens would have been pushed.
+
+        Returns:
+            Always True.
+        """
+        return True
+
+    monkeypatch.setattr(selkies, "push_tokens", _accept)
+    sess = _activate()
+    viewer = await session.add_viewer("participant")
+
+    await session.handle_assign_slot(sess["controller_token"], 3)
+    assert sess["input_shared"] is False
+
+    await session.handle_assign_slot(viewer["token"], 2)
+    await session.handle_assign_slot(viewer["token"], None)
+    assert sess["input_shared"] is True
+
+
+async def test_input_is_shared_once_a_viewer_gets_mouse_and_keyboard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Handing mouse and keyboard back to the controller does not undo what the viewer could have done."""
+
+    async def _accept(_session: dict[str, Any]) -> bool:
+        """Take the push.
+
+        Args:
+            _session: The session whose tokens would have been pushed.
+
+        Returns:
+            Always True.
+        """
+        return True
+
+    monkeypatch.setattr(selkies, "push_tokens", _accept)
+    sess = _activate()
+    viewer = await session.add_viewer("participant")
+
+    await session.handle_assign_mk(None)
+    assert sess["input_shared"] is False
+
+    await session.handle_assign_mk(viewer["token"])
+    await session.handle_assign_mk(None)
+    assert sess["input_shared"] is True
+
+
 def test_a_session_with_no_bootable_rom_file_records_none() -> None:
     """Activate resolves no rom file for some launches, and the session has to carry that through."""
     sess = session.new_session(

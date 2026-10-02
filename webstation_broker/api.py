@@ -32,6 +32,7 @@ from .emulators.base import (
     STATE_HEAD_BYTES,
     CoreRejectedError,
     Emulator,
+    RetroAchievementsChange,
     RetroAchievementsLogin,
     reap_orphan,
 )
@@ -1384,6 +1385,33 @@ async def _keep_archive(zip_bytes: bytes, name: str, session_id: str) -> Optiona
         return None
 
 
+def _creditable_ra_change(emulator: Emulator, sess: dict[str, Any]) -> Optional[RetroAchievementsChange]:
+    """The RetroAchievements login change to credit to the session's player, or None.
+
+    Once a viewer has held input, the emulator's menu was open to the whole
+    room, so a login to any account but the pinned one may be a guest's and is
+    not reported. A refreshed token or a logout of the pinned account still is.
+
+    Args:
+        emulator: The session's emulator, still holding the pinned login.
+        sess: The session being exited.
+
+    Returns:
+        The change to hold for collection, or None.
+    """
+    change = emulator.retroachievements_change
+    if change is None or change.login is None or not sess.get("input_shared"):
+        return change
+    pinned = emulator.retroachievements
+    if pinned is not None and change.login.username.casefold() == pinned.username.casefold():
+        return change
+    log.warning(
+        "session %s: ra login moved to another account after input was shared, not collecting it",
+        sess["id"],
+    )
+    return None
+
+
 async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
     """Save state, stop the emulator, dump the save delta, and report.
 
@@ -1491,7 +1519,7 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
             archive_path = await _keep_archive(dump["zip_bytes"], archive_name, sess["id"])
             upload["archive_path"] = archive_path
 
-    change = emulator.retroachievements_change
+    change = _creditable_ra_change(emulator, sess)
     if change is not None:
         # Held for RomM to collect; the token goes nowhere else.
         session.PENDING_RA_LOGIN = {

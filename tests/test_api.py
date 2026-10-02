@@ -354,6 +354,93 @@ def test_exit_holds_a_changed_ra_login_for_collection(
         assert "tok456secret" not in text
 
 
+def test_a_login_to_another_account_after_input_was_shared_is_not_collected(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Once a viewer has held input, a login to another account may be the viewer's.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+        caplog: The pytest log capture fixture.
+    """
+    _activate(client, broker_dirs, retroachievements={"username": "alice", "token": "tok123secret"})
+    session.SESSION["input_shared"] = True
+    ended = base.RetroAchievementsLogin(username="bob", token="tok456secret")
+    fake_emulator[0].retroachievements_change = base.RetroAchievementsChange(login=ended)
+
+    with caplog.at_level(logging.DEBUG):
+        body = client.post(f"{API}/session/exit").json()
+
+    assert "retroachievements" not in body
+    assert session.PENDING_RA_LOGIN is None
+    assert client.post(COLLECT, json={"session_id": "sess-1"}).status_code == 204
+    assert "another account after input was shared" in caplog.text
+    assert "tok456secret" not in caplog.text
+    assert "bob" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("pinned", "ended"),
+    [
+        ({"username": "alice", "token": "tok123secret"}, ("ALICE", "tok456secret")),
+        ({"username": "alice", "token": "tok123secret"}, None),
+        (None, None),
+    ],
+    ids=["same-account-refresh", "logout", "nothing-pinned-logout"],
+)
+def test_a_change_to_the_pinned_account_after_input_was_shared_is_still_collected(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    pinned: Optional[dict[str, str]],
+    ended: Optional[tuple[str, str]],
+) -> None:
+    """A refreshed token or a logout of the player's own account is still collected after input was shared.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+        pinned: The login activate pinned, or None.
+        ended: The (username, token) the player ended with, or None for a logout.
+    """
+    overrides = {"retroachievements": pinned} if pinned else {}
+    _activate(client, broker_dirs, **overrides)
+    session.SESSION["input_shared"] = True
+    login = base.RetroAchievementsLogin(*ended) if ended else None
+    fake_emulator[0].retroachievements_change = base.RetroAchievementsChange(login=login)
+
+    client.post(f"{API}/session/exit")
+
+    assert session.PENDING_RA_LOGIN is not None
+    assert session.PENDING_RA_LOGIN["login"] == login
+
+
+def test_a_new_login_after_input_was_shared_is_not_collected_when_nothing_was_pinned(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """With no pinned account to match, any login after a viewer held input could be the viewer's.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+    """
+    _activate(client, broker_dirs)
+    session.SESSION["input_shared"] = True
+    ended = base.RetroAchievementsLogin(username="bob", token="tok456secret")
+    fake_emulator[0].retroachievements_change = base.RetroAchievementsChange(login=ended)
+
+    client.post(f"{API}/session/exit")
+
+    assert session.PENDING_RA_LOGIN is None
+
+
 def test_the_retired_emulator_keeps_no_ra_login(
     client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
 ) -> None:

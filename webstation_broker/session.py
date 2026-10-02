@@ -184,6 +184,9 @@ def new_session(
         # The controller starts with gamepad 1.
         "controller_slot": 1,
         "mk_owner_token": None,
+        # Set for good once a viewer holds a gamepad or mouse and keyboard:
+        # from then on anyone in the room could have used the emulator's menu.
+        "input_shared": False,
         "designated_speaker": None,
         "save_baseline": time.time(),
         "emulator_obj": emulator_obj,
@@ -651,6 +654,8 @@ async def handle_assign_slot(viewer_token: Optional[str], slot: Optional[int]) -
         SESSION["controller_slot"] = slot
     else:
         target_user["slot"] = slot
+        if slot is not None:
+            SESSION["input_shared"] = True
 
     if slot is not None and old_slot != slot:
         notifications.append(f"Gamepad {slot} was assigned to {target_username}.")
@@ -691,6 +696,8 @@ async def handle_assign_mk(target_token: Optional[str]) -> None:
     if SESSION.get("mk_owner_token") == target_token:
         return
     SESSION["mk_owner_token"] = target_token
+    if target_token is not None:
+        SESSION["input_shared"] = True
 
     username = "Controller"
     if target_token:
