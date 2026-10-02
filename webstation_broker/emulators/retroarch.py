@@ -1084,7 +1084,7 @@ def _ra_login_change(
     if ended is None:
         log.info("ra login capture: the player's login was cleared")
     else:
-        log.info("ra login capture: the player is now logged in as %s", ended.username)
+        log.info("ra login capture: the player logged in or their token changed")
     return RetroAchievementsChange(login=ended)
 
 

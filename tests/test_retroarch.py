@@ -6223,13 +6223,14 @@ class TestRaLoginCapture:
         )
 
     def test_the_captured_token_is_never_logged(self, caplog: pytest.LogCaptureFixture) -> None:
-        """The capture logs the username it saw, never the token.
+        """The capture logs that the login changed, never the username or token it saw.
 
         Args:
             caplog: The pytest log capture fixture.
         """
         with caplog.at_level(logging.DEBUG):
-            self._end_session('cheevos_username = "alice"\ncheevos_token = "tok456"\n', self.PINNED)
+            self._end_session('cheevos_username = "bob"\ncheevos_token = "tok456"\n', self.PINNED)
 
-        assert "alice" in caplog.text
+        assert "logged in" in caplog.text
+        assert "bob" not in caplog.text
         assert "tok456" not in caplog.text
