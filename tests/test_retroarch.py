@@ -6,6 +6,7 @@ pinned per player and scrubbed from the shared config after every exit.
 """
 
 import dataclasses
+import errno
 import io
 import json
 import logging
@@ -735,6 +736,63 @@ class TestScrubRaCredentials:
         assert retroarch.RA_CONFIG_PATH.is_symlink()
         assert target.read_text() == "menu_driver = ozone\n"
 
+    def test_a_config_in_a_read_only_directory_is_scrubbed_in_place(self) -> None:
+        """No temp file fits beside it, but the file itself is writable, so it is rewritten where it is."""
+        cfg = _ra_cfg(retroarch.RA_CONFIG_PATH, 'cheevos_token = "tok123"\nmenu_driver = ozone\n')
+        cfg.parent.chmod(0o555)
+        try:
+            retroarch._scrub_ra_credentials()
+        finally:
+            cfg.parent.chmod(0o755)
+
+        assert cfg.read_text() == "menu_driver = ozone\n"
+        assert (cfg.stat().st_mode & 0o777) == 0o644
+
+    def test_a_bind_mounted_config_is_scrubbed_in_place(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A file bind-mounted into the container cannot be renamed over, so it is rewritten where it is.
+
+        Args:
+            monkeypatch: Makes the rename fail the way it does on a mount point.
+        """
+        cfg = _ra_cfg(retroarch.RA_CONFIG_PATH, 'cheevos_token = "tok123"\nmenu_driver = ozone\n')
+
+        def _busy(_src: object, _dst: object) -> None:
+            """Refuse the rename as the kernel does for a mount point.
+
+            Args:
+                _src: The temp file.
+                _dst: The config file.
+
+            Raises:
+                OSError: Always, EBUSY.
+            """
+            raise OSError(errno.EBUSY, "Device or resource busy")
+
+        monkeypatch.setattr(retroarch.os, "replace", _busy)
+
+        retroarch._scrub_ra_credentials()
+
+        assert cfg.read_text() == "menu_driver = ozone\n"
+        assert not [p for p in cfg.parent.iterdir() if p.name.startswith(".retroarch.cfg.")]
+
+    def test_a_config_that_cannot_be_written_at_all_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A read-only file in a read-only directory keeps its login, and the log says so without the value.
+
+        Args:
+            caplog: The pytest log capture fixture.
+        """
+        cfg = _ra_cfg(retroarch.RA_CONFIG_PATH, 'cheevos_token = "tok123"\n', mode=0o444)
+        cfg.parent.chmod(0o555)
+        try:
+            with caplog.at_level(logging.WARNING):
+                retroarch._scrub_ra_credentials()
+        finally:
+            cfg.parent.chmod(0o755)
+
+        assert cfg.read_text() == 'cheevos_token = "tok123"\n'
+        assert "could not scrub" in caplog.text
+        assert "tok123" not in caplog.text
+
     def test_sealed_values_leave_the_keychain_file(self) -> None:
         """RetroArch's keychain file loses its credential lines without the key being needed.
 
@@ -813,10 +871,11 @@ class TestScrubRaCredentials:
         cfg = _ra_cfg(retroarch.RA_CONFIG_PATH, 'cheevos_token = "tok123"\n')
 
         def _fail(*args: object, **kwargs: object) -> None:
-            """Refuse the atomic replace."""
+            """Refuse the atomic replace and the in-place rewrite."""
             raise OSError("read-only file system")
 
         monkeypatch.setattr(retroarch.os, "replace", _fail)
+        monkeypatch.setattr(retroarch, "_overwrite", _fail)
 
         with caplog.at_level(logging.WARNING):
             retroarch._scrub_ra_credentials()
@@ -947,10 +1006,11 @@ class TestScrubRaOverrides:
         override = _ra_cfg(retroarch.RA_OVERRIDE_DIR / "Snes9x" / "Snes9x.cfg", OVERRIDE_WITH_LOGIN)
 
         def _fail(*args: object, **kwargs: object) -> None:
-            """Refuse the atomic replace."""
+            """Refuse the atomic replace and the in-place rewrite."""
             raise OSError("read-only file system")
 
         monkeypatch.setattr(retroarch.os, "replace", _fail)
+        monkeypatch.setattr(retroarch, "_overwrite", _fail)
 
         with caplog.at_level(logging.DEBUG):
             retroarch._scrub_ra_credentials()
@@ -5960,6 +6020,49 @@ class TestRaLoginLifecycle:
             emu.launch(tmp_path / "game.sfc", None)
 
         assert "tok123secret" not in retroarch.BROKER_CFG.read_text()
+
+    def test_a_launch_whose_retroarch_survives_the_stop_still_blanks_the_pin(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The pid record and the kill both failed: the shared files wait, the overlay's token goes now.
+
+        RetroArch read the overlay at startup, so blanking it changes nothing
+        for the running process; it only stops the token sitting on disk
+        until the next activate.
+
+        Args:
+            tmp_path: The per-test temporary directory.
+            monkeypatch: The pytest monkeypatch fixture.
+        """
+
+        class _Alive:
+            """A process handle that never exits."""
+
+            pid = 4242
+
+            def poll(self) -> None:
+                """Report the process as still running."""
+                return None
+
+        def _spawn_then_fail(self: retroarch.Retroarch, cmd: list[str], env: dict[str, str]) -> None:
+            """Leave a process behind and raise, as a failed pid record with a failed kill does."""
+            self._proc = _Alive()  # type: ignore[assignment]
+            raise OSError("no space left on device")
+
+        scrubs: list[str] = []
+        _stub_launch_deps(monkeypatch, tmp_path)
+        monkeypatch.setattr(retroarch.Retroarch, "_spawn_ra", _spawn_then_fail)
+        monkeypatch.setattr(retroarch, "_scrub_ra_credentials", lambda: scrubs.append("scrub"))
+        emu = retroarch.Retroarch()
+        emu.platform = "snes"
+        emu.retroachievements = RetroAchievementsLogin(username="alice", token="tok123secret")
+
+        with pytest.raises(OSError, match="no space"):
+            emu.launch(tmp_path / "game.sfc", None)
+
+        assert "tok123secret" not in retroarch.BROKER_CFG.read_text()
+        # Only the opening stop's scrub; none while RetroArch is still running.
+        assert scrubs == ["scrub"]
 
     def test_a_pid_record_that_cannot_be_written_stops_retroarch(
         self, ra_calls: list[object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch

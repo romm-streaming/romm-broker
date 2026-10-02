@@ -1172,12 +1172,37 @@ def _scrub_cfg(path: Path) -> None:
         return
     if kept and not kept[-1].endswith(b"\n"):
         kept[-1] += b"\n"
+    scrubbed = b"".join(kept)
     try:
-        _write_with_mode(path, b"".join(kept), path.stat().st_mode & 0o7777)
+        _write_with_mode(path, scrubbed, path.stat().st_mode & 0o7777)
     except OSError as exc:
-        log.warning("ra credentials: could not scrub %s: %s", path, exc)
+        # A bind-mounted file cannot be renamed over and a read-only directory
+        # takes no temp file, yet the file itself may still be writable.
+        try:
+            _overwrite(path, scrubbed)
+        except OSError as in_place_exc:
+            log.warning("ra credentials: could not scrub %s: %s; in place: %s", path, exc, in_place_exc)
+            return
+        log.info("ra credentials: removed %d line(s) from %s, in place", removed, path)
         return
     log.info("ra credentials: removed %d line(s) from %s", removed, path)
+
+
+def _overwrite(path: Path, data: bytes) -> None:
+    """Rewrite `path` with `data` through its own inode, for a file that cannot be replaced.
+
+    Args:
+        path: The file to rewrite.
+        data: Its new contents.
+
+    Raises:
+        OSError: When the file cannot be opened or written.
+    """
+    with open(path, "r+b") as fh:
+        fh.write(data)
+        fh.truncate()
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 def _scrub_ra_credentials() -> None:
@@ -3058,6 +3083,13 @@ class Retroarch(Emulator):
         except BaseException:
             if self._proc is None:
                 clear_ra_login()
+            else:
+                # RetroArch outlived the stop and would save over a scrub now;
+                # the pin it already read can go.
+                try:
+                    _write_broker_cfg()
+                except OSError as exc:
+                    log.warning("ra credentials: could not blank %s: %s", BROKER_CFG, exc)
             raise
         self._playing_monotonic = None
         threading.Thread(target=self._track_first_playing, args=(seq,), daemon=True).start()
