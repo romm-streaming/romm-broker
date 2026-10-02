@@ -738,6 +738,8 @@ class Emulator:
         language: The language the rom was activated for, or None.
         gui_language: The player's own interface language, or None.
         requires_rom: Whether a launch needs a ROM; the desktop session does not.
+        rom_cacheable: Whether the ROM cache may boot this emulator from a
+            local copy of its ROM.
         save_root: Root of the emulator's writable data.
         save_subtrees: Subtrees under `save_root` that hold save data; save
             restore and dump are scoped to these.
@@ -806,6 +808,20 @@ class Emulator:
     """
     requires_rom: bool = True
     """Whether a launch needs a ROM; the desktop session is the one that does not."""
+    rom_cacheable: bool = False
+    """Whether `rom_cache` may hand `launch()` a local copy of the ROM instead of the `ROM_ROOT` path.
+
+    Off by default. Before turning it on, check the launcher against both ways a copy breaks:
+
+    - Every booted path it saves or compares (a resume-state owner marker, a playlist match
+      against a disc RomM names) goes through `rom_cache.logical()`, or it never matches the
+      `ROM_ROOT` path.
+    - Nothing loads files from beside the ROM entry RomM handed over (an arcade core's parent
+      or BIOS set), since a copy holds that entry and nothing else.
+
+    Launchers with an extraction cache of their own stay off, so an archive is never stored
+    twice. `tests/test_rom_cache.py` pins the launchers that opt in.
+    """
     save_root: Path = Path("/config")
     """Root of the emulator's writable data."""
     save_subtrees: tuple[str, ...] = ()

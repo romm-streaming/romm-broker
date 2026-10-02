@@ -75,7 +75,7 @@ from typing import Any, Callable, Optional, Union
 import httpx
 
 from .. import imports, settings
-from . import extraction_cache, retroarch_cores, wii_nand
+from . import extraction_cache, retroarch_cores, rom_cache, wii_nand
 from .base import Emulator, _record_pid, base_launch_env, disc_number, xdg_config_dir
 from .retroarch_cores import safe_dir_name
 
@@ -538,6 +538,8 @@ platform rather than the core, so an alternate may not carry it.
 
 RA_ARCHIVE_EXTS = (".zip", ".7z")
 """Archives RetroArch extracts itself before handing a core the content inside."""
+_ROMSET_CORE_PREFIXES = ("fbneo", "fbalpha", "mame", "hbmame", "supermodel")
+"""Cores that load parent and BIOS romsets from beside the game, so the ROM cache leaves them be."""
 ARCHIVE_LIST_TIMEOUT = 30.0
 """Seconds `7z l` gets to list a ROM archive for an untested core's extension check."""
 _ROM_SEARCH_GLOBS = ("*", "*/*")
@@ -1436,6 +1438,9 @@ def _m3u_entries(playlist: Path) -> list[Path]:
 def _m3u_index_for_path(playlist: Path, target: Path) -> Optional[int]:
     """Disc index `target` occupies in `playlist`, or None if unlisted.
 
+    A playlist booted from the ROM cache lists its copies, while a swap names
+    the disc under `ROM_ROOT`, so both sides are compared as library paths.
+
     Args:
         playlist: The .m3u file the session booted.
         target: The disc image to look for.
@@ -1443,9 +1448,9 @@ def _m3u_index_for_path(playlist: Path, target: Path) -> Optional[int]:
     Returns:
         The zero-based index of `target` among the playlist's entries, or None.
     """
-    wanted = target.resolve()
+    wanted = rom_cache.logical(target.resolve())
     for index, entry in enumerate(_m3u_entries(playlist)):
-        if entry == wanted:
+        if rom_cache.logical(entry) == wanted:
             return index
     return None
 
@@ -2044,6 +2049,8 @@ class Retroarch(Emulator):
     Attributes:
         name: Registry key, `retroarch`.
         display_name: Shown as "RetroArch".
+        rom_cacheable: Whether, with the ROM cache enabled, launch boots a local
+            copy of the ROM; off for the arcade cores that load romsets from beside it.
         save_root: `RA_DATA_DIR`, the broker-managed data root.
         log_path: `RA_LOG_PATH`, where RetroArch's stderr goes.
         supports_states: Whether the loaded platform's core can save states.
@@ -2498,6 +2505,23 @@ class Retroarch(Emulator):
         """The libretro core booting the loaded platform, or None when unmapped."""
         info = self._profile()
         return info["core"] if info else None
+
+    @property
+    def rom_cacheable(self) -> bool:
+        """Whether the ROM cache may boot a local copy for the loaded platform's core.
+
+        The arcade cores load a clone's parent romset and the system's BIOS
+        set (`neogeo.zip`) from the folder the game sits in. A cached copy
+        holds the game's own zip and nothing beside it, so those cores boot
+        from the library.
+
+        Returns:
+            False for a core in `_ROMSET_CORE_PREFIXES`, else True, including
+            when no platform is loaded yet.
+        """
+        info = self._profile()
+        core = str(info.get("core") or "") if info else ""
+        return not core.startswith(_ROMSET_CORE_PREFIXES)
 
     @property
     def rom_extensions(self) -> tuple[str, ...]:

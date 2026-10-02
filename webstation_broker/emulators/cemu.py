@@ -565,6 +565,7 @@ class Cemu(Emulator):
     Attributes:
         name: Provider key, `cemu`.
         display_name: Human-readable name.
+        rom_cacheable: On; with the ROM cache enabled, launch boots a local copy of the ROM.
         save_root: The MLC directory the save subtrees hang off.
         save_subtrees: `usr/save`, the title save tree.
         rom_extensions: Bootable formats, best first.
@@ -574,6 +575,7 @@ class Cemu(Emulator):
     """
 
     name = "cemu"
+    rom_cacheable = True
     display_name = "Cemu"
     clears_stale_saves = True
     save_root = MLC_DIR

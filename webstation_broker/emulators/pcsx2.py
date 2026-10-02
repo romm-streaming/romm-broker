@@ -1011,6 +1011,7 @@ class Pcsx2(Emulator):
     Attributes:
         name: RomM platform key, `pcsx2`.
         display_name: Human-readable name shown in the UI.
+        rom_cacheable: On; with the ROM cache enabled, launch boots a local copy of the ROM.
         save_root: PCSX2's data root (`DATA_DIR`), which the save subtrees hang off.
         save_subtrees: `memcards` and `sstates`, the directories the save archive carries.
         memory_card_subtree: Subtree the whole-card routes operate on.
@@ -1026,6 +1027,7 @@ class Pcsx2(Emulator):
     """
 
     name = "pcsx2"
+    rom_cacheable = True
     display_name = "PCSX2"
     clears_stale_saves = True
     save_root = DATA_DIR

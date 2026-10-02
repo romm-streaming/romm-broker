@@ -32,6 +32,7 @@ from webstation_broker.emulators import (
     ppsspp,
     retroarch,
     retroarch_cores,
+    rom_cache,
     rpcs3,
     scummvm,
     shadps4,
@@ -388,6 +389,30 @@ def clean_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
             value, which this same fixture already reset to None) when the test ends.
     """
     monkeypatch.setattr(retroarch_cores, "_catalog", None)
+
+
+@pytest.fixture(autouse=True)
+def clean_rom_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
+    """Turn the ROM cache off, point it into tmp_path, and forget the last boot and copy.
+
+    Autouse because a developer's shell may set `ROM_CACHE_ENABLED`, and the
+    default cache dir is the real `/config/rom-cache`. After the test it waits
+    out any copy the test started, before the settings it reads are undone, so
+    a copy never holds the copy slot into the next test.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher, undone when the test ends.
+        tmp_path: The per-test temporary directory.
+
+    Yields:
+        Nothing; the test runs at the yield.
+    """
+    monkeypatch.setattr(settings, "ROM_CACHE_ENABLED", False)
+    monkeypatch.setattr(settings, "ROM_CACHE_DIR", tmp_path / "rom-cache")
+    monkeypatch.setattr(rom_cache, "_active", None)
+    monkeypatch.setattr(rom_cache, "_background_thread", None)
+    yield
+    rom_cache.join_background_copy(10.0)
 
 
 @pytest.fixture(autouse=True)

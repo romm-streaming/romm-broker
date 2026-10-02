@@ -37,6 +37,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Optional, Union
 
 from .. import imports
+from . import rom_cache
 from .base import Emulator, base_launch_env, disc_number
 
 log = logging.getLogger(__name__)
@@ -373,11 +374,12 @@ def _rom_identity(rom: Path) -> str:
         rom: The disc image or playlist the session booted.
 
     Returns:
-        The resolved absolute path as text, so the same disc matches across
+        The resolved absolute path as text, with a ROM cache copy mapped back
+        to its ROM_ROOT path, so the same disc matches across
         sessions while two discs of one title stay distinct.
     """
     try:
-        return str(rom.resolve())
+        return str(rom_cache.logical(rom.resolve()))
     except OSError as exc:
         log.warning("duckstation: could not resolve %s for its state marker: %s", rom, exc)
         return str(rom)
@@ -691,6 +693,7 @@ class Duckstation(Emulator):
     Attributes:
         name: RomM platform key, `duckstation`.
         display_name: Human-readable name shown in the UI.
+        rom_cacheable: On; with the ROM cache enabled, launch boots a local copy of the ROM.
         save_root: DuckStation's data root, which the save subtrees hang off.
         save_subtrees: `memcards` and `savestates`, the directories the save archive carries.
         clears_stale_saves: On; activate empties both save subtrees, keeping quarantined states.
@@ -700,6 +703,7 @@ class Duckstation(Emulator):
     """
 
     name = "duckstation"
+    rom_cacheable = True
     display_name = "DuckStation"
     save_root = DATA_DIR
     save_subtrees = ("memcards", "savestates")

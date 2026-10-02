@@ -475,6 +475,7 @@ class Azahar(Emulator):
     Attributes:
         name: Provider key, `azahar`.
         display_name: Human-readable name.
+        rom_cacheable: On; with the ROM cache enabled, launch boots a local copy of the ROM.
         save_root: The data root the save subtrees hang off.
         save_subtrees: The SD title and extdata trees plus the NAND extdata and sysdata trees.
         rom_extensions: Bootable formats, best first.
@@ -484,6 +485,7 @@ class Azahar(Emulator):
     """
 
     name = "azahar"
+    rom_cacheable = True
     display_name = "Azahar"
     clears_stale_saves = True
     save_root = USER_DIR

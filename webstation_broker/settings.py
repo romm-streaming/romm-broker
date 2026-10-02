@@ -208,6 +208,66 @@ PPSSPP does not boot from inside an archive, so a zipped image only boots once
 extracted. Off, an archived ROM is refused.
 """
 
+ROM_CACHE_ENABLED = truthy(os.environ.get("ROM_CACHE_ENABLED"))
+"""Whether ROMs are copied to local disk and booted from there, from `ROM_CACHE_ENABLED` (default off).
+
+For libraries on a slow network mount. Off, every launch reads the ROM from
+`ROM_ROOT` exactly as it always has, and nothing is written for the cache.
+"""
+
+ROM_CACHE_DIR = Path(os.environ.get("ROM_CACHE_DIR", "/config/rom-cache"))
+"""Where cached ROM copies live, from `ROM_CACHE_DIR` (default `/config/rom-cache`).
+
+Has to be local disk: a cache on the same network mount as the library only
+adds a copy without saving a single read.
+"""
+
+ROM_CACHE_MODE = (
+    "blocking" if os.environ.get("ROM_CACHE_MODE", "").strip().lower() == "blocking" else "background"
+)
+"""When an uncached ROM is copied, from `ROM_CACHE_MODE` (default `background`).
+
+`background` boots the first launch from `ROM_ROOT` straight away and copies
+alongside it, so the copy serves the next launch. `blocking` copies before the
+boot, so even the first launch plays from local disk, at the cost of waiting
+for the copy. Any other value reads as `background`.
+"""
+
+ROM_CACHE_MAX_GB = float(os.environ.get("ROM_CACHE_MAX_GB", "100"))
+"""Cap on the ROM cache's total size in GB, from `ROM_CACHE_MAX_GB` (default 100; `0` is no cap).
+
+Least recently launched games are evicted first.
+"""
+
+ROM_CACHE_MAX_COUNT = int(os.environ.get("ROM_CACHE_MAX_COUNT", "50"))
+"""Cap on how many games the ROM cache keeps, from `ROM_CACHE_MAX_COUNT` (default 50; `0` is no cap).
+
+Least recently launched games are evicted first.
+"""
+
+ROM_CACHE_MAX_AGE_DAYS = float(os.environ.get("ROM_CACHE_MAX_AGE_DAYS", "30"))
+"""Days a cached game is kept without a launch, from `ROM_CACHE_MAX_AGE_DAYS`.
+
+Defaults to 30; `0` keeps a game until the count or size limit evicts it.
+"""
+
+ROM_CACHE_COPY_MBPS = float(os.environ.get("ROM_CACHE_COPY_MBPS", "20"))
+"""Speed cap on a background copy in MB/s, from `ROM_CACHE_COPY_MBPS` (default 20; `0` is uncapped).
+
+A background copy shares the link with the game the player is running from
+`ROM_ROOT`, so an uncapped one can starve the emulator's own reads and make
+that session stutter. A blocking copy is never capped: the player is waiting
+on it.
+"""
+
+ROM_CACHE_COPY_TIMEOUT = float(os.environ.get("ROM_CACHE_COPY_TIMEOUT", "300"))
+"""Seconds a blocking copy may take before the launch boots from `ROM_ROOT` instead.
+
+From `ROM_CACHE_COPY_TIMEOUT` (default 300; `0` or less uses the default). It has to stay under RomM's
+`STREAMING_LAUNCH_TIMEOUT` (default 600), or RomM gives up on the activate
+while the copy is still running.
+"""
+
 XEMU_SOFTWARE_GL = truthy(os.environ.get("XEMU_SOFTWARE_GL"))
 """Whether xemu renders on the CPU via `LIBGL_ALWAYS_SOFTWARE`, from `XEMU_SOFTWARE_GL` (default off).
 

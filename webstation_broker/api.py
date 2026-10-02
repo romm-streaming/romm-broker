@@ -26,7 +26,7 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
 from . import callback, imports, memcard, saves, screenshot, selkies, session, settings
-from .emulators import get_emulator, retroarch, retroarch_cores
+from .emulators import get_emulator, retroarch, retroarch_cores, rom_cache
 from .emulators.base import STATE_HEAD_BYTES, CoreRejectedError, Emulator, reap_orphan
 
 log = logging.getLogger(__name__)
@@ -668,6 +668,7 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     _select_core(emulator, "activate")
 
     rom_file = None
+    rom_path: Optional[Path] = None
     if emulator.requires_rom:
         if body.rom is None:
             log.debug("activate: emulator %s requires a rom, none was given", body.emulator)
@@ -952,8 +953,13 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     )
 
     resume_slot = save.resume_slot if save else None
+    # Only launch sees the cached copy, so nothing persisted names a file the cache may evict.
+    # After new_session, so /status can report a blocking copy's phase.
+    boot_file = rom_file
+    if rom_path is not None and rom_file is not None:
+        boot_file = await anyio.to_thread.run_sync(rom_cache.boot_path, rom_path, rom_file, emulator)
     try:
-        await anyio.to_thread.run_sync(emulator.launch, rom_file, resume_slot)
+        await anyio.to_thread.run_sync(emulator.launch, boot_file, resume_slot)
     except Exception:
         # Otherwise the session stays marked active with no emulator behind
         # it, and every retry 409s instead of reaching launch again.
@@ -2362,7 +2368,8 @@ async def status() -> dict[str, Any]:
         # route only reports it.
         "boot_failed": sess["emulator_obj"].boot_failed,
         # Set while a slow pre-launch extraction (a shadPS4 pkg, or an
-        # archive for shadPS4, RPCS3, PPSSPP or ScummVM) is running, else None. Same passive-signal shape as
+        # archive for shadPS4, RPCS3, PPSSPP or ScummVM) or a blocking ROM
+        # cache copy (`copying_rom`) is running, else None. Same passive-signal shape as
         # boot_failed: RomM decides what to show, this route only reports it.
         "extraction_phase": sess["emulator_obj"].extraction_phase,
         # The emulator class is the authority on what it can do, so RomM reads

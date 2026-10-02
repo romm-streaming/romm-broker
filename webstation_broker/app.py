@@ -18,7 +18,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from . import api, room, settings
-from .emulators import retroarch, retroarch_cores
+from .emulators import retroarch, retroarch_cores, rom_cache
 from .emulators.base import reap_orphan
 from .emulators.ppsspp import sweep_stale_extractions as sweep_ppsspp_extractions
 from .emulators.rpcs3 import sweep_stale_extractions as sweep_rpcs3_extractions
@@ -88,6 +88,9 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     dirs left behind by a crashed broker process, before any new extraction
     can be in flight.
 
+    Trims the ROM cache, when it is enabled, to the limits now in force and
+    drops a copy a crashed broker left half written.
+
     Loads the RetroArch core catalog: the bundled one merged with a cache from
     a previous refresh, so a cache another process wrote is used right away.
     When `RETROARCH_CORE_INFO_REFRESH` is on, a background task then keeps that
@@ -107,6 +110,7 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     await anyio.to_thread.run_sync(sweep_rpcs3_extractions)
     await anyio.to_thread.run_sync(sweep_scummvm_extractions)
     await anyio.to_thread.run_sync(sweep_ppsspp_extractions)
+    await anyio.to_thread.run_sync(rom_cache.startup)
     await anyio.to_thread.run_sync(
         retroarch_cores.load_startup_catalog, retroarch.RA_DATA_DIR, retroarch.CORES_DIR, retroarch.PLATFORMS
     )

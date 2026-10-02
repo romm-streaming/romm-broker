@@ -722,7 +722,9 @@ def test_a_restored_profile_does_not_ride_forward_into_the_next_players_archive(
     emu.clear_working_slot()
     _restore(emu, data_dir, {_PROFILE_REL: b"player-b"})
     emu._session_start = time.time()
-    _content_file(data_dir / _SAVE_REL)
+    # Explicit mtime: the kernel's coarse file clock can stamp a fresh write
+    # just before a time.time() taken a moment earlier.
+    _content_file(data_dir / _SAVE_REL, mtime=emu._session_start + 1)
     emu.save_and_exit(None)
 
     profile = data_dir / _PROFILE_REL
