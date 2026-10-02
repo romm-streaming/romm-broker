@@ -992,28 +992,26 @@ def _write_broker_cfg() -> Path:
         'quick_menu_show_save_content_dir_overrides = "false"\n'
         'quick_menu_show_close_content = "false"\n'
         'menu_show_load_content = "false"\n'
+        'menu_show_load_disc = "false"\n'
+        'menu_show_dump_disc = "false"\n'
+        'menu_show_restart_retroarch = "false"\n'
+        'menu_show_quit_retroarch = "false"\n'
         # Each of these starts something else in place of the session's game:
         # Load Core unloads it, and the tabs list other games to launch.
         'menu_show_load_core = "false"\n'
         'content_show_history = "false"\n'
         'content_show_playlists = "false"\n'
         'content_show_explore = "false"\n'
-        'menu_show_load_disc = "false"\n'
-        'menu_show_dump_disc = "false"\n'
-        'menu_show_restart_retroarch = "false"\n'
-        'menu_show_quit_retroarch = "false"\n'
-        # Settings pages that would undo the above: Configuration turns
-        # config_save_on_exit back on, Directory and Saving move states away
-        # from where the broker looks for them, and User Interface holds the
-        # visibility toggles for everything hidden here.
+        # Settings pages that would undo the above: Configuration re-enables
+        # config_save_on_exit, Directory and Saving move the states away, and
+        # User Interface holds these visibility toggles.
         'settings_show_configuration = "false"\n'
         'settings_show_directory = "false"\n'
         'settings_show_saving = "false"\n'
         'settings_show_user_interface = "false"\n'
         # Writes that outlive the session: a favourite is a launch entry the
-        # next host could start in place of their own game, and the Online
-        # Updater (and Load Core's Download a Core, its other door) overwrites
-        # the cores every later session loads.
+        # next host could start, and the Online Updater and Download a Core
+        # overwrite the cores every later session loads.
         'quick_menu_show_add_to_favorites = "false"\n'
         'content_show_favorites = "false"\n'
         'menu_show_online_updater = "false"\n'
