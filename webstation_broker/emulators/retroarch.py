@@ -1120,8 +1120,13 @@ def _override_cfgs() -> list[Path]:
         if not path.is_relative_to(root):
             log.debug("ra credentials: skipping %s, it resolves outside %s", candidate, root)
             continue
-        if path.is_file():
-            found[path] = None
+        # Path.is_file only swallows a missing file; a core directory the
+        # broker cannot search raises, and that must not stop the sweep.
+        try:
+            if path.is_file():
+                found[path] = None
+        except OSError as exc:
+            log.warning("ra credentials: could not check override %s: %s", path, exc)
     return list(found)
 
 
@@ -1197,9 +1202,9 @@ def clear_ra_login(only_if_pinned: bool = False) -> None:
             write it into.
     """
     _scrub_ra_credentials()
-    if only_if_pinned and not BROKER_CFG.exists():
-        return
     try:
+        if only_if_pinned and not BROKER_CFG.exists():
+            return
         _write_broker_cfg()
     except OSError as exc:
         log.warning("ra credentials: could not blank %s: %s", BROKER_CFG, exc)

@@ -968,6 +968,54 @@ class TestScrubRaOverrides:
 
         assert override.read_text() == OVERRIDE_WITHOUT_LOGIN
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root can search any directory")
+    def test_the_startup_cleanup_survives_a_data_dir_it_cannot_search(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A data directory the broker cannot look into is logged at startup, not raised.
+
+        The cleanup runs in the lifespan with nothing to catch an error, so a
+        raise here would keep the broker from starting at all.
+
+        Args:
+            caplog: The pytest log capture fixture.
+        """
+        retroarch.RA_DATA_DIR.mkdir(parents=True)
+        retroarch.RA_DATA_DIR.chmod(0o000)
+        try:
+            with caplog.at_level(logging.WARNING):
+                retroarch.clear_ra_login(only_if_pinned=True)
+        finally:
+            retroarch.RA_DATA_DIR.chmod(0o700)
+
+        assert str(retroarch.BROKER_CFG) in caplog.text
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root can search any directory")
+    def test_a_core_dir_the_broker_cannot_search_is_logged_and_skipped(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An override the broker cannot stat is named in a warning, and the sweep goes on.
+
+        The scrub runs at every launch and exit and when the broker starts,
+        none of which may fail because one override directory is unreadable.
+
+        Args:
+            caplog: The pytest log capture fixture.
+        """
+        locked = _ra_cfg(retroarch.RA_OVERRIDE_DIR / "Locked" / "Locked.cfg", OVERRIDE_WITH_LOGIN).parent
+        other = _ra_cfg(retroarch.RA_OVERRIDE_DIR / "Snes9x" / "Snes9x.cfg", OVERRIDE_WITH_LOGIN)
+        locked.chmod(0o400)
+        try:
+            with caplog.at_level(logging.WARNING):
+                retroarch.clear_ra_login()
+        finally:
+            locked.chmod(0o700)
+
+        assert other.read_text() == OVERRIDE_WITHOUT_LOGIN
+        assert "Locked.cfg" in caplog.text
+        for value in ("alice", "tok123secret", "hunter2"):
+            assert value not in caplog.text
+
 
 class TestResolveOverrideDir:
     """Where RetroArch keeps its overrides, read the way RetroArch 1.22.2 reads it."""
