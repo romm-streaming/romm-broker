@@ -509,6 +509,30 @@ def test_collect_hands_the_login_out_once(
     assert "alice" not in caplog.text
 
 
+def test_last_exit_keeps_the_ra_change_after_collect(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """`last_exit.retroachievements` records what the exit found; a collect does not blank it.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+    """
+    _exit_with_ra_change(
+        client,
+        broker_dirs,
+        fake_emulator,
+        base.RetroAchievementsLogin(username="alice", token="tok456secret"),
+    )
+    assert client.post(COLLECT, json={"session_id": "sess-1"}).status_code == 200
+
+    status = client.get(f"{API}/session/status")
+
+    assert status.json()["last_exit"]["retroachievements"] == "set"
+    assert "tok456secret" not in status.text
+
+
 def test_collect_hands_out_a_logout_as_null(
     client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
 ) -> None:

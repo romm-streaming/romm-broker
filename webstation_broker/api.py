@@ -219,7 +219,8 @@ class CollectIn(BaseModel):
     """RomM's request for the RetroAchievements login change a session ended with.
 
     Attributes:
-        session_id: The id RomM gave the session on activate.
+        session_id: The session's id as the activate response and the exit
+            report carry it: the id RomM sent, after cleaning.
     """
 
     session_id: str
