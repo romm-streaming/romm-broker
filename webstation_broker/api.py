@@ -14,7 +14,7 @@ import os
 import secrets
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
@@ -331,6 +331,22 @@ def _check_secret(header_value: Optional[str]) -> None:
     if not header_value or not _ct_eq(header_value, settings.BROKER_SECRET):
         log.warning("rejected request: bad or missing broker secret")
         raise HTTPException(status_code=403, detail="bad broker secret")
+
+
+def _check_controller_or_secret(token: Optional[str], header_value: Optional[str]) -> None:
+    """Accept the live session's controller token, else require the broker secret.
+
+    Args:
+        token: The controller token from the query string, or None.
+        header_value: The `X-Broker-Secret` header as received, or None when absent.
+
+    Raises:
+        HTTPException: 403 when the token does not match and the secret check fails.
+    """
+    sess = session.SESSION
+    if sess and token and _ct_eq(token, sess["controller_token"]):
+        return
+    _check_secret(header_value)
 
 
 def _landing_url(token: str) -> str:
@@ -1526,10 +1542,7 @@ async def exit_session(
         HTTPException: 403 when neither credential is accepted; 409 when no
             session is active or another session operation is in flight.
     """
-    sess = session.SESSION
-    is_controller = bool(sess and token and _ct_eq(token, sess["controller_token"]))
-    if not is_controller:
-        _check_secret(x_broker_secret)
+    _check_controller_or_secret(token, x_broker_secret)
     with _session_operation("exit"):
         return await _do_exit(slot if save else None)
 
@@ -1559,10 +1572,7 @@ async def toggle_menu(
             operation is in flight; 400 when the emulator has no menu to reach;
             502 when the emulator did not take the toggle.
     """
-    sess = session.SESSION
-    is_controller = bool(sess and token and _ct_eq(token, sess["controller_token"]))
-    if not is_controller:
-        _check_secret(x_broker_secret)
+    _check_controller_or_secret(token, x_broker_secret)
     with _session_operation("menu"):
         emulator = _menu_emulator()
         toggled = await anyio.to_thread.run_sync(emulator.toggle_menu)
@@ -1573,31 +1583,42 @@ async def toggle_menu(
     return {"status": "ok"}
 
 
-def _menu_emulator() -> Emulator:
-    """Return the running emulator, if it is in a position to toggle its menu.
+def _capable_emulator(op: str, capable: Callable[[Emulator], bool], lacks: str) -> Emulator:
+    """Return the running emulator, if it is in a position to take `op`.
+
+    Args:
+        op: The operation's name for the refusal logs.
+        capable: Whether the emulator supports the operation at all.
+        lacks: What the emulator is missing, for the 400 refusal.
 
     Returns:
         The live session's emulator.
 
     Raises:
         HTTPException: 409 when no session is active or the emulator is not
-            running; 400 when the emulator has no menu to reach.
+            running; 400 when `capable` is false for the emulator.
     """
     sess = session.SESSION
     if sess is None or not sess.get("active"):
-        log.debug("menu refused: no active session")
+        log.debug("%s refused: no active session", op)
         raise HTTPException(status_code=409, detail="no active session")
     emulator = sess["emulator_obj"]
-    if not emulator.supports_menu:
-        log.debug("menu refused: %s has no menu to reach", emulator.display_name)
-        raise HTTPException(
-            status_code=400,
-            detail=f"{emulator.display_name} has no menu to reach",
-        )
+    if not capable(emulator):
+        log.debug("%s refused: %s %s", op, emulator.display_name, lacks)
+        raise HTTPException(status_code=400, detail=f"{emulator.display_name} {lacks}")
     if not emulator.alive():
-        log.warning("menu refused: %s is not running (session %s)", emulator.name, sess["id"])
+        log.warning("%s refused: %s is not running (session %s)", op, emulator.name, sess["id"])
         raise HTTPException(status_code=409, detail="emulator is not running")
     return emulator
+
+
+def _menu_emulator() -> Emulator:
+    """Return the running emulator, if it is in a position to toggle its menu.
+
+    Returns:
+        The live session's emulator.
+    """
+    return _capable_emulator("menu", lambda e: e.supports_menu, "has no menu to reach")
 
 
 def _state_emulator() -> Emulator:
@@ -1605,28 +1626,8 @@ def _state_emulator() -> Emulator:
 
     Returns:
         The live session's emulator.
-
-    Raises:
-        HTTPException: 409 when no session is active or the emulator is not
-            running; 400 when the emulator has no save states.
     """
-    sess = session.SESSION
-    if sess is None or not sess.get("active"):
-        log.debug("state operation refused: no active session")
-        raise HTTPException(status_code=409, detail="no active session")
-    emulator = sess["emulator_obj"]
-    if not emulator.supports_states:
-        log.debug("state operation refused: %s has no save states", emulator.display_name)
-        raise HTTPException(
-            status_code=400,
-            detail=f"{emulator.display_name} has no save states",
-        )
-    if not emulator.alive():
-        log.warning(
-            "state operation refused: %s is not running (session %s)", emulator.name, sess["id"]
-        )
-        raise HTTPException(status_code=409, detail="emulator is not running")
-    return emulator
+    return _capable_emulator("state operation", lambda e: e.supports_states, "has no save states")
 
 
 def _swap_emulator() -> Emulator:
@@ -1634,28 +1635,8 @@ def _swap_emulator() -> Emulator:
 
     Returns:
         The live session's emulator.
-
-    Raises:
-        HTTPException: 409 when no session is active or the emulator is not
-            running; 400 when the emulator cannot swap discs.
     """
-    sess = session.SESSION
-    if sess is None or not sess.get("active"):
-        log.debug("swap-disc refused: no active session")
-        raise HTTPException(status_code=409, detail="no active session")
-    emulator = sess["emulator_obj"]
-    if not emulator.supports_disc_swap:
-        log.debug("swap-disc refused: %s cannot swap discs", emulator.display_name)
-        raise HTTPException(
-            status_code=400,
-            detail=f"{emulator.display_name} cannot swap discs",
-        )
-    if not emulator.alive():
-        log.warning(
-            "swap-disc refused: %s is not running (session %s)", emulator.name, sess["id"]
-        )
-        raise HTTPException(status_code=409, detail="emulator is not running")
-    return emulator
+    return _capable_emulator("swap-disc", lambda e: e.supports_disc_swap, "cannot swap discs")
 
 
 def _readable_emulator() -> Emulator:

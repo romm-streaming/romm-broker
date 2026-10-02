@@ -2992,7 +2992,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         emulatorMenuBtn.addEventListener('click', async () => {
             // One press in flight at a time: a double tap would open and
             // close the menu before the player saw it.
-            if (emulatorMenuBtn.disabled) return;
             emulatorMenuBtn.disabled = true;
             if (!await toggleEmulatorMenu(fetch, COLLAB_DATA.userToken)) {
                 console.warn('Emulator menu toggle was refused.');
@@ -3000,8 +2999,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             emulatorMenuBtn.disabled = false;
             // Back to the stream, so the keyboard steers the menu instead of
             // Enter or Space pressing this button again and closing it.
-            const frame = document.getElementById('session-frame');
-            if (frame) frame.focus();
+            sessionFrame()?.focus();
         });
 
         gamingModeBtn.addEventListener('click', () => gamingMode.toggle());

@@ -3327,6 +3327,25 @@ class Retroarch(Emulator):
         self._slot_homed = True
         return True
 
+    def _states(self) -> dict[Path, tuple[int, float]]:
+        """Snapshot the loaded game's state files.
+
+        Returns:
+            `_state_snapshot` of `STATE_DIR` for the loaded content.
+        """
+        return _state_snapshot(STATE_DIR, self._rom_base)
+
+    def _toggle_menu_settled(self) -> bool:
+        """Send `MENU_TOGGLE` and give the menu `MENU_SETTLE` to open or close.
+
+        Returns:
+            False when the command could not be written.
+        """
+        if not self._write_cmd("MENU_TOGGLE"):
+            return False
+        time.sleep(MENU_SETTLE)
+        return True
+
     def _try_save(self) -> bool:
         """Send `SAVE_STATE` once and confirm the file landed in `STATE_SLOT`.
 
@@ -3334,7 +3353,7 @@ class Retroarch(Emulator):
             True when the slot's state file changed on disk, is non-empty,
             and held a stable size within `_state_confirm_wait`.
         """
-        before = _state_snapshot(STATE_DIR, self._rom_base)
+        before = self._states()
         if not self._write_cmd("SAVE_STATE"):
             return False
         return _wait_for_state_file(
@@ -3415,13 +3434,13 @@ class Retroarch(Emulator):
                     "(platform=%s, rom=%s)",
                     STATE_SLOT, self.platform, self._rom_base,
                 )
-            before = _state_snapshot(STATE_DIR, self._rom_base)
+            before = self._states()
             if self._try_save():
                 self._observe_library_name()
                 return True
             if not self.alive():
                 return False
-            if _state_snapshot(STATE_DIR, self._rom_base) == before:
+            if self._states() == before:
                 saved = self._save_past_menu()
             else:
                 log.info("retroarch: save missed slot %d, re-homing and retrying", STATE_SLOT)
@@ -3457,21 +3476,16 @@ class Retroarch(Emulator):
             "(platform=%s, rom=%s)",
             self.platform, self._rom_base,
         )
-        if not self._write_cmd("MENU_TOGGLE"):
+        if not self._toggle_menu_settled():
             return False
-        time.sleep(MENU_SETTLE)
         self._home_state_slot()
-        before = _state_snapshot(STATE_DIR, self._rom_base)
+        before = self._states()
         if self._try_save():
             # A first save that was only slow lands about now and would read
             # as this one, with the toggle having opened a menu. A second save
             # tells them apart: that menu would swallow it.
-            before = _state_snapshot(STATE_DIR, self._rom_base)
-            if (
-                not self._try_save()
-                and self.alive()
-                and _state_snapshot(STATE_DIR, self._rom_base) == before
-            ):
+            before = self._states()
+            if not self._try_save() and self.alive() and self._states() == before:
                 log.warning(
                     "retroarch: the first save landed late, toggling back the menu the retry "
                     "opened (platform=%s, rom=%s)",
@@ -3479,7 +3493,7 @@ class Retroarch(Emulator):
                 )
                 self._write_cmd("MENU_TOGGLE")
             return True
-        if self.alive() and _state_snapshot(STATE_DIR, self._rom_base) == before:
+        if self.alive() and self._states() == before:
             log.warning(
                 "retroarch: save still wrote nothing with the menu toggled, toggling it back "
                 "(platform=%s, rom=%s)",
@@ -3519,12 +3533,9 @@ class Retroarch(Emulator):
                     "disc swap: check save wrote nothing, closing the menu (platform=%s, rom=%s)",
                     self.platform, self._rom_base,
                 )
-                if not self._write_cmd("MENU_TOGGLE"):
+                if not self._toggle_menu_settled():
                     return False
-                time.sleep(MENU_SETTLE)
-                # A first save that was only slow lands about now and would
-                # read as this one, with the toggle having opened a menu. A
-                # second save tells them apart: that menu would swallow it.
+                # Two saves, for the late first save `_save_past_menu` describes.
                 if self._probe_save() and self._probe_save():
                     return True
                 log.warning(
@@ -3549,7 +3560,7 @@ class Retroarch(Emulator):
         Returns:
             True once a write to any slot is seen within `_state_confirm_wait`.
         """
-        before = _state_snapshot(STATE_DIR, self._rom_base)
+        before = self._states()
         if not self._write_cmd("SAVE_STATE"):
             return False
         return _wait_for_any_state_write(
