@@ -182,9 +182,8 @@ def _split(path: Path) -> Optional[tuple[Path, Path]]:
         The entry directory and the path inside it, or None when `path` is not
         inside a cache entry, or when the cache dir is one `_misplaced` refuses.
     """
-    # A refused cache dir holds no entries. With ROM_CACHE_DIR at or above
-    # ROM_ROOT every library path would otherwise read as a cached one, and
-    # logical() would map it to a different game whether the cache is on or not.
+    # A refused cache dir holds no entries: at or above ROM_ROOT, every library
+    # path would read as cached and logical() would map it to a different game.
     if _misplaced() is not None:
         return None
     try:
@@ -389,9 +388,8 @@ def _boot_path(rom_path: Path, rom_file: Path, emulator: Emulator) -> Path:
         finally:
             _copy_slot.release()
 
-    # The copy runs on its own thread because the budget only checks the
-    # deadline between chunks: a read hung on a stalled NFS mount would
-    # otherwise hold activate, and the session lock, until the mount recovers.
+    # Its own thread, because the budget only checks the deadline between chunks: a read
+    # hung on a stalled NFS mount would otherwise hold activate and the session lock.
     emulator.extraction_phase = PHASE
     try:
         thread = _start_copy(copy, rom_path, plan)

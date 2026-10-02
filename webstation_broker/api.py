@@ -953,10 +953,8 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     )
 
     resume_slot = save.resume_slot if save else None
-    # Only launch sees the cached copy: the session, the response and the save
-    # helpers above all keep the ROM_ROOT path, so nothing persisted names a
-    # file the cache may evict. After new_session, so /status can report a
-    # blocking copy's phase.
+    # Only launch sees the cached copy, so nothing persisted names a file the cache may evict.
+    # After new_session, so /status can report a blocking copy's phase.
     boot_file = rom_file
     if rom_path is not None and rom_file is not None:
         boot_file = await anyio.to_thread.run_sync(rom_cache.boot_path, rom_path, rom_file, emulator)
