@@ -278,7 +278,18 @@ class DiscIn(BaseModel):
 
 
 class RetroAchievementsIn(BaseModel):
-    """The controlling player's RetroAchievements login, as RomM stores it for them."""
+    """The controlling player's RetroAchievements login, as RomM stores it for them.
+
+    Both fields are checked against `RA_CREDENTIAL_RE`, since each is written
+    into a RetroArch config line.
+
+    Attributes:
+        username: The RetroAchievements account name.
+        token: The login token RetroArch got from RetroAchievements, which
+            stands in for the password; a `SecretStr`, so it stays out of
+            `repr`. A malformed one is kept out of the 422 reply by the
+            app's validation handler, not by the model.
+    """
 
     username: str
     """The RetroAchievements account name."""
