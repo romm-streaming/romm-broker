@@ -99,7 +99,9 @@ A `200` answers once, with `Cache-Control: no-store`:
 `retroachievements` is `null` when `change` is `cleared`, meaning the player
 logged out. A `204` means nothing is pending: the login didn't change, the
 broker couldn't tell what RetroArch saved this session, it was collected already, the
-`session_id` is another session's, or a new session has started since. A
+`session_id` is another session's, a new session has started since, or a
+viewer held input during the session and the login moved to another account
+(see [RetroAchievements](/docs/emulators#retroachievements)). A
 `409` means another operation holds the session lock right now: not only an
 activate or exit, but also a join, a state or disc command, a memory card
 transfer, or another collect. The change stays pending, so try again. The

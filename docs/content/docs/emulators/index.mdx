@@ -148,6 +148,12 @@ deletes it from those when the session ends, when the next one starts, and when 
 collects is dropped at the next launch, and a broker restart loses it; in
 both cases the player logs in again once, from the menu.
 
+Once the controller hands a viewer a gamepad or mouse and keyboard, anyone
+in the room could have opened RetroArch's menu. From then on, a login to a
+different account than the one activate pinned is not reported, since it may
+be a guest's. A refreshed token or a logout of the pinned account still is.
+Without a pinned login, no new login is reported.
+
 If RetroArch closes or crashes on its own mid-session, the login stays on
 disk until the session ends. No other session can start in the meantime, so
 nobody else can reach it.
