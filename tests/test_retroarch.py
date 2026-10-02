@@ -6064,13 +6064,18 @@ class TestRaLoginCapture:
     PINNED = RetroAchievementsLogin(username="alice", token="tok123")
 
     def _end_session(
-        self, saved: Optional[str], pinned: Optional[RetroAchievementsLogin]
+        self,
+        saved: Optional[str],
+        pinned: Optional[RetroAchievementsLogin],
+        launch_wall: float = 0.0,
     ) -> retroarch.Retroarch:
         """Run a session that pinned `pinned` and ended with `saved` in `retroarch.cfg`.
 
         Args:
             saved: What RetroArch saved on its way out, or None for no config at all.
             pinned: The login the launch pinned.
+            launch_wall: The session's launch wall time; the default is older
+                than any file the test writes.
 
         Returns:
             The emulator, after its graceful quit.
@@ -6079,6 +6084,7 @@ class TestRaLoginCapture:
             _ra_cfg(retroarch.RA_CONFIG_PATH, saved)
         emu = retroarch.Retroarch()
         emu.retroachievements = pinned
+        emu._launch_wall = launch_wall
         emu._proc = _QuitsCleanly()  # type: ignore[assignment]
         emu._quit()
         return emu
@@ -6163,7 +6169,7 @@ class TestRaLoginCapture:
             caplog: The pytest log capture fixture.
         """
 
-        def _boom(config_path: Path) -> None:
+        def _boom(config_path: Path, not_before: Optional[float] = None) -> None:
             """Fail the read."""
             raise RuntimeError("reader bug")
 
@@ -6174,6 +6180,40 @@ class TestRaLoginCapture:
         assert emu.retroachievements_change is None
         assert "tok456" not in retroarch.RA_CONFIG_PATH.read_text()
         assert "reader bug" in caplog.text
+
+    def test_a_login_older_than_the_launch_is_not_a_change(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A login another player left behind (its scrub failed) is not this player's change.
+
+        Args:
+            caplog: The pytest log capture fixture.
+        """
+        launch = time.time()
+        _ra_cfg(retroarch.RA_CONFIG_PATH, 'cheevos_username = "bob"\ncheevos_token = "bobtok"\n')
+        os.utime(retroarch.RA_CONFIG_PATH, (launch - 60, launch - 60))
+        emu = retroarch.Retroarch()
+        emu.retroachievements = self.PINNED
+        emu._launch_wall = launch
+        emu._proc = _QuitsCleanly()  # type: ignore[assignment]
+
+        with caplog.at_level(logging.INFO):
+            emu._quit()
+
+        assert emu.retroachievements_change is None
+        assert "not written this session" in caplog.text
+        assert "bobtok" not in retroarch.RA_CONFIG_PATH.read_text()
+
+    def test_the_same_login_saved_after_the_launch_is_a_change(self) -> None:
+        """The file RetroArch rewrote during the session is trusted, as before."""
+        launch = time.time() - 60
+        emu = self._end_session(
+            'cheevos_username = "bob"\ncheevos_token = "bobtok"\n', self.PINNED, launch
+        )
+
+        assert emu.retroachievements_change == RetroAchievementsChange(
+            login=RetroAchievementsLogin(username="bob", token="bobtok")
+        )
 
     def test_the_captured_token_is_never_logged(self, caplog: pytest.LogCaptureFixture) -> None:
         """The capture logs the username it saw, never the token.

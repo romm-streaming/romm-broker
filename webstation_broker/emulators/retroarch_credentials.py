@@ -227,33 +227,50 @@ def _open(key: bytes, name: str, sealed: str) -> str:
     return plain.decode("utf-8", errors="replace")
 
 
-def read_saved_login(config_path: Path) -> Optional[RetroAchievementsLogin]:
+def read_saved_login(
+    config_path: Path, not_before: Optional[float] = None
+) -> Optional[RetroAchievementsLogin]:
     """The RetroAchievements login RetroArch saved, from whichever layout it used.
 
     The keychain file wins when it holds either credential; otherwise the
-    plaintext config is read. Only a file RetroArch wrote this session should
-    hold either, since the broker scrubs both before every launch.
+    plaintext config is read. The broker scrubs both before every launch, so
+    either should only hold a login RetroArch wrote this session. A scrub can
+    fail, though (a read-only file, say), and the login left behind is then an
+    older one, not the player's. So with `not_before`, a file last modified
+    before it is passed over as if it held nothing.
 
     Args:
         config_path: RetroArch's `retroarch.cfg`.
+        not_before: The session's launch, as a `time.time()` wall time, or
+            None to trust either file whatever its age.
 
     Returns:
         The saved login, whose token is empty when RetroArch saved the player
-        logged out. None when nothing was saved, or when it could not be read
-        or opened (logged), so the caller can tell "unknown" from "logged out".
+        logged out. None when nothing was saved this session, or when it
+        could not be read or opened (logged), so the caller can tell
+        "unknown" from "logged out".
     """
     keychain_cfg = config_path.parent / KEYCHAIN_CFG
+    values: dict[str, str] = {}
+    source = config_path
     try:
-        values = _read_credentials(keychain_cfg)
-        source = keychain_cfg
-        if not values:
-            values = _read_credentials(config_path)
-            source = config_path
+        for candidate in (keychain_cfg, config_path):
+            found = _read_credentials(candidate)
+            if not found:
+                continue
+            if not_before is not None and candidate.stat().st_mtime < not_before:
+                log.info(
+                    "ra login capture: %s was not written this session, ignoring the login in it",
+                    candidate,
+                )
+                continue
+            values, source = found, candidate
+            break
     except OSError as exc:
         log.warning("ra login capture: could not read RetroArch's config: %s", exc)
         return None
     if not values:
-        log.debug("ra login capture: RetroArch saved no login")
+        log.debug("ra login capture: RetroArch saved no login this session")
         return None
     key: Optional[bytes] = None
     opened: dict[str, str] = {}

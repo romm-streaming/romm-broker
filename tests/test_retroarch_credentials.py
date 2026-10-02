@@ -9,6 +9,7 @@ rerun it.
 """
 
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -351,3 +352,83 @@ def test_an_unreadable_config_reads_as_unknown(
     with caplog.at_level(logging.WARNING):
         assert retroarch_credentials.read_saved_login(config_path) is None
     assert "could not read" in caplog.text
+
+
+LAUNCH = 1_800_000_000.0
+"""A stand-in launch wall time for the freshness tests."""
+
+
+def _age(path: Path, mtime: float) -> None:
+    """Set a file's modification time.
+
+    Args:
+        path: The file.
+        mtime: Its new modification time, as a wall time.
+    """
+    os.utime(path, (mtime, mtime))
+
+
+class TestOnlyThisSessionsLogin:
+    """With `not_before`, a login in a file RetroArch did not write this session is not trusted."""
+
+    def test_a_config_older_than_the_launch_reads_as_unknown(
+        self, config_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A login left over from before the launch is None, logged by path only."""
+        _cfg(config_path, {"cheevos_username": "bob", "cheevos_token": "oldtok"})
+        _age(config_path, LAUNCH - 60)
+        with caplog.at_level(logging.DEBUG):
+            assert retroarch_credentials.read_saved_login(config_path, not_before=LAUNCH) is None
+        assert str(config_path) in caplog.text
+        assert "bob" not in caplog.text
+        assert "oldtok" not in caplog.text
+
+    @pytest.mark.parametrize("offset", [0.0, 5.0], ids=["at-launch", "after-launch"])
+    def test_a_config_written_since_the_launch_is_read(
+        self, config_path: Path, offset: float
+    ) -> None:
+        """A file modified at or after the launch is trusted."""
+        _cfg(config_path, {"cheevos_username": "alice", "cheevos_token": "tok123"})
+        _age(config_path, LAUNCH + offset)
+        assert retroarch_credentials.read_saved_login(config_path, not_before=LAUNCH) == ALICE
+
+    def test_without_not_before_any_age_is_read(self, config_path: Path) -> None:
+        """The check is opt-in, so an old file still reads when no launch time is given."""
+        _cfg(config_path, {"cheevos_username": "alice", "cheevos_token": "tok123"})
+        _age(config_path, LAUNCH - 60)
+        assert retroarch_credentials.read_saved_login(config_path) == ALICE
+
+    def test_an_old_keychain_falls_through_to_a_fresh_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config_path: Path
+    ) -> None:
+        """A keychain left from before the launch gives way to this session's plain config."""
+        _machine(monkeypatch, tmp_path, MACHINE_A)
+        _keychain(config_path, PLAIN_KEY, PLAIN_VALUES)
+        _age(config_path.parent / retroarch_credentials.KEYCHAIN_CFG, LAUNCH - 60)
+        _cfg(config_path, {"cheevos_username": "carol", "cheevos_token": "fresh"})
+        _age(config_path, LAUNCH + 1)
+        assert retroarch_credentials.read_saved_login(
+            config_path, not_before=LAUNCH
+        ) == RetroAchievementsLogin(username="carol", token="fresh")
+
+    def test_an_old_keychain_beside_an_old_config_reads_as_unknown(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config_path: Path
+    ) -> None:
+        """When neither file was written this session, the login is unknown."""
+        _machine(monkeypatch, tmp_path, MACHINE_A)
+        _keychain(config_path, PLAIN_KEY, PLAIN_VALUES)
+        _age(config_path.parent / retroarch_credentials.KEYCHAIN_CFG, LAUNCH - 60)
+        _cfg(config_path, {"cheevos_username": "bob", "cheevos_token": "oldtok"})
+        _age(config_path, LAUNCH - 60)
+        assert retroarch_credentials.read_saved_login(config_path, not_before=LAUNCH) is None
+
+    def test_a_fresh_keychain_still_wins(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config_path: Path
+    ) -> None:
+        """A keychain written this session beats a plain config, as without the check."""
+        _machine(monkeypatch, tmp_path, MACHINE_A)
+        _keychain(config_path, PLAIN_KEY, PLAIN_VALUES)
+        _age(config_path.parent / retroarch_credentials.KEYCHAIN_CFG, LAUNCH + 1)
+        _cfg(config_path, {"cheevos_username": "carol", "cheevos_token": "fresh"})
+        _age(config_path, LAUNCH + 1)
+        assert retroarch_credentials.read_saved_login(config_path, not_before=LAUNCH) == ALICE

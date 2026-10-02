@@ -4045,7 +4045,9 @@ class Retroarch(Emulator):
         super()._forget()
         if ran:
             try:
-                saved = retroarch_credentials.read_saved_login(RA_CONFIG_PATH)
+                saved = retroarch_credentials.read_saved_login(
+                    RA_CONFIG_PATH, not_before=self._launch_wall
+                )
                 self.retroachievements_change = _ra_login_change(self.retroachievements, saved)
             except Exception:
                 # The scrub below is what keeps the next player off this
