@@ -354,6 +354,39 @@ def test_exit_holds_a_changed_ra_login_for_collection(
         assert "tok456secret" not in text
 
 
+def test_the_retired_emulator_keeps_no_ra_login(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """The emulator object kept in `LAST_EXIT` gives up the pinned and the captured login.
+
+    The token stays out of `repr`, so the check reads the attributes
+    themselves as well as the object's `repr`.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+    """
+    _activate(client, broker_dirs, retroachievements={"username": "alice", "token": "tok123secret"})
+    ended = base.RetroAchievementsLogin(username="alice", token="tok456secret")
+    fake_emulator[0].retroachievements_change = base.RetroAchievementsChange(login=ended)
+
+    assert client.post(f"{API}/session/exit").status_code == 200
+
+    assert session.LAST_EXIT is not None
+    retired = session.LAST_EXIT["emulator_obj"]
+    assert retired.retroachievements is None
+    assert retired.retroachievements_change is None
+    held = [repr(retired), repr(vars(retired))]
+    for value in vars(retired).values():
+        held.append(str(getattr(value, "token", "")))
+        held.append(str(getattr(getattr(value, "login", None), "token", "")))
+    for sentinel in ("tok123secret", "tok456secret"):
+        assert all(sentinel not in text for text in held)
+    assert session.PENDING_RA_LOGIN is not None
+    assert session.PENDING_RA_LOGIN["login"] == ended
+
+
 def test_exit_holds_nothing_when_the_ra_login_did_not_change(
     client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
 ) -> None:

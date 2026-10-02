@@ -1484,6 +1484,10 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
             "login": change.login,
         }
         log.info("session %s: ra login %s, waiting for collection", sess["id"], change.kind)
+    # The emulator object outlives the session in `session.LAST_EXIT`, so it
+    # gives up both logins now that the pending one is the only copy needed.
+    emulator.retroachievements = None
+    emulator.retroachievements_change = None
 
     report = {
         "status": "exited",
