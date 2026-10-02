@@ -21,8 +21,6 @@ container somewhere other than `/streaming/`.
 | `BROKER_PID_FILE` | `/config/broker-emulator.json` | Where the running emulator's process ID is recorded, so if the broker restarts it can still find and stop that emulator. |
 | `BROKER_SAVE_UPLOAD_PATH` | `/api/webstation/saves` | The path added to the callback URL when exit uploads the save archive. |
 | `BROKER_SAVE_UPLOAD_TIMEOUT` | `30` | How many seconds exit is allowed to spend uploading the save. |
-| `BROKER_RA_LOGIN_TIMEOUT` | `10` | How many seconds exit is allowed to spend reporting a changed RetroAchievements login. |
-| `BROKER_RA_LOGIN_PATH` | `/api/webstation/retroachievements` | The path added to the callback URL when exit reports a changed RetroAchievements login (see [The RetroAchievements login](/docs/api/exit#the-retroachievements-login)). |
 | `BROKER_EMULATOR_WATCH_INTERVAL` | `15` | How many seconds apart the broker checks that the open session's emulator is still running. It logs one line per session when the emulator exits while the session is open (see [The game froze mid-session](/docs/troubleshooting#the-game-froze-mid-session-and-the-emulator-is-gone)). `0` turns the check off. |
 | `BROKER_STATE_FILE_MAX_BYTES` | `268435456` | The largest a single state file (a save-state snapshot) is allowed to be on the state-file routes, 256 MiB. RomM enforces the same limit on its side, so raising just this one only shifts which side rejects the file first. |
 | `BROKER_STATE_SCREENSHOT_SIZE` | `640` | The longest side, in pixels, of the thumbnail saved with a state. The broker captures the whole streamed desktop, then shrinks it to this size before saving it as the thumbnail. |
