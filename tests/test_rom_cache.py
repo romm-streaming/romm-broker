@@ -11,7 +11,7 @@ from typing import NoReturn, Optional
 import pytest
 
 from webstation_broker import settings
-from webstation_broker.emulators import duckstation, flycast, retroarch, rom_cache
+from webstation_broker.emulators import REGISTRY, duckstation, flycast, retroarch, rom_cache
 from webstation_broker.emulators.base import Emulator
 
 _DAY = 86400.0
@@ -101,6 +101,22 @@ def _set_last_launched(cached: Path, when: float) -> None:
     assert entry is not None
     marker = entry / rom_cache.LAST_ACCESSED_MARKER
     os.utime(marker, (when, when))
+
+
+_OPTED_IN = {
+    "azahar", "cemu", "dolphin", "duckstation", "eden", "flycast", "pcsx2", "retroarch", "xemu", "xenia",
+}
+"""The launchers checked against the `Emulator.rom_cacheable` checklist."""
+
+
+def test_the_launchers_that_opt_in_are_the_checked_ones() -> None:
+    """A launcher that turns the cache on fails here until it has been checked.
+
+    Opting in without the `Emulator.rom_cacheable` checklist breaks quietly: a
+    resume state that never matches, a disc swap refused, a missing BIOS set.
+    """
+    opted_in = {name for name, cls in REGISTRY.items() if cls.rom_cacheable is not False}
+    assert opted_in == _OPTED_IN
 
 
 class TestOffByDefault:

@@ -811,11 +811,16 @@ class Emulator:
     rom_cacheable: bool = False
     """Whether `rom_cache` may hand `launch()` a local copy of the ROM instead of the `ROM_ROOT` path.
 
-    Off by default. A launcher turns it on once nothing in its `launch()`
-    checks the boot path against `ROM_ROOT` or reads files from beside the ROM
-    entry RomM handed over, since a copy holds that entry and nothing else.
-    Launchers with an extraction cache of their own stay off, so an archive
-    is never stored twice.
+    Off by default. Before turning it on, check the launcher against both ways a copy breaks:
+
+    - Every booted path it saves or compares (a resume-state owner marker, a playlist match
+      against a disc RomM names) goes through `rom_cache.logical()`, or it never matches the
+      `ROM_ROOT` path.
+    - Nothing loads files from beside the ROM entry RomM handed over (an arcade core's parent
+      or BIOS set), since a copy holds that entry and nothing else.
+
+    Launchers with an extraction cache of their own stay off, so an archive is never stored
+    twice. `tests/test_rom_cache.py` pins the launchers that opt in.
     """
     save_root: Path = Path("/config")
     """Root of the emulator's writable data."""
