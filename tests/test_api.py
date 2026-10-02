@@ -1664,6 +1664,30 @@ def test_starting_the_app_clears_an_ra_login_an_earlier_broker_left(
     assert "tok456secret" not in retroarch.BROKER_CFG.read_text()
 
 
+def test_activate_clears_an_ra_login_left_on_disk_before_any_emulator(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """Activate takes a leftover RetroAchievements login off disk, whatever it launches.
+
+    A RetroArch that outlived its exit never scrubbed it, and a session that
+    is not RetroArch would otherwise start with the last player's token on disk.
+
+    Args:
+        client: The test client.
+        broker_dirs: The redirected ROM root and archive directories.
+        fake_emulator: The registered fake emulator.
+    """
+    cfg = retroarch.RA_CONFIG_PATH
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('video_fullscreen = "true"\ncheevos_username = "alice"\ncheevos_token = "tok456secret"\n')
+    retroarch._write_broker_cfg(base.RetroAchievementsLogin(username="alice", token="tok456secret"))
+
+    assert _activate(client, broker_dirs).status_code == 200
+
+    assert cfg.read_text() == 'video_fullscreen = "true"\n'
+    assert "tok456secret" not in retroarch.BROKER_CFG.read_text()
+
+
 def test_exiting_nothing_is_a_conflict(client: TestClient) -> None:
     """Exiting with no session running is a conflict."""
     assert client.post(f"{API}/session/exit").status_code == 409

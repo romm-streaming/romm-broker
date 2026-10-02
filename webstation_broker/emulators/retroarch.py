@@ -57,6 +57,7 @@ which merges stderr into stdout (that would corrupt the reply stream).
 
 import dataclasses
 import glob
+import hmac
 import io
 import json
 import logging
@@ -1054,6 +1055,23 @@ def _write_with_mode(path: Path, data: bytes, mode: int) -> None:
         raise
 
 
+def _same_login(a: Optional[RetroAchievementsLogin], b: Optional[RetroAchievementsLogin]) -> bool:
+    """Whether two logins are the same account and token, with the tokens compared in constant time.
+
+    Args:
+        a: One login, or None for none.
+        b: The other, or None for none.
+
+    Returns:
+        True when both are None, or both name the same username and token.
+    """
+    if a is None or b is None:
+        return a is b
+    return a.username == b.username and hmac.compare_digest(
+        a.token.encode("utf-8", "replace"), b.token.encode("utf-8", "replace")
+    )
+
+
 def _ra_login_change(
     injected: Optional[RetroAchievementsLogin], saved: Optional[RetroAchievementsLogin]
 ) -> Optional[RetroAchievementsChange]:
@@ -1079,7 +1097,7 @@ def _ra_login_change(
         # every later launch for this player would fail with a 422.
         log.warning("ra login capture: the saved login has characters the broker cannot pin")
         return None
-    if ended == injected:
+    if _same_login(ended, injected):
         return None
     if ended is None:
         log.info("ra login capture: the player's login was cleared")
