@@ -6,6 +6,24 @@ code, so the tests check the broker's reader against what RetroArch actually
 writes. Rerun it when the keychain format changes upstream. It is not built in
 CI, and the tests only use the constants it printed.
 
+## On every RetroArch bump
+
+`webstation_broker/emulators/retroarch_credentials.py` mirrors the keychain
+at `388637b6`, which no RetroArch release ships yet. Whenever the image's
+RetroArch changes, diff `file/keychain.c`, `crypto/crypto.c` and
+`crypto/kdf.c` in libretro-common against `388637b6`:
+
+```sh
+git -C ra-src diff 388637b6 <new ref> -- \
+  libretro-common/file/keychain.c libretro-common/crypto/
+```
+
+If they changed, port the change to the reader, rebuild `gen` at the new ref,
+regenerate the constants below, and update the ref in this file and in the
+module docstring. A format the reader does not follow reads as an unknown
+login, so the exit reports no change: a login made in the emulator never
+reaches RomM, and the only sign is a log line.
+
 ## Build
 
 Against RetroArch master at `388637b6` (libretro-common, MIT):
