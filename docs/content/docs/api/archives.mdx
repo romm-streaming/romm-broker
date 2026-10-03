@@ -33,15 +33,15 @@ it.
 
 ```bash
 # hand a save archive to the container, then launch with it
-curl -k -X PUT https://localhost:3001/streaming/api/session/imports/4471.zip \
+curl -X PUT http://localhost:3000/streaming/api/session/imports/4471.zip \
   -H 'X-Broker-Secret: <shared secret>' --data-binary @4471.zip
 # -> {"status": "stored", "name": "4471.zip", "path": "/config/broker-imports/4471.zip", "size": 12345}
 
 # list, fetch and discard what exit left behind
-curl -k https://localhost:3001/streaming/api/session/exports -H 'X-Broker-Secret: <shared secret>'
-curl -k https://localhost:3001/streaming/api/session/exports/abc123-1723600000.zip \
+curl http://localhost:3000/streaming/api/session/exports -H 'X-Broker-Secret: <shared secret>'
+curl http://localhost:3000/streaming/api/session/exports/abc123-1723600000.zip \
   -H 'X-Broker-Secret: <shared secret>' -o abc123.zip
-curl -k -X DELETE https://localhost:3001/streaming/api/session/exports/abc123-1723600000.zip \
+curl -X DELETE http://localhost:3000/streaming/api/session/exports/abc123-1723600000.zip \
   -H 'X-Broker-Secret: <shared secret>'
 ```
 

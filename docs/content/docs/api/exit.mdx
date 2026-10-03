@@ -6,7 +6,7 @@ description: "Ending a session with POST /api/session/exit: the final state, the
 You can trigger this from RomM's stop button, or call it directly:
 
 ```bash
-curl -k -X POST 'https://localhost:3001/streaming/api/session/exit?slot=10' \
+curl -X POST 'http://localhost:3000/streaming/api/session/exit?slot=10' \
   -H 'X-Broker-Secret: <shared secret>'
 ```
 

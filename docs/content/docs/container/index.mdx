@@ -42,7 +42,6 @@ services:
       # - /path/to/bios:/config/.config/retroarch/system
     ports:
       - 3000:3000
-      - 3001:3001
     shm_size: "1gb"
     restart: unless-stopped
 ```
@@ -58,7 +57,6 @@ docker run -d \
   -e SUBFOLDER=/streaming/ \
   -e BROKER_SECRET=change-me \
   -p 3000:3000 \
-  -p 3001:3001 \
   -v /path/to/config:/config \
   -v /path/to/library:/romm/library \
   -v /path/to/bios:/config/.config/retroarch/system \
@@ -78,8 +76,7 @@ for the matching path to mount for other emulators.
 
 | Parameter | Function |
 | --- | --- |
-| `-p 3000` | Plain, unencrypted web traffic (HTTP). This port must sit behind a reverse proxy. See [Reverse proxy](/docs/deployment/reverse-proxy). |
-| `-p 3001` | HTTPS (encrypted), using a self-signed certificate, for connecting directly to the container while testing. |
+| `-p 3000` | Plain, unencrypted web traffic (HTTP). This is the only port you need to publish, and it must sit behind a reverse proxy, which provides the HTTPS. See [Reverse proxy](/docs/deployment/reverse-proxy). |
 | `-v /config` | The user's home directory inside the container. Holds emulator settings, BIOS and firmware, and save data. It's also where the broker keeps its pid record (a small file it uses to find the running emulator again after a restart) and its export directory. |
 | `-v /romm/library` | Your ROM library, which you can mount read-only if you like. Use the same host folder and the same `/romm/library` path as the library mount on your RomM container, so the ROM paths RomM sends are valid here without any extra config. See [Mounting the library somewhere else](#mounting-the-library-somewhere-else) if you can't. |
 | `-v .../retroarch/system` (optional) | A host folder already filled with BIOS and firmware, mounted at RetroArch's shared system directory (`RETROARCH_SYSTEM_DIR`, default `/config/.config/retroarch/system`) so you don't have to drag files into the desktop by hand afterward. See [Getting files into the container](/docs/emulators/setup#getting-files-into-the-container). |
@@ -100,7 +97,17 @@ variables are needed. The full guide, covering multi-GPU pinning (choosing
 which GPU to use when you have more than one), hardware encoders, and
 troubleshooting, is the selkies
 [GPU acceleration page](https://docs.linuxserver.io/selkies/user-guide/gpu/#automatic-configuration).
-Here's the minimum you need to add to the examples above:
+Here's the minimum you need to add:
+
+<Callout type="warn" title="Add these to the webstation compose, not RomM's">
+Everything below goes under the `webstation` service in the compose file you
+just wrote for this container (the one running
+`lscr.io/linuxserver/webstation:romm`). Don't add any of it to RomM's own
+compose file: RomM doesn't render or encode anything, so giving it the GPU
+does nothing. The snippets are indented to sit directly inside the
+`webstation:` service, next to `image:` and `volumes:`. The `docker cli`
+flags go on the `docker run` command for the webstation container.
+</Callout>
 
 <Tabs items={['Intel / AMD', 'NVIDIA']}>
 <Tab value="Intel / AMD">
@@ -108,19 +115,19 @@ Here's the minimum you need to add to the examples above:
 Open-source drivers only need the render node (a device file for the GPU)
 passed through.
 
-```yaml title="docker-compose"
+```yaml title="webstation docker-compose.yml"
     devices:
       - /dev/dri:/dev/dri
 ```
 
-```bash title="docker cli"
+```bash title="webstation docker cli"
   --device /dev/dri \
 ```
 
 If your host has more than one GPU, pin (select) the node the container
-should use:
+should use, again in the `webstation` service:
 
-```yaml
+```yaml title="webstation docker-compose.yml"
     environment:
       - DRINODE=/dev/dri/renderD129
       - DRI_NODE=/dev/dri/renderD129
@@ -129,12 +136,27 @@ should use:
 </Tab>
 <Tab value="NVIDIA">
 
-Needs the NVIDIA container runtime installed on the host, with driver
-version 595.80 or newer. Older cards stuck on the 580 driver (Pascal, like
-the GTX 10-series) can work with extra host steps; see [Unraid with an older
-NVIDIA GPU](/docs/deployment/unraid).
+Needs the NVIDIA container runtime installed on the host (set it up with
+`sudo nvidia-ctk runtime configure --runtime=docker`, then restart Docker),
+and the proprietary NVIDIA driver, version **580 or newer**. Install the
+driver from the `.run` file downloaded directly from NVIDIA, since
+distribution-packaged drivers frequently cause problems.
 
-```yaml title="docker-compose"
+- **Driver 595.80 or newer** is the preferred path. Run
+  `sudo nvidia-modprobe --modeset` on the host once so the modeset device
+  exists, and use the settings below.
+- **Driver 580 to 594** (older cards stuck on the 580 driver, like the Pascal
+  GTX 10-series) also works, but needs extra host steps: the kernel
+  parameters `nvidia-drm.modeset=1 nvidia_drm.fbdev=1`, and on a headless
+  machine a physical dummy plug (a cheap HDMI/DisplayPort adapter that makes
+  the GPU think a monitor is attached). See [Unraid with an older NVIDIA
+  GPU](/docs/deployment/unraid) for a worked example.
+- **Older than 580** is not supported.
+
+NVIDIA is not available on Alpine-based images, which doesn't affect the
+`webstation` image.
+
+```yaml title="webstation docker-compose.yml"
     deploy:
       resources:
         reservations:
@@ -146,7 +168,7 @@ NVIDIA GPU](/docs/deployment/unraid).
       - /dev/nvidia-modeset:/dev/nvidia-modeset
 ```
 
-```bash title="docker cli"
+```bash title="webstation docker cli"
   --runtime nvidia \
   --gpus all \
   -e NVIDIA_DRIVER_CAPABILITIES=compute,video,graphics,utility \
@@ -204,7 +226,7 @@ uses a different driver (radeonsi) that's confirmed to work.
 The container boots straight to the webstation desktop. Before you launch
 games through RomM, every emulator you plan to use needs its BIOS, firmware,
 or decryption keys set up, plus a quick controller check. Launch a `desktop`
-session from RomM (or open `https://yourhost:3001/streaming/` directly) and
+session from RomM (or open `/streaming/` on your RomM address directly) and
 follow [Emulator setup](/docs/emulators/setup).
 
 ## Wiring it into RomM

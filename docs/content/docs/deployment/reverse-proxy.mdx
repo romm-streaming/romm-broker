@@ -78,12 +78,19 @@ SUBFOLDER=/streaming/
 That is the whole container-side configuration. Inside the container, its own
 nginx (a small web server) serves the room UI, the broker API, and the selkies
 stream, all under that one prefix, so a single proxy rule covers all three.
-Port 3000 serves plain HTTP, and port 3001 serves HTTPS with a self-signed
-certificate, one your browser or `curl` won't trust automatically, since the
-container issued it itself rather than a recognized authority. If your reverse
-proxy already handles HTTPS for you (often called TLS termination), point it
-at port 3000 instead and skip the warning that certificate would otherwise
-trigger.
+Point your reverse proxy at port `3000`, which serves plain HTTP, and use
+only that port for everything: the proxy, `broker_host`, and any `curl`
+checks. Your reverse proxy handles HTTPS for browsers (often called TLS
+termination), so the container never needs to.
+
+<Callout type="info" title="For advanced users: port 3001">
+The container also listens on port `3001`, which serves HTTPS with a
+self-signed certificate (one browsers and `curl` won't trust, since the
+container issued it itself). Streaming needs a reverse proxy in front
+regardless, so there is nothing port `3001` does that the proxy doesn't
+already do better. Don't publish it, and don't point a proxy or RomM at it
+unless you have a specific reason.
+</Callout>
 
 ## RomM side
 
@@ -215,11 +222,52 @@ has no effect on anything described here.
 </Tab>
 <Tab value="Caddy">
 
+The `/streaming/*` block is the only part this feature needs. Here it is
+inside a complete, simple Caddyfile that serves RomM and the container from
+one address:
+
 ```txt title="Caddyfile"
-handle /streaming/* {
-    reverse_proxy 10.0.1.56:3000
+# RomM
+romm.example.com {
+    # The container, on its plain HTTP port (3000).
+    handle /streaming/* {
+        reverse_proxy 10.0.1.56:3000
+    }
+
+    # Everything else is RomM itself.
+    handle {
+        reverse_proxy 127.0.0.1:8080
+    }
 }
 ```
+
+With a public domain name like this, Caddy gets and renews the HTTPS
+certificate by itself. For a private setup, such as a Tailscale domain with a
+certificate you already have on disk, name the port and the certificate
+yourself instead:
+
+```txt title="Caddyfile"
+# RomM
+https://<mytailscaledomain>:8286 {
+    tls /certs/tailscale.crt /certs/tailscale.key
+
+    handle /streaming/* {
+        reverse_proxy 10.0.1.56:3000
+    }
+
+    handle {
+        reverse_proxy 127.0.0.1:8285 {
+            header_up Host {upstream_hostport}
+        }
+    }
+}
+```
+
+Replace the address in each `reverse_proxy` line with where RomM and the
+container actually run (`10.0.1.56:3000` is the container's HTTP port;
+`127.0.0.1:8285` is wherever RomM listens). `header_up Host
+{upstream_hostport}` is only needed if RomM is picky about the `Host` header
+it receives, so drop it if RomM works without it.
 
 Use `handle`, never `handle_path`. `handle_path` strips the matched prefix,
 the same problem as with nginx above. Caddy forwards websocket upgrades on
