@@ -6,7 +6,7 @@ description: "Adding people to a running session with POST /api/session/join, an
 ## Add a user to the session
 
 ```bash
-curl -k -X POST https://localhost:3001/streaming/api/session/join \
+curl -X POST http://localhost:3000/streaming/api/session/join \
   -H 'X-Broker-Secret: <shared secret>' \
   -H 'Content-Type: application/json' \
   -d '{
@@ -32,7 +32,7 @@ selkies drops that connection live.
 ## Invite links
 
 ```bash
-curl -k -X POST 'https://localhost:3001/streaming/api/session/invite?token=<controller token>' \
+curl -X POST 'http://localhost:3000/streaming/api/session/invite?token=<controller token>' \
   -H 'Content-Type: application/json' \
   -d '{ "permission": "participant" }'
 ```

@@ -37,7 +37,6 @@ services:
       - /path/to/library:/romm/library
     ports:
       - 3000:3000
-      - 3001:3001
     shm_size: "1gb"
     restart: unless-stopped
 ```

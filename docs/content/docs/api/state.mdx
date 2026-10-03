@@ -6,7 +6,7 @@ description: "Saving and loading state mid-session, and moving state files and t
 ## Save and load state mid-session
 
 ```bash
-curl -k -X POST https://localhost:3001/streaming/api/session/save-state \
+curl -X POST http://localhost:3000/streaming/api/session/save-state \
   -H 'X-Broker-Secret: <shared secret>' \
   -H 'Content-Type: application/json' \
   -d '{ "slot": 3 }'
@@ -42,10 +42,10 @@ state file in it, or a save whose file never showed up on disk.
 ## Move a state file in or out
 
 ```bash
-curl -k -X GET https://localhost:3001/streaming/api/session/state-file \
+curl -X GET http://localhost:3000/streaming/api/session/state-file \
   -H 'X-Broker-Secret: <shared secret>' -o state.bin
 
-curl -k -X PUT "https://localhost:3001/streaming/api/session/state-file?filename=NAME" \
+curl -X PUT "http://localhost:3000/streaming/api/session/state-file?filename=NAME" \
   -H 'X-Broker-Secret: <shared secret>' --data-binary @state.bin
 ```
 
@@ -109,7 +109,7 @@ which end rejects the file first.
 ## Fetch the frame a state was taken at
 
 ```bash
-curl -k -X GET https://localhost:3001/streaming/api/session/state-screenshot \
+curl -X GET http://localhost:3000/streaming/api/session/state-screenshot \
   -H 'X-Broker-Secret: <shared secret>' -o state.png
 ```
 

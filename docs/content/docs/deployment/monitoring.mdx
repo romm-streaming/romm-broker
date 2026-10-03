@@ -36,7 +36,7 @@ variable.
 | Option | Default | What it does |
 | --- | --- | --- |
 | `--url` | `$BROKER_URL`, else `http://` plus `BROKER_HOST` and `BROKER_PORT` (`127.0.0.1:8000` when unset) plus the `SUBFOLDER` prefix (`/streaming` when unset) | The broker's base URL, prefix included. |
-| `--insecure` | off | Skip TLS certificate checks, for the container's self-signed port `3001`. |
+| `--insecure` | off | Skip TLS certificate checks. Only needed for advanced setups that talk to the container's self-signed HTTPS port (`3001`), which you shouldn't need. |
 | `--timeout` | `5` | Seconds to wait for each request. |
 | `--max-session-hours` | `12` | Warn when one session has been open longer than this. |
 | `--max-exit-seconds` | `120` | Warn when the last exit took longer than this. |
@@ -70,13 +70,12 @@ Replace `webstation` with your `container_name`.
 
 ### From another machine
 
-Point it at the container's HTTPS port. Port `3001` carries a self-signed
-certificate, hence `--insecure`; drop it when you go through a reverse proxy
-with a real certificate instead:
+Point it at the container's HTTP port, `3000`. If you'd rather go through
+your reverse proxy, use RomM's own address instead:
 
 ```bash
 BROKER_SECRET=change-me python3 check_broker.py \
-  --url https://yourhost:3001/streaming --insecure
+  --url http://yourhost:3000/streaming
 ```
 
 ### On a schedule
@@ -207,11 +206,11 @@ List what is waiting, download each archive, then delete it once it is safe
 elsewhere (in RomM, or anywhere you keep backups):
 
 ```bash
-curl -k -H "X-Broker-Secret: $BROKER_SECRET" https://yourhost:3001/streaming/api/session/exports
-curl -k -H "X-Broker-Secret: $BROKER_SECRET" -o save.zip \
-  https://yourhost:3001/streaming/api/session/exports/<name>
-curl -k -X DELETE -H "X-Broker-Secret: $BROKER_SECRET" \
-  https://yourhost:3001/streaming/api/session/exports/<name>
+curl -H "X-Broker-Secret: $BROKER_SECRET" http://yourhost:3000/streaming/api/session/exports
+curl -H "X-Broker-Secret: $BROKER_SECRET" -o save.zip \
+  http://yourhost:3000/streaming/api/session/exports/<name>
+curl -X DELETE -H "X-Broker-Secret: $BROKER_SECRET" \
+  http://yourhost:3000/streaming/api/session/exports/<name>
 ```
 
 See [Save archives](/docs/api/archives) for the archive layout.

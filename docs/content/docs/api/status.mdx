@@ -6,7 +6,7 @@ description: "GET /api/session/status for a session summary and GET /api/health 
 ## Status
 
 ```bash
-curl -k -H "X-Broker-Secret: $BROKER_SECRET" https://localhost:3001/streaming/api/session/status
+curl -H "X-Broker-Secret: $BROKER_SECRET" http://localhost:3000/streaming/api/session/status
 ```
 
 Send the broker secret as `X-Broker-Secret` when one is set, since the answer
@@ -35,7 +35,7 @@ instead of leaving them staring at a frozen frame.
 ## Health
 
 ```bash
-curl -k https://localhost:3001/streaming/api/health
+curl http://localhost:3000/streaming/api/health
 ```
 
 Answers `{"status": "ok"}` as soon as the broker is up and serving requests.
@@ -46,7 +46,7 @@ means selkies is up and reachable.
 ## Room context
 
 ```bash
-curl -k "https://localhost:3001/streaming/api/session/context?token=<personal token>"
+curl "http://localhost:3000/streaming/api/session/context?token=<personal token>"
 ```
 
 This is what the room UI reads when it loads: who the token belongs to, what
