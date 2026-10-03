@@ -32,6 +32,9 @@
 * deep check fixes for status codes, RetroArch setup coverage and monitoring ([62b1b92](https://github.com/romm-streaming/romm-broker/commit/62b1b924f869093b665b90b43641794629c1bcb0))
 * docs pass for accuracy and missing surface ([04431ec](https://github.com/romm-streaming/romm-broker/commit/04431eccdf04cfe86442155191fc46daeea54b0c))
 * docs pass for accuracy and missing surface ([2ddff60](https://github.com/romm-streaming/romm-broker/commit/2ddff6036ef3589289be85d3e83f638ccf6382d2))
+* document NVIDIA driver 580+ requirement and 595.80 preferred path ([d7e84b4](https://github.com/romm-streaming/romm-broker/commit/d7e84b424a7266797ac439c3141d90a7fe72edfd))
+* use HTTP port only, clarify GPU compose, add full Caddyfile example ([74f1c1c](https://github.com/romm-streaming/romm-broker/commit/74f1c1c884d86ccdc903c29f0a64228af36550e4))
+* use HTTP port only, clarify GPU compose, add full Caddyfile example ([f890c09](https://github.com/romm-streaming/romm-broker/commit/f890c0990d3c1fa9be6c1272536e0bf4d275d536))
 * use one host port and example IP set across the docs ([9c24603](https://github.com/romm-streaming/romm-broker/commit/9c24603ccb89f3557a75ba75aa874c63e7dc2c58))
 
 ## [0.13.0](https://github.com/romm-streaming/romm-broker/compare/v0.12.0...v0.13.0) (2026-09-30)
