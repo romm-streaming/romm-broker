@@ -30,12 +30,12 @@ services:
       - /path/to/library:/romm/library
     ports:
       - 3000:3000
-      - 3001:3001
     shm_size: "1gb"
     restart: unless-stopped
 ```
 
-You also need a GPU passed through, or most emulators won't run: `/dev/dri`
+You also need a GPU passed through, added to this webstation compose (not
+RomM's), or most emulators won't run: `/dev/dri`
 for Intel or AMD, or the NVIDIA container runtime with driver 595.80 or newer
 for NVIDIA, plus the `/dev/nvidia-modeset` device specifically, which is easy
 to miss since the container toolkit doesn't add it automatically. See
@@ -96,7 +96,7 @@ anything up for you, so before RomM can boot a game straight into an
 emulator, you need to open that emulator from the desktop once and get it
 working by hand: BIOS or firmware installed, keys in place, controller
 responding. Launch a `desktop` session from RomM (or open
-`https://yourhost:3001/streaming/` directly) to get there.
+`/streaming/` on your RomM address directly) to get there.
 
 [Emulator setup](/docs/emulators/setup) has the full walkthrough per
 emulator. A few of the sharper pitfalls, so you're not caught flat-footed:

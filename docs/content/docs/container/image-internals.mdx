@@ -160,7 +160,8 @@ emulator process a previous broker left running, using the pid record at
 
 `/defaults/default.conf` is nginx's config file. `SUBFOLDER` gets filled into
 it at boot, and it serves everything under that one prefix, on port 3000
-(HTTP) and port 3001 (HTTPS, self-signed):
+(HTTP). It also listens on port 3001 (HTTPS, self-signed), which you can ignore: use
+port 3000 only.
 
 | Location | Upstream | Purpose |
 | --- | --- | --- |

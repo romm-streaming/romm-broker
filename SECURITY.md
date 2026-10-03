@@ -101,11 +101,10 @@ connections for websockets, and recipes for specific proxies). Two more
 things matter only once this is public:
 
 **Handle real TLS encryption at the proxy, never at the container.** (TLS is
-what puts the padlock in a browser's address bar.) Port 3001's certificate
-is self-signed, meaning a browser will never trust it on its own; it exists
-only for the short hop between the proxy and the container. The proxy is
-the only thing that should ever hold a certificate a browser is meant to
-trust.
+what puts the padlock in a browser's address bar.) The container
+only needs its plain HTTP port, 3000; its self-signed HTTPS port (3001) is
+unnecessary, so leave it unpublished. The proxy is the only thing that
+should ever hold a certificate a browser is meant to trust.
 
 **The proxy is what actually faces the internet, so the protections the
 broker doesn't implement belong there.** The broker deliberately has no rate

@@ -6,7 +6,7 @@ description: "POST /api/session/activate, with save data to restore, a state to 
 ## Launch a game
 
 ```bash
-curl -k -X POST https://localhost:3001/streaming/api/session/activate \
+curl -X POST http://localhost:3000/streaming/api/session/activate \
   -H 'X-Broker-Secret: <shared secret>' \
   -H 'Content-Type: application/json' \
   -d '{
@@ -17,7 +17,7 @@ curl -k -X POST https://localhost:3001/streaming/api/session/activate \
 ```
 
 You get back `{"status": "launching", "session_id": ..., "url": "/streaming/?token=<controller token>"}`.
-Open `https://<host>:3001/streaming/?token=...` in a browser to land in the
+Open `https://<your RomM address>/streaming/?token=...` in a browser (through your reverse proxy) to land in the
 room, where the game is already streaming. If a session is already active,
 you get back an HTTP error, `409`, instead.
 
@@ -60,7 +60,7 @@ Both the archive restore and the later resume push happen after this
 clearing step, so neither one is affected by it.
 
 ```bash
-curl -k -X POST https://localhost:3001/streaming/api/session/activate \
+curl -X POST http://localhost:3000/streaming/api/session/activate \
   -H 'X-Broker-Secret: <shared secret>' \
   -H 'Content-Type: application/json' \
   -d '{
@@ -98,7 +98,7 @@ mode takes no `rom` or `save`. Everything else works the same: the same room,
 the same exit teardown.
 
 ```bash
-curl -k -X POST https://localhost:3001/streaming/api/session/activate \
+curl -X POST http://localhost:3000/streaming/api/session/activate \
   -H 'X-Broker-Secret: <shared secret>' \
   -H 'Content-Type: application/json' \
   -d '{ "emulator": "desktop", "user": { "id": 1, "username": "ryan", "display_name": "Ryan" } }'
@@ -110,7 +110,7 @@ Some emulators (currently RetroArch) report `supports_disc_swap`, meaning
 they can change the mounted disc without restarting the game:
 
 ```bash
-curl -k -X POST https://localhost:3001/streaming/api/session/swap-disc \
+curl -X POST http://localhost:3000/streaming/api/session/swap-disc \
   -H 'X-Broker-Secret: <shared secret>' \
   -H 'Content-Type: application/json' \
   -d '{ "path": "/romm/psx/Final Fantasy VII (Disc 2).chd" }'
