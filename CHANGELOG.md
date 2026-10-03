@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.14.0](https://github.com/romm-streaming/romm-broker/compare/v0.13.0...v0.14.0) (2026-10-03)
+
+
+### Features
+
+* **retroarch:** add Philips CD-i and TI-83 as untested platforms ([fd521ff](https://github.com/romm-streaming/romm-broker/commit/fd521ffd054efbcfc7bdca23e62b81464cd43890))
+* **retroarch:** add Philips CD-i and TI-83 platforms ([6644a26](https://github.com/romm-streaming/romm-broker/commit/6644a26bd68f79b5b2aa57ee9d8c3d615f1d0e24)), closes [#61](https://github.com/romm-streaming/romm-broker/issues/61)
+* **retroarch:** flag CD-i and TI-83 as untested platforms ([389cbff](https://github.com/romm-streaming/romm-broker/commit/389cbffc090bd6298f492dd0ac2815263c1e9df2)), closes [#61](https://github.com/romm-streaming/romm-broker/issues/61)
+* **rom-cache:** opt-in local ROM copy cache for network libraries ([d15fce0](https://github.com/romm-streaming/romm-broker/commit/d15fce03ed4fb8b653f31a2619f600a3f04c9318))
+* **rom-cache:** opt-in local ROM copy cache for network libraries ([5bc5db8](https://github.com/romm-streaming/romm-broker/commit/5bc5db88be7c6723338e17342ae0f666ffc94cd1))
+* **room:** RetroArch menu button, L3+R3 pad combo, and saves past an open menu ([f4a93f2](https://github.com/romm-streaming/romm-broker/commit/f4a93f265cedcef0a71ac6ccb21809ccc51eaae9))
+* **room:** RetroArch menu toolbar button and default L3+R3 pad combo ([1982a77](https://github.com/romm-streaming/romm-broker/commit/1982a77b57811ced05b42733b367b7ba040d604b)), closes [#108](https://github.com/romm-streaming/romm-broker/issues/108)
+
+
+### Bug Fixes
+
+* **api:** name the RomM upgrade when an old RomM sends core shorthand as the emulator ([66037aa](https://github.com/romm-streaming/romm-broker/commit/66037aaba9729579ab578dbaf88751e27ddc2866))
+* **api:** name the RomM upgrade when an old RomM sends core shorthand as the emulator ([c0f74e8](https://github.com/romm-streaming/romm-broker/commit/c0f74e836190efac605a5d114b44bce04bea87fd))
+* **retroarch:** code-review pass fixes ([aa73ff4](https://github.com/romm-streaming/romm-broker/commit/aa73ff4f28c51919f4af8347f2de275ee72551ec))
+* **retroarch:** get saves past an open menu and stop writing broker.cfg into retroarch.cfg ([25df290](https://github.com/romm-streaming/romm-broker/commit/25df29071e6d36185153f1e3fb54c0fe6745f4d3)), closes [#108](https://github.com/romm-streaming/romm-broker/issues/108)
+* **rom-cache:** code-review pass fixes ([2f8da89](https://github.com/romm-streaming/romm-broker/commit/2f8da8991ca0b94bd5c91eaa09286acfba25ab6b))
+* **test:** stamp the xenia session save past the session start ([58898db](https://github.com/romm-streaming/romm-broker/commit/58898db538eab5ad59d998c4483c4e87843975c7))
+
+
+### Documentation
+
+* add README configuration section ([8da581e](https://github.com/romm-streaming/romm-broker/commit/8da581e989e8e9a2cffcf90e9315e491eea2ad65))
+* correct DSi BIOS requirements from the melonDS DS source ([865de21](https://github.com/romm-streaming/romm-broker/commit/865de217bd41a18a1c063adc158f0f812577458c))
+* correct DSi BIOS requirements from the melonDS DS source ([8759837](https://github.com/romm-streaming/romm-broker/commit/8759837c0a2dfa7011ab455b820157057bef55ea))
+* deep check fixes for status codes, RetroArch setup coverage and monitoring ([62b1b92](https://github.com/romm-streaming/romm-broker/commit/62b1b924f869093b665b90b43641794629c1bcb0))
+* docs pass for accuracy and missing surface ([04431ec](https://github.com/romm-streaming/romm-broker/commit/04431eccdf04cfe86442155191fc46daeea54b0c))
+* docs pass for accuracy and missing surface ([2ddff60](https://github.com/romm-streaming/romm-broker/commit/2ddff6036ef3589289be85d3e83f638ccf6382d2))
+* use one host port and example IP set across the docs ([9c24603](https://github.com/romm-streaming/romm-broker/commit/9c24603ccb89f3557a75ba75aa874c63e7dc2c58))
+
 ## [0.13.0](https://github.com/romm-streaming/romm-broker/compare/v0.12.0...v0.13.0) (2026-09-30)
 
 
