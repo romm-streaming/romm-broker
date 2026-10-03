@@ -515,6 +515,8 @@ class FakeEmulator(Emulator):
         state_file: The path state_path and state_target answer with.
         swapped_discs: Every path passed to swap_disc, in order.
         swap_ok: What swap_disc answers.
+        menu_toggles: How many times toggle_menu was called.
+        menu_ok: What toggle_menu answers.
         launch_fails: Whether launch raises instead of recording the call.
     """
 
@@ -523,6 +525,7 @@ class FakeEmulator(Emulator):
     rom_extensions = (".iso",)
     supports_states = True
     supports_disc_swap = True
+    supports_menu = True
     state_slot = 3
     launch_fails = False
 
@@ -539,6 +542,8 @@ class FakeEmulator(Emulator):
         self.state_file: Optional[Path] = None
         self.swapped_discs: list[Path] = []
         self.swap_ok = True
+        self.menu_toggles = 0
+        self.menu_ok = True
 
     def alive(self) -> bool:
         """Report whether the fake is still running.
@@ -660,6 +665,15 @@ class FakeEmulator(Emulator):
         """
         self.swapped_discs.append(path)
         return self.swap_ok
+
+    def toggle_menu(self) -> bool:
+        """Record a menu toggle.
+
+        Returns:
+            The value of menu_ok, so a test can make the toggle fail.
+        """
+        self.menu_toggles += 1
+        return self.menu_ok
 
 
 @pytest.fixture

@@ -33,6 +33,7 @@ const en = {
         resizeClient: 'Resize to Client',
         invite: 'Invite someone to this session',
         renameSelf: 'Change your name',
+        emulatorMenu: 'Open or close the emulator menu',
     },
     usernamePrompt: {
         title: 'Welcome!',
@@ -104,6 +105,7 @@ const es = {
         resizeClient: 'Redimensionar al cliente',
         invite: 'Invitar a alguien a esta sesión',
         renameSelf: 'Cambiar tu nombre',
+        emulatorMenu: 'Abrir o cerrar el menú del emulador',
     },
     usernamePrompt: {
         title: '¡Bienvenido!',
@@ -174,6 +176,7 @@ const zh = {
         resizeClient: '调整为客户端大小',
         invite: '邀请他人加入此会话',
         renameSelf: '更改你的名字',
+        emulatorMenu: '打开或关闭模拟器菜单',
     },
     usernamePrompt: {
         title: '欢迎！',
@@ -244,6 +247,7 @@ const hi = {
         resizeClient: 'क्लाइंट के आकार में बदलें',
         invite: 'किसी को इस सत्र में आमंत्रित करें',
         renameSelf: 'अपना नाम बदलें',
+        emulatorMenu: 'एम्युलेटर मेनू खोलें या बंद करें',
     },
     usernamePrompt: {
         title: 'स्वागत है!',
@@ -314,6 +318,7 @@ const pt = {
         resizeClient: 'Redimensionar para o Cliente',
         invite: 'Convidar alguém para esta sessão',
         renameSelf: 'Alterar seu nome',
+        emulatorMenu: 'Abrir ou fechar o menu do emulador',
     },
     usernamePrompt: {
         title: 'Bem-vindo(a)!',
@@ -384,6 +389,7 @@ const fr = {
         resizeClient: 'Redimensionner au client',
         invite: 'Inviter quelqu\'un à cette session',
         renameSelf: 'Changer votre nom',
+        emulatorMenu: 'Ouvrir ou fermer le menu de l\'émulateur',
     },
     usernamePrompt: {
         title: 'Bienvenue !',
@@ -454,6 +460,7 @@ const ru = {
         resizeClient: 'Изменить размер под клиента',
         invite: 'Пригласить кого-то в этот сеанс',
         renameSelf: 'Изменить имя',
+        emulatorMenu: 'Открыть или закрыть меню эмулятора',
     },
     usernamePrompt: {
         title: 'Добро пожаловать!',
@@ -524,6 +531,7 @@ const de = {
         resizeClient: 'Größe an Client anpassen',
         invite: 'Jemanden zu dieser Sitzung einladen',
         renameSelf: 'Namen ändern',
+        emulatorMenu: 'Emulator-Menü öffnen oder schließen',
     },
     usernamePrompt: {
         title: 'Willkommen!',
@@ -594,6 +602,7 @@ const tr = {
         resizeClient: 'İstemciye Göre Yeniden Boyutlandır',
         invite: 'Birini bu oturuma davet et',
         renameSelf: 'Adını değiştir',
+        emulatorMenu: 'Emülatör menüsünü aç veya kapat',
     },
     usernamePrompt: {
         title: 'Hoş geldiniz!',
@@ -664,6 +673,7 @@ const it = {
         resizeClient: 'Ridimensiona al client',
         invite: 'Invita qualcuno a questa sessione',
         renameSelf: 'Cambia il tuo nome',
+        emulatorMenu: 'Apri o chiudi il menu dell\'emulatore',
     },
     usernamePrompt: {
         title: 'Benvenuto!',
@@ -734,6 +744,7 @@ const nl = {
         resizeClient: 'Formaat aanpassen aan client',
         invite: 'Nodig iemand uit voor deze sessie',
         renameSelf: 'Je naam wijzigen',
+        emulatorMenu: 'Emulatormenu openen of sluiten',
     },
     usernamePrompt: {
         title: 'Welkom!',
@@ -804,6 +815,7 @@ const ar = {
         resizeClient: 'تغيير الحجم ليناسب العميل',
         invite: 'دعوة شخص ما إلى هذه الجلسة',
         renameSelf: 'تغيير اسمك',
+        emulatorMenu: 'فتح قائمة المحاكي أو إغلاقها',
     },
     usernamePrompt: {
         title: 'أهلاً بك!',
@@ -874,6 +886,7 @@ const ko = {
         resizeClient: '클라이언트에 맞게 크기 조정',
         invite: '이 세션에 누군가를 초대',
         renameSelf: '이름 변경',
+        emulatorMenu: '에뮬레이터 메뉴 열기/닫기',
     },
     usernamePrompt: {
         title: '환영합니다!',
@@ -944,6 +957,7 @@ const ja = {
         resizeClient: 'クライアントに合わせてサイズ変更',
         invite: 'このセッションに誰かを招待',
         renameSelf: '名前を変更',
+        emulatorMenu: 'エミュレーターメニューを開く/閉じる',
     },
     usernamePrompt: {
         title: 'ようこそ！',
@@ -1014,6 +1028,7 @@ const vi = {
         resizeClient: 'Thay đổi kích thước theo máy khách',
         invite: 'Mời ai đó vào phiên này',
         renameSelf: 'Đổi tên của bạn',
+        emulatorMenu: 'Mở hoặc đóng menu trình giả lập',
     },
     usernamePrompt: {
         title: 'Chào mừng!',
@@ -1084,6 +1099,7 @@ const th = {
         resizeClient: 'ปรับขนาดตามไคลเอนต์',
         invite: 'เชิญใครสักคนเข้าร่วมเซสชันนี้',
         renameSelf: 'เปลี่ยนชื่อของคุณ',
+        emulatorMenu: 'เปิดหรือปิดเมนูอีมูเลเตอร์',
     },
     usernamePrompt: {
         title: 'ยินดีต้อนรับ!',
@@ -1154,6 +1170,7 @@ const fil = {
         resizeClient: 'I-resize sa Client',
         invite: 'Mag-imbita ng isang tao sa session na ito',
         renameSelf: 'Palitan ang iyong pangalan',
+        emulatorMenu: 'Buksan o isara ang menu ng emulator',
     },
     usernamePrompt: {
         title: 'Maligayang pagdating!',
@@ -1224,6 +1241,7 @@ const da = {
         resizeClient: 'Tilpas størrelse til klient',
         invite: 'Inviter nogen til denne session',
         renameSelf: 'Skift dit navn',
+        emulatorMenu: 'Åbn eller luk emulatormenuen',
     },
     usernamePrompt: {
         title: 'Velkommen!',
