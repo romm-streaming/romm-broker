@@ -68,3 +68,22 @@ websocket's `state_update` broadcast. Over the websocket the room carries
 chat, webcam and microphone fanout, resolution changes, and gamepad and
 mouse/keyboard reassignment. The wire format is documented on the
 [`room` module](/docs/developer/reference/room) in the Python reference.
+
+## Emulator menu
+
+```bash
+curl -k -X POST 'https://localhost:3001/streaming/api/session/menu?token=<controller token>'
+```
+
+Opens or closes the running emulator's own menu (RetroArch's Quick Menu),
+for players with no keyboard or gamepad combo to do it themselves. Like the
+exit route it takes the controller token, or the broker secret in
+`X-Broker-Secret`. A participant or read-only token answers `403`. The
+context response's `emulator` names the running emulator; the room only
+shows its button to the controller when it's `retroarch`.
+
+Returns `{"status": "ok"}`. You get `400` if the emulator has no menu, `409`
+if there's no active session, the emulator isn't running, or another session
+action is in progress, and `502` if the emulator refused the toggle. A
+toggle is also refused while a save, a resume load or a disc swap is
+running, so it can't land in the middle of one.
