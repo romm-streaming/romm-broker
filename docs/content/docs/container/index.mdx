@@ -136,10 +136,25 @@ should use, again in the `webstation` service:
 </Tab>
 <Tab value="NVIDIA">
 
-Needs the NVIDIA container runtime installed on the host, with driver
-version 595.80 or newer. Older cards stuck on the 580 driver (Pascal, like
-the GTX 10-series) can work with extra host steps; see [Unraid with an older
-NVIDIA GPU](/docs/deployment/unraid).
+Needs the NVIDIA container runtime installed on the host (set it up with
+`sudo nvidia-ctk runtime configure --runtime=docker`, then restart Docker),
+and the proprietary NVIDIA driver, version **580 or newer**. Install the
+driver from the `.run` file downloaded directly from NVIDIA, since
+distribution-packaged drivers frequently cause problems.
+
+- **Driver 595.80 or newer** is the preferred path. Run
+  `sudo nvidia-modprobe --modeset` on the host once so the modeset device
+  exists, and use the settings below.
+- **Driver 580 to 594** (older cards stuck on the 580 driver, like the Pascal
+  GTX 10-series) also works, but needs extra host steps: the kernel
+  parameters `nvidia-drm.modeset=1 nvidia_drm.fbdev=1`, and on a headless
+  machine a physical dummy plug (a cheap HDMI/DisplayPort adapter that makes
+  the GPU think a monitor is attached). See [Unraid with an older NVIDIA
+  GPU](/docs/deployment/unraid) for a worked example.
+- **Older than 580** is not supported.
+
+NVIDIA is not available on Alpine-based images, which doesn't affect the
+`webstation` image.
 
 ```yaml title="webstation docker-compose.yml"
     deploy:

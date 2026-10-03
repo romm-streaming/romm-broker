@@ -36,8 +36,8 @@ services:
 
 You also need a GPU passed through, added to this webstation compose (not
 RomM's), or most emulators won't run: `/dev/dri`
-for Intel or AMD, or the NVIDIA container runtime with driver 595.80 or newer
-for NVIDIA, plus the `/dev/nvidia-modeset` device specifically, which is easy
+for Intel or AMD, or the NVIDIA container runtime with driver 580 or newer
+(595.80 or newer is preferred) for NVIDIA, plus the `/dev/nvidia-modeset` device specifically, which is easy
 to miss since the container toolkit doesn't add it automatically. See
 [Running the container](/docs/container#gpu) for the full recipes.
 
