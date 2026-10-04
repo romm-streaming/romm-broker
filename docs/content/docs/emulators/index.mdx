@@ -115,15 +115,17 @@ physical gamepad, the layer sets RetroArch's menu combo to L3 + R3 (both
 sticks pressed in), but only when your `retroarch.cfg` has no combo of its
 own. [`RETROARCH_MENU_COMBO`](/docs/configuration/emulators#retroarch)
 changes which combo that is, and `0` turns it off. The layer also hides the
-menu entries that don't belong in a streamed session: Save Configuration,
-the core, game and content-directory override saves, Close Content, Load
+menu entries that don't belong in a streamed session: Configuration File
+(which loads, saves and resets whole configs), the core, game and
+content-directory override saves, Close Content, Load
 Content, Load Core, Load Disc, Dump Disc, the History, Playlists and Explore
 tabs, Restart RetroArch and Quit RetroArch. Add to Favorites, the
 Favorites tab, the Online Updater and Download a Core are hidden as well,
 since what they write outlives the session: a
 favorite is a game the next host could launch in place of their own, and
 the updater replaces the cores every later session runs. It hides four
-Settings pages too: Configuration (where Save Configuration on Quit lives), Directory and Saving (both can move states away from where the
+Settings pages too: Configuration (where Save Configuration on Quit
+lives), Directory and Saving (both can move states away from where the
 broker looks for them), and User Interface (which could un-hide all of
 this). Save states, shaders, cheats, core options, controls and Disc
 Control stay visible. A remap file saved under Controls, or a shader preset
