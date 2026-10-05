@@ -1150,6 +1150,21 @@ class TestPlaylistPreference:
         emulator.platform = "dc"
         assert emulator.resolve_rom_file(game) == (game / "Game.m3u").resolve()
 
+    def test_a_jaguar_cd_folder_of_a_cue_and_its_tracks_picks_the_cue(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A Jaguar CD folder holding a .cue beside its .bin tracks resolves to the .cue."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        game = tmp_path / "Game"
+        game.mkdir()
+        (game / "Game.cue").write_text('FILE "Game (Track 1).bin" BINARY\n')
+        (game / "Game (Track 1).bin").write_bytes(b"1")
+        (game / "Game (Track 2).bin").write_bytes(b"2")
+
+        emulator = retroarch.Retroarch()
+        emulator.platform = "atari-jaguar-cd"
+        assert emulator.resolve_rom_file(game) == (game / "Game.cue").resolve()
+
     def test_a_direct_path_that_is_a_symlink_out_of_the_rom_root_is_rejected(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

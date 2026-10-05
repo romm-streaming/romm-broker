@@ -278,6 +278,13 @@
     "extensions": [".j64", ".jag", ".rom", ".abs", ".cof", ".bin"],
     "savestate": false
   },
+  "atari-jaguar-cd": {
+    "core": "virtualjaguar",
+    "library_name": "Virtual Jaguar",
+    "save_ram": false,
+    "extensions": [".cue", ".chd", ".cdi"],
+    "savestate": false
+  },
   "3do": {
     "core": "opera",
     "library_name": "Opera",
