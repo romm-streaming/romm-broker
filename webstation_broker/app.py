@@ -21,6 +21,7 @@ from . import api, room, settings
 from .emulators import retroarch, retroarch_cores, rom_cache
 from .emulators.base import reap_orphan
 from .emulators.ppsspp import sweep_stale_extractions as sweep_ppsspp_extractions
+from .emulators.retroarch import sweep_stale_extractions as sweep_retroarch_extractions
 from .emulators.rpcs3 import sweep_stale_extractions as sweep_rpcs3_extractions
 from .emulators.scummvm import sweep_stale_extractions as sweep_scummvm_extractions
 from .emulators.shadps4 import sweep_stale_extractions as sweep_shadps4_extractions
@@ -110,6 +111,7 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     await anyio.to_thread.run_sync(sweep_rpcs3_extractions)
     await anyio.to_thread.run_sync(sweep_scummvm_extractions)
     await anyio.to_thread.run_sync(sweep_ppsspp_extractions)
+    await anyio.to_thread.run_sync(sweep_retroarch_extractions)
     await anyio.to_thread.run_sync(rom_cache.startup)
     await anyio.to_thread.run_sync(
         retroarch_cores.load_startup_catalog, retroarch.RA_DATA_DIR, retroarch.CORES_DIR, retroarch.PLATFORMS

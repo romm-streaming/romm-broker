@@ -208,6 +208,14 @@ PPSSPP does not boot from inside an archive, so a zipped image only boots once
 extracted. Off, an archived ROM is refused.
 """
 
+RETROARCH_MSU1_CACHE_ENABLED = truthy(os.environ.get("RETROARCH_MSU1_CACHE_ENABLED", "true"))
+"""Whether a zipped MSU-1 game is extracted to boot, from `RETROARCH_MSU1_CACHE_ENABLED` (default on).
+
+Snes9x reads a game's `.msu` data and `-N.pcm` tracks from beside the ROM on
+disk, so a zip handed to RetroArch boots without them. Off, the zip boots as
+is, without its MSU-1 audio and video.
+"""
+
 ROM_CACHE_ENABLED = truthy(os.environ.get("ROM_CACHE_ENABLED"))
 """Whether ROMs are copied to local disk and booted from there, from `ROM_CACHE_ENABLED` (default off).
 

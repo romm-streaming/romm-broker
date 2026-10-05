@@ -5969,3 +5969,285 @@ class TestStateCoreHeader:
             content=b"state",
         )
         assert r.status_code != 409
+
+
+class TestMsu1Companions:
+    """A zipped MSU-1 game boots with its `.msu` and `.pcm` tracks beside the ROM.
+
+    Snes9x finds MSU-1 data by the booted ROM's path on disk. Handing
+    RetroArch the zip gets the core the ROM alone, so the game runs silent.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _stub_launch(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+        """Stub everything launch() touches but the content path, and capture each spawn's command.
+
+        Args:
+            tmp_path: The per-test temporary directory.
+            monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            The command of every RetroArch spawn, in order.
+        """
+        spawned: list[list[str]] = []
+        monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
+        monkeypatch.setattr(retroarch, "_ensure_core_info", lambda *a, **k: None)
+        monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
+        monkeypatch.setattr(retroarch, "_ensure_save_links", lambda links: None)
+        monkeypatch.setattr(retroarch, "_write_core_options", lambda options: tmp_path / "core-options.cfg")
+        monkeypatch.setattr(retroarch, "_write_broker_cfg", lambda *a: tmp_path / "broker.cfg")
+        monkeypatch.setattr(retroarch.shutil, "which", lambda binary, path=None: "/usr/bin/retroarch")
+        monkeypatch.setattr(retroarch.Retroarch, "stop", lambda self: None)
+        monkeypatch.setattr(retroarch.Retroarch, "_spawn_ra", lambda self, cmd, env: spawned.append(cmd))
+        monkeypatch.setattr(retroarch.Retroarch, "_track_first_playing", lambda self, seq: None)
+        monkeypatch.setattr(retroarch, "MSU1_CACHE_DIR", tmp_path / "msu1-cache")
+        monkeypatch.setattr(retroarch.settings, "RETROARCH_MSU1_CACHE_ENABLED", True)
+        return spawned
+
+    def test_a_zipped_msu1_game_boots_beside_its_tracks(
+        self, tmp_path: Path, _stub_launch: list[list[str]]
+    ) -> None:
+        """The reported case: the ROM RetroArch boots has its .msu and .pcm files next to it."""
+        rom = tmp_path / "library" / "Aladdin (USA) (MSU1).zip"
+        rom.parent.mkdir()
+        with zipfile.ZipFile(rom, "w") as zf:
+            zf.writestr("aladdin_msu1.sfc", b"rom")
+            zf.writestr("aladdin_msu1.msu", b"msu")
+            zf.writestr("aladdin_msu1-1.pcm", b"pcm")
+
+        emu = _on("snes")
+        emu.launch(rom, None)
+
+        booted = Path(_stub_launch[-1][-1])
+        assert booted.name == "Aladdin (USA) (MSU1).sfc"
+        assert (booted.parent / "Aladdin (USA) (MSU1).msu").read_bytes() == b"msu"
+        assert (booted.parent / "Aladdin (USA) (MSU1)-1.pcm").read_bytes() == b"pcm"
+
+    @staticmethod
+    def _zip(root: Path, name: str, members: Mapping[str, bytes]) -> Path:
+        """Write a zip of `members` at `root / "library" / name`.
+
+        Args:
+            root: The per-test temporary directory.
+            name: The zip's file name.
+            members: Member path mapped to its bytes.
+
+        Returns:
+            The zip's path.
+        """
+        rom = root / "library" / name
+        rom.parent.mkdir(exist_ok=True)
+        with zipfile.ZipFile(rom, "w") as zf:
+            for member, data in members.items():
+                zf.writestr(member, data)
+        return rom
+
+    _MSU1 = MappingProxyType({"game.sfc": b"rom", "game.msu": b"msu", "game-1.pcm": b"pcm"})
+
+    def test_states_and_saves_keep_the_zips_name(self, tmp_path: Path) -> None:
+        """The booted ROM carries the zip's stem, the name every existing save and state has."""
+        rom = self._zip(tmp_path, "Axelay (USA) (MSU1).zip", self._MSU1)
+
+        emu = _on("snes")
+        emu.launch(rom, None)
+
+        assert emu._rom_base == "Axelay (USA) (MSU1)"
+
+    def test_a_super_famicom_game_is_extracted_too(
+        self, tmp_path: Path, _stub_launch: list[list[str]]
+    ) -> None:
+        """`sfam` boots the same core as `snes`, and the reporter's set is a Super Famicom one."""
+        rom = self._zip(tmp_path, "Area 88 (MSU1).zip", self._MSU1)
+
+        _on("sfam").launch(rom, None)
+
+        assert Path(_stub_launch[-1][-1]).name == "Area 88 (MSU1).sfc"
+
+    def test_a_plain_zip_still_boots_as_is(self, tmp_path: Path, _stub_launch: list[list[str]]) -> None:
+        """A zip with no MSU-1 data goes to RetroArch unopened, and nothing is cached."""
+        rom = self._zip(tmp_path, "Game.zip", {"game.sfc": b"rom"})
+
+        _on("snes").launch(rom, None)
+
+        assert _stub_launch[-1][-1] == str(rom)
+        assert not (tmp_path / "msu1-cache").exists()
+
+    def test_another_platform_is_left_alone(self, tmp_path: Path, _stub_launch: list[list[str]]) -> None:
+        """Only SNES cores read MSU-1 data, so a `.pcm` in another platform's zip changes nothing."""
+        rom = self._zip(tmp_path, "Game.zip", {"game.gba": b"rom", "game-1.pcm": b"pcm"})
+
+        _on("gba").launch(rom, None)
+
+        assert _stub_launch[-1][-1] == str(rom)
+
+    def test_switched_off_boots_the_zip(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _stub_launch: list[list[str]]
+    ) -> None:
+        """With `RETROARCH_MSU1_CACHE_ENABLED` off the zip boots as is."""
+        monkeypatch.setattr(retroarch.settings, "RETROARCH_MSU1_CACHE_ENABLED", False)
+        rom = self._zip(tmp_path, "Game.zip", self._MSU1)
+
+        _on("snes").launch(rom, None)
+
+        assert _stub_launch[-1][-1] == str(rom)
+
+    def test_a_second_launch_reuses_the_extraction(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _stub_launch: list[list[str]]
+    ) -> None:
+        """The second launch neither lists nor extracts the archive again."""
+        rom = self._zip(tmp_path, "Game.zip", self._MSU1)
+        emu = _on("snes")
+        emu.launch(rom, None)
+        first = _stub_launch[-1][-1]
+
+        def refuse(*args: object, **kwargs: object) -> None:
+            raise AssertionError("the archive was touched again")
+
+        monkeypatch.setattr(retroarch.extraction_cache, "extract_archive", refuse)
+        monkeypatch.setattr(retroarch, "_archive_member_names", refuse)
+        emu.launch(rom, None)
+
+        assert _stub_launch[-1][-1] == first
+
+    def test_a_nested_game_with_shouted_extensions_is_normalized(
+        self, tmp_path: Path, _stub_launch: list[list[str]]
+    ) -> None:
+        """A nested ROM, `.MSU`/`.PCM` from Windows, and a dotted zip name all land under the zip's stem."""
+        rom = self._zip(
+            tmp_path,
+            "Aladdin (USA) (MSU1) [Hack v1.4].zip",
+            {
+                "Aladdin/aladdin.SFC": b"rom",
+                "Aladdin/aladdin.MSU": b"msu",
+                "Aladdin/aladdin-12.PCM": b"pcm",
+                "readme.txt": b"txt",
+            },
+        )
+
+        emu = _on("snes")
+        emu.launch(rom, None)
+
+        booted = Path(_stub_launch[-1][-1])
+        assert booted.name == "Aladdin (USA) (MSU1) [Hack v1.4].sfc"
+        assert emu._rom_base == rom.stem
+        assert (booted.parent / f"{rom.stem}.msu").is_file()
+        assert (booted.parent / f"{rom.stem}-12.pcm").is_file()
+
+    @pytest.mark.parametrize(
+        "members",
+        [
+            pytest.param(
+                {"a.sfc": b"r", "a.msu": b"m", "b.sfc": b"r", "b-1.pcm": b"p"}, id="two-msu1-roms"
+            ),
+            pytest.param({"tracks/game-1.pcm": b"p", "game.sfc": b"r"}, id="tracks-apart-from-rom"),
+            pytest.param({"../game.msu": b"m", "game.sfc": b"r"}, id="member-escapes"),
+        ],
+    )
+    def test_an_unusable_extraction_falls_back_to_the_zip(
+        self,
+        tmp_path: Path,
+        _stub_launch: list[list[str]],
+        caplog: pytest.LogCaptureFixture,
+        members: dict[str, bytes],
+    ) -> None:
+        """With no single ROM beside its MSU-1 data, the game still boots from the zip, and says why."""
+        rom = self._zip(tmp_path, "Game.zip", members)
+
+        with caplog.at_level(logging.WARNING):
+            _on("snes").launch(rom, None)
+
+        assert _stub_launch[-1][-1] == str(rom)
+        assert "without its MSU-1 data" in caplog.text
+
+    @pytest.mark.parametrize(
+        "members",
+        [
+            pytest.param(
+                {"a.sfc": b"r", "a.msu": b"m", "b.sfc": b"r", "b-1.pcm": b"p"}, id="two-msu1-roms"
+            ),
+            pytest.param({"tracks/game-1.pcm": b"p", "game.sfc": b"r"}, id="tracks-apart-from-rom"),
+            pytest.param({"game.sfc": b"r", "notes-1.pcm.txt": b"t"}, id="pcm-is-not-the-extension"),
+        ],
+    )
+    def test_an_unusable_layout_is_never_extracted(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        _stub_launch: list[list[str]],
+        members: dict[str, bytes],
+    ) -> None:
+        """A zip whose listing rules out an MSU-1 boot is never extracted, on any launch."""
+        rom = self._zip(tmp_path, "Game.zip", members)
+
+        def refuse(*args: object, **kwargs: object) -> None:
+            raise AssertionError("the archive was extracted")
+
+        monkeypatch.setattr(retroarch.extraction_cache, "extract_archive", refuse)
+        emu = _on("snes")
+        emu.launch(rom, None)
+        emu.launch(rom, None)
+
+        assert _stub_launch[-1][-1] == str(rom)
+
+    def test_a_rom_cache_copy_reuses_the_librarys_extraction(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _stub_launch: list[list[str]]
+    ) -> None:
+        """The ROM cache's local copy of a zip boots the extraction its library original already has."""
+        rom = self._zip(tmp_path, "Game.zip", self._MSU1)
+        monkeypatch.setattr(retroarch.settings, "ROM_ROOT", rom.parent)
+        monkeypatch.setattr(retroarch.settings, "ROM_CACHE_DIR", tmp_path / "rom-cache")
+        copy = tmp_path / "rom-cache" / "entry" / rom.name
+        copy.parent.mkdir(parents=True)
+        copy.write_bytes(rom.read_bytes())
+        emu = _on("snes")
+        emu.launch(rom, None)
+        first = _stub_launch[-1][-1]
+
+        def refuse(*args: object, **kwargs: object) -> None:
+            raise AssertionError("the copy was extracted again")
+
+        monkeypatch.setattr(retroarch.extraction_cache, "extract_archive", refuse)
+        emu.launch(copy, None)
+
+        assert _stub_launch[-1][-1] == first
+
+    def test_a_rom_cache_copy_of_a_plain_zip_still_boots_the_copy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _stub_launch: list[list[str]]
+    ) -> None:
+        """Without MSU-1 data the ROM cache's local copy boots, not the library zip it copies."""
+        rom = self._zip(tmp_path, "Game.zip", {"game.sfc": b"rom"})
+        monkeypatch.setattr(retroarch.settings, "ROM_ROOT", rom.parent)
+        monkeypatch.setattr(retroarch.settings, "ROM_CACHE_DIR", tmp_path / "rom-cache")
+        copy = tmp_path / "rom-cache" / "entry" / rom.name
+        copy.parent.mkdir(parents=True)
+        copy.write_bytes(rom.read_bytes())
+
+        _on("snes").launch(copy, None)
+
+        assert _stub_launch[-1][-1] == str(copy)
+
+    def test_a_corrupt_zip_boots_as_is(self, tmp_path: Path, _stub_launch: list[list[str]]) -> None:
+        """An archive that cannot be listed is left for RetroArch to report on."""
+        rom = tmp_path / "Game.zip"
+        rom.write_bytes(b"not a zip")
+
+        _on("snes").launch(rom, None)
+
+        assert _stub_launch[-1][-1] == str(rom)
+
+    def test_a_game_too_big_for_the_cache_boots_the_zip(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        _stub_launch: list[list[str]],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A cap smaller than the game refuses the extraction rather than filling the disk."""
+        monkeypatch.setattr(retroarch, "MSU1_CACHE_MAX_GB", 1e-9)
+        rom = self._zip(tmp_path, "Game.zip", {**self._MSU1, "game-2.pcm": b"p" * 4096})
+
+        with caplog.at_level(logging.WARNING):
+            _on("snes").launch(rom, None)
+
+        assert _stub_launch[-1][-1] == str(rom)
+        assert "without its MSU-1 data" in caplog.text
