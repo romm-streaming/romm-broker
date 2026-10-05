@@ -358,16 +358,9 @@ def _is_searchable_dir(path: Path) -> bool:
 def _folder_packages(folder: Path) -> list[Path]:
     """The `.pkg` and archive files a game folder with no eboot.bin could boot, best first.
 
-    RomM stores a game it found as a folder by the folder's path, so a lone
-    `.pkg` in a folder arrives here as the folder. Anything named as an update,
-    patch or DLC (in its own name or its subfolder's) ranks below the rest,
-    since a cumulative PS4 patch is often bigger than the game it patches.
-    Then a `.pkg` beats an archive, and among several the largest wins, which
-    is normally the base game. Anything under a dot-folder (a snapshot or
-    trash copy) is skipped without being listed. The search covers the
-    folder's top level and one subfolder down. A folder or a candidate that
-    cannot be read costs only itself, so one bad entry cannot hide the
-    folder's real `.pkg`.
+    Searches the top level and one subfolder down, skipping dot-names and
+    unreadable entries. Update/patch/DLC names rank last (a cumulative PS4
+    patch often outweighs its game), then `.pkg` beats archive, then largest.
 
     Args:
         folder: The game folder RomM handed over.
@@ -1371,10 +1364,8 @@ class Shadps4(Emulator):
             archive inside the folder (see `_folder_packages`), else the
             folder (shadPS4 appends eboot.bin to directory paths itself),
             or None when the path does not exist, resolves outside the ROM
-            library root, or is a `.pkg`/archive with the extraction cache
-            disabled. A folder with no eboot.bin is None as well when its
-            `.pkg`/archive needs the disabled cache, or when every one it
-            holds is refused.
+            library root, or is (or only holds) a `.pkg`/archive that is
+            refused or needs the disabled extraction cache.
         """
         rom_root = settings.rom_root()
         if path.is_file():
@@ -1436,9 +1427,8 @@ class Shadps4(Emulator):
             )
             return None
         for package in packages:
-            # Back through the file branch, so the .pkg gets the same
-            # containment check as one RomM handed over directly. A refused
-            # candidate moves on to the next rather than failing the folder.
+            # The file branch applies the containment check a direct .pkg gets;
+            # a refused candidate falls through to the next.
             if self.resolve_rom_file(package) is not None:
                 log.info(
                     "shadps4: %s has no eboot.bin, booting %s from it (%d candidate(s))",
