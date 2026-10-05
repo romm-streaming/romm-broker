@@ -576,6 +576,23 @@ ARCHIVE_LIST_TIMEOUT = 30.0
 """Seconds `7z l` gets to list a ROM archive for an untested core's extension check."""
 _ROM_SEARCH_GLOBS = ("*", "*/*")
 """Globs a ROM folder is searched with: its top level and one level of subfolders."""
+MSU1_CACHE_DIR = Path(os.environ.get("RETROARCH_MSU1_CACHE_DIR", str(RA_DATA_DIR / "msu1")))
+"""Where zipped MSU-1 games are extracted and booted from (env `RETROARCH_MSU1_CACHE_DIR`).
+
+Defaults to `msu1` under `RA_DATA_DIR`, outside the `states` and `saves`
+subtrees the save archive carries.
+"""
+MSU1_CACHE_MAX_GB = float(os.environ.get("RETROARCH_MSU1_CACHE_MAX_GB", "20"))
+"""Cap on the MSU-1 extraction cache in GB (env `RETROARCH_MSU1_CACHE_MAX_GB`, default 20).
+
+The least recently booted games are evicted to make room for a new one.
+"""
+_MSU1_PLATFORMS = frozenset({"snes", "sfam"})
+"""Platforms whose zipped games are checked for MSU-1 companions."""
+_MSU1_ROM_EXTS = (".sfc", ".smc")
+"""ROM formats an MSU-1 game ships as."""
+_MSU1_TRACK_RE = re.compile(r"-\d+\.pcm", re.IGNORECASE)
+"""The part of an MSU-1 audio track's name after the ROM's stem: `-<track>.pcm`."""
 _ADDON_RE = re.compile(
     r"(?:^|[^a-z0-9])(?:update|upd|dlc|patch)(?:[^a-z0-9]|$)", re.IGNORECASE
 )
@@ -1675,6 +1692,155 @@ def _archive_holds_content(path: Path, profile: Mapping[str, Any]) -> bool:
         "retroarch: %s holds nothing among core %s's extensions %s", path.name, profile["core"], extensions
     )
     return False
+
+
+def _is_msu1_companion(stem: str, name: str) -> bool:
+    """Whether `name` is MSU-1 data Snes9x opens for a ROM named `stem`: `<stem>.msu` or `<stem>-N.pcm`.
+
+    Matched case-insensitively on the extension, since an archive made on
+    Windows may carry `.MSU` or `.PCM`.
+
+    Args:
+        stem: The ROM's file name without its extension.
+        name: A file name, without its folders.
+
+    Returns:
+        True for the ROM's `.msu` data file or one of its `-<track>.pcm` tracks.
+    """
+    if not name.startswith(stem):
+        return False
+    rest = name[len(stem):]
+    return rest.lower() == ".msu" or _MSU1_TRACK_RE.fullmatch(rest) is not None
+
+
+def _holds_msu1(archive: Path) -> bool:
+    """Whether an archive holds the one ROM with MSU-1 data beside it that `_stage_msu1` boots.
+
+    Judged from the member list, so an archive `_stage_msu1` would reject is
+    never extracted, on this launch or any later one.
+
+    Args:
+        archive: A `.zip` or `.7z`.
+
+    Returns:
+        True when exactly one ROM, at the top or one folder down as
+        `_ROM_SEARCH_GLOBS` searches, has MSU-1 data beside it; False
+        otherwise, or when the archive cannot be listed.
+    """
+    members = [PurePosixPath(m.replace("\\", "/")) for m in _archive_member_names(archive) or []]
+    roms = [
+        p
+        for p in members
+        if p.suffix.lower() in _MSU1_ROM_EXTS
+        and len(p.parts) <= 2
+        and any(q.parent == p.parent and _is_msu1_companion(p.stem, q.name) for q in members)
+    ]
+    if len(roms) != 1 and any(p.suffix.lower() in (".msu", ".pcm") for p in members):
+        log.warning(
+            "retroarch: booting %s without its MSU-1 data: want one ROM with MSU-1 data beside it, found %s",
+            archive.name,
+            ", ".join(sorted(str(p) for p in roms)) or "none",
+        )
+    return len(roms) == 1
+
+
+def _msu1_companions(rom: Path) -> list[Path]:
+    """The files Snes9x opens beside `rom` for MSU-1: `<stem>.msu` and `<stem>-N.pcm`.
+
+    Args:
+        rom: The ROM file.
+
+    Returns:
+        The companions in `rom`'s folder, empty when it has none.
+    """
+    return [
+        sibling
+        for sibling in rom.parent.iterdir()
+        if sibling != rom and _is_msu1_companion(rom.stem, sibling.name) and sibling.is_file()
+    ]
+
+
+def _msu1_rom(folder: Path) -> Optional[Path]:
+    """The ROM to boot out of an MSU-1 extraction: the one top-level ROM with companions.
+
+    Args:
+        folder: The extraction, after `_stage_msu1` moved the game to its top.
+
+    Returns:
+        The ROM, or None when no top-level ROM, or more than one, has MSU-1 data beside it.
+    """
+    try:
+        roms = [
+            f for f in folder.iterdir()
+            if f.suffix.lower() in _MSU1_ROM_EXTS and f.is_file() and _msu1_companions(f)
+        ]
+    except OSError as exc:
+        log.warning("retroarch: could not read the MSU-1 extraction %s: %s", folder, exc)
+        return None
+    return roms[0] if len(roms) == 1 else None
+
+
+def _stage_msu1(archive: Path, staged: Path, scratch: Path, emulator: Emulator, kept_bytes: int) -> None:
+    """Extract an MSU-1 archive and name the game after the archive, at the extraction's top.
+
+    RetroArch names the `.srm` and states after the content path it was
+    given, so the zip's own stem is what every save this game already has is
+    called. Booting the member under its own name would orphan them. The ROM
+    and its companions are moved to `<archive stem>.sfc`, `.msu` and `-N.pcm`
+    together, since Snes9x finds the companions by the ROM's stem.
+
+    Args:
+        archive: The zipped game.
+        staged: The scratch folder the extraction goes into.
+        scratch: The scratch folder holding `staged`; unused.
+        emulator: The launching emulator; unused.
+        kept_bytes: The extraction's budgeted size; unused.
+
+    Raises:
+        RuntimeError: When the extraction fails, or holds no ROM, or several,
+            with MSU-1 data beside it.
+    """
+    extraction_cache.extract_archive(archive, staged, MSU1_EXTRACT_TIMEOUT, owner="retroarch")
+    roms = [
+        f
+        for pattern in _ROM_SEARCH_GLOBS
+        for f in staged.glob(pattern)
+        if f.suffix.lower() in _MSU1_ROM_EXTS and f.is_file() and _msu1_companions(f)
+    ]
+    if len(roms) != 1:
+        names = ", ".join(sorted(f.name for f in roms)) or "none"
+        raise RuntimeError(f"want one ROM with MSU-1 data beside it, found {names}")
+    rom = roms[0]
+    for member in [*_msu1_companions(rom), rom]:
+        member.replace(staged / f"{archive.stem}{member.name[len(rom.stem):].lower()}")
+
+
+MSU1_EXTRACT_TIMEOUT = 1800.0
+"""Seconds `7z` gets to extract an MSU-1 archive, which can run to most of a gigabyte."""
+
+_MSU1_CACHE = extraction_cache.ExtractionCache(
+    name="retroarch msu1",
+    cache_dir=lambda: MSU1_CACHE_DIR,
+    enabled=lambda: settings.RETROARCH_MSU1_CACHE_ENABLED,
+    max_gb=lambda: MSU1_CACHE_MAX_GB,
+    find_boot_target=_msu1_rom,
+    stage=_stage_msu1,
+    extract_timeout=lambda: MSU1_EXTRACT_TIMEOUT,
+    missing_target_error="held no ROM with MSU-1 data beside it",
+)
+"""Extracts zipped MSU-1 games into MSU1_CACHE_DIR, one folder per archive, reused on every later launch."""
+
+
+def sweep_stale_extractions() -> None:
+    """Remove MSU-1 extraction scratch dirs orphaned by a crashed broker process.
+
+    Call once at broker startup, so the space is reclaimed before the first
+    launch rather than only when the next extraction happens to run.
+    """
+    try:
+        _MSU1_CACHE.sweep_stale_extractions()
+    except (RuntimeError, OSError) as exc:
+        log.warning("retroarch msu1 cache: startup scratch sweep skipped: %s", exc)
 
 
 def _pick_rom_file(candidates: Iterable[Path], base: Path, extensions: tuple[str, ...]) -> Optional[Path]:
@@ -2933,6 +3099,7 @@ class Retroarch(Emulator):
         if "/" not in binary and shutil.which(binary, path=launch_path) is None:
             raise RuntimeError(f"retroarch binary not found in PATH ({launch_path}): {binary}")
 
+        rom_path = self._msu1_boot_path(rom_path)
         self._rom_base = rom_path.stem
         # A fresh process starts on whatever slot the config left it on.
         self._slot_homed = False
@@ -2979,6 +3146,39 @@ class Retroarch(Emulator):
                     resume_slot,
                     self.platform,
                 )
+
+    def _msu1_boot_path(self, rom_path: Path) -> Path:
+        """The file to boot for `rom_path`: an MSU-1 extraction for a zipped MSU-1 game, else itself.
+
+        Snes9x finds MSU-1 audio and video beside the ROM on disk, so a zip
+        RetroArch opens itself boots silent. Its extraction keeps the zip's
+        stem, so saves and states keep their names. A game that cannot be
+        extracted still boots from the zip, without the MSU-1 data.
+
+        Args:
+            rom_path: The file `launch` was handed.
+
+        Returns:
+            The extracted ROM, or `rom_path` unchanged.
+        """
+        if (
+            not settings.RETROARCH_MSU1_CACHE_ENABLED
+            or (self.platform or "").lower() not in _MSU1_PLATFORMS
+            or rom_path.suffix.lower() not in RA_ARCHIVE_EXTS
+        ):
+            return rom_path
+        # A ROM cache copy keys its extraction differently from the library
+        # zip it copies, so the library zip is extracted, once, for both.
+        library = rom_cache.logical(rom_path)
+        source = library if library != rom_path and library.is_file() else rom_path
+        # Already extracted means it held MSU-1 data, so only a new archive is listed.
+        if _MSU1_CACHE.entry_dir(source) is None and not _holds_msu1(source):
+            return rom_path
+        try:
+            return _MSU1_CACHE.extract(source, self)
+        except (RuntimeError, OSError) as exc:
+            log.warning("retroarch: booting %s without its MSU-1 data: %s", rom_path.name, exc)
+            return rom_path
 
     def _deferred_load_state(self, slot: int, seq: int) -> None:
         """Load `slot` once RetroArch reports the content PLAYING.

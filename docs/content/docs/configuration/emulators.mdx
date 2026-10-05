@@ -162,6 +162,9 @@ written) sits at the root of that folder, and saves live under
 | `RETROARCH_CORE_INFO_URL` | `https://buildbot.libretro.com/assets/frontend/info.zip` | Where a refresh downloads the core-info zip from. |
 | `RETROARCH_CORE_INDEX_URL` | `https://buildbot.libretro.com/nightly/linux/x86_64/latest/.index` | Where a refresh downloads the x86_64 build index from. |
 | `RETROARCH_DATA_DIR` | `/config/.retroarch` | Broker-managed `states/`, `saves/` and the `broker.cfg` layered on with `--appendconfig`. |
+| `RETROARCH_MSU1_CACHE_ENABLED` | `true` | Whether a zipped MSU-1 SNES or Super Famicom game is extracted before it boots. Snes9x reads a game's `.msu` data and `-N.pcm` audio tracks from beside the ROM on disk, so a zip handed to RetroArch boots without its MSU-1 music and video. The first launch extracts the archive into `RETROARCH_MSU1_CACHE_DIR`, renames the ROM and its tracks after the zip so saves and states keep their names, and every later launch reuses it. A zip with no `.msu` or `.pcm` member boots as before. Off, or when the extraction fails, the zip boots as is, without the MSU-1 data. |
+| `RETROARCH_MSU1_CACHE_DIR` | `$RETROARCH_DATA_DIR/msu1` | Where a kept MSU-1 extraction is cached. Broker-owned scratch, outside the save archive. |
+| `RETROARCH_MSU1_CACHE_MAX_GB` | `20` | Ceiling on the cache's total size; the least recently booted game is evicted first once a new one would exceed it. A game that still doesn't fit, or exceeds the free space on the filesystem, boots from its zip instead. |
 | `RETROARCH_LOG_PATH` | `/config/retroarch.log` | Where RetroArch's stdout/stderr is captured. |
 | `RETROARCH_JOYPAD_DRIVER` | `linuxraw` | Joypad driver forced at launch; the udev driver sees the selkies pads as one device plugged eight times. Set empty to leave the user's own driver alone. |
 | `RETROARCH_STATE_SLOT` | `0` | The slot RetroArch works in; 0 is its default, so the player's own load hotkey reaches the same file. |
