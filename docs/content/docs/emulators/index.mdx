@@ -69,15 +69,13 @@ own `libretro_directory`. That's also where RetroArch keeps the matching
 `.info` file for each core, so a core placed anywhere else has no matching
 info file, and checking its status (`GET_STATUS`) then crashes RetroArch
 mid-session (a segfault, a crash from the program touching memory it isn't
-allowed to). The broker installs a missing `.info` from its core-info catalog
-and leaves an existing one alone, unless that file has no `systemid` value. An
-older info file without one crashes `GET_STATUS` the same way (NeoCD, FreeChaF
-and EmuSCV only gained it in August 2026), so the broker replaces it with the
-catalog's copy when that copy has one, and logs a warning either way. RetroArch
-also caches core info in `core_info.cache` in the same directory and keeps
-using a core's cached entry after its `.info` changes, so whenever the broker
-writes an `.info` it also drops a `core_info.refresh` file there, which makes
-RetroArch re-read every `.info` on its next start. The broker never edits your
+allowed to). The broker installs a missing `.info` and leaves an existing one
+alone unless it has no `systemid` value, which crashes `GET_STATUS` the same
+way (NeoCD, FreeChaF and EmuSCV only gained one in August 2026). Then the
+broker replaces it with its catalog's copy, when that has one, and logs a
+warning. After writing an
+`.info` it also drops a `core_info.refresh` file there, so RetroArch rebuilds
+its `core_info.cache` on the next start. The broker never edits your
 RetroArch config directly; it only layers extra settings on top with
 `--appendconfig`. That layer also turns off
 `config_save_on_exit`. Left on (RetroArch's default), a clean quit writes the

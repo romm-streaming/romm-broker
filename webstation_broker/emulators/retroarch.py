@@ -773,29 +773,17 @@ def _ensure_core(core: str, source: Optional[dict[str, Any]] = None) -> Path:
 
 
 _SYSTEM_ID_LINE = re.compile(rb'^[ \t]*systemid[ \t]*=[ \t]*(?:"[^"\r\n]|[^"\s])', re.MULTILINE)
-"""A `systemid` assignment with a non-empty value, quoted or bare.
-
-RetroArch skips an empty value (`systemid = ""`) and leaves `system_id` NULL,
-so a bare key match is not enough.
-"""
+"""A non-empty `systemid` value; RetroArch leaves `system_id` NULL for `systemid = ""`."""
 
 CORE_INFO_REFRESH = "core_info.refresh"
-"""The marker RetroArch's core-info cache checks for in `libretro_info_path`.
-
-With `core_info_cache_enable` on (RetroArch's default), cores are looked up in
-`core_info.cache` by file name alone, so a rewritten `.info` is ignored until
-this file makes the next start re-read every `.info` and rebuild the cache.
-"""
+"""Makes RetroArch rebuild `core_info.cache`, which otherwise ignores a rewritten `.info`."""
 
 
 def _names_system_id(info: bytes) -> bool:
     """Whether a core's `.info` sets a non-empty `systemid`.
 
-    RetroArch 1.22.2's `GET_STATUS` copies the core info's `system_id` with no
-    NULL check, so a loaded core whose `.info` lacks the key segfaults
-    RetroArch on the broker's first status poll. libretro only added it for
-    NeoCD, FreeChaF and EmuSCV on 2026-08-25, so older copies of those files
-    still lack it.
+    RetroArch 1.22.2's `GET_STATUS` segfaults on a core without one, and
+    NeoCD, FreeChaF and EmuSCV only gained it upstream on 2026-08-25.
 
     Args:
         info: The `.info` file's bytes.
@@ -811,11 +799,8 @@ def _ensure_core_info(core: str, *, tier: str, has_source: bool) -> None:
 
     `CORES_DIR` is also RetroArch's `libretro_info_path`, and a core loaded
     without its info file leaves the core info unset, after which
-    `GET_STATUS` segfaults RetroArch mid-session. An existing file is left
-    alone unless it lacks `systemid`, which crashes `GET_STATUS` the same way;
-    then the catalog's copy replaces it, when that copy has one. Every write
-    also drops `CORE_INFO_REFRESH`, since RetroArch otherwise keeps serving
-    the core's old entry out of `core_info.cache`.
+    `GET_STATUS` segfaults RetroArch mid-session. An existing file without a
+    `systemid` crashes it the same way, so the catalog's copy replaces it.
 
     Args:
         core: The core name.
