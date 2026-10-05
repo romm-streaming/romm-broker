@@ -772,11 +772,24 @@ def _ensure_core(core: str, source: Optional[dict[str, Any]] = None) -> Path:
     return so
 
 
-_SYSTEM_ID_LINE = re.compile(rb"^[ \t]*systemid[ \t]*=", re.MULTILINE)
+_SYSTEM_ID_LINE = re.compile(rb'^[ \t]*systemid[ \t]*=[ \t]*(?:"[^"\r\n]|[^"\s])', re.MULTILINE)
+"""A `systemid` assignment with a non-empty value, quoted or bare.
+
+RetroArch skips an empty value (`systemid = ""`) and leaves `system_id` NULL,
+so a bare key match is not enough.
+"""
+
+CORE_INFO_REFRESH = "core_info.refresh"
+"""The marker RetroArch's core-info cache checks for in `libretro_info_path`.
+
+With `core_info_cache_enable` on (RetroArch's default), cores are looked up in
+`core_info.cache` by file name alone, so a rewritten `.info` is ignored until
+this file makes the next start re-read every `.info` and rebuild the cache.
+"""
 
 
 def _names_system_id(info: bytes) -> bool:
-    """Whether a core's `.info` sets `systemid`.
+    """Whether a core's `.info` sets a non-empty `systemid`.
 
     RetroArch 1.22.2's `GET_STATUS` copies the core info's `system_id` with no
     NULL check, so a loaded core whose `.info` lacks the key segfaults
@@ -788,7 +801,7 @@ def _names_system_id(info: bytes) -> bool:
         info: The `.info` file's bytes.
 
     Returns:
-        True when a `systemid` line is present.
+        True when a `systemid` line with a non-empty value is present.
     """
     return _SYSTEM_ID_LINE.search(info) is not None
 
@@ -800,7 +813,9 @@ def _ensure_core_info(core: str, *, tier: str, has_source: bool) -> None:
     without its info file leaves the core info unset, after which
     `GET_STATUS` segfaults RetroArch mid-session. An existing file is left
     alone unless it lacks `systemid`, which crashes `GET_STATUS` the same way;
-    then the catalog's copy replaces it, when that copy has one.
+    then the catalog's copy replaces it, when that copy has one. Every write
+    also drops `CORE_INFO_REFRESH`, since RetroArch otherwise keeps serving
+    the core's old entry out of `core_info.cache`.
 
     Args:
         core: The core name.
@@ -857,6 +872,17 @@ def _ensure_core_info(core: str, *, tier: str, has_source: bool) -> None:
         log.error("retroarch: info file %s could not be installed: %s", dest.name, exc)
         raise RuntimeError(f"failed to install {dest.name}: {exc}") from exc
     log.info("retroarch: installed %s", dest.name)
+    if not _names_system_id(data):
+        log.warning("retroarch: %s has no systemid; RetroArch may crash on status", dest.name)
+    try:
+        (CORES_DIR / CORE_INFO_REFRESH).touch()
+    except OSError as exc:
+        log.warning(
+            "retroarch: could not mark the core-info cache stale, RetroArch may keep the old "
+            "entry for %s: %s",
+            core,
+            exc,
+        )
 
 
 def _ensure_core_assets(assets: dict[str, str]) -> None:
