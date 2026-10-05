@@ -772,12 +772,35 @@ def _ensure_core(core: str, source: Optional[dict[str, Any]] = None) -> Path:
     return so
 
 
+_SYSTEM_ID_LINE = re.compile(rb"^[ \t]*systemid[ \t]*=", re.MULTILINE)
+
+
+def _names_system_id(info: bytes) -> bool:
+    """Whether a core's `.info` sets `systemid`.
+
+    RetroArch 1.22.2's `GET_STATUS` copies the core info's `system_id` with no
+    NULL check, so a loaded core whose `.info` lacks the key segfaults
+    RetroArch on the broker's first status poll. libretro only added it for
+    NeoCD, FreeChaF and EmuSCV on 2026-08-25, so older copies of those files
+    still lack it.
+
+    Args:
+        info: The `.info` file's bytes.
+
+    Returns:
+        True when a `systemid` line is present.
+    """
+    return _SYSTEM_ID_LINE.search(info) is not None
+
+
 def _ensure_core_info(core: str, *, tier: str, has_source: bool) -> None:
     """Make sure `<core>_libretro.info` sits beside the core in `CORES_DIR`.
 
     `CORES_DIR` is also RetroArch's `libretro_info_path`, and a core loaded
     without its info file leaves the core info unset, after which
-    `GET_STATUS` segfaults RetroArch mid-session.
+    `GET_STATUS` segfaults RetroArch mid-session. An existing file is left
+    alone unless it lacks `systemid`, which crashes `GET_STATUS` the same way;
+    then the catalog's copy replaces it, when that copy has one.
 
     Args:
         core: The core name.
@@ -791,14 +814,35 @@ def _ensure_core_info(core: str, *, tier: str, has_source: bool) -> None:
             the core is not a `core_source` one; or it cannot be written.
     """
     dest = CORES_DIR / f"{core}_libretro.info"
+    stale = False
     if dest.is_file():
-        return
+        try:
+            if _names_system_id(dest.read_bytes()):
+                return
+        except OSError as exc:
+            log.warning(
+                "retroarch: could not read %s to check its systemid; RetroArch may crash on "
+                "status: %s",
+                dest,
+                exc,
+            )
+            return
+        stale = True
     catalog = (
         retroarch_cores.load_bundled_catalog()
         if tier in ("default", "vetted")
         else retroarch_cores.catalog()
     )
     data = catalog.info_file(core)
+    if stale:
+        if data is None or not _names_system_id(data):
+            log.warning(
+                "retroarch: %s has no systemid and the catalog has none to replace it with; "
+                "RetroArch may crash on status",
+                dest.name,
+            )
+            return
+        log.warning("retroarch: %s has no systemid, replacing it with the catalog's", dest.name)
     if data is None:
         if has_source:
             log.warning(
