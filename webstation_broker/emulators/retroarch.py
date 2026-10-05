@@ -832,8 +832,7 @@ def _ensure_core_info(core: str, *, tier: str, has_source: bool) -> None:
     stale = False
     if dest.is_file():
         try:
-            if _names_system_id(dest.read_bytes()):
-                return
+            existing = dest.read_bytes()
         except OSError as exc:
             log.warning(
                 "retroarch: could not read %s to check its systemid; RetroArch may crash on "
@@ -842,6 +841,8 @@ def _ensure_core_info(core: str, *, tier: str, has_source: bool) -> None:
                 exc,
             )
             return
+        if _names_system_id(existing):
+            return
         stale = True
     catalog = (
         retroarch_cores.load_bundled_catalog()
@@ -849,15 +850,14 @@ def _ensure_core_info(core: str, *, tier: str, has_source: bool) -> None:
         else retroarch_cores.catalog()
     )
     data = catalog.info_file(core)
-    if stale:
-        if data is None or not _names_system_id(data):
-            log.warning(
-                "retroarch: %s has no systemid and the catalog has none to replace it with; "
-                "RetroArch may crash on status",
-                dest.name,
-            )
-            return
-        log.warning("retroarch: %s has no systemid, replacing it with the catalog's", dest.name)
+    has_id = data is not None and _names_system_id(data)
+    if stale and not has_id:
+        log.warning(
+            "retroarch: %s has no systemid and the catalog has none to replace it with; "
+            "RetroArch may crash on status",
+            dest.name,
+        )
+        return
     if data is None:
         if has_source:
             log.warning(
@@ -865,6 +865,10 @@ def _ensure_core_info(core: str, *, tier: str, has_source: bool) -> None:
             )
             return
         raise RuntimeError(f"no {dest.name} in the core-info catalog")
+    if not has_id:
+        log.warning("retroarch: %s has no systemid; RetroArch may crash on status", dest.name)
+    elif stale:
+        log.warning("retroarch: %s has no systemid, replacing it with the catalog's", dest.name)
     CORES_DIR.mkdir(parents=True, exist_ok=True)
     try:
         retroarch_cores._write_atomic(dest, data)
@@ -872,8 +876,6 @@ def _ensure_core_info(core: str, *, tier: str, has_source: bool) -> None:
         log.error("retroarch: info file %s could not be installed: %s", dest.name, exc)
         raise RuntimeError(f"failed to install {dest.name}: {exc}") from exc
     log.info("retroarch: installed %s", dest.name)
-    if not _names_system_id(data):
-        log.warning("retroarch: %s has no systemid; RetroArch may crash on status", dest.name)
     try:
         (CORES_DIR / CORE_INFO_REFRESH).touch()
     except OSError as exc:
