@@ -270,8 +270,9 @@ def test_resolve_ranks_a_larger_update_or_dlc_below_the_base_game(
     alone would boot the patch.
     """
     folder = _pkg_folder(rom_root, monkeypatch)
-    (folder / addon).parent.mkdir(parents=True, exist_ok=True)
-    (folder / addon).write_bytes(b"x" * 64)
+    addon_path = folder / addon
+    addon_path.parent.mkdir(parents=True, exist_ok=True)
+    addon_path.write_bytes(b"x" * 64)
     base_game = folder / "Game [CUSA00001].pkg"
     base_game.write_bytes(b"x" * 16)
 
@@ -323,13 +324,17 @@ def test_resolve_keeps_the_folder_pkg_when_another_candidate_cannot_be_read(
 
 
 def test_resolve_refuses_a_folder_pkg_when_the_cache_is_disabled(
-    rom_root: Path, monkeypatch: pytest.MonkeyPatch
+    rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A folder's .pkg is refused like a direct .pkg when the extraction cache is off."""
+    """With the cache off, a folder's .pkg is refused like a direct one, never logged as booting."""
     folder = _pkg_folder(rom_root, monkeypatch, cache_enabled=False)
     (folder / "game.pkg").write_bytes(b"x")
 
-    assert shadps4.Shadps4().resolve_rom_file(folder) is None
+    with caplog.at_level("INFO", logger=shadps4.log.name):
+        assert shadps4.Shadps4().resolve_rom_file(folder) is None
+
+    assert "booting" not in caplog.text
+    assert "SHADPS4_CACHE_ENABLED" in caplog.text
 
 
 def test_resolve_refuses_a_folder_pkg_that_symlinks_out_of_the_rom_root(
@@ -369,20 +374,6 @@ def test_resolve_falls_through_a_refused_folder_pkg_to_the_next(
     real.write_bytes(b"x")
 
     assert shadps4.Shadps4().resolve_rom_file(folder) == real
-
-
-def test_resolve_does_not_log_a_boot_for_a_refused_folder_pkg(
-    rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """With the cache off, the folder's .pkg is refused without first being logged as booting."""
-    folder = _pkg_folder(rom_root, monkeypatch, cache_enabled=False)
-    (folder / "game.pkg").write_bytes(b"x")
-
-    with caplog.at_level("INFO", logger=shadps4.log.name):
-        assert shadps4.Shadps4().resolve_rom_file(folder) is None
-
-    assert "booting" not in caplog.text
-    assert "SHADPS4_CACHE_ENABLED" in caplog.text
 
 
 def test_resolve_returns_nothing_for_a_path_that_is_neither_file_nor_folder(

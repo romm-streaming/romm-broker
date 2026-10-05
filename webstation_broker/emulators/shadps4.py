@@ -174,6 +174,8 @@ _ARCHIVE_EXTS = extraction_cache._ARCHIVE_EXTS
 ROM_EXTENSIONS = (".zar", ".bin", ".pkg") + _ARCHIVE_EXTS
 """Bootable formats: a game folder (eboot.bin inside it), a .zar archive, a raw
 .pkg, or a .7z/.zip/.rar archive holding one."""
+_CACHED_EXTS = (".pkg",) + _ARCHIVE_EXTS
+"""Formats that only boot by way of CACHE_DIR: a raw `.pkg`, or an archive holding one."""
 
 
 PKG_EXTRACTOR_BIN = os.environ.get("SHADPS4_PKG_EXTRACTOR_BIN", "pkg_extractor")
@@ -328,10 +330,29 @@ def _archive_pkg_member(root: Path) -> Optional[Path]:
     return None
 
 
-_FOLDER_SEARCH_GLOBS = ("*", "*/*")
-"""Where `_folder_packages` looks in a RomM game folder: its top level and one subfolder down."""
 _ADDON_RE = re.compile(r"(?:^|[^a-z0-9])(?:update|upd|dlc|patch)(?:[^a-z0-9]|$)", re.IGNORECASE)
 """Matches update and DLC names: they sit beside base games in library folders, and the base game boots."""
+
+
+def _visible_entries(directory: Path) -> list[Path]:
+    """`directory`'s entries, minus dot-names, or none when it cannot be listed."""
+    try:
+        return [p for p in directory.iterdir() if not p.name.startswith(".")]
+    except OSError as exc:
+        log.warning("pkg search: could not list %s: %s", directory, exc)
+        return []
+
+
+def _is_searchable_dir(path: Path) -> bool:
+    """Whether `path` is a folder to search, False when it cannot be read.
+
+    `Path.is_dir` lets an I/O error through, and one bad entry must not end the search.
+    """
+    try:
+        return path.is_dir()
+    except OSError as exc:
+        log.debug("pkg search: skipping %s: %s", path, exc)
+        return False
 
 
 def _folder_packages(folder: Path) -> list[Path]:
@@ -343,8 +364,10 @@ def _folder_packages(folder: Path) -> list[Path]:
     since a cumulative PS4 patch is often bigger than the game it patches.
     Then a `.pkg` beats an archive, and among several the largest wins, which
     is normally the base game. Anything under a dot-folder (a snapshot or
-    trash copy) is skipped. A pattern or a candidate that cannot be read costs
-    only itself, so one bad entry cannot hide the folder's real `.pkg`.
+    trash copy) is skipped without being listed. The search covers the
+    folder's top level and one subfolder down. A folder or a candidate that
+    cannot be read costs only itself, so one bad entry cannot hide the
+    folder's real `.pkg`.
 
     Args:
         folder: The game folder RomM handed over.
@@ -352,29 +375,22 @@ def _folder_packages(folder: Path) -> list[Path]:
     Returns:
         The candidates in boot preference order, empty when the folder holds none.
     """
+    top = _visible_entries(folder)
+    entries = top + [p for sub in top if _is_searchable_dir(sub) for p in _visible_entries(sub)]
     ranked: list[tuple[bool, bool, int, str, Path]] = []
-    for pattern in _FOLDER_SEARCH_GLOBS:
-        try:
-            matches = list(folder.glob(pattern))
-        except OSError as exc:
-            log.warning("pkg search: could not search %s for %s: %s", folder, pattern, exc)
+    for p in entries:
+        ext = p.suffix.lower()
+        if ext not in _CACHED_EXTS:
             continue
-        for p in matches:
-            ext = p.suffix.lower()
-            if ext != ".pkg" and ext not in _ARCHIVE_EXTS:
-                continue
-            rel = p.relative_to(folder)
-            if any(part.startswith(".") for part in rel.parts):
-                continue
-            try:
-                st = p.stat()
-            except OSError as exc:
-                log.debug("pkg search: skipping %s: %s", p, exc)
-                continue
-            if not stat.S_ISREG(st.st_mode):
-                continue
-            is_addon = _ADDON_RE.search(rel.as_posix()) is not None
-            ranked.append((is_addon, ext != ".pkg", -st.st_size, p.name.lower(), p))
+        try:
+            st = p.stat()
+        except OSError as exc:
+            log.debug("pkg search: skipping %s: %s", p, exc)
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        is_addon = _ADDON_RE.search(p.relative_to(folder).as_posix()) is not None
+        ranked.append((is_addon, ext != ".pkg", -st.st_size, p.name.lower(), p))
     return [entry[-1] for entry in sorted(ranked)]
 
 
@@ -1285,7 +1301,7 @@ class Shadps4(Emulator):
         """
         if settings.SHADPS4_CACHE_ENABLED:
             return ROM_EXTENSIONS
-        return tuple(e for e in ROM_EXTENSIONS if e != ".pkg" and e not in _ARCHIVE_EXTS)
+        return tuple(e for e in ROM_EXTENSIONS if e not in _CACHED_EXTS)
 
     def clear_working_slot(self, excluded: tuple[str, ...] = ()) -> None:
         """Drop the previous session's save data before this session's restore.
@@ -1372,7 +1388,7 @@ class Shadps4(Emulator):
             except OSError as exc:
                 log.warning("shadps4: could not resolve %s (%s)", path, exc)
                 return None
-            if not settings.SHADPS4_CACHE_ENABLED and path.suffix.lower() in (".pkg",) + _ARCHIVE_EXTS:
+            if not settings.SHADPS4_CACHE_ENABLED and path.suffix.lower() in _CACHED_EXTS:
                 log.warning(
                     "shadps4: refusing %s, %s needs the extraction cache "
                     "(set SHADPS4_CACHE_ENABLED=true to boot this format)",
@@ -1455,7 +1471,7 @@ class Shadps4(Emulator):
         if binary is None:
             raise RuntimeError(f"no shadps4 binary found under {VERSIONS_DIR}")
         ext = rom_path.suffix.lower()
-        if ext == ".pkg" or ext in _ARCHIVE_EXTS:
+        if ext in _CACHED_EXTS:
             boot = _extract_and_cache_pkg(rom_path, self)
         else:
             boot = rom_path
