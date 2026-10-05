@@ -327,6 +327,41 @@ def _archive_pkg_member(root: Path) -> Optional[Path]:
     return None
 
 
+_FOLDER_SEARCH_GLOBS = ("*", "*/*")
+"""Where `_folder_packages` looks in a RomM game folder: its top level and one subfolder down."""
+
+
+def _folder_packages(folder: Path) -> list[Path]:
+    """The `.pkg` and archive files a game folder with no eboot.bin could boot, best first.
+
+    RomM stores a game it found as a folder by the folder's path, so a lone
+    `.pkg` in a folder arrives here as the folder. A `.pkg` beats an archive,
+    and among several the largest wins: a folder carrying a game alongside its
+    update or DLC packages should boot the base game, which is the biggest.
+    Anything under a dot-folder (a snapshot or trash copy) is skipped.
+
+    Args:
+        folder: The game folder RomM handed over.
+
+    Returns:
+        The candidates in boot preference order, empty when the folder holds none.
+    """
+    ranked = []
+    for pattern in _FOLDER_SEARCH_GLOBS:
+        try:
+            for p in folder.glob(pattern):
+                ext = p.suffix.lower()
+                if ext != ".pkg" and ext not in _ARCHIVE_EXTS:
+                    continue
+                if any(part.startswith(".") for part in p.relative_to(folder).parts) or not p.is_file():
+                    continue
+                ranked.append((ext != ".pkg", -p.stat().st_size, p.name.lower(), p))
+        except OSError as exc:
+            log.debug("shadps4: could not search %s for a .pkg (%s): %s", folder, pattern, exc)
+            return []
+    return [entry[3] for entry in sorted(ranked)]
+
+
 def _require_room(peak_bytes: int, kept_bytes: int, rom_name: str) -> None:
     """Refuse an extraction that cannot fit before any of it is written.
 
@@ -1300,8 +1335,9 @@ class Shadps4(Emulator):
             path: A ROM file, or a game folder.
 
         Returns:
-            The file itself, the folder's `eboot.bin`, the folder when it
-            has none (shadPS4 appends eboot.bin to directory paths itself),
+            The file itself, the folder's `eboot.bin`, else the `.pkg` or
+            archive inside the folder (see `_folder_packages`), else the
+            folder (shadPS4 appends eboot.bin to directory paths itself),
             or None when the path does not exist, resolves outside the ROM
             library root, or is a `.pkg`/archive with the extraction cache
             disabled.
@@ -1355,7 +1391,29 @@ class Shadps4(Emulator):
         except OSError as exc:
             log.debug("shadps4: could not check %s while resolving the boot target: %s", eboot, exc)
             return None
-        return path  # shadps4 appends eboot.bin to directory paths itself
+        packages = _folder_packages(path)
+        if not packages:
+            return path  # shadps4 appends eboot.bin to directory paths itself
+        if not settings.SHADPS4_CACHE_ENABLED:
+            log.warning(
+                "shadps4: refusing %s, its .pkg/archive needs the extraction cache "
+                "(set SHADPS4_CACHE_ENABLED=true to boot this format)",
+                path.name,
+            )
+            return None
+        for package in packages:
+            # Back through the file branch, so the .pkg gets the same
+            # containment check as one RomM handed over directly. A refused
+            # candidate moves on to the next rather than failing the folder.
+            if self.resolve_rom_file(package) is not None:
+                log.info(
+                    "shadps4: %s has no eboot.bin, booting %s from it (%d candidate(s))",
+                    path.name,
+                    package.name,
+                    len(packages),
+                )
+                return package
+        return None
 
     def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
         """Spawn the newest shadPS4 with IPC enabled and boot the game.

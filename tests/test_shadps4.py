@@ -197,6 +197,125 @@ def test_resolve_falls_back_to_the_bare_folder_when_there_is_no_eboot(rom_root: 
     assert shadps4.Shadps4().resolve_rom_file(folder) == folder
 
 
+@pytest.mark.parametrize("ext", [".pkg", ".7z", ".zip", ".rar"])
+def test_resolve_picks_the_pkg_or_archive_inside_a_folder_without_eboot(
+    rom_root: Path, monkeypatch: pytest.MonkeyPatch, ext: str
+) -> None:
+    """A RomM folder holding a lone .pkg or archive resolves to that file, not the folder.
+
+    Returning the folder handed shadPS4 a directory with no eboot.bin and
+    never sent the .pkg through pkg_extractor.
+    """
+    monkeypatch.setattr(settings, "SHADPS4_CACHE_ENABLED", True)
+    folder = rom_root / "MyGame"
+    folder.mkdir()
+    (folder / "cover.jpg").write_bytes(b"")
+    rom = folder / f"MyGame{ext}"
+    rom.write_bytes(b"x")
+
+    assert shadps4.Shadps4().resolve_rom_file(folder) == rom
+
+
+def test_resolve_finds_a_pkg_one_level_down_in_a_folder(
+    rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A .pkg in a subfolder of the RomM folder is still found."""
+    monkeypatch.setattr(settings, "SHADPS4_CACHE_ENABLED", True)
+    sub = rom_root / "MyGame" / "CUSA00001"
+    sub.mkdir(parents=True)
+    pkg = sub / "game.pkg"
+    pkg.write_bytes(b"x")
+
+    assert shadps4.Shadps4().resolve_rom_file(rom_root / "MyGame") == pkg
+
+
+def test_resolve_prefers_the_largest_pkg_over_archives_in_a_folder(
+    rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With several candidates, a .pkg beats an archive and the largest .pkg (the base game) wins."""
+    monkeypatch.setattr(settings, "SHADPS4_CACHE_ENABLED", True)
+    folder = rom_root / "MyGame"
+    folder.mkdir()
+    (folder / "a-big.zip").write_bytes(b"x" * 64)
+    (folder / "b-patch.pkg").write_bytes(b"x" * 4)
+    base_game = folder / "c-base.pkg"
+    base_game.write_bytes(b"x" * 16)
+
+    assert shadps4.Shadps4().resolve_rom_file(folder) == base_game
+
+
+def test_resolve_refuses_a_folder_pkg_when_the_cache_is_disabled(
+    rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A folder's .pkg is refused like a direct .pkg when the extraction cache is off."""
+    monkeypatch.setattr(settings, "SHADPS4_CACHE_ENABLED", False)
+    folder = rom_root / "MyGame"
+    folder.mkdir()
+    (folder / "game.pkg").write_bytes(b"x")
+
+    assert shadps4.Shadps4().resolve_rom_file(folder) is None
+
+
+def test_resolve_refuses_a_folder_pkg_that_symlinks_out_of_the_rom_root(
+    rom_root: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A .pkg inside the folder that points outside the ROM root is refused."""
+    monkeypatch.setattr(settings, "SHADPS4_CACHE_ENABLED", True)
+    outside = tmp_path / "outside.pkg"
+    outside.write_bytes(b"x")
+    folder = rom_root / "MyGame"
+    folder.mkdir()
+    (folder / "game.pkg").symlink_to(outside)
+
+    assert shadps4.Shadps4().resolve_rom_file(folder) is None
+
+
+def test_resolve_skips_a_pkg_under_a_hidden_subfolder(
+    rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A larger .pkg under a dot-folder (a snapshot or trash copy) does not outrank the game's own."""
+    monkeypatch.setattr(settings, "SHADPS4_CACHE_ENABLED", True)
+    folder = rom_root / "MyGame"
+    (folder / ".snapshot").mkdir(parents=True)
+    (folder / ".snapshot" / "old.pkg").write_bytes(b"x" * 64)
+    game = folder / "game.pkg"
+    game.write_bytes(b"x")
+
+    assert shadps4.Shadps4().resolve_rom_file(folder) == game
+
+
+def test_resolve_falls_through_a_refused_folder_pkg_to_the_next(
+    rom_root: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A top-ranked .pkg that symlinks out of the ROM root is skipped, not fatal to the folder."""
+    monkeypatch.setattr(settings, "SHADPS4_CACHE_ENABLED", True)
+    outside = tmp_path / "outside.pkg"
+    outside.write_bytes(b"x" * 64)
+    folder = rom_root / "MyGame"
+    folder.mkdir()
+    (folder / "big.pkg").symlink_to(outside)
+    real = folder / "real.pkg"
+    real.write_bytes(b"x")
+
+    assert shadps4.Shadps4().resolve_rom_file(folder) == real
+
+
+def test_resolve_does_not_log_a_boot_for_a_refused_folder_pkg(
+    rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """With the cache off, the folder's .pkg is refused without first being logged as booting."""
+    monkeypatch.setattr(settings, "SHADPS4_CACHE_ENABLED", False)
+    folder = rom_root / "MyGame"
+    folder.mkdir()
+    (folder / "game.pkg").write_bytes(b"x")
+
+    with caplog.at_level("INFO", logger=shadps4.log.name):
+        assert shadps4.Shadps4().resolve_rom_file(folder) is None
+
+    assert "booting" not in caplog.text
+    assert "SHADPS4_CACHE_ENABLED" in caplog.text
+
+
 def test_resolve_returns_nothing_for_a_path_that_is_neither_file_nor_folder(
     rom_root: Path,
 ) -> None:
