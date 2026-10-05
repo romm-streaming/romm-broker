@@ -34,6 +34,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from collections.abc import Iterator
@@ -329,16 +330,21 @@ def _archive_pkg_member(root: Path) -> Optional[Path]:
 
 _FOLDER_SEARCH_GLOBS = ("*", "*/*")
 """Where `_folder_packages` looks in a RomM game folder: its top level and one subfolder down."""
+_ADDON_RE = re.compile(r"(?:^|[^a-z0-9])(?:update|upd|dlc|patch)(?:[^a-z0-9]|$)", re.IGNORECASE)
+"""Matches update and DLC names: they sit beside base games in library folders, and the base game boots."""
 
 
 def _folder_packages(folder: Path) -> list[Path]:
     """The `.pkg` and archive files a game folder with no eboot.bin could boot, best first.
 
     RomM stores a game it found as a folder by the folder's path, so a lone
-    `.pkg` in a folder arrives here as the folder. A `.pkg` beats an archive,
-    and among several the largest wins: a folder carrying a game alongside its
-    update or DLC packages should boot the base game, which is the biggest.
-    Anything under a dot-folder (a snapshot or trash copy) is skipped.
+    `.pkg` in a folder arrives here as the folder. Anything named as an update,
+    patch or DLC (in its own name or its subfolder's) ranks below the rest,
+    since a cumulative PS4 patch is often bigger than the game it patches.
+    Then a `.pkg` beats an archive, and among several the largest wins, which
+    is normally the base game. Anything under a dot-folder (a snapshot or
+    trash copy) is skipped. A pattern or a candidate that cannot be read costs
+    only itself, so one bad entry cannot hide the folder's real `.pkg`.
 
     Args:
         folder: The game folder RomM handed over.
@@ -346,20 +352,30 @@ def _folder_packages(folder: Path) -> list[Path]:
     Returns:
         The candidates in boot preference order, empty when the folder holds none.
     """
-    ranked = []
+    ranked: list[tuple[bool, bool, int, str, Path]] = []
     for pattern in _FOLDER_SEARCH_GLOBS:
         try:
-            for p in folder.glob(pattern):
-                ext = p.suffix.lower()
-                if ext != ".pkg" and ext not in _ARCHIVE_EXTS:
-                    continue
-                if any(part.startswith(".") for part in p.relative_to(folder).parts) or not p.is_file():
-                    continue
-                ranked.append((ext != ".pkg", -p.stat().st_size, p.name.lower(), p))
+            matches = list(folder.glob(pattern))
         except OSError as exc:
-            log.debug("shadps4: could not search %s for a .pkg (%s): %s", folder, pattern, exc)
-            return []
-    return [entry[3] for entry in sorted(ranked)]
+            log.warning("pkg search: could not search %s for %s: %s", folder, pattern, exc)
+            continue
+        for p in matches:
+            ext = p.suffix.lower()
+            if ext != ".pkg" and ext not in _ARCHIVE_EXTS:
+                continue
+            rel = p.relative_to(folder)
+            if any(part.startswith(".") for part in rel.parts):
+                continue
+            try:
+                st = p.stat()
+            except OSError as exc:
+                log.debug("pkg search: skipping %s: %s", p, exc)
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            is_addon = _ADDON_RE.search(rel.as_posix()) is not None
+            ranked.append((is_addon, ext != ".pkg", -st.st_size, p.name.lower(), p))
+    return [entry[-1] for entry in sorted(ranked)]
 
 
 def _require_room(peak_bytes: int, kept_bytes: int, rom_name: str) -> None:
@@ -1340,7 +1356,9 @@ class Shadps4(Emulator):
             folder (shadPS4 appends eboot.bin to directory paths itself),
             or None when the path does not exist, resolves outside the ROM
             library root, or is a `.pkg`/archive with the extraction cache
-            disabled.
+            disabled. A folder with no eboot.bin is None as well when its
+            `.pkg`/archive needs the disabled cache, or when every one it
+            holds is refused.
         """
         rom_root = settings.rom_root()
         if path.is_file():
