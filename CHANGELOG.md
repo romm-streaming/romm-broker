@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.2](https://github.com/romm-streaming/romm-broker/compare/v0.14.1...v0.14.2) (2026-10-06)
+
+
+### Bug Fixes
+
+* **retroarch:** replace core .info files missing systemid ([f49a95b](https://github.com/romm-streaming/romm-broker/commit/f49a95b2a01273e3c4a9edf6649c226ccb2aebec))
+
 ## [0.14.1](https://github.com/romm-streaming/romm-broker/compare/v0.14.0...v0.14.1) (2026-10-06)
 
 
