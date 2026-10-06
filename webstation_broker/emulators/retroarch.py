@@ -190,13 +190,13 @@ CORES_DIR = Path(
 """Where libretro cores are installed and loaded from.
 
 Taken from `RETROARCH_CORES_DIR`, else the `libretro_directory` in the user's
-config, else `cores` under `RA_BASE_DIR`, which is both the `libretro_directory`
-and the `libretro_info_path` RetroArch falls back to. A core has to land in the dir
-RetroArch also reads .info files from. Loading one from anywhere else leaves
-its core info unset, and `GET_STATUS` then segfaults RetroArch mid-session
-(1.22.2). Following the user's own `libretro_directory` is also what makes a
-downloaded core show up in the desktop RetroArch without its in-app core
-downloader.
+config, else `cores` under `RA_BASE_DIR`, which is RetroArch's own default
+`libretro_directory`. A core has to land in the dir RetroArch also reads .info
+files from, so the broker config pins `libretro_info_path` here. Loading one
+without its info leaves its core info unset, and `GET_STATUS` then segfaults
+RetroArch mid-session (1.22.2). Following the user's own `libretro_directory`
+is also what makes a downloaded core show up in the desktop RetroArch without
+its in-app core downloader.
 """
 SYSTEM_DIR = Path(
     os.environ.get("RETROARCH_SYSTEM_DIR")
@@ -772,12 +772,60 @@ def _ensure_core(core: str, source: Optional[dict[str, Any]] = None) -> Path:
     return so
 
 
+_SYSTEM_ID_LINE = re.compile(rb'^[ \t]*systemid[ \t]*=[ \t]*(?:"[^"\r\n]|[^"\s])', re.MULTILINE)
+"""A non-empty `systemid` value; RetroArch leaves `system_id` NULL for `systemid = ""`."""
+
+_SYSTEM_ID_LINES = re.compile(rb"^[ \t]*systemid[ \t]*=.*(?:\r?\n|$)", re.MULTILINE)
+"""Every `systemid` line, value and line ending included."""
+
+CORE_INFO_REFRESH = "core_info.refresh"
+"""Makes RetroArch rebuild `core_info.cache`, which otherwise ignores a rewritten `.info`."""
+
+
+def _names_system_id(info: bytes) -> bool:
+    """Whether a core's `.info` sets a non-empty `systemid`.
+
+    RetroArch 1.22.2's `GET_STATUS` segfaults on a core without one, and
+    NeoCD, FreeChaF and EmuSCV only gained it upstream on 2026-08-25.
+
+    Args:
+        info: The `.info` file's bytes.
+
+    Returns:
+        True when a `systemid` line with a non-empty value is present.
+    """
+    return _SYSTEM_ID_LINE.search(info) is not None
+
+
+def _with_system_id(info: bytes, core: str) -> bytes:
+    """A `.info` with `systemid` set to the core's name.
+
+    Any empty `systemid` line is dropped first, so the added one is the only
+    one. The value is only echoed back in `GET_STATUS PLAYING <systemid>,...`,
+    which the broker matches on its prefix, so the core name serves.
+
+    Args:
+        info: The `.info` file's bytes, without a non-empty `systemid`.
+        core: The core name.
+
+    Returns:
+        The file's bytes with a `systemid = "<core>"` line appended.
+    """
+    body = _SYSTEM_ID_LINES.sub(b"", info)
+    if body and not body.endswith(b"\n"):
+        body += b"\n"
+    return body + f'systemid = "{core}"\n'.encode()
+
+
 def _ensure_core_info(core: str, *, tier: str, has_source: bool) -> None:
     """Make sure `<core>_libretro.info` sits beside the core in `CORES_DIR`.
 
     `CORES_DIR` is also RetroArch's `libretro_info_path`, and a core loaded
     without its info file leaves the core info unset, after which
-    `GET_STATUS` segfaults RetroArch mid-session.
+    `GET_STATUS` segfaults RetroArch mid-session. An existing file without a
+    `systemid` crashes it the same way, so the catalog's copy replaces it.
+    When neither has one, as with a few dozen of libretro's own files,
+    the core's name is written in as its `systemid`.
 
     Args:
         core: The core name.
@@ -791,20 +839,41 @@ def _ensure_core_info(core: str, *, tier: str, has_source: bool) -> None:
             the core is not a `core_source` one; or it cannot be written.
     """
     dest = CORES_DIR / f"{core}_libretro.info"
+    existing = None
     if dest.is_file():
-        return
+        try:
+            existing = dest.read_bytes()
+        except OSError as exc:
+            log.warning(
+                "retroarch: could not read %s to check its systemid; RetroArch may crash on "
+                "status: %s",
+                dest,
+                exc,
+            )
+            return
+        if _names_system_id(existing):
+            return
     catalog = (
         retroarch_cores.load_bundled_catalog()
         if tier in ("default", "vetted")
         else retroarch_cores.catalog()
     )
     data = catalog.info_file(core)
-    if data is None:
-        if has_source:
-            log.warning(
-                "retroarch: core %s has no .info in the catalog; RetroArch may crash on status", core
-            )
-            return
+    if data is not None and _names_system_id(data):
+        if existing is not None:
+            log.warning("retroarch: %s has no systemid, replacing it with the catalog's", dest.name)
+    elif existing is not None:
+        log.warning("retroarch: %s has no systemid, adding %r", dest.name, core)
+        data = _with_system_id(existing, core)
+    elif data is not None:
+        log.info("retroarch: the catalog's %s has no systemid, adding %r", dest.name, core)
+        data = _with_system_id(data, core)
+    elif has_source:
+        log.warning(
+            "retroarch: core %s has no .info in the catalog; RetroArch may crash on status", core
+        )
+        return
+    else:
         raise RuntimeError(f"no {dest.name} in the core-info catalog")
     CORES_DIR.mkdir(parents=True, exist_ok=True)
     try:
@@ -813,6 +882,15 @@ def _ensure_core_info(core: str, *, tier: str, has_source: bool) -> None:
         log.error("retroarch: info file %s could not be installed: %s", dest.name, exc)
         raise RuntimeError(f"failed to install {dest.name}: {exc}") from exc
     log.info("retroarch: installed %s", dest.name)
+    try:
+        (CORES_DIR / CORE_INFO_REFRESH).touch()
+    except OSError as exc:
+        log.warning(
+            "retroarch: could not mark the core-info cache stale, RetroArch may keep the old "
+            "entry for %s: %s",
+            core,
+            exc,
+        )
 
 
 def _ensure_core_assets(assets: dict[str, str]) -> None:
@@ -978,6 +1056,10 @@ def _write_broker_cfg() -> Path:
         # are what this run's cores look for. Nothing on the command line names
         # it, and an --appendconfig key outranks the user's own config.
         f'system_directory = "{SYSTEM_DIR}"\n'
+        # The .info files and core_info.refresh go beside the cores; a user
+        # libretro_info_path elsewhere leaves the core without its info, and
+        # GET_STATUS then segfaults RetroArch (1.22.2).
+        f'libretro_info_path = "{CORES_DIR}"\n'
         f'savestate_directory = "{STATE_DIR}"\n'
         f'savefile_directory = "{SAVE_DIR}"\n'
         # RetroArch's shipped defaults, stated so a user config cannot move

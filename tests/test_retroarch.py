@@ -562,6 +562,17 @@ class TestBrokerConfig:
 
         assert f'system_directory = "{retroarch.SYSTEM_DIR}"' in cfg
 
+    def test_the_info_path_is_pinned_to_the_cores_dir(self) -> None:
+        """RetroArch reads .info files from where the broker writes them.
+
+        Probed on RetroArch 1.22.2: with the user's libretro_info_path on an
+        empty dir, GET_STATUS segfaulted 2 of 2 runs; with this key appended,
+        it replied PLAYING 2 of 2.
+        """
+        cfg = retroarch._write_broker_cfg().read_text()
+
+        assert f'libretro_info_path = "{retroarch.CORES_DIR}"' in cfg
+
     def test_retroarch_own_thumbnails_are_off(self) -> None:
         """The overlay turns RetroArch's save thumbnail off; the broker captures the frame itself."""
         cfg = retroarch._write_broker_cfg().read_text()
@@ -2685,40 +2696,189 @@ class TestCoreDownload:
 class TestCoreInfoInstall:
     """A core without its .info segfaults GET_STATUS."""
 
-    def test_missing_info_is_written_from_the_zip(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Written atomically next to the .so."""
+    @pytest.fixture(autouse=True)
+    def _cores_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Point CORES_DIR at the per-test temporary directory.
+
+        Args:
+            tmp_path: The per-test temporary directory.
+            monkeypatch: The pytest monkeypatch fixture.
+        """
         monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path)
+
+    @staticmethod
+    def _snes9x_catalog(keys: dict[str, str]) -> retroarch_cores.Catalog:
+        """A catalog holding only snes9x, with the given `.info` keys.
+
+        Args:
+            keys: The keys of snes9x's `.info`.
+
+        Returns:
+            The catalog.
+        """
+        return retroarch_cores.build_catalog(info_zip_bytes({"snes9x": keys}), "snes9x_libretro.so.zip")
+
+    def test_missing_info_is_written_from_the_zip(self, tmp_path: Path) -> None:
+        """Written atomically next to the .so."""
         retroarch._ensure_core_info("snes9x", tier="default", has_source=False)
         expected = retroarch_cores.load_bundled_catalog().info_file("snes9x")
         assert (tmp_path / "snes9x_libretro.info").read_bytes() == expected
         assert (tmp_path / "snes9x_libretro.info").stat().st_size > 0
         assert not list(tmp_path.glob(".*.tmp"))
 
-    def test_existing_info_is_left_alone(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """An operator's own .info is never overwritten."""
-        monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path)
-        (tmp_path / "snes9x_libretro.info").write_bytes(b"mine")
+    def test_existing_info_is_left_alone(self, tmp_path: Path) -> None:
+        """An operator's own .info is never overwritten while it names a systemid."""
+        mine = b'corename = "mine"\nsystemid = "super_nes"\n'
+        (tmp_path / "snes9x_libretro.info").write_bytes(mine)
         retroarch._ensure_core_info("snes9x", tier="default", has_source=False)
-        assert (tmp_path / "snes9x_libretro.info").read_bytes() == b"mine"
+        assert (tmp_path / "snes9x_libretro.info").read_bytes() == mine
+        assert not (tmp_path / retroarch.CORE_INFO_REFRESH).exists()
 
-    def test_core_source_core_without_info_only_logs(
+    def test_existing_info_without_systemid_is_replaced(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A .info from before libretro added NeoCD's systemid is swapped for the catalog's.
+
+        RetroArch 1.22.2's GET_STATUS copies the core info's system_id without a
+        NULL check, so the broker's first status poll segfaulted every NeoCD boot
+        while a hand-loaded game, which sends no GET_STATUS, ran fine.
+        """
+        bundled = retroarch_cores.load_bundled_catalog().info_file("neocd")
+        assert bundled is not None and b"systemid" in bundled
+        stale = b"\n".join(line for line in bundled.split(b"\n") if not line.startswith(b"systemid"))
+        (tmp_path / "neocd_libretro.info").write_bytes(stale)
+        with caplog.at_level(logging.WARNING):
+            retroarch._ensure_core_info("neocd", tier="default", has_source=False)
+        assert (tmp_path / "neocd_libretro.info").read_bytes() == bundled
+        assert "no systemid" in caplog.text
+
+    def test_a_written_info_marks_retroarchs_cache_stale(self, tmp_path: Path) -> None:
+        """RetroArch looks cores up in core_info.cache by file name, so a new .info needs a refresh.
+
+        Without the marker, a NeoCD entry cached while its .info had no systemid
+        keeps a NULL system_id after the file is replaced, and GET_STATUS still
+        segfaults.
+        """
+        (tmp_path / "neocd_libretro.info").write_bytes(b'corename = "old"\n')
+        retroarch._ensure_core_info("neocd", tier="default", has_source=False)
+        assert (tmp_path / retroarch.CORE_INFO_REFRESH).is_file()
+
+    def test_an_empty_systemid_counts_as_missing(self, tmp_path: Path) -> None:
+        """RetroArch skips `systemid = ""`, leaving system_id NULL, so the file is replaced."""
+        (tmp_path / "snes9x_libretro.info").write_bytes(b'corename = "mine"\nsystemid = ""\n')
+        retroarch._ensure_core_info("snes9x", tier="default", has_source=False)
+        expected = retroarch_cores.load_bundled_catalog().info_file("snes9x")
+        assert (tmp_path / "snes9x_libretro.info").read_bytes() == expected
+
+    @pytest.mark.parametrize(
+        ("info", "named"),
+        [
+            (b'systemid = "neo_geo_cd"\n', True),
+            (b"  systemid=neo_geo_cd\n", True),
+            (b'systemid = ""\n', False),
+            (b"systemid =\n", False),
+            (b"systemid =   \r\n", False),
+            (b'# systemid = "neo_geo_cd"\n', False),
+            (b'systemname = "Neo Geo CD"\n', False),
+        ],
+    )
+    def test_names_system_id(self, info: bytes, named: bool) -> None:
+        """Only a systemid line with a value counts."""
+        assert retroarch._names_system_id(info) is named
+
+    def test_info_without_systemid_gets_one_when_the_catalog_has_none_either(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
+        """Nothing better to put there, so the core's name goes in as its systemid."""
+        bare = self._snes9x_catalog({"corename": "Snes9x"})
+        monkeypatch.setattr(retroarch_cores, "load_bundled_catalog", lambda: bare)
+        (tmp_path / "snes9x_libretro.info").write_bytes(b'corename = "mine"')
+        with caplog.at_level(logging.WARNING):
+            retroarch._ensure_core_info("snes9x", tier="default", has_source=False)
+        assert (tmp_path / "snes9x_libretro.info").read_bytes() == (
+            b'corename = "mine"\nsystemid = "snes9x"\n'
+        )
+        assert "no systemid" in caplog.text
+        assert (tmp_path / retroarch.CORE_INFO_REFRESH).is_file()
+
+    def test_installing_an_info_without_systemid_adds_one(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The first launch is the one that crashes, so a fresh install gets a systemid too."""
+        monkeypatch.setattr(retroarch_cores, "_catalog", self._snes9x_catalog({"corename": "Snes9x"}))
+        retroarch._ensure_core_info("snes9x", tier="untested", has_source=False)
+        assert retroarch._names_system_id((tmp_path / "snes9x_libretro.info").read_bytes())
+
+    @pytest.mark.parametrize("core", ["cannonball", "easyrpg", "skyemu"])
+    def test_bundled_info_without_systemid_installs_with_one(self, core: str, tmp_path: Path) -> None:
+        """These cores' .info in libretro's zip has none; the installed copy names the core.
+
+        Probed on RetroArch 1.22.2 with gambatte: its .info with the systemid
+        line removed segfaulted on GET_STATUS 3 of 3 runs, and with
+        `systemid = "gambatte"` in its place replied PLAYING 3 of 3.
+        """
+        bundled = retroarch_cores.load_bundled_catalog().info_file(core)
+        assert bundled is not None and not retroarch._names_system_id(bundled)
+        retroarch._ensure_core_info(core, tier="untested", has_source=False)
+        installed = (tmp_path / f"{core}_libretro.info").read_bytes()
+        assert installed.startswith(bundled.rstrip(b"\n"))
+        assert installed.endswith(f'systemid = "{core}"\n'.encode())
+
+    @pytest.mark.parametrize(
+        ("info", "expected"),
+        [
+            (b'corename = "x"\n', b'corename = "x"\nsystemid = "x"\n'),
+            (b'corename = "x"', b'corename = "x"\nsystemid = "x"\n'),
+            (b'systemid = ""\ncorename = "x"\n', b'corename = "x"\nsystemid = "x"\n'),
+            (b'corename = "x"\r\n  systemid =\r\n', b'corename = "x"\r\nsystemid = "x"\n'),
+            (b"", b'systemid = "x"\n'),
+        ],
+    )
+    def test_with_system_id(self, info: bytes, expected: bytes) -> None:
+        """Empty systemid lines go, so the added one is the only one."""
+        assert retroarch._with_system_id(info, "x") == expected
+
+    def test_unreadable_info_stays_and_warns(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A .info the broker cannot read may lack its systemid, so the skipped check is visible."""
+        dest = tmp_path / "neocd_libretro.info"
+        dest.write_bytes(b"mine")
+
+        def refuse(self: Path) -> bytes:
+            raise PermissionError("denied")
+
+        with monkeypatch.context() as patch, caplog.at_level(logging.WARNING):
+            patch.setattr(Path, "read_bytes", refuse)
+            retroarch._ensure_core_info("neocd", tier="default", has_source=False)
+        assert dest.read_bytes() == b"mine"
+        assert "could not read" in caplog.text
+
+    def test_untested_info_without_systemid_is_replaced_from_the_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An untested core's stale .info comes from the refreshed cache, not the bundle."""
+        cached = self._snes9x_catalog({"corename": "Cached", "systemid": "super_nes"})
+        monkeypatch.setattr(retroarch_cores, "_catalog", cached)
+        (tmp_path / "snes9x_libretro.info").write_bytes(b'corename = "old"\n')
+        retroarch._ensure_core_info("snes9x", tier="untested", has_source=False)
+        assert (tmp_path / "snes9x_libretro.info").read_bytes() == cached.info_file("snes9x")
+
+    @pytest.mark.parametrize("core", ["neocd", "freechaf", "emuscv"])
+    def test_bundled_info_names_a_systemid(self, core: str) -> None:
+        """The three mapped cores libretro gave a systemid on 2026-08-25 have one in the bundle."""
+        info = retroarch_cores.load_bundled_catalog().info_file(core)
+        assert info is not None
+        assert retroarch._names_system_id(info)
+
+    def test_core_source_core_without_info_only_logs(self, caplog: pytest.LogCaptureFixture) -> None:
         """Azahar may not be in the zip; the launch goes on."""
-        monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path)
         with caplog.at_level(logging.WARNING):
             retroarch._ensure_core_info("nosuchcore", tier="default", has_source=True)
         assert "no .info" in caplog.text
 
-    def test_other_core_without_info_raises(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_other_core_without_info_raises(self) -> None:
         """Launching it would crash mid-session, so the launch fails now, naming the file."""
-        monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path)
         with pytest.raises(RuntimeError, match="nosuchcore_libretro.info"):
             retroarch._ensure_core_info("nosuchcore", tier="untested", has_source=False)
 
@@ -2727,11 +2887,7 @@ class TestCoreInfoInstall:
         self, tier: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A refreshed cache never supplies a default or vetted core's .info."""
-        monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path)
-        bogus = retroarch_cores.build_catalog(
-            info_zip_bytes({"snes9x": {"corename": "EVIL"}}), "snes9x_libretro.so.zip"
-        )
-        monkeypatch.setattr(retroarch_cores, "_catalog", bogus)
+        monkeypatch.setattr(retroarch_cores, "_catalog", self._snes9x_catalog({"corename": "EVIL"}))
         retroarch._ensure_core_info("snes9x", tier=tier, has_source=False)
         assert b"EVIL" not in (tmp_path / "snes9x_libretro.info").read_bytes()
 
@@ -2739,7 +2895,6 @@ class TestCoreInfoInstall:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A rename that fails cleans up its temp file rather than leaving a stray .info."""
-        monkeypatch.setattr(retroarch, "CORES_DIR", tmp_path)
 
         def refuse(src: Any, dst: Any) -> None:
             raise OSError("read-only")
@@ -2751,6 +2906,7 @@ class TestCoreInfoInstall:
 
         assert list(tmp_path.glob(".*.tmp")) == []
         assert not (tmp_path / "snes9x_libretro.info").is_file()
+        assert not (tmp_path / retroarch.CORE_INFO_REFRESH).exists()
 
 
 class TestSaveStateAgainstResume:

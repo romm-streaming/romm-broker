@@ -65,12 +65,22 @@ dc, saturn, psp, nds, 3ds, arcade and genesis). The
 platform-to-core mapping and what BIOS, firmware, or key file each one needs
 before it'll boot. If a core is missing, the broker downloads it from the
 libretro buildbot (libretro's server that hosts precompiled cores) into your
-own `libretro_directory`. That's also where RetroArch keeps the matching
-`.info` file for each core, so a core placed anywhere else has no matching
-info file, and checking its status (`GET_STATUS`) then crashes RetroArch
-mid-session (a segfault, a crash from the program touching memory it isn't
-allowed to). The broker never edits your RetroArch config directly; it only
-layers extra settings on top with `--appendconfig`. That layer also turns off
+own `libretro_directory`, and puts the core's `.info` file beside it. A core
+without its info file crashes RetroArch mid-session when the broker checks its
+status (`GET_STATUS`): a segfault, a crash from the program touching memory it
+isn't allowed to. So the broker's settings layer points RetroArch's
+`libretro_info_path` at that same folder for the session, whatever your
+`retroarch.cfg` says. The broker installs a missing `.info` and leaves an
+existing one alone unless it has no `systemid` value, which crashes
+`GET_STATUS` the same way (NeoCD, FreeChaF and EmuSCV only gained one in
+August 2026). Then the broker replaces it with its catalog's copy when that
+has a `systemid`, and otherwise adds `systemid = "<core>"` to the file, logging
+a warning either way. A few dozen of libretro's own `.info` files have no
+`systemid`, so a core installed from one gets the same line. After writing an
+`.info` it also drops a `core_info.refresh` file there, so RetroArch rebuilds
+its `core_info.cache` on the next start. The broker never edits your
+RetroArch config directly; it only layers extra settings on top with
+`--appendconfig`. That layer also turns off
 `config_save_on_exit`. Left on (RetroArch's default), a clean quit writes the
 merged config, broker settings included, back over your `retroarch.cfg`.
 Earlier broker versions left it on and could leave keys such as
