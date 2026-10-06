@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.14.1](https://github.com/romm-streaming/romm-broker/compare/v0.14.0...v0.14.1) (2026-10-06)
+
+
+### Bug Fixes
+
+* **retroarch:** boot zipped MSU-1 games with their audio tracks ([2f96fe1](https://github.com/romm-streaming/romm-broker/commit/2f96fe1069432c262d0b72a4ba9608a923ffb6b5))
+* **retroarch:** boot zipped MSU-1 games with their audio tracks ([d5a2284](https://github.com/romm-streaming/romm-broker/commit/d5a228403997e33243cf505ecf1fe686f36684c1))
+* **retroarch:** map atari-jaguar-cd to virtualjaguar ([c05e67b](https://github.com/romm-streaming/romm-broker/commit/c05e67bf7cb6b1fbb432dd3455c75f12776845c3))
+* **retroarch:** map atari-jaguar-cd to virtualjaguar ([878b4e4](https://github.com/romm-streaming/romm-broker/commit/878b4e431f2f937ec2621f00a5e6666bcff3dc5b))
+* **shadps4:** boot the .pkg inside a game folder that has no eboot.bin ([4fb3891](https://github.com/romm-streaming/romm-broker/commit/4fb3891eb6e2f1ddb95e4ac6f8fd7ff82d3ac123))
+* **shadps4:** boot the .pkg inside a game folder that has no eboot.bin ([b917b78](https://github.com/romm-streaming/romm-broker/commit/b917b7831524bbebfa6d8fb9c6646f7660ec58d1))
+* **shadps4:** pick a folder's base game by its PKG header, not its name ([c6f65d8](https://github.com/romm-streaming/romm-broker/commit/c6f65d85839ded58bfd320005820e9448c8693b1))
+* **shadps4:** rank update/DLC packages below the base game and survive unreadable entries ([2f25a6a](https://github.com/romm-streaming/romm-broker/commit/2f25a6ac3391c451ccd6af07654edb5f53893336))
+
+
+### Documentation
+
+* **retroarch:** tighten the menu docs against RetroArch 1.22.2 ([a16d6a5](https://github.com/romm-streaming/romm-broker/commit/a16d6a57ea5dce1bc0a43483fdad8cf5a424319a))
+* **retroarch:** tighten the menu docs against RetroArch 1.22.2 ([1462f7e](https://github.com/romm-streaming/romm-broker/commit/1462f7e9deb3e404c10d9036ee076d588c326f2b))
+* **shadps4:** trim the folder search docstrings, pr-ready step 4 (review-polish) ([0a71c8f](https://github.com/romm-streaming/romm-broker/commit/0a71c8f87d6a3d273a9107ac66c3bb839fdf7855))
+
 ## [0.14.0](https://github.com/romm-streaming/romm-broker/compare/v0.13.0...v0.14.0) (2026-10-03)
 
 
