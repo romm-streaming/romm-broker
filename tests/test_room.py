@@ -231,6 +231,79 @@ def test_a_disconnecting_viewer_releases_its_gamepad_but_keeps_its_seat(
     assert seat["slot"] is None
 
 
+def test_a_disconnecting_viewer_releases_every_gamepad_it_held(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A viewer holding several gamepads gives them all back to the tray on disconnect, in one notice."""
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+
+    viewer_public_id = session.find_viewer(viewer)["public_id"]
+    with _connect(client, controller) as host:
+        with _connect(client, viewer) as guest:
+            for slot in (2, 3):
+                host.send_json({"action": "assign_slot", "viewer_public_id": viewer_public_id, "slot": slot})
+            _wait_for_state(
+                guest,
+                lambda m: any(
+                    u["publicId"] == viewer_public_id and u["slot"] == [2, 3] for u in m["viewers"]
+                ),
+            )
+        while True:
+            message = host.receive_json()
+            if message["type"] == "gamepad_change" and "disconnected" in message["message"]:
+                break
+
+    assert message["message"].endswith("disconnected and was unassigned from Gamepads 2 and 3.")
+    assert session.find_viewer(viewer)["slot"] is None
+
+
+def test_the_host_releases_one_gamepad_and_its_holder_keeps_the_rest(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """Dragging one of a member's gamepads back to the tray takes that one alone."""
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+    viewer_public_id = session.find_viewer(viewer)["public_id"]
+
+    with _connect(client, controller) as host:
+        for slot in (2, 3):
+            host.send_json({"action": "assign_slot", "viewer_public_id": viewer_public_id, "slot": slot})
+        _wait_for_state(
+            host,
+            lambda m: any(u["publicId"] == viewer_public_id and u["slot"] == [2, 3] for u in m["viewers"]),
+        )
+        host.send_json({"action": "release_slot", "slot": 2})
+        _wait_for_state(
+            host,
+            lambda m: any(u["publicId"] == viewer_public_id and u["slot"] == 3 for u in m["viewers"]),
+        )
+
+    assert session.find_viewer(viewer)["slot"] == 3
+
+
+def test_only_the_host_releases_a_gamepad_and_only_one_in_range(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A release names one slot inside settings.GAMEPAD_SLOTS, and only the host may send one."""
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+    viewer_public_id = session.find_viewer(viewer)["public_id"]
+
+    with _connect(client, controller) as host, _connect(client, viewer) as guest:
+        host.send_json({"action": "assign_slot", "viewer_public_id": viewer_public_id, "slot": 2})
+        _wait_for_state(
+            host, lambda m: any(u["publicId"] == viewer_public_id and u["slot"] == 2 for u in m["viewers"])
+        )
+        guest.send_json({"action": "release_slot", "slot": 2})
+        for slot in (None, 0, settings.GAMEPAD_SLOTS + 1, "2", True, 1.5, [2]):
+            host.send_json({"action": "release_slot", "slot": slot})
+        host.send_json({"action": "video_state", "state": 1})
+        assert _next_control(host)["state"] == 1
+
+        assert session.find_viewer(viewer)["slot"] == 2
+
+
 def test_a_seat_reclaimed_mid_handshake_gets_the_new_socket_closed(
     client: TestClient,
     broker_dirs: dict[str, Path],
