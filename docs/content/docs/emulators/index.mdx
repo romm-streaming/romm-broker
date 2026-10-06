@@ -371,11 +371,12 @@ cache and the disk space an archive needs.
 
 A game folder with no `eboot.bin` is searched (its top level and one
 subfolder down) for a `.pkg` or archive, which then boots as if RomM had
-pointed at it directly. Anything with `update`, `patch` or `dlc` in its
-file or subfolder name is only picked when nothing else is there, since a
-PS4 patch can be bigger than the game it patches. After that a `.pkg` wins
-over an archive, and when there are several the largest is picked, since
-that's normally the base game.
+pointed at it directly. A `.pkg` whose header says it's the base game is
+picked first, and one whose header says it's a patch or DLC is picked last.
+Between those (archives, and a `.pkg` with no readable header), anything with
+`update`, `patch` or `dlc` in its file or subfolder name loses, since a PS4
+patch can be bigger than the game it patches. After that a `.pkg` wins over
+an archive, and when there are several the largest is picked.
 
 A [declared import](/docs/api/imports#what-each-emulator-takes) can bring in
 PS4 save folders. They are placed under the default user, whoever made them.

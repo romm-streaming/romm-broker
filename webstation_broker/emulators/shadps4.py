@@ -39,6 +39,7 @@ import subprocess
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
+from enum import IntEnum
 from pathlib import Path
 from threading import Lock
 from typing import Any, Optional, Union
@@ -334,6 +335,42 @@ _ADDON_RE = re.compile(r"(?:^|[^a-z0-9])(?:update|upd|dlc|patch)(?:[^a-z0-9]|$)"
 """Matches update and DLC names: they sit beside base games in library folders, and the base game boots."""
 
 
+class _PkgKind(IntEnum):
+    """What a PS4 `.pkg` header says the package is, in boot preference order."""
+
+    GAME = 0
+    UNKNOWN = 1
+    PATCH = 2
+    DLC = 3
+
+
+_PKG_MAGIC = b"\x7fCNT"
+"""The first four bytes of a PS4 `.pkg`."""
+_PKG_HEADER_LEN = 0x7C
+"""Enough of the header to hold the content type (0x74) and content flags (0x78), both big-endian u32."""
+_PKG_DLC_TYPES = (0x1B, 0x1C)
+"""Content types AC (additional content) and AL (additional license): DLC, never a bootable game."""
+_PKG_PATCH_FLAGS = 0x00100000 | 0x40000000 | 0x41000000 | 0x60000000
+"""FIRST_, SUBSEQUENT_, DELTA_ and CUMULATIVE_PATCH: the flags shadPS4's installer reads as an update."""
+
+
+def _pkg_kind(pkg: Path) -> _PkgKind:
+    """Whether `pkg`'s header marks it a base game, a patch or DLC; UNKNOWN when it cannot tell."""
+    try:
+        with open(pkg, "rb") as f:
+            header = f.read(_PKG_HEADER_LEN)
+    except OSError as exc:
+        log.debug("pkg search: could not read the header of %s: %s", pkg, exc)
+        return _PkgKind.UNKNOWN
+    if len(header) < _PKG_HEADER_LEN or header[:4] != _PKG_MAGIC:
+        return _PkgKind.UNKNOWN
+    if int.from_bytes(header[0x74:0x78], "big") in _PKG_DLC_TYPES:
+        return _PkgKind.DLC
+    if int.from_bytes(header[0x78:0x7C], "big") & _PKG_PATCH_FLAGS:
+        return _PkgKind.PATCH
+    return _PkgKind.GAME
+
+
 def _visible_entries(directory: Path) -> list[Path]:
     """`directory`'s entries, minus dot-names, or none when it cannot be listed."""
     try:
@@ -355,22 +392,34 @@ def _is_searchable_dir(path: Path) -> bool:
         return False
 
 
-def _folder_packages(folder: Path) -> list[Path]:
+def _is_inside(path: Path, rom_root: Path) -> bool:
+    """Whether `path` resolves inside `rom_root`, False when it cannot be resolved."""
+    try:
+        return path.resolve().is_relative_to(rom_root)
+    except OSError:
+        return False
+
+
+def _folder_packages(folder: Path, rom_root: Path) -> list[Path]:
     """The `.pkg` and archive files a game folder with no eboot.bin could boot, best first.
 
     Searches the top level and one subfolder down, skipping dot-names and
-    unreadable entries. Update/patch/DLC names rank last (a cumulative PS4
-    patch often outweighs its game), then `.pkg` beats archive, then largest.
+    unreadable entries. A `.pkg` header naming a base game ranks first and one
+    naming a patch or DLC last; archives and headerless files sit between,
+    where update/patch/DLC names rank last (a cumulative PS4 patch often
+    outweighs its game). Then `.pkg` beats archive, then largest.
 
     Args:
         folder: The game folder RomM handed over.
+        rom_root: The resolved ROM library root; a header is only read off a
+            file inside it.
 
     Returns:
         The candidates in boot preference order, empty when the folder holds none.
     """
     top = _visible_entries(folder)
     entries = top + [p for sub in top if _is_searchable_dir(sub) for p in _visible_entries(sub)]
-    ranked: list[tuple[bool, bool, int, str, Path]] = []
+    ranked: list[tuple[_PkgKind, bool, bool, int, str, Path]] = []
     for p in entries:
         ext = p.suffix.lower()
         if ext not in _CACHED_EXTS:
@@ -382,8 +431,11 @@ def _folder_packages(folder: Path) -> list[Path]:
             continue
         if not stat.S_ISREG(st.st_mode):
             continue
+        kind = _PkgKind.UNKNOWN
+        if ext == ".pkg" and _is_inside(p, rom_root):
+            kind = _pkg_kind(p)
         is_addon = _ADDON_RE.search(p.relative_to(folder).as_posix()) is not None
-        ranked.append((is_addon, ext != ".pkg", -st.st_size, p.name.lower(), p))
+        ranked.append((kind, is_addon, ext != ".pkg", -st.st_size, p.name.lower(), p))
     return [entry[-1] for entry in sorted(ranked)]
 
 
@@ -1416,7 +1468,7 @@ class Shadps4(Emulator):
         except OSError as exc:
             log.debug("shadps4: could not check %s while resolving the boot target: %s", eboot, exc)
             return None
-        packages = _folder_packages(path)
+        packages = _folder_packages(path, rom_root)
         if not packages:
             return path  # shadps4 appends eboot.bin to directory paths itself
         if not settings.SHADPS4_CACHE_ENABLED:

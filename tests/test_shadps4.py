@@ -376,6 +376,105 @@ def test_resolve_falls_through_a_refused_folder_pkg_to_the_next(
     assert shadps4.Shadps4().resolve_rom_file(folder) == real
 
 
+def _write_ps4_pkg(path: Path, content_type: int = 0x1A, flags: int = 0, size: int = 0x100) -> Path:
+    """Write a file whose header reads as a PS4 `.pkg` of the given content type and flags.
+
+    Args:
+        path: Where to write it.
+        content_type: The big-endian u32 at 0x74 (0x1A game data, 0x1B/0x1C DLC).
+        flags: The big-endian u32 content flags at 0x78.
+        size: The file size, so ranking by size can be set against the header.
+
+    Returns:
+        The written path.
+    """
+    header = bytearray(max(size, 0x80))
+    header[:4] = b"\x7fCNT"
+    struct.pack_into(">II", header, 0x74, content_type, flags)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(header))
+    return path
+
+
+@pytest.mark.parametrize(
+    ("content_type", "flags"),
+    [(0x1A, 0x00100000), (0x1A, 0x40000000), (0x1A, 0x41000000), (0x1A, 0x60000000), (0x1B, 0), (0x1C, 0)],
+)
+def test_resolve_boots_the_header_base_game_over_a_larger_patch_or_dlc(
+    rom_root: Path, monkeypatch: pytest.MonkeyPatch, content_type: int, flags: int
+) -> None:
+    """A .pkg whose header says patch or DLC loses to the base game whatever their names and sizes."""
+    folder = _pkg_folder(rom_root, monkeypatch)
+    _write_ps4_pkg(folder / "aaa.pkg", content_type, flags, size=0x4000)
+    base_game = _write_ps4_pkg(folder / "Game-Update.pkg", size=0x100)
+
+    assert shadps4.Shadps4().resolve_rom_file(folder) == base_game
+
+
+def test_resolve_ranks_a_header_patch_above_header_dlc(
+    rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no base game present, a patch is tried before DLC, which can never boot."""
+    folder = _pkg_folder(rom_root, monkeypatch)
+    _write_ps4_pkg(folder / "a-dlc.pkg", 0x1B, size=0x4000)
+    patch = _write_ps4_pkg(folder / "b.pkg", flags=0x60000000)
+
+    assert shadps4.Shadps4().resolve_rom_file(folder) == patch
+
+
+def test_resolve_ranks_a_header_base_game_above_an_archive(
+    rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An archive cannot be read cheaply, so a .pkg the header confirms as the game outranks it."""
+    folder = _pkg_folder(rom_root, monkeypatch)
+    (folder / "Game.7z").write_bytes(b"x" * 0x4000)
+    base_game = _write_ps4_pkg(folder / "game.pkg")
+
+    assert shadps4.Shadps4().resolve_rom_file(folder) == base_game
+
+
+def test_resolve_ranks_a_headerless_pkg_above_a_header_patch(
+    rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A .pkg whose header cannot be read may be the game, so it is tried before a confirmed patch."""
+    folder = _pkg_folder(rom_root, monkeypatch)
+    _write_ps4_pkg(folder / "a.pkg", flags=0x40000000, size=0x4000)
+    unknown = folder / "b.pkg"
+    unknown.write_bytes(b"x" * 0x10)
+
+    assert shadps4.Shadps4().resolve_rom_file(folder) == unknown
+
+
+@pytest.mark.parametrize("data", [b"", b"\x7fCNT", b"\x7fPKG" + bytes(0x100)])
+def test_pkg_kind_is_unknown_for_a_short_or_foreign_header(tmp_path: Path, data: bytes) -> None:
+    """A truncated file or a PS3 .pkg says nothing about a PS4 package."""
+    pkg = tmp_path / "x.pkg"
+    pkg.write_bytes(data)
+
+    assert shadps4._pkg_kind(pkg) is shadps4._PkgKind.UNKNOWN
+
+
+def test_resolve_does_not_read_the_header_of_a_pkg_outside_the_rom_root(
+    rom_root: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A .pkg symlinked out of the library is ranked unread, so no host file is opened for it."""
+    outside = _write_ps4_pkg(tmp_path / "outside.pkg")
+    folder = _pkg_folder(rom_root, monkeypatch)
+    (folder / "link.pkg").symlink_to(outside)
+    real = _write_ps4_pkg(folder / "real.pkg")
+    read: list[Path] = []
+    real_kind = shadps4._pkg_kind
+
+    def spy(pkg: Path) -> shadps4._PkgKind:
+        read.append(pkg)
+        return real_kind(pkg)
+
+    monkeypatch.setattr(shadps4, "_pkg_kind", spy)
+
+    assert shadps4.Shadps4().resolve_rom_file(folder) == real
+    assert read == [real]
+
+
 def test_resolve_returns_nothing_for_a_path_that_is_neither_file_nor_folder(
     rom_root: Path,
 ) -> None:
