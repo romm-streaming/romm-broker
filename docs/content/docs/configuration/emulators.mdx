@@ -150,7 +150,7 @@ written) sits at the root of that folder, and saves live under
 | --- | --- | --- |
 | `RETROARCH_BIN` | `retroarch` | RetroArch binary. |
 | `RETROARCH_CONFIG_DIR` | RetroArch's own search order: `$XDG_CONFIG_HOME/retroarch`, else `$HOME/.config/retroarch`, else the legacy `$HOME/.retroarch.cfg` | Where the user's `retroarch.cfg` lives. Passed to RetroArch as `--config` on every launch, so moving it moves the file both read. |
-| `RETROARCH_CORES_DIR` | `libretro_directory` from `retroarch.cfg`, else `cores` under RetroArch's own root (`/config/.config/retroarch/cores`) | Where cores are loaded from and downloaded into. That default is also RetroArch's `libretro_info_path`, and a core whose `.info` file is not beside it loads without core info. |
+| `RETROARCH_CORES_DIR` | `libretro_directory` from `retroarch.cfg`, else `cores` under RetroArch's own root (`/config/.config/retroarch/cores`) | Where cores are loaded from and downloaded into. The broker puts each core's `.info` file beside it and points RetroArch's `libretro_info_path` here for the session, since a core loaded without its core info crashes RetroArch on a status check. |
 | `RETROARCH_SYSTEM_DIR` | `system_directory` from `retroarch.cfg`, else `system` under RetroArch's own root (`/config/.config/retroarch/system`) | Where cores look for BIOS files and firmware. Written into the `broker.cfg` overlay as `system_directory` on every launch, so moving it moves the directory both use. |
 | `RETROARCH_CORES_BASE_URL` | `https://buildbot.libretro.com/nightly/linux/x86_64/latest` | Where missing cores are downloaded from. |
 | `RETROARCH_CORE_URL_<CORE>` | unset | Pins one core's download URL without editing `retroarch_platforms.json`. |

@@ -562,6 +562,17 @@ class TestBrokerConfig:
 
         assert f'system_directory = "{retroarch.SYSTEM_DIR}"' in cfg
 
+    def test_the_info_path_is_pinned_to_the_cores_dir(self) -> None:
+        """RetroArch reads .info files from where the broker writes them.
+
+        Probed on RetroArch 1.22.2: with the user's libretro_info_path on an
+        empty dir, GET_STATUS segfaulted 2 of 2 runs; with this key appended,
+        it replied PLAYING 2 of 2.
+        """
+        cfg = retroarch._write_broker_cfg().read_text()
+
+        assert f'libretro_info_path = "{retroarch.CORES_DIR}"' in cfg
+
     def test_retroarch_own_thumbnails_are_off(self) -> None:
         """The overlay turns RetroArch's save thumbnail off; the broker captures the frame itself."""
         cfg = retroarch._write_broker_cfg().read_text()
@@ -2775,27 +2786,57 @@ class TestCoreInfoInstall:
         """Only a systemid line with a value counts."""
         assert retroarch._names_system_id(info) is named
 
-    def test_info_without_systemid_stays_when_the_catalog_has_none_either(
+    def test_info_without_systemid_gets_one_when_the_catalog_has_none_either(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Nothing better to put there, so the file stays and the crash risk is logged."""
+        """Nothing better to put there, so the core's name goes in as its systemid."""
         bare = self._snes9x_catalog({"corename": "Snes9x"})
         monkeypatch.setattr(retroarch_cores, "load_bundled_catalog", lambda: bare)
-        (tmp_path / "snes9x_libretro.info").write_bytes(b"mine")
+        (tmp_path / "snes9x_libretro.info").write_bytes(b'corename = "mine"')
         with caplog.at_level(logging.WARNING):
             retroarch._ensure_core_info("snes9x", tier="default", has_source=False)
-        assert (tmp_path / "snes9x_libretro.info").read_bytes() == b"mine"
+        assert (tmp_path / "snes9x_libretro.info").read_bytes() == (
+            b'corename = "mine"\nsystemid = "snes9x"\n'
+        )
         assert "no systemid" in caplog.text
+        assert (tmp_path / retroarch.CORE_INFO_REFRESH).is_file()
 
-    def test_installing_an_info_without_systemid_warns(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    def test_installing_an_info_without_systemid_adds_one(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The first launch is the one that crashes, so a fresh install warns as a stale file does."""
+        """The first launch is the one that crashes, so a fresh install gets a systemid too."""
         monkeypatch.setattr(retroarch_cores, "_catalog", self._snes9x_catalog({"corename": "Snes9x"}))
-        with caplog.at_level(logging.WARNING):
-            retroarch._ensure_core_info("snes9x", tier="untested", has_source=False)
-        assert (tmp_path / "snes9x_libretro.info").is_file()
-        assert "no systemid" in caplog.text
+        retroarch._ensure_core_info("snes9x", tier="untested", has_source=False)
+        assert retroarch._names_system_id((tmp_path / "snes9x_libretro.info").read_bytes())
+
+    @pytest.mark.parametrize("core", ["cannonball", "easyrpg", "skyemu"])
+    def test_bundled_info_without_systemid_installs_with_one(self, core: str, tmp_path: Path) -> None:
+        """These cores' .info in libretro's zip has none; the installed copy names the core.
+
+        Probed on RetroArch 1.22.2 with gambatte: its .info with the systemid
+        line removed segfaulted on GET_STATUS 3 of 3 runs, and with
+        `systemid = "gambatte"` in its place replied PLAYING 3 of 3.
+        """
+        bundled = retroarch_cores.load_bundled_catalog().info_file(core)
+        assert bundled is not None and not retroarch._names_system_id(bundled)
+        retroarch._ensure_core_info(core, tier="untested", has_source=False)
+        installed = (tmp_path / f"{core}_libretro.info").read_bytes()
+        assert installed.startswith(bundled.rstrip(b"\n"))
+        assert installed.endswith(f'systemid = "{core}"\n'.encode())
+
+    @pytest.mark.parametrize(
+        ("info", "expected"),
+        [
+            (b'corename = "x"\n', b'corename = "x"\nsystemid = "x"\n'),
+            (b'corename = "x"', b'corename = "x"\nsystemid = "x"\n'),
+            (b'systemid = ""\ncorename = "x"\n', b'corename = "x"\nsystemid = "x"\n'),
+            (b'corename = "x"\r\n  systemid =\r\n', b'corename = "x"\r\nsystemid = "x"\n'),
+            (b"", b'systemid = "x"\n'),
+        ],
+    )
+    def test_with_system_id(self, info: bytes, expected: bytes) -> None:
+        """Empty systemid lines go, so the added one is the only one."""
+        assert retroarch._with_system_id(info, "x") == expected
 
     def test_unreadable_info_stays_and_warns(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
