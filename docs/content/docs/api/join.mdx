@@ -24,10 +24,12 @@ the same user (by id, else username) replaces their old token.
 
 Every user gets a personal token. The broker pushes the full token map,
 `{token: {role, slot, mk_control}}`, to selkies, which enforces input routing
-per streaming connection: a participant can be handed a gamepad slot or the
-mouse and keyboard from the room UI by dragging the icons onto them; a
-spectator never gets input. Removing a user from the room revokes the token and
-selkies drops that connection live.
+per streaming connection: a participant can be handed one or more gamepad
+slots or the mouse and keyboard from the room UI by dragging the icons onto
+them (a seat holding several slots carries them as a list, such as `[3, 4]`,
+whose slots its local pads take in turn); a spectator never gets input.
+Removing a user from the room revokes the token and selkies drops that
+connection live.
 
 ## Invite links
 
@@ -52,8 +54,8 @@ session for joining and whether the room shows its comms surface (chat,
 webcam) while the host is alone.
 
 Seats live for the whole session. Disconnecting (closing the tab, reloading,
-a network blip) releases any gamepad slot or mouse/keyboard the seat was
-holding but keeps the seat, and the room remembers its seat per tab, so a
+a network blip) releases every gamepad slot and the mouse/keyboard the seat
+was holding but keeps the seat, and the room remembers its seat per tab, so a
 reload lands back in the same seat rather than taking another. Both kinds of
 link stop working when the session ends.
 
