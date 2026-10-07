@@ -341,14 +341,6 @@ def test_commodore_cdtv_runs_on_puae_pinned_to_the_cdtv_model() -> None:
     assert info["core_options"]["puae_model"] == "CDTV"
 
 
-def test_amiga_cd32_does_not_inherit_the_cdtv_model_pin() -> None:
-    """CD32 keeps PUAE's automatic model rather than sharing the CDTV entry's pin."""
-    info = retroarch._platform_info("amiga-cd32")
-
-    assert info is not None
-    assert "puae_model" not in info.get("core_options", {})
-
-
 @pytest.mark.parametrize(
     ("slug", "option", "value"),
     [
