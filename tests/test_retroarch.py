@@ -327,13 +327,7 @@ def test_a_platform_whose_core_writes_saves_into_the_content_disk_pins_it_off(
 
 
 def test_commodore_cdtv_runs_on_puae_pinned_to_the_cdtv_model() -> None:
-    """A CDTV disc boots PUAE as a CDTV, not the CD32 its CD default picks.
-
-    On its "Automatic" model PUAE only picks CDTV when the uppercase string
-    "CDTV" is in the content path; anything else falls to `puae_model_cd`,
-    which defaults to CD32. RomM's `commodore-cdtv` folder never matches
-    that, so the model is pinned rather than left to the path.
-    """
+    """A CDTV disc boots PUAE pinned to CDTV, since its automatic model reads a lowercase path as CD32."""
     info = retroarch._platform_info("commodore-cdtv")
 
     assert info is not None
