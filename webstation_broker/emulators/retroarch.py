@@ -534,7 +534,10 @@ such as PPSSPP's multi-megabyte state files.
 `core_options` pins libretro core option keys to values on every launch, via
 `_write_core_options`; for cores that default to writing a game's save into
 its own content file or disk image (PUAE) rather than `SAVE_DIR`, so the ROM
-library never gets a save mixed into it.
+library never gets a save mixed into it. It also pins the machine a shared
+core emulates when the core would otherwise guess it from the content path
+(PUAE's `puae_model` for CDTV, which the core only detects from an uppercase
+"CDTV" in the path and otherwise boots as a CD32).
 
 `core_option_seeds` pins a core option key the same way, but only the first
 time it is missing from `CORE_OPTIONS_CFG`; once seeded, whatever value is
