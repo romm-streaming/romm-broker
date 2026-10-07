@@ -130,28 +130,40 @@ def test_cd_i_offers_only_the_images_same_cdi_loads() -> None:
     assert ".bin" not in retroarch._platform_info("philips-cd-i")["extensions"]
 
 
-def test_a_cd_i_folder_with_a_cue_and_its_track_boots_the_cue(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    ("slug", "names", "winner"),
+    [
+        ("philips-cd-i", ("Game.cue", "Game.bin"), "Game.cue"),
+        # VICE attaches a `.20` given directly as that one part alone; only from a
+        # playlist does it look for the `$A000` half beside it.
+        ("vic-20", ("Game (USA).m3u", "Game (USA) $2000.20", "Game (USA) $A000.a0"), "Game (USA).m3u"),
+    ],
+)
+def test_a_folder_boots_its_cue_or_playlist_over_the_parts_beside_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, slug: str, names: tuple[str, ...], winner: str
 ) -> None:
-    """A CD-i dump's `.cue` is picked over the `.bin` track sitting beside it.
+    """A CD-i `.cue` or a split VIC-20 cart's `.m3u` is picked over the files it points at.
 
     Args:
         monkeypatch: Pytest's attribute patcher.
         tmp_path: Holds the ROM folder, and stands in for `ROM_ROOT`.
+        slug: The RomM platform slug.
+        names: The files in the ROM folder.
+        winner: The file that must be picked.
     """
     monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
-    for name in ("Game.cue", "Game.bin"):
+    for name in names:
         (tmp_path / name).touch()
-    extensions = retroarch._platform_info("philips-cd-i")["extensions"]
+    extensions = retroarch._platform_info(slug)["extensions"]
 
     picked = retroarch._pick_rom_file(tmp_path.iterdir(), tmp_path, extensions)
 
-    assert picked == (tmp_path / "Game.cue").resolve()
+    assert picked == (tmp_path / winner).resolve()
 
 
-@pytest.mark.parametrize("slug", ["philips-cd-i", "ti-83"])
+@pytest.mark.parametrize("slug", ["philips-cd-i", "ti-83", "sega-pico", "c-plus-4", "vic-20"])
 def test_a_platform_nobody_has_booted_yet_ships_flagged_untested(slug: str) -> None:
-    """CD-i and TI-83 launch, but carry the `untested` flag until a tester confirms them (#61).
+    """Platforms nobody has booted carry the `untested` flag until a tester confirms them (#61).
 
     Args:
         slug: The RomM platform slug.
@@ -331,6 +343,8 @@ def test_a_platform_whose_core_writes_saves_into_the_content_disk_pins_it_off(
     [
         ("c64", "vice_floppy_write_protection", "enabled"),
         ("c64", "vice_easyflash_write_protection", "enabled"),
+        ("c-plus-4", "vice_floppy_write_protection", "enabled"),
+        ("vic-20", "vice_floppy_write_protection", "enabled"),
         ("atari-st", "hatari_floppy_write_protection", "on"),
     ],
 )
@@ -812,6 +826,9 @@ def test_extensions_and_save_subtrees_survive_the_load_as_tuples() -> None:
         ("atari-st", "hatari"),
         ("philips-cd-i", "SAME_CDI"),
         ("ti-83", "Numero"),
+        ("sega-pico", "Genesis Plus GX"),
+        ("c-plus-4", "VICE xplus4"),
+        ("vic-20", "VICE xvic"),
     ],
 )
 def test_a_platform_names_the_sorted_dir_its_core_reports(platform: str, name: str) -> None:
@@ -1138,10 +1155,10 @@ class TestPlaylistPreference:
     """
 
     @pytest.mark.parametrize(
-        "platform", ["dc", "saturn", "segacd", "turbografx-cd", "dos"]
+        "platform", ["dc", "saturn", "segacd", "turbografx-cd", "dos", "c-plus-4", "vic-20"]
     )
     def test_m3u_is_the_first_choice_on_every_disc_platform(self, platform: str) -> None:
-        """Every disc-based platform lists .m3u as its first extension."""
+        """Every disc-based platform, and Plus/4 and VIC-20, list .m3u as their first extension."""
         info = retroarch._platform_info(platform)
         assert info is not None
         assert info["extensions"][0] == ".m3u"
