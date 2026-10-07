@@ -126,8 +126,8 @@ that platform," not as settled fact.
 | Amiga | `puae` | Required | Kickstart ROM matching the emulated model (e.g. `kick13.rom`/`kick31.rom`). |
 | Amiga CD32 | `puae` | Required | `kick40060.CD32` and `kick40060.CD32.ext`. |
 | Commodore 64 | `vice_x64` | None | VICE ships open-licensed replacement ROMs by default; real Kernal/Basic ROMs are optional. |
-| Commodore Plus/4 | `vice_xplus4` | None | VICE ships the system ROMs with the core. A folder with an `.m3u` boots the playlist ahead of the disk and tape files beside it. |
-| Commodore VIC-20 | `vice_xvic` | None | VICE ships the system ROMs with the core. A folder with an `.m3u` boots the playlist ahead of the disk, tape and cart files beside it. |
+| Commodore Plus/4 | `vice_xplus4` | None | VICE ships the system ROMs with the core. A folder's `.m3u` boots ahead of the files beside it. |
+| Commodore VIC-20 | `vice_xvic` | None | VICE ships the system ROMs with the core. A folder's `.m3u` boots ahead of the files beside it. |
 | MSX / MSX2 | `bluemsx` | Required | Machine-specific system ROMs (e.g. `MSX.ROM`, `MSX2.ROM`, `MSX2EXT.ROM`, `DISK.ROM`). Which ones you need varies by region. |
 | ZX Spectrum | `fuse` | None | ROM ships bundled with the core. |
 | Apple II | `applewin` | None | |
@@ -233,10 +233,10 @@ platforms launches with no options file on disk yet, write protection is
 turned on to protect the ROM library by default. After that, whatever value
 is already on disk is left alone, including a value a player changed from
 RetroArch's own Quick Menu, so choosing to re-enable in-game saves (at the
-cost of the ROM being writable) sticks on later launches. This is `core_option_seeds` in the
-platform table, resolved against the broker's own options file by
-`_resolve_core_options`, as opposed to `core_options`, which is pinned on
-every launch and always wins over a same-named seed.
+cost of the ROM being writable) sticks on later launches. This is
+`core_option_seeds` in the platform table, resolved against the broker's own
+options file by `_resolve_core_options`, as opposed to `core_options`, which
+is pinned on every launch and always wins over a same-named seed.
 
 ### DOSBox Pure mouse
 
