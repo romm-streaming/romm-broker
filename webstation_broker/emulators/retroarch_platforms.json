@@ -504,5 +504,23 @@
     "library_name": "Atari800",
     "extensions": [".xfd", ".atr", ".atx", ".cdm", ".cas", ".bin", ".a52", ".xex", ".zip"],
     "extra_extensions": [".cdm"]
+  },
+    "sega-pico": {
+    "core": "genesis_plus_gx",
+    "save_ram": false,
+	  "library_name": "SegaPico",
+    "extensions": [".bin", ".md", ".pic", ".zip"]
+  },
+  "c-plus-4": {
+    "core": "vice_xplus4",
+    "save_ram": false,
+	  "library_name": "Vice_Xplus",
+    "extensions": [".d64", ".d81", ".t64", ".tap", ".prg", ".crt", ".bin", ".zip"]
+  },
+  "vic-20": {
+    "core": "vice_xvic",
+    "save_ram": false,
+	  "library_name": "Vic-20",
+    "extensions": [".d64", ".t64", ".tap", ".prg", ".crt", ".bin", ".20", ".40", ".60", ".70", ".a0", ".b0", ".zip"]
   }
 }
