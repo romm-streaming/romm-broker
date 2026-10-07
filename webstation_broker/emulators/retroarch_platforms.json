@@ -516,7 +516,7 @@
     "core": "vice_xplus4",
     "library_name": "VICE xplus4",
     "save_ram": false,
-    "extensions": [".d64", ".d81", ".t64", ".tap", ".prg", ".crt", ".bin", ".zip"],
+    "extensions": [".m3u", ".d64", ".d81", ".t64", ".tap", ".prg", ".crt", ".bin", ".zip"],
     "core_option_seeds": {"vice_floppy_write_protection": "enabled"},
     "untested": true
   },
@@ -524,7 +524,8 @@
     "core": "vice_xvic",
     "library_name": "VICE xvic",
     "save_ram": false,
-    "extensions": [".d64", ".t64", ".tap", ".prg", ".crt", ".bin", ".20", ".40", ".60", ".a0", ".b0", ".zip"],
+    "extensions": [".m3u", ".d64", ".t64", ".tap", ".prg", ".crt", ".bin", ".rom", ".20", ".40", ".60", ".70", ".a0", ".b0", ".zip"],
+    "extra_extensions": [".70"],
     "core_option_seeds": {"vice_floppy_write_protection": "enabled"},
     "untested": true
   }

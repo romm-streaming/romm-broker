@@ -149,9 +149,32 @@ def test_a_cd_i_folder_with_a_cue_and_its_track_boots_the_cue(
     assert picked == (tmp_path / "Game.cue").resolve()
 
 
-@pytest.mark.parametrize("slug", ["philips-cd-i", "ti-83"])
+def test_a_vic_20_folder_with_a_playlist_and_its_cart_parts_boots_the_playlist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A split No-Intro VIC-20 cart boots its `.m3u`, never one of the parts beside it.
+
+    VICE attaches a `.20` given directly as that one part alone. Only from a
+    playlist does it look for the `$A000` half beside it, so booting the
+    `.20` would start a cart with half its ROM missing.
+
+    Args:
+        monkeypatch: Pytest's attribute patcher.
+        tmp_path: Holds the ROM folder, and stands in for `ROM_ROOT`.
+    """
+    monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+    for name in ("Game (USA).m3u", "Game (USA) $2000.20", "Game (USA) $A000.a0"):
+        (tmp_path / name).touch()
+    extensions = retroarch._platform_info("vic-20")["extensions"]
+
+    picked = retroarch._pick_rom_file(tmp_path.iterdir(), tmp_path, extensions)
+
+    assert picked == (tmp_path / "Game (USA).m3u").resolve()
+
+
+@pytest.mark.parametrize("slug", ["philips-cd-i", "ti-83", "sega-pico", "c-plus-4", "vic-20"])
 def test_a_platform_nobody_has_booted_yet_ships_flagged_untested(slug: str) -> None:
-    """CD-i and TI-83 launch, but carry the `untested` flag until a tester confirms them (#61).
+    """Platforms nobody has booted carry the `untested` flag until a tester confirms them (#61).
 
     Args:
         slug: The RomM platform slug.
@@ -814,6 +837,9 @@ def test_extensions_and_save_subtrees_survive_the_load_as_tuples() -> None:
         ("atari-st", "hatari"),
         ("philips-cd-i", "SAME_CDI"),
         ("ti-83", "Numero"),
+        ("sega-pico", "Genesis Plus GX"),
+        ("c-plus-4", "VICE xplus4"),
+        ("vic-20", "VICE xvic"),
     ],
 )
 def test_a_platform_names_the_sorted_dir_its_core_reports(platform: str, name: str) -> None:
