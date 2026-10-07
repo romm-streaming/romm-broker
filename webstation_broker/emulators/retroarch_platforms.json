@@ -505,22 +505,27 @@
     "extensions": [".xfd", ".atr", ".atx", ".cdm", ".cas", ".bin", ".a52", ".xex", ".zip"],
     "extra_extensions": [".cdm"]
   },
-    "sega-pico": {
+  "sega-pico": {
     "core": "genesis_plus_gx",
+    "library_name": "Genesis Plus GX",
     "save_ram": false,
-	  "library_name": "SegaPico",
-    "extensions": [".bin", ".md", ".pic", ".zip"]
+    "extensions": [".md", ".bin"],
+    "untested": true
   },
   "c-plus-4": {
     "core": "vice_xplus4",
+    "library_name": "VICE xplus4",
     "save_ram": false,
-	  "library_name": "Vice_Xplus",
-    "extensions": [".d64", ".d81", ".t64", ".tap", ".prg", ".crt", ".bin", ".zip"]
+    "extensions": [".d64", ".d81", ".t64", ".tap", ".prg", ".crt", ".bin", ".zip"],
+    "core_option_seeds": {"vice_floppy_write_protection": "enabled"},
+    "untested": true
   },
   "vic-20": {
     "core": "vice_xvic",
+    "library_name": "VICE xvic",
     "save_ram": false,
-	  "library_name": "Vic-20",
-    "extensions": [".d64", ".t64", ".tap", ".prg", ".crt", ".bin", ".20", ".40", ".60", ".70", ".a0", ".b0", ".zip"]
+    "extensions": [".d64", ".t64", ".tap", ".prg", ".crt", ".bin", ".20", ".40", ".60", ".a0", ".b0", ".zip"],
+    "core_option_seeds": {"vice_floppy_write_protection": "enabled"},
+    "untested": true
   }
 }

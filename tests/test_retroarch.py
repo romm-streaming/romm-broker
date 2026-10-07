@@ -331,6 +331,8 @@ def test_a_platform_whose_core_writes_saves_into_the_content_disk_pins_it_off(
     [
         ("c64", "vice_floppy_write_protection", "enabled"),
         ("c64", "vice_easyflash_write_protection", "enabled"),
+        ("c-plus-4", "vice_floppy_write_protection", "enabled"),
+        ("vic-20", "vice_floppy_write_protection", "enabled"),
         ("atari-st", "hatari_floppy_write_protection", "on"),
     ],
 )
