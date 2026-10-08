@@ -191,9 +191,9 @@ CORES_DIR = Path(
 
 Taken from `RETROARCH_CORES_DIR`, else the `libretro_directory` in the user's
 config, else `cores` under `RA_BASE_DIR`, which is RetroArch's own default
-`libretro_directory`. A core has to land in the dir RetroArch also reads .info
-files from, so the broker config pins `libretro_info_path` here. Loading one
-without its info leaves its core info unset, and `GET_STATUS` then segfaults
+`libretro_directory`. RetroArch only gives a core its core info when the core
+sits in its `libretro_directory` and the `.info` in its `libretro_info_path`,
+so the broker config pins both here. Without it, `GET_STATUS` segfaults
 RetroArch mid-session (1.22.2). Following the user's own `libretro_directory`
 is also what makes a downloaded core show up in the desktop RetroArch without
 its in-app core downloader.
@@ -1056,9 +1056,11 @@ def _write_broker_cfg() -> Path:
         # are what this run's cores look for. Nothing on the command line names
         # it, and an --appendconfig key outranks the user's own config.
         f'system_directory = "{SYSTEM_DIR}"\n'
-        # The .info files and core_info.refresh go beside the cores; a user
-        # libretro_info_path elsewhere leaves the core without its info, and
-        # GET_STATUS then segfaults RetroArch (1.22.2).
+        # RetroArch looks up the launched core's info among the cores in
+        # libretro_directory, reading .info files from libretro_info_path. The
+        # broker puts both in CORES_DIR; either key elsewhere leaves the core
+        # without its info, and GET_STATUS then segfaults RetroArch (1.22.2).
+        f'libretro_directory = "{CORES_DIR}"\n'
         f'libretro_info_path = "{CORES_DIR}"\n'
         f'savestate_directory = "{STATE_DIR}"\n'
         f'savefile_directory = "{SAVE_DIR}"\n'
