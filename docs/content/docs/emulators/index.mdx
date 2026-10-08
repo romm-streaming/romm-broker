@@ -69,8 +69,8 @@ own `libretro_directory`, and puts the core's `.info` file beside it. A core
 without its info file crashes RetroArch mid-session when the broker checks its
 status (`GET_STATUS`): a segfault, a crash from the program touching memory it
 isn't allowed to. So the broker's settings layer points RetroArch's
-`libretro_info_path` at that same folder for the session, whatever your
-`retroarch.cfg` says. The broker installs a missing `.info` and leaves an
+`libretro_directory` and `libretro_info_path` at that same folder for the
+session, whatever your `retroarch.cfg` says. The broker installs a missing `.info` and leaves an
 existing one alone unless it has no `systemid` value, which crashes
 `GET_STATUS` the same way (NeoCD, FreeChaF and EmuSCV only gained one in
 August 2026). Then the broker replaces it with its catalog's copy when that

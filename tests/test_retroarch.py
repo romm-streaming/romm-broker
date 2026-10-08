@@ -576,16 +576,23 @@ class TestBrokerConfig:
 
         assert f'system_directory = "{retroarch.SYSTEM_DIR}"' in cfg
 
-    def test_the_info_path_is_pinned_to_the_cores_dir(self) -> None:
-        """RetroArch reads .info files from where the broker writes them.
+    @pytest.mark.parametrize("key", ["libretro_info_path", "libretro_directory"])
+    def test_the_core_dirs_are_pinned_to_the_cores_dir(self, key: str) -> None:
+        """RetroArch finds the launched core and its .info where the broker put them.
 
         Probed on RetroArch 1.22.2: with the user's libretro_info_path on an
-        empty dir, GET_STATUS segfaulted 2 of 2 runs; with this key appended,
-        it replied PLAYING 2 of 2.
+        empty dir, GET_STATUS segfaulted 2 of 2 runs, and replied PLAYING 2 of
+        2 with libretro_info_path appended. With only that key appended and the
+        user's libretro_directory elsewhere, as under RETROARCH_CORES_DIR, it
+        still segfaulted 2 of 2; appending libretro_directory too gave PLAYING
+        2 of 2.
+
+        Args:
+            key: The retroarch.cfg key.
         """
         cfg = retroarch._write_broker_cfg().read_text()
 
-        assert f'libretro_info_path = "{retroarch.CORES_DIR}"' in cfg
+        assert f'{key} = "{retroarch.CORES_DIR}"' in cfg
 
     def test_retroarch_own_thumbnails_are_off(self) -> None:
         """The overlay turns RetroArch's save thumbnail off; the broker captures the frame itself."""
