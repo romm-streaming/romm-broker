@@ -34,10 +34,12 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
+from enum import IntEnum
 from pathlib import Path
 from threading import Lock
 from typing import Any, Optional, Union
@@ -173,6 +175,8 @@ _ARCHIVE_EXTS = extraction_cache._ARCHIVE_EXTS
 ROM_EXTENSIONS = (".zar", ".bin", ".pkg") + _ARCHIVE_EXTS
 """Bootable formats: a game folder (eboot.bin inside it), a .zar archive, a raw
 .pkg, or a .7z/.zip/.rar archive holding one."""
+_CACHED_EXTS = (".pkg",) + _ARCHIVE_EXTS
+"""Formats that only boot by way of CACHE_DIR: a raw `.pkg`, or an archive holding one."""
 
 
 PKG_EXTRACTOR_BIN = os.environ.get("SHADPS4_PKG_EXTRACTOR_BIN", "pkg_extractor")
@@ -325,6 +329,114 @@ def _archive_pkg_member(root: Path) -> Optional[Path]:
         if _is_safe_extracted_member(pkg, root_real):
             return pkg
     return None
+
+
+_ADDON_RE = re.compile(r"(?:^|[^a-z0-9])(?:update|upd|dlc|patch)(?:[^a-z0-9]|$)", re.IGNORECASE)
+"""Matches update and DLC names: they sit beside base games in library folders, and the base game boots."""
+
+
+class _PkgKind(IntEnum):
+    """What a PS4 `.pkg` header says the package is, in boot preference order."""
+
+    GAME = 0
+    UNKNOWN = 1
+    PATCH = 2
+    DLC = 3
+
+
+_PKG_MAGIC = b"\x7fCNT"
+"""The first four bytes of a PS4 `.pkg`."""
+_PKG_HEADER_LEN = 0x7C
+"""Enough of the header to hold the content type (0x74) and content flags (0x78), both big-endian u32."""
+_PKG_DLC_TYPES = (0x1B, 0x1C)
+"""Content types AC (additional content) and AL (additional license): DLC, never a bootable game."""
+_PKG_PATCH_FLAGS = 0x00100000 | 0x40000000 | 0x41000000 | 0x60000000
+"""FIRST_, SUBSEQUENT_, DELTA_ and CUMULATIVE_PATCH: the flags shadPS4's installer reads as an update."""
+
+
+def _pkg_kind(pkg: Path) -> _PkgKind:
+    """Whether `pkg`'s header marks it a base game, a patch or DLC; UNKNOWN when it cannot tell."""
+    try:
+        with open(pkg, "rb") as f:
+            header = f.read(_PKG_HEADER_LEN)
+    except OSError as exc:
+        log.debug("pkg search: could not read the header of %s: %s", pkg, exc)
+        return _PkgKind.UNKNOWN
+    if len(header) < _PKG_HEADER_LEN or header[:4] != _PKG_MAGIC:
+        return _PkgKind.UNKNOWN
+    if int.from_bytes(header[0x74:0x78], "big") in _PKG_DLC_TYPES:
+        return _PkgKind.DLC
+    if int.from_bytes(header[0x78:0x7C], "big") & _PKG_PATCH_FLAGS:
+        return _PkgKind.PATCH
+    return _PkgKind.GAME
+
+
+def _visible_entries(directory: Path) -> list[Path]:
+    """`directory`'s entries, minus dot-names, or none when it cannot be listed."""
+    try:
+        return [p for p in directory.iterdir() if not p.name.startswith(".")]
+    except OSError as exc:
+        log.warning("pkg search: could not list %s: %s", directory, exc)
+        return []
+
+
+def _is_searchable_dir(path: Path) -> bool:
+    """Whether `path` is a folder to search, False when it cannot be read.
+
+    `Path.is_dir` lets an I/O error through, and one bad entry must not end the search.
+    """
+    try:
+        return path.is_dir()
+    except OSError as exc:
+        log.debug("pkg search: skipping %s: %s", path, exc)
+        return False
+
+
+def _is_inside(path: Path, rom_root: Path) -> bool:
+    """Whether `path` resolves inside `rom_root`, False when it cannot be resolved."""
+    try:
+        return path.resolve().is_relative_to(rom_root)
+    except OSError:
+        return False
+
+
+def _folder_packages(folder: Path, rom_root: Path) -> list[Path]:
+    """The `.pkg` and archive files a game folder with no eboot.bin could boot, best first.
+
+    Searches the top level and one subfolder down, skipping dot-names and
+    unreadable entries. A `.pkg` header naming a base game ranks first and one
+    naming a patch or DLC last; archives and headerless files sit between,
+    where update/patch/DLC names rank last (a cumulative PS4 patch often
+    outweighs its game). Then `.pkg` beats archive, then largest.
+
+    Args:
+        folder: The game folder RomM handed over.
+        rom_root: The resolved ROM library root; a header is only read off a
+            file inside it.
+
+    Returns:
+        The candidates in boot preference order, empty when the folder holds none.
+    """
+    top = _visible_entries(folder)
+    entries = top + [p for sub in top if _is_searchable_dir(sub) for p in _visible_entries(sub)]
+    ranked: list[tuple[_PkgKind, bool, bool, int, str, Path]] = []
+    for p in entries:
+        ext = p.suffix.lower()
+        if ext not in _CACHED_EXTS:
+            continue
+        try:
+            st = p.stat()
+        except OSError as exc:
+            log.debug("pkg search: skipping %s: %s", p, exc)
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        kind = _PkgKind.UNKNOWN
+        if ext == ".pkg" and _is_inside(p, rom_root):
+            kind = _pkg_kind(p)
+        is_addon = _ADDON_RE.search(p.relative_to(folder).as_posix()) is not None
+        ranked.append((kind, is_addon, ext != ".pkg", -st.st_size, p.name.lower(), p))
+    return [entry[-1] for entry in sorted(ranked)]
 
 
 def _require_room(peak_bytes: int, kept_bytes: int, rom_name: str) -> None:
@@ -1234,7 +1346,7 @@ class Shadps4(Emulator):
         """
         if settings.SHADPS4_CACHE_ENABLED:
             return ROM_EXTENSIONS
-        return tuple(e for e in ROM_EXTENSIONS if e != ".pkg" and e not in _ARCHIVE_EXTS)
+        return tuple(e for e in ROM_EXTENSIONS if e not in _CACHED_EXTS)
 
     def clear_working_slot(self, excluded: tuple[str, ...] = ()) -> None:
         """Drop the previous session's save data before this session's restore.
@@ -1300,11 +1412,12 @@ class Shadps4(Emulator):
             path: A ROM file, or a game folder.
 
         Returns:
-            The file itself, the folder's `eboot.bin`, the folder when it
-            has none (shadPS4 appends eboot.bin to directory paths itself),
+            The file itself, the folder's `eboot.bin`, else the `.pkg` or
+            archive inside the folder (see `_folder_packages`), else the
+            folder (shadPS4 appends eboot.bin to directory paths itself),
             or None when the path does not exist, resolves outside the ROM
-            library root, or is a `.pkg`/archive with the extraction cache
-            disabled.
+            library root, or is (or only holds) a `.pkg`/archive that is
+            refused or needs the disabled extraction cache.
         """
         rom_root = settings.rom_root()
         if path.is_file():
@@ -1318,7 +1431,7 @@ class Shadps4(Emulator):
             except OSError as exc:
                 log.warning("shadps4: could not resolve %s (%s)", path, exc)
                 return None
-            if not settings.SHADPS4_CACHE_ENABLED and path.suffix.lower() in (".pkg",) + _ARCHIVE_EXTS:
+            if not settings.SHADPS4_CACHE_ENABLED and path.suffix.lower() in _CACHED_EXTS:
                 log.warning(
                     "shadps4: refusing %s, %s needs the extraction cache "
                     "(set SHADPS4_CACHE_ENABLED=true to boot this format)",
@@ -1355,7 +1468,28 @@ class Shadps4(Emulator):
         except OSError as exc:
             log.debug("shadps4: could not check %s while resolving the boot target: %s", eboot, exc)
             return None
-        return path  # shadps4 appends eboot.bin to directory paths itself
+        packages = _folder_packages(path, rom_root)
+        if not packages:
+            return path  # shadps4 appends eboot.bin to directory paths itself
+        if not settings.SHADPS4_CACHE_ENABLED:
+            log.warning(
+                "shadps4: refusing %s, its .pkg/archive needs the extraction cache "
+                "(set SHADPS4_CACHE_ENABLED=true to boot this format)",
+                path.name,
+            )
+            return None
+        for package in packages:
+            # The file branch applies the containment check a direct .pkg gets;
+            # a refused candidate falls through to the next.
+            if self.resolve_rom_file(package) is not None:
+                log.info(
+                    "shadps4: %s has no eboot.bin, booting %s from it (%d candidate(s))",
+                    path.name,
+                    package.name,
+                    len(packages),
+                )
+                return package
+        return None
 
     def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
         """Spawn the newest shadPS4 with IPC enabled and boot the game.
@@ -1379,7 +1513,7 @@ class Shadps4(Emulator):
         if binary is None:
             raise RuntimeError(f"no shadps4 binary found under {VERSIONS_DIR}")
         ext = rom_path.suffix.lower()
-        if ext == ".pkg" or ext in _ARCHIVE_EXTS:
+        if ext in _CACHED_EXTS:
             boot = _extract_and_cache_pkg(rom_path, self)
         else:
             boot = rom_path
