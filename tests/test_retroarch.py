@@ -339,7 +339,7 @@ def test_a_platform_whose_core_writes_saves_into_the_content_disk_pins_it_off(
 
 
 def test_commodore_cdtv_runs_on_puae_pinned_to_the_cdtv_model() -> None:
-    """A CDTV disc boots PUAE pinned to CDTV, since its automatic model reads a lowercase path as CD32."""
+    """PUAE is pinned to CDTV, as its automatic model boots any path lacking an uppercase "CDTV" as a CD32."""
     info = retroarch._platform_info("commodore-cdtv")
 
     assert info is not None
