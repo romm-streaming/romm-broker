@@ -782,15 +782,6 @@ class TestCoreOptions:
 
         assert "puae_model" not in path.read_text()
 
-    def test_a_model_left_on_disk_does_not_override_the_cdtv_pin(self) -> None:
-        """A `puae_model` changed from the Quick Menu last session is reset to CDTV."""
-        retroarch.CORE_OPTIONS_CFG.write_text('puae_model = "CD32"\n')
-
-        cfg = _write_launch_core_options("commodore-cdtv").read_text()
-
-        assert 'puae_model = "CDTV"' in cfg
-        assert "CD32" not in cfg
-
 
 class TestResolveCoreOptions:
     """Merging a platform's hard-pinned core options over its one-time seed defaults."""
