@@ -206,6 +206,7 @@ The other platforms refuse a `.srm`:
 | `genesis_plus_gx` (segacd) | `scd_<region>.brm`, shared by every game of that region |
 | `mesen` (fds) | `<game>.ips`, a patch against the disk |
 | `puae` (amiga) | written to a substitute disk under `saves/`, not the mounted image. The broker pins `puae_floppy_write_redirect` to `enabled` |
+| `puae` (amiga-cd32, commodore-cdtv) | `<game>.nvr`, the console's NVRAM (CDTV bookmarks, CD32 game saves), per game |
 | `vice_x64`, `vice_xplus4`, `vice_xvic`, `hatari` (c64, c-plus-4, vic-20, atari-st) | written into the disk image by default; see the write-protection note below |
 | `a5200`, `prosystem`, `freeintv`, `vecx`, `o2em`, `fuse`, `genesis_plus_gx` (sega-pico) | no battery save |
 

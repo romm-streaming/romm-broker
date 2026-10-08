@@ -708,7 +708,7 @@ class TestBrokerConfig:
 
 
 def _write_launch_core_options(platform: str) -> Path:
-    """Write a platform's core options the way `Retroarch.launch` does.
+    """Write a platform's core options through `_pin_core_options`, as `Retroarch.launch` does.
 
     Args:
         platform: The RomM platform slug.
@@ -720,9 +720,7 @@ def _write_launch_core_options(platform: str) -> Path:
     emulator.platform = platform
     info = emulator._profile()
     assert info is not None
-    return retroarch._write_core_options(
-        retroarch._resolve_core_options(info.get("core_options", {}), info.get("core_option_seeds", {}))
-    )
+    return retroarch._pin_core_options(info)
 
 
 class TestCoreOptions:
