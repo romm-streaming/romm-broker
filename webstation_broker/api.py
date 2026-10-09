@@ -1775,13 +1775,10 @@ async def swap_disc(body: DiscIn) -> dict[str, str]:
 
 
 def _library_token(name: Optional[str]) -> Optional[str]:
-    """`name` when RomM can be told to file under it, else None.
+    """`name` when RomM can file states under it, else None.
 
-    The activate reply and the state GET's `X-State-Library` header both go
-    through this, so RomM gets one answer per session. A name is left out
-    rather than mangled: one with a byte a header can't carry, surrounding
-    whitespace, or a leading dot would name a folder no RetroArch client
-    files under, and without it RomM files under the core id instead.
+    A name is left out rather than mangled, so RomM falls back to the core id
+    instead of a folder no RetroArch client files under.
 
     Args:
         name: The library name, or None.

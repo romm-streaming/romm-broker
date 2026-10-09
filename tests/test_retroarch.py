@@ -5725,11 +5725,7 @@ class TestActivateCore:
     def test_no_core_response_names_the_library(
         self, client: TestClient, broker_dirs: dict[str, Path], no_launch: list
     ) -> None:
-        """Activate names the folder the core sorts into, as the manifest does.
-
-        RomM files the session's states under it, where every other RetroArch
-        client files that core's.
-        """
+        """Activate names the folder the core sorts into, as the manifest does."""
         r = _ra_activate(client, broker_dirs["roms"])
         assert r.status_code == 200
         assert r.json()["library_name"] == "Snes9x"

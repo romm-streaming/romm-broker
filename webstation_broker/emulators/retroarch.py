@@ -2691,11 +2691,8 @@ class Retroarch(Emulator):
     def state_library(self, path: Path) -> Optional[str]:
         """The sorted dir `path` sits in, which can differ from `library_name`.
 
-        An untested core whose dir isn't confirmed yet is served from
-        wherever its newest state turned up, so the file's own dir says
-        where RetroArch put it, not the guess. A legacy state at the
-        unsorted root belongs to the default core, so it goes under that
-        core's name.
+        An unconfirmed core's state sits where RetroArch put it, not where the
+        catalog guessed; a legacy state at the unsorted root is the default core's.
 
         Args:
             path: The state file the state GET is serving.
