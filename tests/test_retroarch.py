@@ -161,7 +161,9 @@ def test_a_folder_boots_its_cue_or_playlist_over_the_parts_beside_it(
     assert picked == (tmp_path / winner).resolve()
 
 
-@pytest.mark.parametrize("slug", ["philips-cd-i", "ti-83", "sega-pico", "c-plus-4", "vic-20"])
+@pytest.mark.parametrize(
+    "slug", ["philips-cd-i", "ti-83", "sega-pico", "c-plus-4", "vic-20", "commodore-cdtv"]
+)
 def test_a_platform_nobody_has_booted_yet_ships_flagged_untested(slug: str) -> None:
     """Platforms nobody has booted carry the `untested` flag until a tester confirms them (#61).
 
