@@ -26,9 +26,10 @@ A RetroArch launch also answers with `core`, the libretro core it booted,
 `library_name`, the folder RetroArch sorts that core's saves and states into.
 Every RetroArch client files the core's saves and states under that folder
 name, so RomM files the session's there too. For an untested or blocked
-core, the name is the core-info catalog's until RetroArch writes its first
-file, which can turn out to be a different folder; the state GET's
-`X-State-Library` header names the folder each state actually came from.
+core, the name is a guess: the folder the restored archive's manifest
+recorded for that core, else the core-info catalog's name. RetroArch can
+turn out to write somewhere else; the state GET's `X-State-Library` header
+names the folder each state actually came from.
 
 `rom.path` can point to a single file or to a whole game folder. When it's a
 folder, the broker automatically picks the best disc image to boot: it

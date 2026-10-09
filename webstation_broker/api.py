@@ -998,7 +998,7 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     # The library name is the folder every RetroArch client files the core's
     # saves and states under, so RomM files the session's there too.
     ident = emulator.core_identity()
-    ident["library_name"] = _library_token(ident.get("library_name"))
+    ident["library_name"] = _library_token(ident.get("library_name"), "activate")
     return {
         "status": "launching",
         "session_id": sess["id"],
@@ -1774,24 +1774,31 @@ async def swap_disc(body: DiscIn) -> dict[str, str]:
     return {"status": "ok", "path": str(disc_path)}
 
 
-def _library_token(name: Optional[str]) -> Optional[str]:
-    """`name` when RomM can file states under it, else None.
+def _library_token(name: Optional[str], operation: str) -> Optional[str]:
+    """`name` when RomM can file saves and states under it, else None.
 
     A name is left out rather than mangled, so RomM falls back to the core id
     instead of a folder no RetroArch client files under.
 
     Args:
         name: The library name, or None.
+        operation: The route asking, e.g. `activate`, named in the warning.
 
     Returns:
         `name`, or None when it is missing or unfit to send.
     """
     if not name:
         return None
-    if _header_token(name, "") != name or name != name.strip() or name.startswith("."):
+    if (
+        retroarch_cores.safe_dir_name(name) is None
+        or _header_token(name, "") != name
+        or name != name.strip()
+        or name.startswith(".")
+    ):
         log.warning(
-            "library name %r is not a folder RomM can file under; "
-            "RomM files this session's states under the core id instead",
+            "%s: library name %r is not a folder RomM can file under; "
+            "RomM files under the core id instead",
+            operation,
             name,
         )
         return None
@@ -1873,7 +1880,7 @@ async def get_state_file() -> Response:
         core = emulator.archive_core()
         if core:
             headers["X-State-Core"] = core
-        library = _library_token(emulator.state_library(path))
+        library = _library_token(emulator.state_library(path), "state-file")
         if library:
             headers["X-State-Library"] = library
         return Response(

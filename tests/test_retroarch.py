@@ -5730,7 +5730,7 @@ class TestActivateCore:
         assert r.status_code == 200
         assert r.json()["library_name"] == "Snes9x"
 
-    @pytest.mark.parametrize("library", ["Snës9x", ".Snes9x", " Snes9x", "Snes\n9x"])
+    @pytest.mark.parametrize("library", ["Snës9x", ".Snes9x", " Snes9x", "Snes\n9x", "Snes/9x", "Snes\\9x"])
     def test_a_library_name_unfit_for_a_folder_is_left_out(
         self,
         client: TestClient,
@@ -6091,6 +6091,7 @@ class TestStateCoreHeader:
         ra_dirs: Path,
         no_launch: list[retroarch.Retroarch],
         monkeypatch: pytest.MonkeyPatch,
+        **rom: object,
     ) -> retroarch.Retroarch:
         """Activate a game, stub the emulator as running, and return it.
 
@@ -6100,11 +6101,12 @@ class TestStateCoreHeader:
             ra_dirs: The patched data root.
             no_launch: The launched instances list.
             monkeypatch: The pytest monkeypatch fixture.
+            **rom: Extra `rom` fields for the activate (core, experimental_cores).
 
         Returns:
             The active emulator.
         """
-        assert _ra_activate(client, broker_dirs["roms"]).status_code == 200
+        assert _ra_activate(client, broker_dirs["roms"], **rom).status_code == 200
         emu = no_launch[0]
         emu._rom_base = "Game"
         monkeypatch.setattr(emu, "alive", lambda: True)
@@ -6164,10 +6166,7 @@ class TestStateCoreHeader:
     ) -> None:
         """The served file's own dir, not the catalog's guess at it."""
         core = _untested_snes_core()
-        assert _ra_activate(client, broker_dirs["roms"], core=core).status_code == 200
-        emu = no_launch[0]
-        emu._rom_base = "Game"
-        monkeypatch.setattr(emu, "alive", lambda: True)
+        emu = self._running(client, broker_dirs, ra_dirs, no_launch, monkeypatch, core=core)
         assert emu._observed_lib is None
         assert emu.library_name() != "Actual Dir"
         _state(ra_dirs, "Actual Dir")
@@ -6184,8 +6183,9 @@ class TestStateCoreHeader:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Left out rather than mangled into a folder no client files under."""
-        emu = self._running(client, broker_dirs, ra_dirs, no_launch, monkeypatch)
-        emu._observed_lib = "Snës9x"
+        core = _untested_snes_core()
+        emu = self._running(client, broker_dirs, ra_dirs, no_launch, monkeypatch, core=core)
+        assert emu._observed_lib is None
         _state(ra_dirs, "Snës9x")
         r = client.get(f"{PREFIX}/api/session/state-file", params={"slot": 0})
         assert r.status_code == 200
