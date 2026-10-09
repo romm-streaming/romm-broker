@@ -998,8 +998,7 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     # The library name is the folder every RetroArch client files the core's
     # saves and states under, so RomM files the session's there too.
     ident = emulator.core_identity()
-    if "library_name" in ident:
-        ident["library_name"] = _library_token(ident["library_name"])
+    ident["library_name"] = _library_token(ident.get("library_name"))
     return {
         "status": "launching",
         "session_id": sess["id"],
