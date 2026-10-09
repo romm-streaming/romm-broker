@@ -211,10 +211,35 @@ The other platforms refuse a `.srm`:
 | `a5200`, `prosystem`, `freeintv`, `vecx`, `o2em`, `fuse`, `genesis_plus_gx` (sega-pico) | no battery save |
 
 The broker renames an imported save after the game being launched, whatever
-it was called before. It refuses a `.sav`, `.rtc`, `.nv`, `.eep` or `.mpk`
-file as needing conversion until each core's name for that file has been
-checked. A save state isn't imported as a save: send it to
+it was called before. A save state isn't imported as a save: send it to
 `PUT /api/session/state-file` after activate.
+
+**`.sav` battery saves.** Handhelds and sync clients often name a battery
+save `.sav`. MinUI and NextUI write `<rom>.<ext>.sav`, and Grout uploads
+files under whatever name the device gave them. On 15 platforms the core
+reads that file the same way it reads its own `.srm`, so the broker renames
+it to the `.srm` and copies the bytes unchanged. The platform table records
+this as `sav_is_srm`:
+
+`snes`, `sfam`, `gb`, `gbc`, `gba`, `virtualboy`, `nds`, `sms`, `gamegear`,
+`sg1000`, `sega32`, `tg16`, `turbografx-cd`, `supergrafx` and `colecovision`.
+
+Three of them have a catch:
+
+- **Game Boy and Game Boy Color**: mGBA, VBA-M and cartridge dumpers add the
+  real-time clock to the end of the file. RetroArch drops anything past the
+  core's save size, so the save loads and the game's clock resets.
+- **GBA**: mGBA works out the save type from its own game database, not from
+  the file's size. A 128 KB gpSP save and a 32 KB cartridge dump both load.
+- **NDS**: melonDS DS sizes the save from its game database. A file shorter
+  than that is padded with zeros.
+
+Everywhere else a `.sav` is refused as `needs_conversion`, because placing
+it as the `.srm` would load the wrong data without any error. mupen64plus_next
+packs every N64 save type into one `.srm`, Mesen keeps Bandai EEPROM and
+CHR-battery saves in other files, and a PlayStation `.srm` has to be a raw
+memory card. Send the core's `.srm` on those platforms. A `.rtc`, `.nv`,
+`.eep` or `.mpk` file is refused the same way on every platform.
 
 NeoCD's backup RAM has a similar problem even though `neo-geo-cd` takes a
 `.srm` import: the core reads and writes its `neocd/neocd.srm` in the system
@@ -436,5 +461,5 @@ Generated from `webstation_broker/emulators/retroarch_platforms.json` and
 `webstation_broker/emulators/retroarch.py`, cross-referenced against
 libretro's BIOS Information Hub. Update this table if platform mappings,
 `core_source` overrides, `assets`, `save_subtrees`, `library_name`,
-`save_ram`, `savestate`, `core_options`, `core_option_seeds`, or `save_links`
-fields change in `retroarch_platforms.json`.
+`save_ram`, `sav_is_srm`, `savestate`, `core_options`, `core_option_seeds`,
+or `save_links` fields change in `retroarch_platforms.json`.

@@ -130,7 +130,7 @@ through a symlink, or the member is refused.
 
 | `emulator` | `save` | `memcard` | `state` |
 | --- | --- | --- | --- |
-| `retroarch` | one `.srm`, on a platform whose core loads one; on `wii`, title folders, `title/<type>/<title id>/data/`; on `3ds`, folders inside Azahar's `sdmc/Nintendo 3DS/` or `nand/data/` | not taken; `expected` names `save` | `PUT /api/session/state-file` after activate |
+| `retroarch` | one `.srm`, on a platform whose core loads one, or one `.sav` where the core reads it as its `.srm`; on `wii`, title folders, `title/<type>/<title id>/data/`; on `3ds`, folders inside Azahar's `sdmc/Nintendo 3DS/` or `nand/data/` | not taken; `expected` names `save` | `PUT /api/session/state-file` after activate |
 | `flycast` | raw 131072-byte `vmu_save_<A-D><1-2>.bin` images, and `dc_nvmem.bin` | a raw 131072-byte VMU (Dreamcast memory card) image | one `.state`; needs `save.resume_slot` |
 | `duckstation` | a raw 131072-byte `.mcd`, `.mcr`, `.mc` or `.srm` card | the same as `save` | one `<serial>_resume.sav` or `<serial>_<n>.sav`; needs `save.resume_slot` |
 | `ppsspp` | PSP save folders, `SAVEDATA/<product code><suffix>/`, each holding `PARAM.SFO` | not taken | one `<game id>_<version>_<n>.ppst`, with its `.jpg` screenshot if sent; needs `save.resume_slot` |
@@ -164,17 +164,22 @@ save the archive already carries at the same path, is a `destination_conflict`.
   `dolphin` instead; this refusal names no `suggest_emulator`.
 - A `.srm` on `wii` or `3ds`: `unrecognised_layout`, whatever its name. The
   detail names the kind of folder that platform takes.
-- On any other platform whose core loads no `.srm`, such as `nds`, `dc` or
+- On any other platform whose core loads no `.srm`, such as `dc` or
   `arcade`: `destination_unresolvable`. The core keeps its save in a file of
   its own, or has none. Discovery lists no `save` shapes there, and
   [RetroArch cores](/docs/emulators/retroarch-cores#saves-states-and-imports)
   lists the 23 platforms that take a `.srm` and where each other core keeps
   its save.
 - On a platform RetroArch has no core for: `destination_unresolvable`.
-- A `.sav`, `.rtc`, `.nv`, `.eep` or `.mpk` file: `needs_conversion`, until
-  each core's name for that file has been checked. On `wii` and `3ds` a file
-  with one of those names is judged as part of a save folder, so it gets the
-  folder refusals instead.
+- A `.sav` is placed as the `.srm` on the 15 platforms whose core reads it
+  as one, and discovery lists `<name>.sav` there.
+  [RetroArch cores](/docs/emulators/retroarch-cores#saves-states-and-imports) lists
+  them. A `.sav` and a `.srm` in the same archive would both become that one
+  file, so both get `destination_conflict`.
+- A `.sav` on any other platform, or a `.rtc`, `.nv`, `.eep` or `.mpk` file
+  anywhere: `needs_conversion`, until each core's name for that file has
+  been checked. On `wii` and `3ds` a file with one of those names is judged
+  as part of a save folder, so it gets the folder refusals instead.
 - A `memcard` member: `kind_not_accepted`, with `expected` naming `save`.
   On a platform that takes a `.srm`, send the core's `.srm` as a save instead.
 - A `state` member: `state_uses_push`. On `jaguar`, whose core has no states,

@@ -340,7 +340,11 @@ STATE_SLOT = int(os.environ.get("RETROARCH_STATE_SLOT", "0"))
 """The one slot the broker works in, from `RETROARCH_STATE_SLOT` (default 0).
 
 0 is RetroArch's own default, so a state written here is also the one the
-player's own load hotkey reaches for.
+player's own load hotkey reaches for. -1 works in the auto slot,
+`<content>.state.auto`, instead (#135): the homing presses stop on that floor,
+`SAVE_STATE` writes it, and `LOAD_STATE_SLOT -1` reads it. The appended config
+keeps `savestate_auto_save` and `savestate_auto_load` off either way, so
+RetroArch never writes or loads that file behind the broker's back.
 """
 SLOT_STEP_DELAY = float(os.environ.get("RETROARCH_SLOT_STEP_DELAY", "0.1"))
 """Seconds between slot-homing presses, from `RETROARCH_SLOT_STEP_DELAY` (default 0.1).
@@ -447,11 +451,11 @@ _PLATFORMS_FILE = Path(__file__).with_name("retroarch_platforms.json")
 
 
 _ENTRY_KEYS = (
-    frozenset({"core", "library_name", "save_ram", "extensions", "alternates", "untested"})
+    frozenset({"core", "library_name", "save_ram", "sav_is_srm", "extensions", "alternates", "untested"})
     | retroarch_cores.CORE_OWNED_FIELDS
 )
 """Every key a platform entry may carry."""
-_ALTERNATE_KEYS = frozenset({"library_name", "save_ram"}) | retroarch_cores.CORE_OWNED_FIELDS
+_ALTERNATE_KEYS = frozenset({"library_name", "save_ram", "sav_is_srm"}) | retroarch_cores.CORE_OWNED_FIELDS
 """Every key an alternate may carry: its name is its key and its extensions are the platform's."""
 
 
@@ -467,7 +471,8 @@ def _validate_entry(slug: str, info: dict[str, Any], *, alternate: bool) -> None
         ValueError: On an unknown key, a missing `library_name`, or a
             `save_ram` that is not a boolean. It decides whether an import may
             place a `.srm`, so a missing one is never read as either answer.
-            Also on an `untested` that is present but not a boolean.
+            Also on an `untested` or `sav_is_srm` that is present but not a
+            boolean, and on a `sav_is_srm` set where `save_ram` is not.
     """
     unknown = set(info) - (_ALTERNATE_KEYS if alternate else _ENTRY_KEYS)
     if unknown:
@@ -478,6 +483,10 @@ def _validate_entry(slug: str, info: dict[str, Any], *, alternate: bool) -> None
         raise ValueError(f"{_PLATFORMS_FILE.name}: {slug} needs a library_name")
     if "untested" in info and not isinstance(info["untested"], bool):
         raise ValueError(f"{_PLATFORMS_FILE.name}: {slug} needs a true or false untested")
+    if "sav_is_srm" in info and not isinstance(info["sav_is_srm"], bool):
+        raise ValueError(f"{_PLATFORMS_FILE.name}: {slug} needs a true or false sav_is_srm")
+    if info.get("sav_is_srm") and not info["save_ram"]:
+        raise ValueError(f"{_PLATFORMS_FILE.name}: {slug} sets sav_is_srm without save_ram")
     for key in ("extensions", "save_subtrees", "extra_extensions"):
         if key in info:
             info[key] = tuple(info[key])
@@ -517,6 +526,12 @@ always the core's file name: dolphin reports `dolphin-emu`.
 `RETRO_MEMORY_SAVE_RAM` on this platform, so that RetroArch loads its battery
 save from `<stem>.srm`. Where it is false the core keeps its save in a file of
 its own, or has none, so an imported `.srm` would never reach the game.
+
+`sav_is_srm` is optional, and true only where a device's `.sav` for this
+platform was checked to hold the same bytes, at the same offsets, as the
+core's `.srm` (#135). There an import places a `.sav` as the `.srm`; it is
+renamed, never converted. An alternate states its own, and an untested core
+has none.
 
 `savestate` is assumed true; only specialized cores opt out.
 
@@ -2087,6 +2102,23 @@ _UNCONVERTED_SAVE_SUFFIXES: frozenset[str] = frozenset({".sav", ".rtc", ".nv", "
 """Other save-file suffixes cores write, not placed until each core's name for them is verified."""
 _SRM_EXPECTED = "one non-empty <name>.srm, the core's SRAM"
 """The save shape RetroArch takes, in words, for a refusal's `expected`."""
+_SRM_OR_SAV_NAME_RE = re.compile(r"[^/]+\.(?:srm|sav)", re.IGNORECASE | re.ASCII)
+"""`_SRM_NAME_RE` where the core reads a `.sav` as its `.srm` (`sav_is_srm`)."""
+_SRM_OR_SAV_EXPECTED = "one non-empty <name>.srm or <name>.sav, the core's SRAM"
+"""`_SRM_EXPECTED` where the core reads a `.sav` as its `.srm`."""
+
+
+def _sav_is_srm(info: Optional[Mapping[str, Any]]) -> bool:
+    """Whether the profile's core reads a device's `.sav` as its `.srm`.
+
+    Args:
+        info: The resolved profile, or None for an unmapped platform.
+
+    Returns:
+        True only where the table sets `sav_is_srm`; an untested core never does.
+    """
+    return info is not None and info.get("sav_is_srm") is True
+
 _LAYOUT_WII = "wii"
 """`_layout`'s answer for the Dolphin core on the Wii: an emulated NAND tree."""
 _LAYOUT_3DS = "3ds"
@@ -2316,40 +2348,43 @@ def _place_n3ds(
 
 
 def _place_srm(
-    member: imports.ImportMember, lib: str, rom_file: Path
+    member: imports.ImportMember, lib: str, rom_file: Path, *, sav: bool = False
 ) -> Union[imports.Placement, imports.ImportRefusal]:
     """Place one `.srm` where the core loads SRAM for the booted content.
 
     RetroArch names SRAM after the content it loaded, so the member's own
     stem is replaced with the booted file's; for a playlist boot that is the
-    playlist's stem.
+    playlist's stem. With `sav`, a `.sav` is placed the same way, renamed to
+    the `.srm` and left byte for byte as it came.
 
     Args:
         member: The save member, already past the kind gate.
         lib: The core's `library_name`, which names the sorted save dir.
         rom_file: The booted file.
+        sav: Whether the core reads a `.sav` as its `.srm` (`sav_is_srm`).
 
     Returns:
         The placement at `saves/<lib>/<rom_file.stem>.srm`, or a refusal.
     """
+    expected = _SRM_OR_SAV_EXPECTED if sav else _SRM_EXPECTED
     if len(member.parts) != 1:
         return imports.ImportRefusal(
-            "unrecognised_layout", member.name, _SRM_EXPECTED, detail="expected a single file"
+            "unrecognised_layout", member.name, expected, detail="expected a single file"
         )
     leaf = member.parts[0]
     if _STATE_LEAF_RE.fullmatch(leaf):
         return imports.ImportRefusal(
             "unrecognised_layout",
             member.name,
-            _SRM_EXPECTED,
+            expected,
             detail="a RetroArch state, which is PUT to /api/session/state-file after activate",
         )
     suffix = PurePosixPath(leaf).suffix.lower()
-    if suffix in _UNCONVERTED_SAVE_SUFFIXES:
+    if suffix in _UNCONVERTED_SAVE_SUFFIXES and not (sav and suffix == ".sav"):
         return imports.ImportRefusal(
             "needs_conversion",
             member.name,
-            _SRM_EXPECTED,
+            expected,
             detail=(
                 f"{suffix} files are not placed until each core's name for them is verified; "
                 "send the core's .srm"
@@ -2370,16 +2405,16 @@ def _place_srm(
     dest = imports.place_single_file(
         member,
         subtree=f"{SAVE_DIR.name}/{lib}",
-        pattern=_SRM_NAME_RE,
+        pattern=_SRM_OR_SAV_NAME_RE if sav else _SRM_NAME_RE,
         rename=rename,
-        expected=_SRM_EXPECTED,
+        expected=expected,
         nonempty=True,
         # A state name is refused above, with the route it belongs on.
         refuse_libretro_states=False,
     )
     if isinstance(dest, imports.ImportRefusal):
         return dest
-    if PurePosixPath(leaf).stem != rom_file.stem:
+    if PurePosixPath(leaf).stem != rom_file.stem or suffix == ".sav":
         log.info("retroarch: import %s placed as %s, named for the loaded content", member.name, dest)
     return imports.Placement(member, dest)
 
@@ -2458,7 +2493,8 @@ class Retroarch(Emulator):
     Declared imports take one `.srm` save per archive, renamed to the booted
     content's stem and placed in `saves/<library_name>/`, where the core
     loads SRAM. Only a platform whose core loads a `.srm` (`save_ram` in
-    `PLATFORMS`) takes one. The Wii and 3DS platforms take the files of
+    `PLATFORMS`) takes one, and where the core reads a device's `.sav` the
+    same way (`sav_is_srm`), a `.sav` is placed as the `.srm`. The Wii and 3DS platforms take the files of
     their core's own tree instead, a NAND title folder or a path in
     Azahar's SD card and NAND, and GameCube and every other platform whose
     core keeps its saves elsewhere take nothing. States are never imported;
@@ -4173,7 +4209,10 @@ class Retroarch(Emulator):
         return STATE_DIR / lib / name if lib else STATE_DIR / name
 
     def import_spec(self) -> imports.ImportSpec:
-        """Take one `.srm`, NAND or SD files, or nothing; take states through the push routes.
+        """Take one `.srm` (or `.sav`), NAND or SD files, or nothing; take states through the push routes.
+
+        A platform whose core reads a `.sav` as its `.srm` (`sav_is_srm`)
+        names both shapes, still one member at most.
 
         A platform whose core loads no `.srm` and has no layout of its own
         (see `_srm_dir` and `_layout`), and an unmapped platform, declare the
@@ -4199,7 +4238,8 @@ class Retroarch(Emulator):
             save = imports.KindSpec("save", _N3DS_SHAPES)
             protected = _N3DS_PROTECTED
         elif isinstance(_srm_dir(self.platform, profile), str):
-            save = imports.KindSpec("save", ("<name>.srm",), max_members=1)
+            shapes = ("<name>.srm", "<name>.sav") if _sav_is_srm(profile) else ("<name>.srm",)
+            save = imports.KindSpec("save", shapes, max_members=1)
         else:
             save = imports.KindSpec("save", ())
         channel: imports.StateChannel = "push" if profile is not None and self.supports_states else "none"
@@ -4281,10 +4321,10 @@ class Retroarch(Emulator):
             return imports.ImportRefusal(
                 "destination_unresolvable",
                 member.name,
-                _SRM_EXPECTED,
+                _SRM_OR_SAV_EXPECTED if _sav_is_srm(profile) else _SRM_EXPECTED,
                 detail="no rom file to name the save after",
             )
-        placed = _place_srm(member, lib, ctx.rom_file)
+        placed = _place_srm(member, lib, ctx.rom_file, sav=_sav_is_srm(profile))
         if isinstance(placed, imports.Placement) and profile is not None and profile["save_ram"] is None:
             log.warning(
                 "retroarch: placed %s for untested core %s, which may not read a .srm",

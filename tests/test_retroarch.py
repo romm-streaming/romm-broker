@@ -939,6 +939,52 @@ _SRM_PLATFORMS = frozenset(
 (updated 2026-09-23: nds moved from `melonds` to `melondsds`, which does expose it;
 2026-09-25: nintendo-dsi added on the same `melondsds` core)."""
 
+_SAV_PLATFORMS = frozenset(
+    {
+        "snes", "sfam", "gb", "gbc", "gba", "virtualboy", "nds", "sms", "gamegear", "sg1000", "sega32",
+        "tg16", "turbografx-cd", "supergrafx", "colecovision",
+    }
+)  # fmt: skip
+"""The 15 platforms whose core reads a device's `.sav` as its `.srm`, per the 2026-10-06 source check (#135).
+
+Left out: n64 (mupen64plus_next packs every save type into one container),
+nes and famicom (Bandai EEPROM and CHR-battery boards), genesis (half-size
+dumps), psx (only a raw card would do), nintendo-dsi (DSiWare saves skip
+SAVE_RAM), and the cores no `.sav` source was checked for.
+"""
+
+
+def test_a_sav_is_taken_on_exactly_the_checked_platforms() -> None:
+    """The table opts in the 15 checked platforms, each of which also takes a `.srm`."""
+    taken = {slug for slug, info in retroarch.PLATFORMS.items() if info.get("sav_is_srm")}
+
+    assert taken == _SAV_PLATFORMS
+    assert taken <= _SRM_PLATFORMS
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_a_sav_is_srm_that_is_not_a_boolean_fails_the_load(value: object) -> None:
+    """`sav_is_srm` is optional, but present it has to be a bool.
+
+    Args:
+        value: What the entry spells it as.
+    """
+    with pytest.raises(ValueError, match="snes needs a true or false sav_is_srm"):
+        retroarch._validate_entry("snes", {**_BASE, "sav_is_srm": value}, alternate=False)
+
+
+def test_a_sav_is_srm_without_save_ram_fails_the_load() -> None:
+    """A core that loads no `.srm` cannot read a `.sav` as one."""
+    with pytest.raises(ValueError, match="snes sets sav_is_srm without save_ram"):
+        retroarch._validate_entry("snes", {**_BASE, "save_ram": False, "sav_is_srm": True}, alternate=False)
+
+
+def test_an_alternate_may_set_its_own_sav_is_srm() -> None:
+    """The flag belongs to the core, so an alternate states its own."""
+    alt = {"library_name": "bsnes", "save_ram": True, "sav_is_srm": True}
+
+    retroarch._validate_entry("snes", alt, alternate=True)
+
 
 def test_a_srm_is_taken_on_exactly_the_platforms_whose_core_loads_one() -> None:
     """The `.srm` predicate answers yes on the 25 checked platforms, and the table's flags agree.
@@ -3590,6 +3636,157 @@ class TestSaveWithTheMenuOpen:
         assert fake.toggles == 1
 
 
+class TestAutoStateSlot:
+    """`RETROARCH_STATE_SLOT=-1`: the broker works in RetroArch's auto slot, `.state.auto` (#135).
+
+    RetroArch 1.22.2 takes it both ways: `SAVE_STATE` with the current slot
+    parked on the -1 floor writes `<content>.state.auto`, and
+    `LOAD_STATE_SLOT -1` reads it back.
+    """
+
+    @pytest.fixture
+    def make(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]:
+        """Build a live Retroarch working in slot -1, wired to a `FakeMenuRetroarch`.
+
+        Args:
+            tmp_path: Backs the state directory.
+            monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            A factory taking `FakeMenuRetroarch`'s keyword arguments and a
+            `homed` flag, returning the emulator and its fake.
+        """
+        state_dir = tmp_path / "states"
+        monkeypatch.setattr(retroarch, "STATE_DIR", state_dir)
+        monkeypatch.setattr(retroarch, "STATE_SLOT", -1)
+        monkeypatch.setattr(retroarch, "SLOT_STEP_DELAY", 0)
+        monkeypatch.setattr(retroarch, "SLOT_HOME_STEPS", 4)
+        monkeypatch.setattr(retroarch, "MENU_SETTLE", 0)
+
+        def build(homed: bool = True, **kwargs: Any) -> tuple[retroarch.Retroarch, FakeMenuRetroarch]:
+            fake = FakeMenuRetroarch(state_dir, **kwargs)
+            emu = retroarch.Retroarch()
+            emu.platform = "gb"
+            emu._rom_base = "Game"
+            emu._slot_homed = homed
+            emu._state_confirm_wait = 0.8
+            monkeypatch.setattr(emu, "alive", lambda: True)
+            monkeypatch.setattr(emu, "_write_cmd", fake.write_cmd)
+            monkeypatch.setattr(emu, "_observe_library_name", lambda: None)
+            monkeypatch.setattr(emu, "_wait_for_first_save_settle", lambda: None)
+            return emu, fake
+
+        return build
+
+    def test_homing_parks_the_slot_on_the_floor_and_saves_there(
+        self, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]
+    ) -> None:
+        """The MINUS presses alone reach -1, so no PLUS press follows them."""
+        emu, fake = make(homed=False, slot=3)
+
+        assert emu.save_state(-1) is True
+        assert fake.slot == -1
+        assert "STATE_SLOT_PLUS" not in fake.sent
+        assert (fake.dir / "Game.state.auto").exists()
+        assert not (fake.dir / "Game.state").exists()
+
+    def test_a_save_that_drifted_off_the_auto_slot_is_re_homed(
+        self, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]
+    ) -> None:
+        """A save the player's own slot keys sent elsewhere is retried in the auto slot."""
+        emu, fake = make(slot=2)
+
+        assert emu.save_state(-1) is True
+        assert fake.slot == -1
+        assert (fake.dir / "Game.state.auto").exists()
+
+    def test_the_working_state_is_the_auto_file(
+        self, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]
+    ) -> None:
+        """`state_path` serves `.state.auto`, never a slot 0 state beside it."""
+        emu, fake = make()
+        fake.dir.mkdir(parents=True)
+        (fake.dir / "Game.state").write_bytes(b"slot 0")
+        (fake.dir / "Game.state.auto").write_bytes(b"auto")
+
+        assert emu.state_path() == fake.dir / "Game.state.auto"
+
+    def test_a_load_names_the_auto_slot(
+        self,
+        make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`LOAD_STATE_SLOT -1` is the command, and the read of `.state.auto` confirms it."""
+        emu, fake = make()
+        fake.dir.mkdir(parents=True)
+        auto = fake.dir / "Game.state.auto"
+        auto.write_bytes(b"auto")
+        monkeypatch.setattr(retroarch, "_atime_tracked", lambda d: True)
+        monkeypatch.setattr(retroarch, "LOAD_CONFIRM_WAIT", 0.5)
+        sent: list[str] = []
+
+        def echo_and_read(cmd: str, wait_prefix: Any, timeout: float) -> str:
+            sent.append(cmd)
+            auto.read_bytes()
+            return cmd
+
+        monkeypatch.setattr(emu, "_send", echo_and_read)
+
+        assert emu.load_state(-1) is True
+        assert sent == ["LOAD_STATE_SLOT -1"]
+
+    def test_a_resume_loads_the_auto_slot(
+        self,
+        make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The deferred resume waits for `.state.auto`, then loads it with `LOAD_STATE_SLOT -1`."""
+        emu, fake = make()
+        emu._resume_settle = 0
+        fake.dir.mkdir(parents=True)
+        auto = fake.dir / "Game.state.auto"
+        auto.write_bytes(b"auto")
+        monkeypatch.setattr(retroarch, "_atime_tracked", lambda d: True)
+        monkeypatch.setattr(retroarch, "LOAD_CONFIRM_WAIT", 0.5)
+        sent: list[str] = []
+
+        def echo_and_read(cmd: str, wait_prefix: Any, timeout: float) -> str:
+            sent.append(cmd)
+            auto.read_bytes()
+            return cmd
+
+        monkeypatch.setattr(emu, "_send", echo_and_read)
+
+        assert emu._load_until_confirmed(-1, time.monotonic() + 5.0, emu._launch_seq) is True
+        assert sent == ["LOAD_STATE_SLOT -1"]
+
+    def test_an_exit_saves_into_the_auto_slot_and_reports_it(
+        self,
+        make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The exit save lands in `.state.auto`, and the report names slot -1 and that file."""
+        emu, fake = make()
+        monkeypatch.setattr(emu, "_flush_sram", lambda: True)
+        monkeypatch.setattr(emu, "_quit", lambda: None)
+
+        report = emu.save_and_exit(-1)
+
+        assert report["state_saved"] is True
+        assert report["state_slot"] == -1
+        assert report["state_file"]["path"] == str(fake.dir / "Game.state.auto")
+
+    def test_a_first_push_lands_in_the_auto_slot(
+        self, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]
+    ) -> None:
+        """A pushed state from any slot is filed as `.state.auto`, where the load looks."""
+        emu, fake = make()
+
+        assert emu.state_target("Game.state3") == fake.dir / "Game.state.auto"
+
+
 class TestResumeLoadRetry:
     """The deferred resume load's bounded retry and its failure escalation."""
 
@@ -4210,6 +4407,8 @@ def _on(platform: Optional[str]) -> retroarch.Retroarch:
 
 _SRM_EXPECTED = "one non-empty <name>.srm, the core's SRAM"
 """The shape a refused save is told to take, spelled out so the tests do not lean on the module."""
+_SRM_OR_SAV_EXPECTED = "one non-empty <name>.srm or <name>.sav, the core's SRAM"
+"""The shape a refused save is told to take where the core reads a `.sav` as its `.srm`."""
 _STATE_AS_SAVE = "a RetroArch state, which is PUT to /api/session/state-file after activate"
 """The detail a state sent as a save is refused with."""
 _PUSHED = "a state PUT to /api/session/state-file after activate, with resume_slot set"
@@ -4297,7 +4496,9 @@ def _member(tail: str, kind: str) -> imports.ImportMember:
 @pytest.mark.parametrize(
     ("platform", "shapes", "max_members", "channel", "protected"),
     [
-        ("snes", ["<name>.srm"], 1, "push", ()),
+        ("snes", ["<name>.srm", "<name>.sav"], 1, "push", ()),
+        ("gba", ["<name>.srm", "<name>.sav"], 1, "push", ()),
+        ("n64", ["<name>.srm"], 1, "push", ()),
         ("psx", ["<name>.srm"], 1, "push", ()),
         ("jaguar", ["<name>.srm"], 1, "none", ()),
         ("dc", [], None, "push", ()),
@@ -4319,6 +4520,9 @@ def test_the_import_spec_follows_the_platform(
     protected: tuple[str, ...],
 ) -> None:
     """One `.srm` where the core loads SRAM from one, NAND or SD files on wii and 3ds, none elsewhere.
+
+    A platform whose core reads a device's `.sav` as its `.srm` names that
+    shape too, still one member at most.
 
     An empty shape list tells RomM the save is refused on that platform, and
     `place_import` says why. Jaguar's core has no states, and nothing launches
@@ -4355,6 +4559,12 @@ def test_the_import_spec_follows_the_platform(
         ("psx", "Game (USA).m3u", "Game (USA) (Disc 1).srm", "saves/SwanStation/Game (USA).srm"),
         ("genesis", "Sonic.md", "Sonic.srm", "saves/Genesis Plus GX/Sonic.srm"),
         ("nds", "Game.nds", "Game.srm", "saves/melonDS DS/Game.srm"),
+        ("gba", "Game (USA).gba", "Game (USA).gba.sav", "saves/mGBA/Game (USA).srm"),
+        ("gba", "Game (USA).gba", "Game (USA).sav", "saves/mGBA/Game (USA).srm"),
+        ("gbc", "Game.gbc", "Game.SAV", "saves/Gambatte/Game.srm"),
+        ("snes", "Game (USA).sfc", "other.sav", "saves/Snes9x/Game (USA).srm"),
+        ("nds", "Game.nds", "Game.sav", "saves/melonDS DS/Game.srm"),
+        ("sega32", "Game.32x", "Game.sav", "saves/PicoDrive/Game.srm"),
     ],
 )
 def test_a_srm_lands_where_the_core_loads_sram_for_the_booted_content(
@@ -4363,6 +4573,8 @@ def test_a_srm_lands_where_the_core_loads_sram_for_the_booted_content(
     """The save is renamed to the booted content's stem, in the core's sorted dir.
 
     For a playlist boot that is the playlist's stem, whichever disc the save was named for.
+    A `.sav` is placed the same way where the core reads one as its `.srm`,
+    including MinUI's `<rom>.<ext>.sav` names.
 
     Args:
         ra_dirs: The patched data root.
@@ -4384,7 +4596,6 @@ def test_a_srm_lands_where_the_core_loads_sram_for_the_booted_content(
     [
         ("sub/Game.srm", 4, "unrecognised_layout", "expected a single file"),
         ("Game.srm", 0, "incomplete_unit", "the file is empty"),
-        ("Game.sav", 4, "needs_conversion", _unconverted(".sav")),
         ("Game.RTC", 4, "needs_conversion", _unconverted(".rtc")),
         ("Game.nv", 4, "needs_conversion", _unconverted(".nv")),
         ("Game.eep", 4, "needs_conversion", _unconverted(".eep")),
@@ -4400,6 +4611,8 @@ def test_a_save_that_is_not_one_srm_is_refused(
 ) -> None:
     """A nested file, an empty one, an unverified save file, a state or any other name is refused.
 
+    snes reads a `.sav` as its `.srm`, so its refusals name both shapes.
+
     Args:
         ra_dirs: The patched data root.
         name: The member's path below `.import/save/`.
@@ -4412,8 +4625,58 @@ def test_a_save_that_is_not_one_srm_is_refused(
     result = preflight_import(_on("snes"), body, rom_file=ra_dirs / "Game.sfc")
 
     assert [(r.reason, r.member, r.expected, r.detail) for r in result.refusals] == [
-        (reason, f".import/save/{name}", _SRM_EXPECTED, detail)
+        (reason, f".import/save/{name}", _SRM_OR_SAV_EXPECTED, detail)
     ]
+
+
+@pytest.mark.parametrize(
+    ("platform", "rom"),
+    [
+        ("n64", "Game.z64"),
+        ("nes", "Game.nes"),
+        ("famicom", "Game.nes"),
+        ("genesis", "Game.md"),
+        ("psx", "Game.cue"),
+        ("nintendo-dsi", "Game.nds"),
+        ("wonderswan", "Game.ws"),
+        ("jaguar", "Game.j64"),
+    ],
+)
+def test_a_sav_is_refused_where_the_core_s_name_for_it_is_unverified(
+    ra_dirs: Path, platform: str, rom: str
+) -> None:
+    """A platform that takes a `.srm` but was not checked for `.sav` still asks for the core's `.srm`.
+
+    Placed as a `.srm`, an n64 `.sra` or a Bandai NES save would load without
+    an error into the wrong bytes, so the refusal stands until a core is checked.
+
+    Args:
+        ra_dirs: The patched data root.
+        platform: The RomM platform slug.
+        rom: The booted file's name.
+    """
+    body = import_zip({".import/save/Game.sav": b"sram"})
+
+    result = preflight_import(_on(platform), body, rom_file=ra_dirs / rom)
+
+    assert [(r.reason, r.expected, r.detail) for r in result.refusals] == [
+        ("needs_conversion", _SRM_EXPECTED, _unconverted(".sav"))
+    ]
+
+
+@pytest.mark.parametrize("name", ["Game.rtc", "Game.eep"])
+def test_a_sav_platform_still_refuses_the_other_unverified_suffixes(ra_dirs: Path, name: str) -> None:
+    """Only `.sav` is opted in; a core's `.rtc` or `.eep` is still not placed.
+
+    Args:
+        ra_dirs: The patched data root.
+        name: The member's file name.
+    """
+    body = import_zip({f".import/save/{name}": b"sram"})
+
+    result = preflight_import(_on("gb"), body, rom_file=ra_dirs / "Game.gb")
+
+    assert [r.reason for r in result.refusals] == ["needs_conversion"]
 
 
 @pytest.mark.parametrize(
@@ -4489,6 +4752,26 @@ def test_a_platform_advertises_a_srm_exactly_when_it_places_one(ra_dirs: Path, p
     assert advertised is (result.refusals == ()), [r.as_dict() for r in result.refusals]
 
 
+@pytest.mark.parametrize("platform", sorted(retroarch.PLATFORMS))
+def test_a_platform_advertises_a_sav_exactly_when_it_places_one(ra_dirs: Path, platform: str) -> None:
+    """The spec's `.sav` shape and `place_import` agree on every platform in the table.
+
+    Args:
+        ra_dirs: The patched data root.
+        platform: The RomM platform slug.
+    """
+    emu = _on(platform)
+    body = import_zip({".import/save/Game.sav": b"sram"})
+
+    result = preflight_import(emu, body, rom_file=ra_dirs / "Game.bin")
+
+    save = emu.import_spec().kind("save")
+    assert save is not None
+    advertised = "<name>.sav" in save.shapes
+    assert advertised is (result.refusals == ()), [r.as_dict() for r in result.refusals]
+    assert advertised is (platform in _SAV_PLATFORMS)
+
+
 def test_a_srm_with_no_rom_to_name_it_after_is_refused(ra_dirs: Path) -> None:
     """RetroArch names SRAM after the booted file, so without one there is nowhere to put it.
 
@@ -4545,6 +4828,96 @@ def test_two_srm_members_are_both_refused(ra_dirs: Path) -> None:
         ("destination_conflict", ".import/save/A.srm", "another member lands on the same file"),
         ("destination_conflict", ".import/save/B.srm", "another member lands on the same file"),
     ]
+
+
+def test_a_sav_and_a_srm_for_the_same_content_are_both_refused(ra_dirs: Path) -> None:
+    """Both would become the one `.srm`, so neither is picked over the other.
+
+    Args:
+        ra_dirs: The patched data root.
+    """
+    body = import_zip({".import/save/Game.sav": b"a", ".import/save/Game.srm": b"b"})
+
+    result = preflight_import(_on("gba"), body, rom_file=ra_dirs / "Game.gba")
+
+    assert [(r.reason, r.member) for r in result.refusals] == [
+        ("destination_conflict", ".import/save/Game.sav"),
+        ("destination_conflict", ".import/save/Game.srm"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("name", "size", "reason", "detail"),
+    [
+        ("Game.sav", 0, "incomplete_unit", "the file is empty"),
+        ("sub/Game.sav", 4, "unrecognised_layout", "expected a single file"),
+        ("Game.sav.bak", 4, "unrecognised_layout", None),
+    ],
+)
+def test_a_sav_that_is_not_one_named_file_is_refused(
+    ra_dirs: Path, name: str, size: int, reason: str, detail: Optional[str]
+) -> None:
+    """A `.sav` is held to the same single, non-empty, named file a `.srm` is.
+
+    Args:
+        ra_dirs: The patched data root.
+        name: The member's path below `.import/save/`.
+        size: The member's size.
+        reason: The refusal code.
+        detail: The refusal's detail.
+    """
+    body = import_zip({f".import/save/{name}": b"\0" * size})
+
+    result = preflight_import(_on("gba"), body, rom_file=ra_dirs / "Game.gba")
+
+    assert [(r.reason, r.member, r.expected, r.detail) for r in result.refusals] == [
+        (reason, f".import/save/{name}", _SRM_OR_SAV_EXPECTED, detail)
+    ]
+
+
+def test_a_mixed_case_sav_is_placed(ra_dirs: Path) -> None:
+    """The suffix is matched in any case, as a `.SRM` is.
+
+    Args:
+        ra_dirs: The patched data root.
+    """
+    body = import_zip({".import/save/Game.SaV": b"sram"})
+
+    result = preflight_import(_on("gba"), body, rom_file=ra_dirs / "Game.gba")
+
+    assert [p.dest for p in result.placements] == [PurePosixPath("saves/mGBA/Game.srm")]
+
+
+def test_a_sav_over_the_archive_s_srm_for_the_content_is_a_conflict(ra_dirs: Path) -> None:
+    """A `.sav` never silently replaces the `.srm` the restored archive already holds.
+
+    Args:
+        ra_dirs: The patched data root.
+    """
+    body = import_zip({".import/save/Game.sav": b"new"}, v1={"saves/mGBA/Game.srm": b"old"})
+
+    result = preflight_import(_on("gba"), body, rom_file=ra_dirs / "Game.gba")
+
+    assert [(r.reason, r.member) for r in result.refusals] == [
+        ("destination_conflict", ".import/save/Game.sav")
+    ]
+
+
+def test_an_imported_sav_is_written_byte_for_byte_as_the_srm(ra_dirs: Path) -> None:
+    """The broker renames a `.sav`, never converts it: the core reads the same bytes.
+
+    Args:
+        ra_dirs: The patched data root.
+    """
+    emu = _on("gba")
+    sram = bytes(range(256)) * 128
+    body = import_zip({".import/save/Game (USA).gba.sav": sram})
+    result = preflight_import(emu, body, rom_file=ra_dirs / "Game (USA).gba")
+
+    report = restore_import(emu, body, result)
+
+    assert (report["imported"], report["failed"]) == (1, 0)
+    assert (ra_dirs / "saves" / "mGBA" / "Game (USA).srm").read_bytes() == sram
 
 
 def test_a_srm_the_archive_already_holds_for_the_content_is_a_conflict(ra_dirs: Path) -> None:
@@ -4680,7 +5053,7 @@ def test_an_imported_srm_is_written_where_the_core_loads_it(ra_dirs: Path) -> No
 @pytest.mark.parametrize(
     ("platform", "shapes", "channel", "slot"),
     [
-        ("snes", ["<name>.srm"], "push", retroarch.STATE_SLOT),
+        ("snes", ["<name>.srm", "<name>.sav"], "push", retroarch.STATE_SLOT),
         ("jaguar", ["<name>.srm"], "none", None),
         ("dc", [], "push", retroarch.STATE_SLOT),
         ("wii", [_WII_SHAPE], "push", retroarch.STATE_SLOT),
@@ -5875,7 +6248,10 @@ class TestActivateCore:
         assert client.get(f"{PREFIX}/api/session/import-spec", params=params).status_code == 200
 
     def test_import_spec_with_untested_core_offers_srm(self, client: TestClient) -> None:
-        """An untested core still takes a .srm, with a warning at placement."""
+        """An untested core still takes a .srm, with a warning at placement, but never a .sav.
+
+        snes's default core reads a `.sav` as its `.srm`; nothing says another core does.
+        """
         params = {"emulator": "retroarch", "platform": "snes", "core": _untested_snes_core()}
         body = client.get(f"{PREFIX}/api/session/import-spec", params=params).json()
         assert body["kinds"][0]["shapes"] == ["<name>.srm"]

@@ -547,6 +547,67 @@ def test_a_state_route_refuses_a_slot_outside_the_accepted_range(
     assert client.post(f"{API}/session/save-state", json={"slot": 99}).status_code == 422
 
 
+@pytest.mark.parametrize(("route", "calls"), [("save-state", "saved_slots"), ("load-state", "loaded_slots")])
+def test_the_auto_slot_resolves_to_the_working_slot_like_any_other(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    route: str,
+    calls: str,
+) -> None:
+    """Slot -1, RetroArch's auto slot, is passed through and resolved on any emulator, not refused."""
+    _activate(client, broker_dirs)
+
+    response = client.post(f"{API}/session/{route}", json={"slot": -1})
+
+    assert response.status_code == 200
+    assert response.json()["slot"] == 3
+    assert getattr(fake_emulator[0], calls) == [-1]
+
+
+def test_a_slot_below_the_auto_slot_is_refused(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """-1 is the floor RetroArch's slots stop at, so -2 is garbage everywhere."""
+    _activate(client, broker_dirs)
+
+    assert client.post(f"{API}/session/save-state", json={"slot": -2}).status_code == 422
+    assert client.post(f"{API}/session/exit", params={"slot": -2}).status_code == 422
+    assert fake_emulator[0].saved_slots == fake_emulator[0].exit_slots == []
+
+
+def test_an_exit_into_the_auto_slot_saves(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exit passes -1 through to the emulator, which resolves it, so the session is saved, not left up."""
+    monkeypatch.setattr(settings, "DEV_MODE", True)
+    _activate(client, broker_dirs)
+
+    body = client.post(f"{API}/session/exit", params={"slot": -1}).json()
+
+    assert body["status"] == "exited"
+    assert fake_emulator[0].exit_slots == [-1]
+
+
+def test_a_stop_without_a_state_ignores_the_slot_it_names(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`save=0` writes no state, so a slot -1 riding along never reaches the emulator."""
+    monkeypatch.setattr(settings, "DEV_MODE", True)
+    _activate(client, broker_dirs)
+
+    body = client.post(f"{API}/session/exit", params={"slot": -1, "save": False}).json()
+
+    assert body["status"] == "exited"
+    assert fake_emulator[0].exit_slots == [None]
+
+
 def test_a_state_route_refuses_an_emulator_that_died(
     client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
 ) -> None:
