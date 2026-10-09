@@ -343,6 +343,17 @@ async def room_websocket(websocket: WebSocket) -> None:
                         continue
                     await session.handle_assign_slot(target_token, slot)
 
+                elif action == "release_slot" and is_controller:
+                    valid, slot = _gamepad_slot(data.get("slot"))
+                    if not valid or slot is None:
+                        log.warning(
+                            "room websocket: rejecting gamepad slot %r to release from %s",
+                            data.get("slot"),
+                            username,
+                        )
+                        continue
+                    await session.handle_release_slot(slot)
+
                 elif action == "assign_mk" and is_controller:
                     target_token = session.resolve_public_id(data.get("public_id"))
                     await session.handle_assign_mk(target_token)
@@ -548,8 +559,8 @@ async def room_websocket(websocket: WebSocket) -> None:
                 input_released = False
                 if disconnected:
                     disconnected["last_seen"] = time.time()
-                    released_slot = disconnected.get("slot")
-                    if released_slot:
+                    released_slots = session.held_slots(disconnected.get("slot"))
+                    if released_slots:
                         # Give the pad up before announcing it: this runs while
                         # the connection is being torn down, and an announcement
                         # that never finishes must not leave the seat holding a
@@ -560,7 +571,7 @@ async def room_websocket(websocket: WebSocket) -> None:
                             {
                                 "type": "gamepad_change",
                                 "message": f"{disconnected.get('username', 'A user')} disconnected "
-                                f"and was unassigned from Gamepad {released_slot}.",
+                                f"and was unassigned from {session.gamepads_text(released_slots)}.",
                                 "timestamp": int(time.time() * 1000),
                             }
                         )
