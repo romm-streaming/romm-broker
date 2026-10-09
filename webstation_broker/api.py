@@ -998,7 +998,11 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     # The library name is the folder every RetroArch client files the core's
     # saves and states under, so RomM files the session's there too.
     ident = emulator.core_identity()
-    ident["library_name"] = _library_token(ident.get("library_name"), "activate")
+    # Named, so a field core_identity() later adds for the manifest stays out of activate.
+    reported = {
+        "core_tier": ident.get("core_tier"),
+        "library_name": _library_token(ident.get("library_name"), "activate"),
+    }
     return {
         "status": "launching",
         "session_id": sess["id"],
@@ -1008,7 +1012,7 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
         "selkies_tokens_pushed": tokens_pushed,
         "url": _landing_url(sess["controller_token"]),
         "core": emulator.archive_core(),
-        **{key: value for key, value in ident.items() if value},
+        **{key: value for key, value in reported.items() if value},
     }
 
 

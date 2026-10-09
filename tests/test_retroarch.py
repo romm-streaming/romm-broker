@@ -5739,6 +5739,23 @@ class TestActivateCore:
         assert "library_name" not in r.json()
         assert r.json()["core_tier"] == "default"
 
+    def test_a_manifest_field_stays_out_of_activate(
+        self,
+        client: TestClient,
+        broker_dirs: dict[str, Path],
+        no_launch: list,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Activate names its core fields, so one added for the manifest is not sent."""
+        identity = retroarch.Retroarch.core_identity
+        monkeypatch.setattr(
+            retroarch.Retroarch, "core_identity", lambda self: {**identity(self), "manifest_only": "x"}
+        )
+        r = _ra_activate(client, broker_dirs["roms"])
+        assert r.status_code == 200
+        assert "manifest_only" not in r.json()
+        assert (r.json()["core_tier"], r.json()["library_name"]) == ("default", "Snes9x")
+
     def test_untested_core_launches_with_its_tier(
         self, client: TestClient, broker_dirs: dict[str, Path], no_launch: list
     ) -> None:
