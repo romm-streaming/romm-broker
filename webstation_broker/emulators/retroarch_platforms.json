@@ -498,6 +498,14 @@
     "library_name": "PUAE",
     "extensions": [".cue", ".ccd", ".chd", ".nrg", ".mds", ".iso", ".zip", ".7z"]
   },
+  "commodore-cdtv": {
+    "core": "puae",
+    "save_ram": false,
+    "library_name": "PUAE",
+    "extensions": [".cue", ".ccd", ".chd", ".nrg", ".mds", ".iso", ".zip", ".7z"],
+    "core_options": {"puae_model": "CDTV"},
+    "untested": true
+  },
   "atari8bit": {
     "core": "atari800",
     "save_ram": false,

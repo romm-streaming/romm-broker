@@ -161,7 +161,9 @@ def test_a_folder_boots_its_cue_or_playlist_over_the_parts_beside_it(
     assert picked == (tmp_path / winner).resolve()
 
 
-@pytest.mark.parametrize("slug", ["philips-cd-i", "ti-83", "sega-pico", "c-plus-4", "vic-20"])
+@pytest.mark.parametrize(
+    "slug", ["philips-cd-i", "ti-83", "sega-pico", "c-plus-4", "vic-20", "commodore-cdtv"]
+)
 def test_a_platform_nobody_has_booted_yet_ships_flagged_untested(slug: str) -> None:
     """Platforms nobody has booted carry the `untested` flag until a tester confirms them (#61).
 
@@ -336,6 +338,15 @@ def test_a_platform_whose_core_writes_saves_into_the_content_disk_pins_it_off(
     info = retroarch._platform_info(slug)
 
     assert info["core_options"][option] == value
+
+
+def test_commodore_cdtv_runs_on_puae_pinned_to_the_cdtv_model() -> None:
+    """PUAE is pinned to CDTV, as its automatic model boots any path lacking an uppercase "CDTV" as a CD32."""
+    info = retroarch._platform_info("commodore-cdtv")
+
+    assert info is not None
+    assert info["core"] == "puae"
+    assert info["core_options"]["puae_model"] == "CDTV"
 
 
 @pytest.mark.parametrize(
@@ -705,6 +716,22 @@ class TestBrokerConfig:
         assert 'game_specific_options = "false"' in cfg
 
 
+def _write_launch_core_options(platform: str) -> Path:
+    """Write a platform's core options through `_pin_core_options`, as `Retroarch.launch` does.
+
+    Args:
+        platform: The RomM platform slug.
+
+    Returns:
+        The written options file, `CORE_OPTIONS_CFG`.
+    """
+    emulator = retroarch.Retroarch()
+    emulator.platform = platform
+    info = emulator._profile()
+    assert info is not None
+    return retroarch._pin_core_options(info)
+
+
 class TestCoreOptions:
     """The per-launch core options file a platform's `core_options` pins into."""
 
@@ -751,6 +778,18 @@ class TestCoreOptions:
         cfg = path.read_text()
         assert "vice_floppy_write_protection" in cfg
         assert "hatari_floppy_write_protection" not in cfg
+
+    def test_a_cd32_launch_after_a_cdtv_launch_drops_the_cdtv_model(self) -> None:
+        """CD32 boots on PUAE's automatic model even straight after a CDTV session.
+
+        Both platforms share PUAE and the one options file; the CDTV pin must
+        not survive into the next launch, or every CD32 disc boots as a CDTV.
+        """
+        _write_launch_core_options("commodore-cdtv")
+
+        path = _write_launch_core_options("amiga-cd32")
+
+        assert "puae_model" not in path.read_text()
 
 
 class TestResolveCoreOptions:
@@ -1185,10 +1224,11 @@ class TestPlaylistPreference:
         emulator.platform = "dc"
         assert emulator.resolve_rom_file(game) == (game / "Game.m3u").resolve()
 
-    def test_a_jaguar_cd_folder_of_a_cue_and_its_tracks_picks_the_cue(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("platform", ["atari-jaguar-cd", "commodore-cdtv"])
+    def test_a_folder_of_a_cue_and_its_tracks_picks_the_cue(
+        self, platform: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A Jaguar CD folder holding a .cue beside its .bin tracks resolves to the .cue."""
+        """A folder holding a .cue beside its .bin tracks resolves to the .cue."""
         monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
         game = tmp_path / "Game"
         game.mkdir()
@@ -1197,7 +1237,7 @@ class TestPlaylistPreference:
         (game / "Game (Track 2).bin").write_bytes(b"2")
 
         emulator = retroarch.Retroarch()
-        emulator.platform = "atari-jaguar-cd"
+        emulator.platform = platform
         assert emulator.resolve_rom_file(game) == (game / "Game.cue").resolve()
 
     def test_a_direct_path_that_is_a_symlink_out_of_the_rom_root_is_rejected(

@@ -534,7 +534,8 @@ such as PPSSPP's multi-megabyte state files.
 `core_options` pins libretro core option keys to values on every launch, via
 `_write_core_options`; for cores that default to writing a game's save into
 its own content file or disk image (PUAE) rather than `SAVE_DIR`, so the ROM
-library never gets a save mixed into it.
+library never gets a save mixed into it. It also pins the machine a shared
+core would otherwise guess from the content path (PUAE's `puae_model` for CDTV).
 
 `core_option_seeds` pins a core option key the same way, but only the first
 time it is missing from `CORE_OPTIONS_CFG`; once seeded, whatever value is
@@ -1031,6 +1032,20 @@ def _write_core_options(options: dict[str, str]) -> Path:
     tmp.write_text(cfg)
     os.replace(tmp, CORE_OPTIONS_CFG)
     return CORE_OPTIONS_CFG
+
+
+def _pin_core_options(info: Mapping[str, Any]) -> Path:
+    """Write a launch profile's pinned and seeded core options, as every launch does.
+
+    Args:
+        info: The launch profile, read for `core_options` and `core_option_seeds`.
+
+    Returns:
+        The path of the written file, `CORE_OPTIONS_CFG`.
+    """
+    return _write_core_options(
+        _resolve_core_options(info.get("core_options", {}), info.get("core_option_seeds", {}))
+    )
 
 
 def _write_broker_cfg() -> Path:
@@ -3183,9 +3198,7 @@ class Retroarch(Emulator):
         _ensure_core_info(info["core"], tier=info["tier"], has_source="core_source" in info)
         _ensure_core_assets(info.get("assets", {}))
         _ensure_save_links(info.get("save_links", {}))
-        _write_core_options(
-            _resolve_core_options(info.get("core_options", {}), info.get("core_option_seeds", {}))
-        )
+        _pin_core_options(info)
         self._resume_settle = info.get("resume_settle", RESUME_LOAD_SETTLE)
         self._state_confirm_wait = info.get("state_confirm_wait", STATE_CONFIRM_WAIT)
         cfg_path = _write_broker_cfg()
