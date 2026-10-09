@@ -5717,18 +5717,11 @@ class TestActivateCore:
     def test_no_core_answers_default(
         self, client: TestClient, broker_dirs: dict[str, Path], no_launch: list
     ) -> None:
-        """Response gains core and core_tier."""
+        """Response gains core, core_tier and the folder the core sorts into."""
         r = _ra_activate(client, broker_dirs["roms"])
         assert r.status_code == 200
-        assert (r.json()["core"], r.json()["core_tier"]) == ("snes9x", "default")
-
-    def test_no_core_response_names_the_library(
-        self, client: TestClient, broker_dirs: dict[str, Path], no_launch: list
-    ) -> None:
-        """Activate names the folder the core sorts into, as the manifest does."""
-        r = _ra_activate(client, broker_dirs["roms"])
-        assert r.status_code == 200
-        assert r.json()["library_name"] == "Snes9x"
+        body = r.json()
+        assert (body["core"], body["core_tier"], body["library_name"]) == ("snes9x", "default", "Snes9x")
 
     @pytest.mark.parametrize("library", ["Snës9x", ".Snes9x", " Snes9x", "Snes\n9x", "Snes/9x", "Snes\\9x"])
     def test_a_library_name_unfit_for_a_folder_is_left_out(
@@ -6139,6 +6132,7 @@ class TestStateCoreHeader:
         self._running(client, broker_dirs, ra_dirs, no_launch, monkeypatch)
         _state(ra_dirs, "Snes9x")
         r = client.get(f"{PREFIX}/api/session/state-file", params={"slot": 0})
+        assert r.status_code == 200
         assert r.headers["X-State-Library"] == "Snes9x"
 
     def test_get_files_a_root_state_under_the_default_core(

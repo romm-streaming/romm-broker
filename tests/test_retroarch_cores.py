@@ -448,6 +448,24 @@ def test_cores_route_lists_one_platform(client: TestClient) -> None:
     assert untested and all(not c["verified"] and "core-report" in c["report_url"] for c in untested)
 
 
+def test_cores_route_leaves_out_a_library_name_unfit_for_a_folder(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A name activate would leave out is null here too, not advertised."""
+    listed = rc.cores_for_platform
+
+    def with_unfit_name(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        """The real rows, with the default core's name made unfit."""
+        rows = listed(*args, **kwargs)
+        rows[0]["library_name"] = "Snes/9x"
+        return rows
+
+    monkeypatch.setattr(rc, "cores_for_platform", with_unfit_name)
+    body = client.get(f"{PREFIX}/api/retroarch/cores", params={"platform": "snes"}).json()
+    assert body["cores"][0]["library_name"] is None
+    assert body["cores"][1]["library_name"]
+
+
 def test_cores_route_lists_every_platform_without_one(client: TestClient) -> None:
     """No platform: all of them."""
     body = client.get(f"{PREFIX}/api/retroarch/cores").json()

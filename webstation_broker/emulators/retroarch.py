@@ -2700,10 +2700,7 @@ class Retroarch(Emulator):
         Returns:
             The file's first dir under `STATE_DIR`, else `library_name()`.
         """
-        try:
-            parts = path.relative_to(STATE_DIR).parts
-        except ValueError:
-            return self.library_name()
+        parts = path.relative_to(STATE_DIR).parts
         return parts[0] if len(parts) > 1 else self.library_name()
 
     def _known_libs(self) -> frozenset[str]:

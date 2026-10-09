@@ -2199,10 +2199,12 @@ def get_retroarch_cores(
 
     def one(slug: str) -> dict[str, Any]:
         """One platform's default core and its cores list."""
-        return {
-            "default": table[slug]["core"],
-            "cores": retroarch_cores.cores_for_platform(table, slug, cat, tiers),
-        }
+        rows = retroarch_cores.cores_for_platform(table, slug, cat, tiers)
+        # The same rule activate and the state GET apply, so RomM never sees
+        # a name here that those two leave out for the same core.
+        for row in rows:
+            row["library_name"] = _library_token(row["library_name"], "retroarch cores")
+        return {"default": table[slug]["core"], "cores": rows}
 
     if platform is None:
         return {"platforms": {slug: one(slug) for slug in sorted(table)}}
