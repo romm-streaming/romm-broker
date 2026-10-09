@@ -995,8 +995,8 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
         tokens_pushed,
     )
 
-    # core_identity() also carries library_name, which belongs in the exit
-    # manifest but not here: only core and its tier are activate's contract.
+    # The library name is the folder every RetroArch client files the core's
+    # saves and states under, so RomM files the session's there too.
     ident = emulator.core_identity()
     return {
         "status": "launching",
@@ -1007,7 +1007,7 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
         "selkies_tokens_pushed": tokens_pushed,
         "url": _landing_url(sess["controller_token"]),
         "core": emulator.archive_core(),
-        **({"core_tier": ident["core_tier"]} if "core_tier" in ident else {}),
+        **{key: ident[key] for key in ("core_tier", "library_name") if ident.get(key)},
     }
 
 
@@ -1802,7 +1802,8 @@ async def get_state_file() -> Response:
     teardown has answered.
 
     Returns:
-        The state file as an octet stream, with `X-State-Filename` and `X-State-Slot` headers.
+        The state file as an octet stream, with `X-State-Filename` and `X-State-Slot` headers,
+        and for a launcher that fronts many cores `X-State-Core` and `X-State-Library`.
 
     Raises:
         HTTPException: 403 on a bad secret; 409 when there is no session to
@@ -1847,6 +1848,11 @@ async def get_state_file() -> Response:
         core = emulator.archive_core()
         if core:
             headers["X-State-Core"] = core
+        # Left out rather than mangled: a folder name with a byte the header
+        # can't carry would name a folder no RetroArch client files under.
+        library = emulator.core_identity().get("library_name")
+        if library and _header_token(library, "") == library:
+            headers["X-State-Library"] = library
         return Response(
             content=body,
             media_type="application/octet-stream",

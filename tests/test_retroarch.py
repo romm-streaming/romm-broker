@@ -5722,17 +5722,17 @@ class TestActivateCore:
         assert r.status_code == 200
         assert (r.json()["core"], r.json()["core_tier"]) == ("snes9x", "default")
 
-    def test_no_core_response_has_no_library_name(
+    def test_no_core_response_names_the_library(
         self, client: TestClient, broker_dirs: dict[str, Path], no_launch: list
     ) -> None:
-        """Activate gains only `core` and `core_tier`, never `library_name`.
+        """Activate names the folder the core sorts into, as the manifest does.
 
-        `library_name` belongs to the exit manifest (`_archive_identity`), not
-        the activate response, which adds exactly these two keys.
+        RomM files the session's states under it, where every other RetroArch
+        client files that core's.
         """
         r = _ra_activate(client, broker_dirs["roms"])
         assert r.status_code == 200
-        assert "library_name" not in r.json()
+        assert r.json()["library_name"] == "Snes9x"
 
     def test_untested_core_launches_with_its_tier(
         self, client: TestClient, broker_dirs: dict[str, Path], no_launch: list
@@ -6112,6 +6112,20 @@ class TestStateCoreHeader:
         _state(ra_dirs, "Snes9x")
         r = client.get(f"{PREFIX}/api/session/state-file", params={"slot": 0})
         assert r.headers["X-State-Core"] == "snes9x"
+
+    def test_get_names_the_library(
+        self,
+        client: TestClient,
+        broker_dirs: dict[str, Path],
+        ra_dirs: Path,
+        no_launch: list[retroarch.Retroarch],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """GET state-file sets X-State-Library to the folder the core sorts into."""
+        self._running(client, broker_dirs, ra_dirs, no_launch, monkeypatch)
+        _state(ra_dirs, "Snes9x")
+        r = client.get(f"{PREFIX}/api/session/state-file", params={"slot": 0})
+        assert r.headers["X-State-Library"] == "Snes9x"
 
     def test_put_with_another_core_is_409_and_writes_nothing(
         self,

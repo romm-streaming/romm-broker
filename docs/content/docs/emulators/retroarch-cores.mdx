@@ -298,7 +298,8 @@ platform to plain `retroarch`.
 ### Finding your options
 
 - `GET /api/retroarch/cores?platform=<slug>` lists every core offered on a
-  platform, its tier, and whether it's verified; leave `platform` off to get
+  platform, its tier, whether it's verified, and its `library_name` (the
+  folder it sorts saves and states into); leave `platform` off to get
   every platform at once. It needs the `X-Broker-Secret` header, and a
   platform RetroArch has no core for answers `404`.
 - `scripts/sync_core_info.py --tiers [--platform <slug>]` prints the same
