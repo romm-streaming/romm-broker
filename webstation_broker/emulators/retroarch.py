@@ -2688,6 +2688,27 @@ class Retroarch(Emulator):
             return {}
         return {"core_tier": profile["tier"], "library_name": self.library_name()}
 
+    def state_library(self, path: Path) -> Optional[str]:
+        """The sorted dir `path` sits in, which can differ from `library_name`.
+
+        An untested core whose dir isn't confirmed yet is served from
+        wherever its newest state turned up, so the file's own dir says
+        where RetroArch put it, not the guess. A legacy state at the
+        unsorted root belongs to the default core, so it goes under that
+        core's name.
+
+        Args:
+            path: The state file the state GET is serving.
+
+        Returns:
+            The file's first dir under `STATE_DIR`, else `library_name()`.
+        """
+        try:
+            parts = path.relative_to(STATE_DIR).parts
+        except ValueError:
+            return self.library_name()
+        return parts[0] if len(parts) > 1 else self.library_name()
+
     def _known_libs(self) -> frozenset[str]:
         """Sorted-dir names that belong to cores other than the running one.
 

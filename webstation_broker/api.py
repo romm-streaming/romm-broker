@@ -998,6 +998,8 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     # The library name is the folder every RetroArch client files the core's
     # saves and states under, so RomM files the session's there too.
     ident = emulator.core_identity()
+    if "library_name" in ident:
+        ident["library_name"] = _library_token(ident["library_name"])
     return {
         "status": "launching",
         "session_id": sess["id"],
@@ -1007,7 +1009,7 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
         "selkies_tokens_pushed": tokens_pushed,
         "url": _landing_url(sess["controller_token"]),
         "core": emulator.archive_core(),
-        **{key: ident[key] for key in ("core_tier", "library_name") if ident.get(key)},
+        **{key: value for key, value in ident.items() if value},
     }
 
 
@@ -1773,6 +1775,33 @@ async def swap_disc(body: DiscIn) -> dict[str, str]:
     return {"status": "ok", "path": str(disc_path)}
 
 
+def _library_token(name: Optional[str]) -> Optional[str]:
+    """`name` when RomM can be told to file under it, else None.
+
+    The activate reply and the state GET's `X-State-Library` header both go
+    through this, so RomM gets one answer per session. A name is left out
+    rather than mangled: one with a byte a header can't carry, surrounding
+    whitespace, or a leading dot would name a folder no RetroArch client
+    files under, and without it RomM files under the core id instead.
+
+    Args:
+        name: The library name, or None.
+
+    Returns:
+        `name`, or None when it is missing or unfit to send.
+    """
+    if not name:
+        return None
+    if _header_token(name, "") != name or name != name.strip() or name.startswith("."):
+        log.warning(
+            "library name %r is not a folder RomM can file under; "
+            "RomM files this session's states under the core id instead",
+            name,
+        )
+        return None
+    return name
+
+
 def _header_token(value: str, fallback: str) -> str:
     """Reduce `value` to something safe to put in a response header.
 
@@ -1848,10 +1877,8 @@ async def get_state_file() -> Response:
         core = emulator.archive_core()
         if core:
             headers["X-State-Core"] = core
-        # Left out rather than mangled: a folder name with a byte the header
-        # can't carry would name a folder no RetroArch client files under.
-        library = emulator.core_identity().get("library_name")
-        if library and _header_token(library, "") == library:
+        library = _library_token(emulator.state_library(path))
+        if library:
             headers["X-State-Library"] = library
         return Response(
             content=body,

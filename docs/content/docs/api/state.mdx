@@ -54,9 +54,9 @@ container storing them. Use the GET after a save, to pull the state file out
 and file it away in RomM's library. Use the PUT to send a stored state back
 in, so a load or a resume can reach it. The GET response reports the file's
 name in the `X-State-Filename` header and its slot in the `X-State-Slot`
-header. On RetroArch it also names the core that wrote the state in
-`X-State-Core`, and the folder that core sorts its states into in
-`X-State-Library`.
+header. On RetroArch it also names the running core in `X-State-Core`,
+and the folder the state file sits in under `states/` in `X-State-Library`.
+A folder name that can't go in a header is left out.
 
 The PUT checks one thing: could the running emulator have written this
 file, under this name, for the game that's loaded right now? The slot number

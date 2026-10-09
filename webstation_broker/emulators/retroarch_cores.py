@@ -500,7 +500,9 @@ def cores_for_platform(
         rows.append({
             "core": core,
             "display_name": info.display_name if info else core,
-            "library_name": _library_name(entry, core, info),
+            "library_name": resolve_profile(
+                platforms, platform, core, experimental=True, catalog=catalog, tiers=tiers
+            )["library_name"],
             "tier": tier,
             "reason": tier_entry.reason if tier_entry and tier == "blocked" else None,
             "reports": list(tier_entry.reports) if tier_entry else [],
@@ -509,25 +511,6 @@ def cores_for_platform(
         })
     rows.sort(key=lambda r: (_TIER_ORDER[r["tier"]], r["core"]))
     return rows
-
-
-def _library_name(entry: Mapping[str, Any], core: str, info: Optional[CoreInfo]) -> str:
-    """The sorted-dir name a core's launch uses, as `resolve_profile` picks it.
-
-    Args:
-        entry: The platform's table entry.
-        core: The core.
-        info: The core's catalog entry, or None.
-
-    Returns:
-        The table's name for the default or a vetted core, else the catalog's.
-    """
-    if core == entry["core"]:
-        return entry["library_name"]
-    alternate = entry.get("alternates", {}).get(core)
-    if alternate is not None:
-        return alternate["library_name"]
-    return LIBRARY_NAME_FIXES.get(core, info.corename if info else core)
 
 
 def _options_detail(
