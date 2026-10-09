@@ -402,6 +402,16 @@ def test_an_untested_platform_s_default_core_is_listed_unverified() -> None:
     assert (default["core"], default["tier"], default["verified"]) == ("mgba", "default", False)
 
 
+def test_cores_for_platform_names_each_core_s_library_name() -> None:
+    """Every row carries the sorted-dir name that core's launch would use."""
+    cores = rc.cores_for_platform(PLATFORMS, "snes", CATALOG, TIERS)
+
+    names = {c["core"]: c["library_name"] for c in cores}
+    assert (names["snes9x"], names["bsnes"], names["armsnes"]) == ("Snes9x", "bsnes", "ARM SNES")
+    for core in cores:
+        assert core["library_name"] == resolve("snes", core["core"], experimental=True)["library_name"]
+
+
 def test_cores_for_platform_includes_report_url() -> None:
     """Every core row includes a report_url with core and platform."""
     cores = rc.cores_for_platform(PLATFORMS, "snes", CATALOG, TIERS)
@@ -433,8 +443,27 @@ def test_cores_route_lists_one_platform(client: TestClient) -> None:
     assert body["default"] == "snes9x"
     first = body["cores"][0]
     assert (first["core"], first["tier"], first["verified"]) == ("snes9x", "default", True)
+    assert first["library_name"] == "Snes9x"
     untested = [c for c in body["cores"] if c["tier"] == "untested"]
     assert untested and all(not c["verified"] and "core-report" in c["report_url"] for c in untested)
+
+
+def test_cores_route_leaves_out_a_library_name_unfit_for_a_folder(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A name activate would leave out is null here too, not advertised."""
+    listed = rc.cores_for_platform
+
+    def with_unfit_name(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        """The real rows, with the default core's name made unfit."""
+        rows = listed(*args, **kwargs)
+        rows[0]["library_name"] = "Snes/9x"
+        return rows
+
+    monkeypatch.setattr(rc, "cores_for_platform", with_unfit_name)
+    body = client.get(f"{PREFIX}/api/retroarch/cores", params={"platform": "snes"}).json()
+    assert body["cores"][0]["library_name"] is None
+    assert body["cores"][1]["library_name"]
 
 
 def test_cores_route_lists_every_platform_without_one(client: TestClient) -> None:

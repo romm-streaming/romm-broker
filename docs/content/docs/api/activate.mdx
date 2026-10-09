@@ -21,6 +21,16 @@ Open `https://<your RomM address>/streaming/?token=...` in a browser (through yo
 room, where the game is already streaming. If a session is already active,
 you get back an HTTP error, `409`, instead.
 
+A RetroArch launch also answers with `core`, the libretro core it booted,
+`core_tier`, that core's [tier](/docs/emulators/retroarch-cores#tiers), and
+`library_name`, the folder RetroArch sorts that core's saves and states into.
+Every RetroArch client files the core's saves and states under that folder
+name, so RomM files the session's there too. For an untested or blocked
+core, the name is a guess: the folder the restored archive's manifest
+recorded for that core, else the core-info catalog's name. RetroArch can
+turn out to write somewhere else; the state GET's `X-State-Library` header
+names the folder each state actually came from.
+
 `rom.path` can point to a single file or to a whole game folder. When it's a
 folder, the broker automatically picks the best disc image to boot: it
 prefers the lowest disc number first, then a fixed format order, such as chd

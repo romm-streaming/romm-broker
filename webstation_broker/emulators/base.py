@@ -1367,6 +1367,17 @@ class Emulator:
         """
         return {}
 
+    def state_library(self, path: Path) -> Optional[str]:
+        """The folder RomM should file the state at `path` under.
+
+        Args:
+            path: The state file the state GET is serving.
+
+        Returns:
+            None by default: only RetroArch sorts states into per-core folders.
+        """
+        return None
+
     def adopt_archive_identity(self, identity: Optional[Mapping[str, Any]]) -> None:
         """Learn from the restored archive's session identity, before the launch.
 

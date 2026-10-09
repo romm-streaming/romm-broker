@@ -500,6 +500,9 @@ def cores_for_platform(
         rows.append({
             "core": core,
             "display_name": info.display_name if info else core,
+            "library_name": resolve_profile(
+                platforms, platform, core, experimental=True, catalog=catalog, tiers=tiers
+            )["library_name"],
             "tier": tier,
             "reason": tier_entry.reason if tier_entry and tier == "blocked" else None,
             "reports": list(tier_entry.reports) if tier_entry else [],

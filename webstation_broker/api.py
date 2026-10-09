@@ -995,9 +995,14 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
         tokens_pushed,
     )
 
-    # core_identity() also carries library_name, which belongs in the exit
-    # manifest but not here: only core and its tier are activate's contract.
+    # The library name is the folder every RetroArch client files the core's
+    # saves and states under, so RomM files the session's there too.
     ident = emulator.core_identity()
+    # Named, so a field core_identity() later adds for the manifest stays out of activate.
+    reported = {
+        "core_tier": ident.get("core_tier"),
+        "library_name": _library_token(ident.get("library_name"), "activate"),
+    }
     return {
         "status": "launching",
         "session_id": sess["id"],
@@ -1007,7 +1012,7 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
         "selkies_tokens_pushed": tokens_pushed,
         "url": _landing_url(sess["controller_token"]),
         "core": emulator.archive_core(),
-        **({"core_tier": ident["core_tier"]} if "core_tier" in ident else {}),
+        **{key: value for key, value in reported.items() if value},
     }
 
 
@@ -1773,6 +1778,37 @@ async def swap_disc(body: DiscIn) -> dict[str, str]:
     return {"status": "ok", "path": str(disc_path)}
 
 
+def _library_token(name: Optional[str], operation: str) -> Optional[str]:
+    """`name` when RomM can file saves and states under it, else None.
+
+    A name is left out rather than mangled, so RomM falls back to the core id
+    instead of a folder no RetroArch client files under.
+
+    Args:
+        name: The library name, or None.
+        operation: The route asking, e.g. `activate`, named in the warning.
+
+    Returns:
+        `name`, or None when it is missing or unfit to send.
+    """
+    if not name:
+        return None
+    if (
+        retroarch_cores.safe_dir_name(name) is None
+        or _header_token(name, "") != name
+        or name != name.strip()
+        or name.startswith(".")
+    ):
+        log.warning(
+            "%s: library name %r is not a folder RomM can file under; "
+            "RomM files under the core id instead",
+            operation,
+            name,
+        )
+        return None
+    return name
+
+
 def _header_token(value: str, fallback: str) -> str:
     """Reduce `value` to something safe to put in a response header.
 
@@ -1802,7 +1838,8 @@ async def get_state_file() -> Response:
     teardown has answered.
 
     Returns:
-        The state file as an octet stream, with `X-State-Filename` and `X-State-Slot` headers.
+        The state file as an octet stream, with `X-State-Filename` and `X-State-Slot` headers,
+        and for a launcher that fronts many cores `X-State-Core` and `X-State-Library`.
 
     Raises:
         HTTPException: 403 on a bad secret; 409 when there is no session to
@@ -1847,6 +1884,9 @@ async def get_state_file() -> Response:
         core = emulator.archive_core()
         if core:
             headers["X-State-Core"] = core
+        library = _library_token(emulator.state_library(path), "state-file")
+        if library:
+            headers["X-State-Library"] = library
         return Response(
             content=body,
             media_type="application/octet-stream",
@@ -2163,10 +2203,12 @@ def get_retroarch_cores(
 
     def one(slug: str) -> dict[str, Any]:
         """One platform's default core and its cores list."""
-        return {
-            "default": table[slug]["core"],
-            "cores": retroarch_cores.cores_for_platform(table, slug, cat, tiers),
-        }
+        rows = retroarch_cores.cores_for_platform(table, slug, cat, tiers)
+        # The same rule activate and the state GET apply, so RomM never sees
+        # a name here that those two leave out for the same core.
+        for row in rows:
+            row["library_name"] = _library_token(row["library_name"], "retroarch cores")
+        return {"default": table[slug]["core"], "cores": rows}
 
     if platform is None:
         return {"platforms": {slug: one(slug) for slug in sorted(table)}}
