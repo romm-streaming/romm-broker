@@ -5717,22 +5717,44 @@ class TestActivateCore:
     def test_no_core_answers_default(
         self, client: TestClient, broker_dirs: dict[str, Path], no_launch: list
     ) -> None:
-        """Response gains core and core_tier; nothing else changes."""
+        """Response gains core, core_tier and the folder the core sorts into."""
         r = _ra_activate(client, broker_dirs["roms"])
         assert r.status_code == 200
-        assert (r.json()["core"], r.json()["core_tier"]) == ("snes9x", "default")
+        body = r.json()
+        assert (body["core"], body["core_tier"], body["library_name"]) == ("snes9x", "default", "Snes9x")
 
-    def test_no_core_response_has_no_library_name(
-        self, client: TestClient, broker_dirs: dict[str, Path], no_launch: list
+    @pytest.mark.parametrize("library", ["Snës9x", ".Snes9x", " Snes9x", "Snes\n9x", "Snes/9x", "Snes\\9x"])
+    def test_a_library_name_unfit_for_a_folder_is_left_out(
+        self,
+        client: TestClient,
+        broker_dirs: dict[str, Path],
+        no_launch: list,
+        monkeypatch: pytest.MonkeyPatch,
+        library: str,
     ) -> None:
-        """Activate gains only `core` and `core_tier`, never `library_name`.
-
-        `library_name` belongs to the exit manifest (`_archive_identity`), not
-        the activate response, which adds exactly these two keys.
-        """
+        """RomM files under the core id rather than a folder no client uses."""
+        monkeypatch.setattr(retroarch.Retroarch, "library_name", lambda self: library)
         r = _ra_activate(client, broker_dirs["roms"])
         assert r.status_code == 200
         assert "library_name" not in r.json()
+        assert r.json()["core_tier"] == "default"
+
+    def test_a_manifest_field_stays_out_of_activate(
+        self,
+        client: TestClient,
+        broker_dirs: dict[str, Path],
+        no_launch: list,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Activate names its core fields, so one added for the manifest is not sent."""
+        identity = retroarch.Retroarch.core_identity
+        monkeypatch.setattr(
+            retroarch.Retroarch, "core_identity", lambda self: {**identity(self), "manifest_only": "x"}
+        )
+        r = _ra_activate(client, broker_dirs["roms"])
+        assert r.status_code == 200
+        assert "manifest_only" not in r.json()
+        assert (r.json()["core_tier"], r.json()["library_name"]) == ("default", "Snes9x")
 
     def test_untested_core_launches_with_its_tier(
         self, client: TestClient, broker_dirs: dict[str, Path], no_launch: list
@@ -6079,6 +6101,7 @@ class TestStateCoreHeader:
         ra_dirs: Path,
         no_launch: list[retroarch.Retroarch],
         monkeypatch: pytest.MonkeyPatch,
+        **rom: object,
     ) -> retroarch.Retroarch:
         """Activate a game, stub the emulator as running, and return it.
 
@@ -6088,11 +6111,12 @@ class TestStateCoreHeader:
             ra_dirs: The patched data root.
             no_launch: The launched instances list.
             monkeypatch: The pytest monkeypatch fixture.
+            **rom: Extra `rom` fields for the activate (core, experimental_cores).
 
         Returns:
             The active emulator.
         """
-        assert _ra_activate(client, broker_dirs["roms"]).status_code == 200
+        assert _ra_activate(client, broker_dirs["roms"], **rom).status_code == 200
         emu = no_launch[0]
         emu._rom_base = "Game"
         monkeypatch.setattr(emu, "alive", lambda: True)
@@ -6112,6 +6136,71 @@ class TestStateCoreHeader:
         _state(ra_dirs, "Snes9x")
         r = client.get(f"{PREFIX}/api/session/state-file", params={"slot": 0})
         assert r.headers["X-State-Core"] == "snes9x"
+
+    def test_get_names_the_library(
+        self,
+        client: TestClient,
+        broker_dirs: dict[str, Path],
+        ra_dirs: Path,
+        no_launch: list[retroarch.Retroarch],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """GET state-file sets X-State-Library to the folder the core sorts into."""
+        self._running(client, broker_dirs, ra_dirs, no_launch, monkeypatch)
+        _state(ra_dirs, "Snes9x")
+        r = client.get(f"{PREFIX}/api/session/state-file", params={"slot": 0})
+        assert r.status_code == 200
+        assert r.headers["X-State-Library"] == "Snes9x"
+
+    def test_get_files_a_root_state_under_the_default_core(
+        self,
+        client: TestClient,
+        broker_dirs: dict[str, Path],
+        ra_dirs: Path,
+        no_launch: list[retroarch.Retroarch],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A legacy unsorted state belongs to the default core's folder."""
+        self._running(client, broker_dirs, ra_dirs, no_launch, monkeypatch)
+        _root_state(ra_dirs)
+        r = client.get(f"{PREFIX}/api/session/state-file", params={"slot": 0})
+        assert r.status_code == 200
+        assert r.headers["X-State-Library"] == "Snes9x"
+
+    def test_get_names_the_dir_an_unconfirmed_core_wrote_to(
+        self,
+        client: TestClient,
+        broker_dirs: dict[str, Path],
+        ra_dirs: Path,
+        no_launch: list[retroarch.Retroarch],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The served file's own dir, not the catalog's guess at it."""
+        core = _untested_snes_core()
+        emu = self._running(client, broker_dirs, ra_dirs, no_launch, monkeypatch, core=core)
+        assert emu._observed_lib is None
+        assert emu.library_name() != "Actual Dir"
+        _state(ra_dirs, "Actual Dir")
+        r = client.get(f"{PREFIX}/api/session/state-file", params={"slot": 0})
+        assert r.status_code == 200
+        assert r.headers["X-State-Library"] == "Actual Dir"
+
+    def test_get_leaves_out_a_dir_a_header_cannot_carry(
+        self,
+        client: TestClient,
+        broker_dirs: dict[str, Path],
+        ra_dirs: Path,
+        no_launch: list[retroarch.Retroarch],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Left out rather than mangled into a folder no client files under."""
+        core = _untested_snes_core()
+        emu = self._running(client, broker_dirs, ra_dirs, no_launch, monkeypatch, core=core)
+        assert emu._observed_lib is None
+        _state(ra_dirs, "Snës9x")
+        r = client.get(f"{PREFIX}/api/session/state-file", params={"slot": 0})
+        assert r.status_code == 200
+        assert "X-State-Library" not in r.headers
 
     def test_put_with_another_core_is_409_and_writes_nothing(
         self,
