@@ -341,7 +341,7 @@ STATE_SLOT = int(os.environ.get("RETROARCH_STATE_SLOT", "0"))
 
 0 is RetroArch's own default, so a state written here is also the one the
 player's own load hotkey reaches for. -1 works in the auto slot,
-`<content>.state.auto`, instead (#135): the homing presses stop on that floor,
+`<content>.state.auto`, instead: the homing presses stop on that floor,
 `SAVE_STATE` writes it, and `LOAD_STATE_SLOT -1` reads it. The appended config
 keeps `savestate_auto_save` and `savestate_auto_load` off either way, so
 RetroArch never writes or loads that file behind the broker's back.
@@ -529,7 +529,7 @@ its own, or has none, so an imported `.srm` would never reach the game.
 
 `sav_is_srm` is optional, and true only where a device's `.sav` for this
 platform was checked to hold the same bytes, at the same offsets, as the
-core's `.srm` (#135). There an import places a `.sav` as the `.srm`; it is
+core's `.srm`. There an import places a `.sav` as the `.srm`; it is
 renamed, never converted. An alternate states its own, and an untested core
 has none.
 
