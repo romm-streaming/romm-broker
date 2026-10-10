@@ -237,12 +237,14 @@ class StateIn(BaseModel):
         slot: The requested slot, resolved to the emulator's single working slot.
     """
 
-    slot: int = Field(default=0, ge=0, le=10)
+    slot: int = Field(default=0, ge=-1, le=10)
     """The requested slot, which the emulator resolves to its working slot.
 
     RomM is the library of states, so the emulator works in a single slot and
     resolves whatever is asked for to it. The bound is kept only to reject
-    obvious garbage, and 0 is the other brokers' "use your default slot".
+    obvious garbage, and 0 is the other brokers' "use your default slot". -1
+    is RetroArch's auto slot, so a state RomM holds can carry it; it resolves
+    like any other slot, on RetroArch and everywhere else.
     """
 
 
@@ -1522,7 +1524,7 @@ async def exit_session(
     request: Request,
     x_broker_secret: Optional[str] = Header(default=None),
     token: Optional[str] = Query(default=None),
-    slot: int = Query(default=0, ge=0, le=10),
+    slot: int = Query(default=0, ge=-1, le=10),
     save: bool = Query(default=True),
 ) -> dict[str, Any]:
     """End the session, accepting either the broker secret or the controller token.

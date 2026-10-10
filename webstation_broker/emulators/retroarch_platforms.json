@@ -21,6 +21,7 @@
     "core": "snes9x",
     "library_name": "Snes9x",
     "save_ram": true,
+    "sav_is_srm": true,
     "extensions": [".sfc", ".smc", ".fig", ".swc", ".st", ".gd3", ".gd7", ".dx2", ".bs", ".bin"],
     "extra_extensions": [".gd3", ".gd7", ".dx2", ".bin"]
   },
@@ -28,6 +29,7 @@
     "core": "snes9x",
     "library_name": "Snes9x",
     "save_ram": true,
+    "sav_is_srm": true,
     "extensions": [".sfc", ".smc", ".fig", ".swc", ".st", ".gd3", ".gd7", ".dx2", ".bs", ".bin"],
     "extra_extensions": [".gd3", ".gd7", ".dx2", ".bin"]
   },
@@ -68,18 +70,21 @@
     "core": "gambatte",
     "library_name": "Gambatte",
     "save_ram": true,
+    "sav_is_srm": true,
     "extensions": [".gb", ".dmg"]
   },
   "gbc": {
     "core": "gambatte",
     "library_name": "Gambatte",
     "save_ram": true,
+    "sav_is_srm": true,
     "extensions": [".gbc", ".gb", ".dmg"]
   },
   "gba": {
     "core": "mgba",
     "library_name": "mGBA",
     "save_ram": true,
+    "sav_is_srm": true,
     "extensions": [".gba", ".agb"],
     "extra_extensions": [".agb"]
   },
@@ -87,12 +92,14 @@
     "core": "mednafen_vb",
     "library_name": "Beetle VB",
     "save_ram": true,
+    "sav_is_srm": true,
     "extensions": [".vb", ".vboy", ".bin"]
   },
   "nds": {
     "core": "melondsds",
     "library_name": "melonDS DS",
     "save_ram": true,
+    "sav_is_srm": true,
     "extensions": [".nds", ".srl"],
     "extra_extensions": [".srl"]
   },
@@ -129,18 +136,21 @@
     "core": "genesis_plus_gx",
     "library_name": "Genesis Plus GX",
     "save_ram": true,
+    "sav_is_srm": true,
     "extensions": [".sms", ".bin"]
   },
   "gamegear": {
     "core": "genesis_plus_gx",
     "library_name": "Genesis Plus GX",
     "save_ram": true,
+    "sav_is_srm": true,
     "extensions": [".gg", ".bin"]
   },
   "sg1000": {
     "core": "genesis_plus_gx",
     "library_name": "Genesis Plus GX",
     "save_ram": true,
+    "sav_is_srm": true,
     "extensions": [".sg", ".bin"]
   },
   "segacd": {
@@ -153,6 +163,7 @@
     "core": "picodrive",
     "library_name": "PicoDrive",
     "save_ram": true,
+    "sav_is_srm": true,
     "extensions": [".32x", ".bin", ".md", ".smd"]
   },
   "dc": {
@@ -190,18 +201,21 @@
     "core": "mednafen_pce",
     "library_name": "Beetle PCE",
     "save_ram": true,
+    "sav_is_srm": true,
     "extensions": [".pce"]
   },
   "supergrafx": {
     "core": "mednafen_supergrafx",
     "library_name": "Beetle SuperGrafx",
     "save_ram": true,
+    "sav_is_srm": true,
     "extensions": [".sgx", ".pce", ".cue", ".chd", ".ccd"]
   },
   "turbografx-cd": {
     "core": "mednafen_pce",
     "library_name": "Beetle PCE",
     "save_ram": true,
+    "sav_is_srm": true,
     "extensions": [".m3u", ".cue", ".chd", ".ccd", ".toc"]
   },
   "neogeoaes": {
@@ -295,6 +309,7 @@
     "core": "gearcoleco",
     "library_name": "Gearcoleco",
     "save_ram": true,
+    "sav_is_srm": true,
     "extensions": [".col", ".cv", ".rom", ".bin"]
   },
   "intellivision": {

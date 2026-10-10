@@ -104,6 +104,11 @@ seconds between presses, by default) and
 [`RETROARCH_SLOT_HOME_STEPS`](/docs/configuration/emulators#retroarch) (24
 presses to reach the floor, by default).
 
+Setting `RETROARCH_STATE_SLOT` to -1 makes the auto slot the working slot:
+the presses stop on the floor, saves write `<content>.state.auto`, and loads
+send `LOAD_STATE_SLOT -1`. RetroArch's own auto save and auto load stay off
+either way, so only the broker writes or reads that file.
+
 RetroArch's menu ignores stdin save commands while it's open, so a save sent
 with the Quick Menu up writes nothing. When a save writes nothing to any
 slot, the broker sends `MENU_TOGGLE` to close the menu, parks the slot again

@@ -26,6 +26,11 @@ every emulator's request format expects it and because the parent needs a
 number back, not because this broker actually keeps several separate save
 slots.
 
+`slot` runs from -1 to 10. -1 is RetroArch's auto slot, so a state RomM
+captured there can be named as it was saved. Like any other number, it is
+mapped onto the emulator's working slot, on RetroArch and every other
+emulator alike.
+
 A `400` response means the running emulator has no save states at all.
 (`desktop`, `shadps4`, and the other emulators marked "no" under [Supported
 emulators](/docs/emulators) save your progress through the game's own save
