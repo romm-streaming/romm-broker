@@ -155,6 +155,11 @@ the manifest's `core` (see
 [RetroArch cores](/docs/emulators/retroarch-cores#saves-states-and-imports)).
 On a platform that takes a `.srm`, it takes one per archive: a second one, or a
 save the archive already carries at the same path, is a `destination_conflict`.
+On the 15 of those platforms whose core reads a `.sav` as its `.srm`, a `.sav`
+is placed as the `.srm`, and discovery lists `<name>.sav` there
+([RetroArch cores](/docs/emulators/retroarch-cores#saves-states-and-imports)
+lists them). A `.sav` and a `.srm` in the same archive would both become that
+one file, so both get `destination_conflict`.
 `wii` and `3ds` take folders instead, described below the list. It refuses these:
 
 - On `psp`: `destination_unresolvable`, with `suggest_emulator: "ppsspp"`.
@@ -171,15 +176,12 @@ save the archive already carries at the same path, is a `destination_conflict`.
   lists the 25 platforms that take a `.srm` and where each other core keeps
   its save.
 - On a platform RetroArch has no core for: `destination_unresolvable`.
-- A `.sav` is placed as the `.srm` on the 15 platforms whose core reads it
-  as one, and discovery lists `<name>.sav` there.
-  [RetroArch cores](/docs/emulators/retroarch-cores#saves-states-and-imports) lists
-  them. A `.sav` and a `.srm` in the same archive would both become that one
-  file, so both get `destination_conflict`.
-- A `.sav` on any other platform, or a `.rtc`, `.nv`, `.eep` or `.mpk` file
-  anywhere: `needs_conversion`, until each core's name for that file has
-  been checked. On `wii` and `3ds` a file with one of those names is judged
-  as part of a save folder, so it gets the folder refusals instead.
+- On a platform that takes a `.srm`, a `.rtc`, `.nv`, `.eep` or `.mpk` file,
+  and a `.sav` where the core does not read one as its `.srm`:
+  `needs_conversion`, until each core's name for that file has been checked.
+  A platform that takes no `.srm` gives its own refusal above first. On `wii`
+  and `3ds` a file with one of those names is judged as part of a save
+  folder, so it gets the folder refusals instead.
 - A `memcard` member: `kind_not_accepted`, with `expected` naming `save`.
   On a platform that takes a `.srm`, send the core's `.srm` as a save instead.
 - A `state` member: `state_uses_push`. On `jaguar`, whose core has no states,

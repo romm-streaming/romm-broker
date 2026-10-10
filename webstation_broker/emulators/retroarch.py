@@ -2099,7 +2099,10 @@ Built from `_STATE_SUFFIX_RE` so the two never disagree on the slot grammar.
 Unlike that one, it ignores case.
 """
 _UNCONVERTED_SAVE_SUFFIXES: frozenset[str] = frozenset({".sav", ".rtc", ".nv", ".eep", ".mpk"})
-"""Other save-file suffixes cores write, not placed until each core's name for them is verified."""
+"""Other save-file suffixes cores write, not placed until each core's name for them is verified.
+
+A `.sav` is the one exception, where the core reads it as its `.srm` (`sav_is_srm`).
+"""
 _SRM_EXPECTED = "one non-empty <name>.srm, the core's SRAM"
 """The save shape RetroArch takes, in words, for a refusal's `expected`."""
 _SRM_OR_SAV_NAME_RE = re.compile(r"[^/]+\.(?:srm|sav)", re.IGNORECASE | re.ASCII)
@@ -2118,6 +2121,7 @@ def _sav_is_srm(info: Optional[Mapping[str, Any]]) -> bool:
         True only where the table sets `sav_is_srm`; an untested core never does.
     """
     return info is not None and info.get("sav_is_srm") is True
+
 
 _LAYOUT_WII = "wii"
 """`_layout`'s answer for the Dolphin core on the Wii: an emulated NAND tree."""
@@ -2494,11 +2498,11 @@ class Retroarch(Emulator):
     content's stem and placed in `saves/<library_name>/`, where the core
     loads SRAM. Only a platform whose core loads a `.srm` (`save_ram` in
     `PLATFORMS`) takes one, and where the core reads a device's `.sav` the
-    same way (`sav_is_srm`), a `.sav` is placed as the `.srm`. The Wii and 3DS platforms take the files of
-    their core's own tree instead, a NAND title folder or a path in
-    Azahar's SD card and NAND, and GameCube and every other platform whose
-    core keeps its saves elsewhere take nothing. States are never imported;
-    they are pushed after activate.
+    same way (`sav_is_srm`), a `.sav` is placed as the `.srm`. The Wii and
+    3DS platforms take the files of their core's own tree instead, a NAND
+    title folder or a path in Azahar's SD card and NAND, and GameCube and
+    every other platform whose core keeps its saves elsewhere take nothing.
+    States are never imported; they are pushed after activate.
 
     Attributes:
         name: Registry key, `retroarch`.
@@ -4272,7 +4276,8 @@ class Retroarch(Emulator):
         and a memory card, which is resent as the core's `.srm` save. On Wii
         and 3DS a member that is not a `.srm` is placed by the layout; a
         `.srm` there, and every member on any other platform, is answered by
-        `_srm_dir`.
+        `_srm_dir`. Where the core reads a `.sav` as its `.srm`
+        (`sav_is_srm`), a `.sav` is placed as that `.srm`.
 
         Args:
             member: The save member, already past the kind gate.
@@ -4317,14 +4322,15 @@ class Retroarch(Emulator):
         # there is one, rather than the untested core's guess: the core loads
         # SRAM from the dir it really writes, and `state_target` uses it too.
         lib = self.library_name() or lib
+        sav = _sav_is_srm(profile)
         if ctx.rom_file is None:
             return imports.ImportRefusal(
                 "destination_unresolvable",
                 member.name,
-                _SRM_OR_SAV_EXPECTED if _sav_is_srm(profile) else _SRM_EXPECTED,
+                _SRM_OR_SAV_EXPECTED if sav else _SRM_EXPECTED,
                 detail="no rom file to name the save after",
             )
-        placed = _place_srm(member, lib, ctx.rom_file, sav=_sav_is_srm(profile))
+        placed = _place_srm(member, lib, ctx.rom_file, sav=sav)
         if isinstance(placed, imports.Placement) and profile is not None and profile["save_ram"] is None:
             log.warning(
                 "retroarch: placed %s for untested core %s, which may not read a .srm",

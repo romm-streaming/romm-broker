@@ -224,7 +224,7 @@ this as `sav_is_srm`:
 `snes`, `sfam`, `gb`, `gbc`, `gba`, `virtualboy`, `nds`, `sms`, `gamegear`,
 `sg1000`, `sega32`, `tg16`, `turbografx-cd`, `supergrafx` and `colecovision`.
 
-Three of them have a catch:
+Four of them have a catch:
 
 - **Game Boy and Game Boy Color**: mGBA, VBA-M and cartridge dumpers add the
   real-time clock to the end of the file. RetroArch drops anything past the
@@ -234,12 +234,15 @@ Three of them have a catch:
 - **NDS**: melonDS DS sizes the save from its game database. A file shorter
   than that is padded with zeros.
 
-Everywhere else a `.sav` is refused as `needs_conversion`, because placing
-it as the `.srm` would load the wrong data without any error. mupen64plus_next
-packs every N64 save type into one `.srm`, Mesen keeps Bandai EEPROM and
-CHR-battery saves in other files, and a PlayStation `.srm` has to be a raw
-memory card. Send the core's `.srm` on those platforms. A `.rtc`, `.nv`,
-`.eep` or `.mpk` file is refused the same way on every platform.
+On the other platforms that take a `.srm`, a `.sav` is refused as
+`needs_conversion`, because placing it as the `.srm` would load the wrong
+data without any error. mupen64plus_next packs every N64 save type into one
+`.srm`, Mesen keeps Bandai EEPROM and CHR-battery saves in other files, and a
+PlayStation `.srm` has to be a raw memory card. Send the core's `.srm` on
+those platforms. A `.rtc`, `.nv`, `.eep` or `.mpk` file is refused the same
+way on every platform that takes a `.srm`. A platform that takes none gives
+these files its own refusal instead, which
+[declared imports](/docs/api/imports) lists.
 
 NeoCD's backup RAM has a similar problem even though `neo-geo-cd` takes a
 `.srm` import: the core reads and writes its `neocd/neocd.srm` in the system

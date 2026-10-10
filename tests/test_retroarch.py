@@ -4772,6 +4772,45 @@ def test_a_platform_advertises_a_sav_exactly_when_it_places_one(ra_dirs: Path, p
     assert advertised is (platform in _SAV_PLATFORMS)
 
 
+@pytest.mark.parametrize(
+    ("flag", "shapes", "reasons"),
+    [
+        ({"sav_is_srm": True}, ["<name>.srm", "<name>.sav"], []),
+        ({}, ["<name>.srm"], ["needs_conversion"]),
+    ],
+)
+def test_a_vetted_alternate_takes_a_sav_only_when_it_says_so(
+    ra_dirs: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    flag: dict[str, bool],
+    shapes: list[str],
+    reasons: list[str],
+) -> None:
+    """An alternate states its own `sav_is_srm`; the default core's never carries over to it.
+
+    snes9x reads a `.sav` as its `.srm`, which says nothing about another core on snes.
+
+    Args:
+        ra_dirs: The patched data root.
+        monkeypatch: The pytest monkeypatch fixture.
+        flag: What the alternate says about `sav_is_srm`, if anything.
+        shapes: The save shapes discovery lists for it.
+        reasons: The refusals a `.sav` gets on it.
+    """
+    alternate = {"library_name": "bsnes", "save_ram": True, **flag}
+    snes = {**retroarch.PLATFORMS["snes"], "alternates": {"bsnes": alternate}}
+    monkeypatch.setitem(retroarch.PLATFORMS, "snes", snes)
+    emu = _with_core("snes", "bsnes")
+    body = import_zip({".import/save/Game.sav": b"sram"})
+
+    result = preflight_import(emu, body, rom_file=ra_dirs / "Game.sfc")
+
+    save = emu.import_spec().kind("save")
+    assert save is not None
+    assert list(save.shapes) == shapes
+    assert [r.reason for r in result.refusals] == reasons
+
+
 def test_a_srm_with_no_rom_to_name_it_after_is_refused(ra_dirs: Path) -> None:
     """RetroArch names SRAM after the booted file, so without one there is nowhere to put it.
 
