@@ -3661,11 +3661,21 @@ class TestAutoStateSlot:
     `LOAD_STATE_SLOT -1` reads it back.
     """
 
+    @pytest.fixture(autouse=True)
+    def auto_slot(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Work in slot -1, in both places `RETROARCH_STATE_SLOT=-1` sets at import.
+
+        Args:
+            monkeypatch: The pytest monkeypatch fixture.
+        """
+        monkeypatch.setattr(retroarch, "STATE_SLOT", -1)
+        monkeypatch.setattr(retroarch.Retroarch, "state_slot", -1)
+
     @pytest.fixture
     def make(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]:
-        """Build a live Retroarch working in slot -1, wired to a `FakeMenuRetroarch`.
+        """Build a live Retroarch wired to a `FakeMenuRetroarch`.
 
         Args:
             tmp_path: Backs the state directory.
@@ -3675,7 +3685,6 @@ class TestAutoStateSlot:
             A factory taking `FakeMenuRetroarch`'s keyword arguments and a
             `homed` flag, returning the emulator and its fake.
         """
-        monkeypatch.setattr(retroarch, "STATE_SLOT", -1)
         return _saving_retroarch_factory(tmp_path, monkeypatch)
 
     @pytest.fixture
@@ -3780,6 +3789,39 @@ class TestAutoStateSlot:
         emu, fake = make()
 
         assert emu.state_target("Game.state3") == fake.dir / "Game.state.auto"
+
+    def test_discovery_reports_the_auto_slot(self, client: TestClient) -> None:
+        """The slot a client is told to push and load is -1, which the state routes accept."""
+        params = {"emulator": "retroarch", "platform": "snes"}
+
+        response = client.get(f"{PREFIX}/api/session/import-spec", params=params)
+
+        assert response.json()["state_slot"] == -1
+
+    @pytest.mark.parametrize(("value", "slot"), [(None, 0), ("3", 3), ("-1", -1)])
+    def test_the_slot_is_read_from_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch, value: Optional[str], slot: int
+    ) -> None:
+        """Unset is slot 0, and -1 is the lowest slot taken.
+
+        Args:
+            monkeypatch: The pytest monkeypatch fixture.
+            value: `RETROARCH_STATE_SLOT`, or None when unset.
+            slot: The slot it must read as.
+        """
+        if value is None:
+            monkeypatch.delenv("RETROARCH_STATE_SLOT", raising=False)
+        else:
+            monkeypatch.setenv("RETROARCH_STATE_SLOT", value)
+
+        assert retroarch._state_slot_from_env() == slot
+
+    def test_a_slot_below_the_floor_fails_the_load(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """RetroArch stops at -1, so -2 would save into `.state.auto` under a slot the routes refuse."""
+        monkeypatch.setenv("RETROARCH_STATE_SLOT", "-2")
+
+        with pytest.raises(ValueError, match="RETROARCH_STATE_SLOT is -2"):
+            retroarch._state_slot_from_env()
 
 
 class TestResumeLoadRetry:
