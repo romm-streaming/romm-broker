@@ -21,6 +21,8 @@
 * **retroarch:** name the folder each state was served from (pr-ready step 2, code-review --fix) ([4f1c7ea](https://github.com/romm-streaming/romm-broker/commit/4f1c7ea6052712191242c45ea91c6b4d0522dfe0))
 * **retroarch:** pin libretro_directory to the cores dir as well ([444db74](https://github.com/romm-streaming/romm-broker/commit/444db74a810d747cd56a61dd0da1767869e11f0c))
 * **retroarch:** pin libretro_directory to the cores dir as well ([ace7cc6](https://github.com/romm-streaming/romm-broker/commit/ace7cc63d5aaf1a952b7fea4f2606fec2165f846))
+* **retroarch:** refuse a RETROARCH_STATE_SLOT below the auto slot ([864506e](https://github.com/romm-streaming/romm-broker/commit/864506e677bda1e3337ab5ab865093168032c960))
+* **retroarch:** refuse a RETROARCH_STATE_SLOT below the auto slot ([495651e](https://github.com/romm-streaming/romm-broker/commit/495651e5b5767097462242b45122f096e7eebf50)), closes [#135](https://github.com/romm-streaming/romm-broker/issues/135)
 * **retroarch:** reject a library name with a slash and tag its warning by route (pr-ready step 2, code-review) ([4ecef84](https://github.com/romm-streaming/romm-broker/commit/4ecef848d1cd65a5006ab6940c3068a2f14303cd))
 * **retroarch:** report each core's library_name to RomM ([c3acee9](https://github.com/romm-streaming/romm-broker/commit/c3acee96eaf8e2fc6a32e768f340ccf9e161cd15))
 * **retroarch:** report each core's library_name to RomM ([753ad74](https://github.com/romm-streaming/romm-broker/commit/753ad7486ba83ba48909bc46c4c8f739ea3b9e92))
