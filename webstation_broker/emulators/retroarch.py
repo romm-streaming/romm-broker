@@ -336,7 +336,26 @@ STATE_READ_HANDOUT_GRACE = float(os.environ.get("RETROARCH_STATE_HANDOUT_GRACE",
 Defaults to 2, enough to cover the gap between a caller asking `state_path`
 for the file and its own read of it landing.
 """
-STATE_SLOT = int(os.environ.get("RETROARCH_STATE_SLOT", "0"))
+
+
+def _state_slot_from_env() -> int:
+    """Read `RETROARCH_STATE_SLOT`, refusing a slot below RetroArch's floor.
+
+    Returns:
+        The slot, 0 when the variable is unset.
+
+    Raises:
+        ValueError: On a slot below -1. RetroArch's slot stops there, so the
+            broker would work in `.state.auto` while reporting a slot the
+            state routes refuse.
+    """
+    slot = int(os.environ.get("RETROARCH_STATE_SLOT", "0"))
+    if slot < -1:
+        raise ValueError(f"RETROARCH_STATE_SLOT is {slot}, below RetroArch's lowest slot, -1")
+    return slot
+
+
+STATE_SLOT = _state_slot_from_env()
 """The one slot the broker works in, from `RETROARCH_STATE_SLOT` (default 0).
 
 0 is RetroArch's own default, so a state written here is also the one the
