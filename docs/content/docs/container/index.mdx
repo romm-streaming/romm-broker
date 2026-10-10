@@ -157,6 +157,7 @@ NVIDIA is not available on Alpine-based images, which doesn't affect the
 `webstation` image.
 
 ```yaml title="webstation docker-compose.yml"
+    runtime: nvidia
     deploy:
       resources:
         reservations:
