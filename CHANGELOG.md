@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.15.0](https://github.com/romm-streaming/romm-broker/compare/v0.14.2...v0.15.0) (2026-10-10)
+
+
+### Features
+
+* **retroarch:** accept .sav battery saves and the auto state slot ([61a8ea1](https://github.com/romm-streaming/romm-broker/commit/61a8ea1f13ad7c3795eb4a49526765cd800fea4e))
+* **retroarch:** accept .sav battery saves and the auto state slot ([3f84d6b](https://github.com/romm-streaming/romm-broker/commit/3f84d6b4ec4175bab3d8efee30917567922c0948)), closes [#135](https://github.com/romm-streaming/romm-broker/issues/135)
+* **retroarch:** add Sega Pico, Commodore Plus/4 and VIC-20 ([193bd57](https://github.com/romm-streaming/romm-broker/commit/193bd57d421bdb8f53422c61ca67264258c092e7))
+* **retroarch:** add Sega Pico, Commodore Plus/4 and VIC-20 ([193bd57](https://github.com/romm-streaming/romm-broker/commit/193bd57d421bdb8f53422c61ca67264258c092e7))
+
+
+### Bug Fixes
+
+* **retroarch:** add VIC-20/Plus4 playlists and cart parts, document the new platforms ([5b9e769](https://github.com/romm-streaming/romm-broker/commit/5b9e7693d23d5cde51b41bb304bf463c68583950))
+* **retroarch:** correct new Pico, Plus/4 and VIC-20 entries ([b9b22a5](https://github.com/romm-streaming/romm-broker/commit/b9b22a5a172de497654bae7d40151e09d8956513))
+* **retroarch:** flag commodore-cdtv untested until a RomM boot confirms it ([e2d3931](https://github.com/romm-streaming/romm-broker/commit/e2d3931777174c97d51a482bc60190a39938e6ea))
+* **retroarch:** map commodore-cdtv to puae pinned to the CDTV model ([2cb0f13](https://github.com/romm-streaming/romm-broker/commit/2cb0f133d95096f112398bfc8fe54aa87867cd8b))
+* **retroarch:** map commodore-cdtv to puae pinned to the CDTV model ([e39dd4b](https://github.com/romm-streaming/romm-broker/commit/e39dd4b411582514a956eba978a38441d2149bb9))
+* **retroarch:** name the folder each state was served from (pr-ready step 2, code-review --fix) ([4f1c7ea](https://github.com/romm-streaming/romm-broker/commit/4f1c7ea6052712191242c45ea91c6b4d0522dfe0))
+* **retroarch:** pin libretro_directory to the cores dir as well ([444db74](https://github.com/romm-streaming/romm-broker/commit/444db74a810d747cd56a61dd0da1767869e11f0c))
+* **retroarch:** pin libretro_directory to the cores dir as well ([ace7cc6](https://github.com/romm-streaming/romm-broker/commit/ace7cc63d5aaf1a952b7fea4f2606fec2165f846))
+* **retroarch:** reject a library name with a slash and tag its warning by route (pr-ready step 2, code-review) ([4ecef84](https://github.com/romm-streaming/romm-broker/commit/4ecef848d1cd65a5006ab6940c3068a2f14303cd))
+* **retroarch:** report each core's library_name to RomM ([c3acee9](https://github.com/romm-streaming/romm-broker/commit/c3acee96eaf8e2fc6a32e768f340ccf9e161cd15))
+* **retroarch:** report each core's library_name to RomM ([753ad74](https://github.com/romm-streaming/romm-broker/commit/753ad7486ba83ba48909bc46c4c8f739ea3b9e92))
+* **retroarch:** scope the .sav refusal docs and test an alternate's sav_is_srm (pr-ready step 2, code-review) ([17b38c0](https://github.com/romm-streaming/romm-broker/commit/17b38c0f7964292c538caa425345392ac77380d7)), closes [#135](https://github.com/romm-streaming/romm-broker/issues/135)
+
+
+### Documentation
+
+* Add NVIDIA runtime to webstation docker-compose example ([dae40a7](https://github.com/romm-streaming/romm-broker/commit/dae40a76bbb7b9d1144448f3d45ca6a723666f98))
+* **retroarch:** correct the count of platforms that take a .srm ([22c6b52](https://github.com/romm-streaming/romm-broker/commit/22c6b529ddaa5f56688b3527a6c56a4c0427471e)), closes [#135](https://github.com/romm-streaming/romm-broker/issues/135)
+* **retroarch:** drop issue numbers from the reference docstrings (pr-ready step 4, review-polish) ([b89c442](https://github.com/romm-streaming/romm-broker/commit/b89c442034bb5722925de37aff309c31f8d35977)), closes [#135](https://github.com/romm-streaming/romm-broker/issues/135)
+* **retroarch:** trim library_name docstrings (pr-ready step 4, review-polish) ([62ef586](https://github.com/romm-streaming/romm-broker/commit/62ef5868e825333081ed4e6c17362c7440d6aaec))
+
 ## [0.14.2](https://github.com/romm-streaming/romm-broker/compare/v0.14.1...v0.14.2) (2026-10-06)
 
 

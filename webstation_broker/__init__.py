@@ -10,5 +10,5 @@ lifecycle routes RomM drives (activate, exit, save states, memory cards),
 and out. Emulator back ends live under `webstation_broker.emulators`.
 """
 
-__version__ = "0.14.2"
+__version__ = "0.15.0"
 """The package version string, bumped by the release tooling."""
