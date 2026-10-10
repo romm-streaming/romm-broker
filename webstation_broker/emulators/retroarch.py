@@ -2352,7 +2352,7 @@ def _place_n3ds(
 
 
 def _place_srm(
-    member: imports.ImportMember, lib: str, rom_file: Path, *, sav: bool = False
+    member: imports.ImportMember, lib: str, rom_file: Optional[Path], *, sav: bool
 ) -> Union[imports.Placement, imports.ImportRefusal]:
     """Place one `.srm` where the core loads SRAM for the booted content.
 
@@ -2364,13 +2364,21 @@ def _place_srm(
     Args:
         member: The save member, already past the kind gate.
         lib: The core's `library_name`, which names the sorted save dir.
-        rom_file: The booted file.
+        rom_file: The booted file, or None when the launch named none.
         sav: Whether the core reads a `.sav` as its `.srm` (`sav_is_srm`).
 
     Returns:
         The placement at `saves/<lib>/<rom_file.stem>.srm`, or a refusal.
     """
     expected = _SRM_OR_SAV_EXPECTED if sav else _SRM_EXPECTED
+    if rom_file is None:
+        return imports.ImportRefusal(
+            "destination_unresolvable",
+            member.name,
+            expected,
+            detail="no rom file to name the save after",
+        )
+    stem = rom_file.stem
     if len(member.parts) != 1:
         return imports.ImportRefusal(
             "unrecognised_layout", member.name, expected, detail="expected a single file"
@@ -2404,7 +2412,7 @@ def _place_srm(
         Returns:
             `<rom_file.stem>.srm`.
         """
-        return f"{rom_file.stem}.srm"
+        return f"{stem}.srm"
 
     dest = imports.place_single_file(
         member,
@@ -2418,7 +2426,7 @@ def _place_srm(
     )
     if isinstance(dest, imports.ImportRefusal):
         return dest
-    if PurePosixPath(leaf).stem != rom_file.stem or suffix == ".sav":
+    if PurePosixPath(leaf).stem != stem or suffix == ".sav":
         log.info("retroarch: import %s placed as %s, named for the loaded content", member.name, dest)
     return imports.Placement(member, dest)
 
@@ -4322,15 +4330,7 @@ class Retroarch(Emulator):
         # there is one, rather than the untested core's guess: the core loads
         # SRAM from the dir it really writes, and `state_target` uses it too.
         lib = self.library_name() or lib
-        sav = _sav_is_srm(profile)
-        if ctx.rom_file is None:
-            return imports.ImportRefusal(
-                "destination_unresolvable",
-                member.name,
-                _SRM_OR_SAV_EXPECTED if sav else _SRM_EXPECTED,
-                detail="no rom file to name the save after",
-            )
-        placed = _place_srm(member, lib, ctx.rom_file, sav=sav)
+        placed = _place_srm(member, lib, ctx.rom_file, sav=_sav_is_srm(profile))
         if isinstance(placed, imports.Placement) and profile is not None and profile["save_ram"] is None:
             log.warning(
                 "retroarch: placed %s for untested core %s, which may not read a .srm",

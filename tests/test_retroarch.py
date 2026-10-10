@@ -3207,6 +3207,41 @@ class FakeMenuRetroarch:
         return self.sent.count("MENU_TOGGLE")
 
 
+def _saving_retroarch_factory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]:
+    """Build the factory behind the save-state classes' `make` fixtures.
+
+    Args:
+        tmp_path: Backs the state directory.
+        monkeypatch: The pytest monkeypatch fixture.
+
+    Returns:
+        A factory taking a `homed` flag and `FakeMenuRetroarch`'s keyword
+        arguments, returning a live Retroarch and its fake.
+    """
+    state_dir = tmp_path / "states"
+    monkeypatch.setattr(retroarch, "STATE_DIR", state_dir)
+    monkeypatch.setattr(retroarch, "SLOT_STEP_DELAY", 0)
+    monkeypatch.setattr(retroarch, "SLOT_HOME_STEPS", 4)
+    monkeypatch.setattr(retroarch, "MENU_SETTLE", 0)
+
+    def build(homed: bool = True, **kwargs: Any) -> tuple[retroarch.Retroarch, FakeMenuRetroarch]:
+        fake = FakeMenuRetroarch(state_dir, **kwargs)
+        emu = retroarch.Retroarch()
+        emu.platform = "gb"
+        emu._rom_base = "Game"
+        emu._slot_homed = homed
+        emu._state_confirm_wait = 0.8
+        monkeypatch.setattr(emu, "alive", lambda: True)
+        monkeypatch.setattr(emu, "_write_cmd", fake.write_cmd)
+        monkeypatch.setattr(emu, "_observe_library_name", lambda: None)
+        monkeypatch.setattr(emu, "_wait_for_first_save_settle", lambda: None)
+        return emu, fake
+
+    return build
+
+
 class TestDiscSwapWithTheMenuOpen:
     """A disc swap sent while RetroArch's menu is up, which drops the tray commands."""
 
@@ -3485,25 +3520,7 @@ class TestSaveWithTheMenuOpen:
             A factory taking `FakeMenuRetroarch`'s keyword arguments and
             returning the emulator and its fake.
         """
-        state_dir = tmp_path / "states"
-        monkeypatch.setattr(retroarch, "STATE_DIR", state_dir)
-        monkeypatch.setattr(retroarch, "SLOT_STEP_DELAY", 0)
-        monkeypatch.setattr(retroarch, "SLOT_HOME_STEPS", 4)
-        monkeypatch.setattr(retroarch, "MENU_SETTLE", 0)
-
-        def build(**kwargs: Any) -> tuple[retroarch.Retroarch, FakeMenuRetroarch]:
-            fake = FakeMenuRetroarch(state_dir, **kwargs)
-            emu = retroarch.Retroarch()
-            emu.platform = "gb"
-            emu._rom_base = "Game"
-            emu._slot_homed = True
-            emu._state_confirm_wait = 0.8
-            monkeypatch.setattr(emu, "alive", lambda: True)
-            monkeypatch.setattr(emu, "_write_cmd", fake.write_cmd)
-            monkeypatch.setattr(emu, "_observe_library_name", lambda: None)
-            return emu, fake
-
-        return build
+        return _saving_retroarch_factory(tmp_path, monkeypatch)
 
     def test_a_save_with_the_menu_open_closes_it_and_lands(
         self, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]
@@ -3658,27 +3675,39 @@ class TestAutoStateSlot:
             A factory taking `FakeMenuRetroarch`'s keyword arguments and a
             `homed` flag, returning the emulator and its fake.
         """
-        state_dir = tmp_path / "states"
-        monkeypatch.setattr(retroarch, "STATE_DIR", state_dir)
         monkeypatch.setattr(retroarch, "STATE_SLOT", -1)
-        monkeypatch.setattr(retroarch, "SLOT_STEP_DELAY", 0)
-        monkeypatch.setattr(retroarch, "SLOT_HOME_STEPS", 4)
-        monkeypatch.setattr(retroarch, "MENU_SETTLE", 0)
+        return _saving_retroarch_factory(tmp_path, monkeypatch)
 
-        def build(homed: bool = True, **kwargs: Any) -> tuple[retroarch.Retroarch, FakeMenuRetroarch]:
-            fake = FakeMenuRetroarch(state_dir, **kwargs)
-            emu = retroarch.Retroarch()
-            emu.platform = "gb"
-            emu._rom_base = "Game"
-            emu._slot_homed = homed
-            emu._state_confirm_wait = 0.8
-            monkeypatch.setattr(emu, "alive", lambda: True)
-            monkeypatch.setattr(emu, "_write_cmd", fake.write_cmd)
-            monkeypatch.setattr(emu, "_observe_library_name", lambda: None)
-            monkeypatch.setattr(emu, "_wait_for_first_save_settle", lambda: None)
-            return emu, fake
+    @pytest.fixture
+    def loading(
+        self,
+        make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[retroarch.Retroarch, list[str]]:
+        """Build a Retroarch with a `.state.auto` on disk, which every command it sends reads.
 
-        return build
+        Args:
+            make: The emulator factory.
+            monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            The emulator and the list its sent commands land in.
+        """
+        emu, fake = make()
+        fake.dir.mkdir(parents=True)
+        auto = fake.dir / "Game.state.auto"
+        auto.write_bytes(b"auto")
+        monkeypatch.setattr(retroarch, "_atime_tracked", lambda d: True)
+        monkeypatch.setattr(retroarch, "LOAD_CONFIRM_WAIT", 0.5)
+        sent: list[str] = []
+
+        def echo_and_read(cmd: str, wait_prefix: Any, timeout: float) -> str:
+            sent.append(cmd)
+            auto.read_bytes()
+            return cmd
+
+        monkeypatch.setattr(emu, "_send", echo_and_read)
+        return emu, sent
 
     def test_homing_parks_the_slot_on_the_floor_and_saves_there(
         self, make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]]
@@ -3713,51 +3742,17 @@ class TestAutoStateSlot:
 
         assert emu.state_path() == fake.dir / "Game.state.auto"
 
-    def test_a_load_names_the_auto_slot(
-        self,
-        make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]],
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    def test_a_load_names_the_auto_slot(self, loading: tuple[retroarch.Retroarch, list[str]]) -> None:
         """`LOAD_STATE_SLOT -1` is the command, and the read of `.state.auto` confirms it."""
-        emu, fake = make()
-        fake.dir.mkdir(parents=True)
-        auto = fake.dir / "Game.state.auto"
-        auto.write_bytes(b"auto")
-        monkeypatch.setattr(retroarch, "_atime_tracked", lambda d: True)
-        monkeypatch.setattr(retroarch, "LOAD_CONFIRM_WAIT", 0.5)
-        sent: list[str] = []
-
-        def echo_and_read(cmd: str, wait_prefix: Any, timeout: float) -> str:
-            sent.append(cmd)
-            auto.read_bytes()
-            return cmd
-
-        monkeypatch.setattr(emu, "_send", echo_and_read)
+        emu, sent = loading
 
         assert emu.load_state(-1) is True
         assert sent == ["LOAD_STATE_SLOT -1"]
 
-    def test_a_resume_loads_the_auto_slot(
-        self,
-        make: Callable[..., tuple[retroarch.Retroarch, FakeMenuRetroarch]],
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    def test_a_resume_loads_the_auto_slot(self, loading: tuple[retroarch.Retroarch, list[str]]) -> None:
         """The deferred resume waits for `.state.auto`, then loads it with `LOAD_STATE_SLOT -1`."""
-        emu, fake = make()
+        emu, sent = loading
         emu._resume_settle = 0
-        fake.dir.mkdir(parents=True)
-        auto = fake.dir / "Game.state.auto"
-        auto.write_bytes(b"auto")
-        monkeypatch.setattr(retroarch, "_atime_tracked", lambda d: True)
-        monkeypatch.setattr(retroarch, "LOAD_CONFIRM_WAIT", 0.5)
-        sent: list[str] = []
-
-        def echo_and_read(cmd: str, wait_prefix: Any, timeout: float) -> str:
-            sent.append(cmd)
-            auto.read_bytes()
-            return cmd
-
-        monkeypatch.setattr(emu, "_send", echo_and_read)
 
         assert emu._load_until_confirmed(-1, time.monotonic() + 5.0, emu._launch_seq) is True
         assert sent == ["LOAD_STATE_SLOT -1"]
@@ -3768,7 +3763,7 @@ class TestAutoStateSlot:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The exit save lands in `.state.auto`, and the report names slot -1 and that file."""
-        emu, fake = make()
+        emu, fake = make(slot=-1)
         monkeypatch.setattr(emu, "_flush_sram", lambda: True)
         monkeypatch.setattr(emu, "_quit", lambda: None)
 
@@ -4596,6 +4591,9 @@ def test_a_srm_lands_where_the_core_loads_sram_for_the_booted_content(
     [
         ("sub/Game.srm", 4, "unrecognised_layout", "expected a single file"),
         ("Game.srm", 0, "incomplete_unit", "the file is empty"),
+        ("sub/Game.sav", 4, "unrecognised_layout", "expected a single file"),
+        ("Game.sav", 0, "incomplete_unit", "the file is empty"),
+        ("Game.sav.bak", 4, "unrecognised_layout", None),
         ("Game.RTC", 4, "needs_conversion", _unconverted(".rtc")),
         ("Game.nv", 4, "needs_conversion", _unconverted(".nv")),
         ("Game.eep", 4, "needs_conversion", _unconverted(".eep")),
@@ -4611,7 +4609,8 @@ def test_a_save_that_is_not_one_srm_is_refused(
 ) -> None:
     """A nested file, an empty one, an unverified save file, a state or any other name is refused.
 
-    snes reads a `.sav` as its `.srm`, so its refusals name both shapes.
+    snes reads a `.sav` as its `.srm`, so its refusals name both shapes. A `.sav` is held to
+    the same single, non-empty file, and no other save suffix is opted in with it.
 
     Args:
         ra_dirs: The patched data root.
@@ -4662,21 +4661,6 @@ def test_a_sav_is_refused_where_the_core_s_name_for_it_is_unverified(
     assert [(r.reason, r.expected, r.detail) for r in result.refusals] == [
         ("needs_conversion", _SRM_EXPECTED, _unconverted(".sav"))
     ]
-
-
-@pytest.mark.parametrize("name", ["Game.rtc", "Game.eep"])
-def test_a_sav_platform_still_refuses_the_other_unverified_suffixes(ra_dirs: Path, name: str) -> None:
-    """Only `.sav` is opted in; a core's `.rtc` or `.eep` is still not placed.
-
-    Args:
-        ra_dirs: The patched data root.
-        name: The member's file name.
-    """
-    body = import_zip({f".import/save/{name}": b"sram"})
-
-    result = preflight_import(_on("gb"), body, rom_file=ra_dirs / "Game.gb")
-
-    assert [r.reason for r in result.refusals] == ["needs_conversion"]
 
 
 @pytest.mark.parametrize(
@@ -4883,48 +4867,6 @@ def test_a_sav_and_a_srm_for_the_same_content_are_both_refused(ra_dirs: Path) ->
         ("destination_conflict", ".import/save/Game.sav"),
         ("destination_conflict", ".import/save/Game.srm"),
     ]
-
-
-@pytest.mark.parametrize(
-    ("name", "size", "reason", "detail"),
-    [
-        ("Game.sav", 0, "incomplete_unit", "the file is empty"),
-        ("sub/Game.sav", 4, "unrecognised_layout", "expected a single file"),
-        ("Game.sav.bak", 4, "unrecognised_layout", None),
-    ],
-)
-def test_a_sav_that_is_not_one_named_file_is_refused(
-    ra_dirs: Path, name: str, size: int, reason: str, detail: Optional[str]
-) -> None:
-    """A `.sav` is held to the same single, non-empty, named file a `.srm` is.
-
-    Args:
-        ra_dirs: The patched data root.
-        name: The member's path below `.import/save/`.
-        size: The member's size.
-        reason: The refusal code.
-        detail: The refusal's detail.
-    """
-    body = import_zip({f".import/save/{name}": b"\0" * size})
-
-    result = preflight_import(_on("gba"), body, rom_file=ra_dirs / "Game.gba")
-
-    assert [(r.reason, r.member, r.expected, r.detail) for r in result.refusals] == [
-        (reason, f".import/save/{name}", _SRM_OR_SAV_EXPECTED, detail)
-    ]
-
-
-def test_a_mixed_case_sav_is_placed(ra_dirs: Path) -> None:
-    """The suffix is matched in any case, as a `.SRM` is.
-
-    Args:
-        ra_dirs: The patched data root.
-    """
-    body = import_zip({".import/save/Game.SaV": b"sram"})
-
-    result = preflight_import(_on("gba"), body, rom_file=ra_dirs / "Game.gba")
-
-    assert [p.dest for p in result.placements] == [PurePosixPath("saves/mGBA/Game.srm")]
 
 
 def test_a_sav_over_the_archive_s_srm_for_the_content_is_a_conflict(ra_dirs: Path) -> None:
