@@ -409,6 +409,127 @@ async def test_the_token_map_carries_the_gamepad_slot_selkies_routes_on() -> Non
     assert tokens[viewer["token"]] == {"role": "viewer", "slot": 2, "mk_control": False}
 
 
+def _gamepad_notices(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Collect the `gamepad_change` messages the room is sent.
+
+    Args:
+        monkeypatch: Replaces the room broadcast for the test.
+
+    Returns:
+        The list each message is appended to, in the order it was sent.
+    """
+    said: list[str] = []
+
+    async def _collect(payload: dict[str, Any]) -> None:
+        """Keep a gamepad notification, drop every other broadcast.
+
+        Args:
+            payload: The message the room would have been sent.
+        """
+        if payload.get("type") == "gamepad_change":
+            said.append(payload["message"])
+
+    monkeypatch.setattr(session, "broadcast_to_room", _collect)
+    return said
+
+
+async def test_a_second_gamepad_is_added_beside_the_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A member handed a second gamepad keeps the first, so one browser can drive two pads.
+
+    selkies gives a token's list of slots to that page's pads in turn, so the list is kept in slot
+    order whichever was handed over first.
+    """
+    said = _gamepad_notices(monkeypatch)
+    sess = _activate()
+    viewer = await session.add_viewer("participant", {"id": 7, "username": "ana"})
+
+    await session.handle_assign_slot(viewer["token"], 4)
+    await session.handle_assign_slot(viewer["token"], 3)
+
+    assert viewer["slot"] == [3, 4]
+    assert selkies.build_token_map(sess)[viewer["token"]]["slot"] == [3, 4]
+    assert said == ["Gamepad 4 was assigned to ana.", "Gamepad 3 was assigned to ana."]
+
+
+async def test_a_gamepad_handed_on_leaves_its_holder_the_others(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Handing on a gamepad takes that one from its holder, who keeps the rest."""
+    said = _gamepad_notices(monkeypatch)
+    sess = _activate()
+    viewer = await session.add_viewer("participant", {"id": 7, "username": "ana"})
+    await session.handle_assign_slot(sess["controller_token"], 2)
+    assert sess["controller_slot"] == [1, 2]
+
+    await session.handle_assign_slot(viewer["token"], 1)
+
+    assert sess["controller_slot"] == 2
+    assert viewer["slot"] == 1
+    assert said[-2:] == ["Controller was unassigned from Gamepad 1.", "Gamepad 1 was assigned to ana."]
+
+
+async def test_releasing_a_gamepad_leaves_its_holder_the_others(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A gamepad dragged back to the tray is the only one its holder loses."""
+    said = _gamepad_notices(monkeypatch)
+    sess = _activate()
+    viewer = await session.add_viewer("participant", {"id": 7, "username": "ana"})
+    await session.handle_assign_slot(viewer["token"], 3)
+    await session.handle_assign_slot(viewer["token"], 4)
+
+    await session.handle_release_slot(3)
+
+    assert viewer["slot"] == 4
+    assert selkies.build_token_map(sess)[viewer["token"]]["slot"] == 4
+    assert said[-1] == "ana was unassigned from Gamepad 3."
+
+
+async def test_releasing_a_gamepad_nobody_holds_pushes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A release that changes nothing leaves selkies and the room alone."""
+    pushed: list[dict[str, Any]] = []
+
+    async def _push(sess: dict[str, Any]) -> bool:
+        """Record a push.
+
+        Args:
+            sess: The session whose tokens would have been pushed.
+
+        Returns:
+            Always True.
+        """
+        pushed.append(sess)
+        return True
+
+    monkeypatch.setattr(selkies, "push_tokens", _push)
+    said = _gamepad_notices(monkeypatch)
+    _activate()
+
+    await session.handle_release_slot(3)
+
+    assert pushed == []
+    assert said == []
+
+
+async def test_taking_a_members_gamepads_away_frees_every_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unassigning a member frees every gamepad it held, in one notice."""
+    said = _gamepad_notices(monkeypatch)
+    _activate()
+    viewer = await session.add_viewer("participant", {"id": 7, "username": "ana"})
+    await session.handle_assign_slot(viewer["token"], 2)
+    await session.handle_assign_slot(viewer["token"], 4)
+
+    await session.handle_assign_slot(viewer["token"], None)
+
+    assert viewer["slot"] is None
+    assert said[-1] == "ana was unassigned from Gamepads 2 and 4."
+
+
+@pytest.mark.parametrize(
+    ("value", "held"),
+    [(None, []), (2, [2]), ([3, 4], [3, 4]), ([], []), (True, []), ([1, "2", False, 3], [1, 3])],
+)
+def test_a_seats_slot_reads_as_the_gamepads_it_holds(value: Any, held: list[int]) -> None:
+    """A seat's slot is none, one number, or a list, and nothing else counts as a gamepad."""
+    assert session.held_slots(value) == held
+
+
 async def test_a_seat_that_was_just_handed_out_is_never_reclaimed(monkeypatch: pytest.MonkeyPatch) -> None:
     """An arrival at the cap is refused rather than reclaiming a seat handed out moments ago.
 
