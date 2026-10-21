@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.2](https://github.com/romm-streaming/romm-broker/compare/v0.15.1...v0.15.2) (2026-10-21)
+
+
+### Bug Fixes
+
+* use screenshot api not the pixelflux CU ([a188ec9](https://github.com/romm-streaming/romm-broker/commit/a188ec9d8d7f140a45bb73ad33dd33bef6ab1ca3))
+
 ## [0.15.1](https://github.com/romm-streaming/romm-broker/compare/v0.15.0...v0.15.1) (2026-10-17)
 
 
