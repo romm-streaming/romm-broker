@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.15.4](https://github.com/romm-streaming/romm-broker/compare/v0.15.3...v0.15.4) (2026-10-28)
+
+
+### Documentation
+
+* Add streaming enabled option to config.yml ([c3ebb43](https://github.com/romm-streaming/romm-broker/commit/c3ebb437ddbf4f4db7d696fbafbe7ec0aa69a983))
+* Add streaming enabled option to config.yml ([4d302d8](https://github.com/romm-streaming/romm-broker/commit/4d302d86639393040ba4059e2f8a10d59ebac682))
+
 ## [0.15.3](https://github.com/romm-streaming/romm-broker/compare/v0.15.2...v0.15.3) (2026-10-26)
 
 
