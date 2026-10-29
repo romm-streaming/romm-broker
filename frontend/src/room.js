@@ -8,6 +8,7 @@ import {
     parseTouchOpacity,
 } from './touchOpacity.js';
 import { showsMenuButton, toggleEmulatorMenu } from './emulatorMenu.js';
+import { slotsOf } from './gamepadSlots.js';
 
 // ---------------------------------------------------------------------------
 // WebCodecs track plumbing: capture (MediaStreamTrack -> VideoFrame/AudioData for
@@ -3335,17 +3336,19 @@ document.addEventListener('DOMContentLoaded', async () => {
         const assignedGamepadIds = new Set();
         let mkAssigned = false;
         users.forEach(user => {
-            if (user.slot) {
-                assignedGamepadIds.add(user.slot);
-                const icon = gamepadIcons[user.slot];
-                const container = user.publicId === COLLAB_DATA.userPublicId
-                    ? document.getElementById('local-user-container')
-                    : document.getElementById(`container-${user.publicId}`);
-
-                if (icon && container && icon.parentElement !== container) {
-                    container.appendChild(icon);
+            const slotContainer = user.publicId === COLLAB_DATA.userPublicId
+                ? document.getElementById('local-user-container')
+                : document.getElementById(`container-${user.publicId}`);
+            slotsOf(user.slot).forEach((slot, position) => {
+                assignedGamepadIds.add(slot);
+                const icon = gamepadIcons[slot];
+                if (!icon || !slotContainer) return;
+                // Side by side in the order the member's controllers take them.
+                icon.style.setProperty('--slot-position', position);
+                if (icon.parentElement !== slotContainer) {
+                    slotContainer.appendChild(icon);
                 }
-            }
+            });
 
             if (user.has_mk) {
                 mkAssigned = true;
@@ -3363,6 +3366,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (!assignedGamepadIds.has(i)) {
                 const icon = gamepadIcons[i];
                 if (icon && icon.parentElement !== sourceBox) {
+                    icon.style.removeProperty('--slot-position');
                     sourceBox.appendChild(icon);
                 }
             }
@@ -3442,8 +3446,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (over.id === 'gamepad-source-box') {
             const parentContainer = source.parentElement;
             if (parentContainer && parentContainer.id !== 'gamepad-source-box') {
-                const userPublicId = parentContainer.dataset.userPublicId;
-                if (userPublicId) ws.send(JSON.stringify({ action: 'assign_slot', viewer_public_id: userPublicId, slot: null }));
+                // Only this gamepad: its holder keeps any others.
+                ws.send(JSON.stringify({ action: 'release_slot', slot: gamepadId }));
             }
         } else {
             const userPublicId = over.dataset.userPublicId;
