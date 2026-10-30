@@ -152,3 +152,5 @@ There's a dedicated walkthrough for this:
 Docs live under `docs/content/docs/` (Fumadocs) and deploy to GitHub Pages on
 merge to `master`. If your change affects behavior a user or contributor would
 read about, update the relevant page in the same PR.
+
+<!-- HOM-608 / HOM-555: signed-commit test from the hermes agent signing subkey. Safe to drop. -->
