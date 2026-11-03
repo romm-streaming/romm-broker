@@ -2130,6 +2130,43 @@ _SRM_OR_SAV_EXPECTED = "one non-empty <name>.srm or <name>.sav, the core's SRAM"
 """`_SRM_EXPECTED` where the core reads a `.sav` as its `.srm`."""
 
 
+_SAV_CONTAINERS: tuple[tuple[int, bytes, str], ...] = (
+    (0, b"NocashGbaBackupMediaSavDataFile\x1a", "no$gba save container"),
+    (4, b"SharkPortSave", "SharkPort or Xploder save container"),
+    (0, b"ADVSAVEG", "GameShark Advance save container"),
+    (0, b"ARDS000000000001", "Action Replay DS save container"),
+)
+"""Headers of `.sav` files that wrap a save rather than hold it: offset, bytes, and the name to refuse with.
+
+RetroArch copies the file into the core's SRAM byte for byte (only its own
+`#RZIPv` compression is unwrapped first), and none of the `sav_is_srm` cores
+parses these, so a wrapped save would load as garbage. A trailer after the raw
+save, such as an RTC block or DeSmuME's footer, is not listed: RetroArch cuts
+the file to the core's SRAM size, so that save still loads.
+"""
+_SAV_SNIFF_BYTES = max(offset + len(magic) for offset, magic, _ in _SAV_CONTAINERS)
+"""How much of a `.sav` the container check reads."""
+
+
+def _sav_container(member: imports.ImportMember) -> Optional[str]:
+    """Name the container format a `.sav` member is wrapped in, if any.
+
+    Args:
+        member: A `.sav` save member, read while its archive is open.
+
+    Returns:
+        The format's name from `_SAV_CONTAINERS`, or None for a raw save.
+
+    Raises:
+        imports.MemberReadError: When the member's data cannot be read.
+    """
+    head = member.head(_SAV_SNIFF_BYTES)
+    for offset, magic, name in _SAV_CONTAINERS:
+        if head[offset : offset + len(magic)] == magic:
+            return name
+    return None
+
+
 def _sav_is_srm(info: Optional[Mapping[str, Any]]) -> bool:
     """Whether the profile's core reads a device's `.sav` as its `.srm`.
 
@@ -2378,7 +2415,8 @@ def _place_srm(
     RetroArch names SRAM after the content it loaded, so the member's own
     stem is replaced with the booted file's; for a playlist boot that is the
     playlist's stem. With `sav`, a `.sav` is placed the same way, renamed to
-    the `.srm` and left byte for byte as it came.
+    the `.srm` and left byte for byte as it came, unless its header shows a
+    container (`_SAV_CONTAINERS`) rather than a raw save.
 
     Args:
         member: The save member, already past the kind gate.
@@ -2421,6 +2459,15 @@ def _place_srm(
                 "send the core's .srm"
             ),
         )
+    if suffix == ".sav":
+        container = _sav_container(member)
+        if container is not None:
+            return imports.ImportRefusal(
+                "needs_conversion",
+                member.name,
+                expected,
+                detail=f"a {container}, not a raw save; export a raw .sav from it and send that",
+            )
 
     def rename(name: str) -> str:
         """Name the save for the booted content.
