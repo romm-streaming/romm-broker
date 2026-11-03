@@ -4705,6 +4705,102 @@ def test_a_sav_is_refused_where_the_core_s_name_for_it_is_unverified(
     ]
 
 
+def _container(name: str) -> str:
+    """The detail a `.sav` wrapped in a container is refused with.
+
+    Args:
+        name: The container format's name.
+
+    Returns:
+        The detail.
+    """
+    return f"a {name}, not a raw save; export a raw .sav from it and send that"
+
+
+_NOCASH = b"NocashGbaBackupMediaSavDataFile\x1a"
+"""The no$gba `.sav` header, with its 0x1A terminator."""
+
+
+@pytest.mark.parametrize(
+    ("platform", "rom", "data", "container"),
+    [
+        ("gba", "Game.gba", _NOCASH + b"\0" * 32 + b"SRAM" + b"\xff" * 64, "no$gba save container"),
+        ("nds", "Game.nds", _NOCASH + b"\0" * 32 + b"SRAM" + b"\xff" * 64, "no$gba save container"),
+        ("gba", "Game.gba", b"\x0d\0\0\0SharkPortSave\0\0\x0f\0", "SharkPort or Xploder save container"),
+        ("gba", "Game.gba", b"ADVSAVEG" + b"\0" * 64, "GameShark Advance save container"),
+        ("nds", "Game.nds", b"ARDS000000000001" + b"\0" * 484, "Action Replay DS save container"),
+        ("snes", "Game.sfc", _NOCASH + b"\0" * 8, "no$gba save container"),
+    ],
+)
+def test_a_sav_wrapped_in_a_container_is_refused(
+    ra_dirs: Path, platform: str, rom: str, data: bytes, container: str
+) -> None:
+    """A `.sav` whose header shows a tool's container would load into SRAM as garbage, so it is refused.
+
+    RetroArch copies the file into SRAM byte for byte and no `sav_is_srm` core
+    unwraps these, so placed as the `.srm` the save would silently not load.
+
+    Args:
+        ra_dirs: The patched data root.
+        platform: The RomM platform slug.
+        rom: The booted file's name.
+        data: The member's bytes, opening with the container's header.
+        container: The format the refusal names.
+    """
+    body = import_zip({".import/save/Game.sav": data})
+
+    result = preflight_import(_on(platform), body, rom_file=ra_dirs / rom)
+
+    assert result.placements == ()
+    assert [(r.reason, r.expected, r.detail) for r in result.refusals] == [
+        ("needs_conversion", _SRM_OR_SAV_EXPECTED, _container(container))
+    ]
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        # One byte short of each header, or the right bytes at the wrong offset.
+        _NOCASH[:-1] + b"\0" + b"\xff" * 64,
+        b"\x0d\0\0\0SharkPortSav",
+        b"SharkPortSave" + b"\0" * 32,
+        b"ADVSAVE\0" + b"\0" * 64,
+        b"\0ADVSAVEG" + b"\0" * 64,
+        b"ARDS00000000000\0" + b"\0" * 64,
+        # The same bytes later in the file are save data, not a header.
+        b"\xff" * 64 + _NOCASH,
+        # A raw save followed by a trailer: RetroArch cuts it to the core's SRAM size.
+        b"\xff" * 8192 + b"|<--Snip above here to create a raw sav by excluding this DeSmuME savedata footer:"
+        b"\0" * 24 + b"|-DESMUME SAVE-|",
+        b"\xff" * 32768 + b"\x01" * 48,
+        b"s",
+    ],
+)
+def test_a_raw_sav_that_only_resembles_a_container_is_placed(ra_dirs: Path, data: bytes) -> None:
+    """Only a full header at its own offset refuses: anything else is a raw save the core reads.
+
+    Args:
+        ra_dirs: The patched data root.
+        data: The member's bytes.
+    """
+    body = import_zip({".import/save/Game.sav": data})
+
+    result = preflight_import(_on("gba"), body, rom_file=ra_dirs / "Game.gba")
+
+    assert result.refusals == ()
+    assert [p.dest for p in result.placements] == [PurePosixPath("saves/mGBA/Game.srm")]
+
+
+def test_a_srm_is_never_sniffed_for_a_container(ra_dirs: Path) -> None:
+    """A `.srm` is taken as the core's own file, whatever it opens with."""
+    body = import_zip({".import/save/Game.srm": _NOCASH + b"\xff" * 64})
+
+    result = preflight_import(_on("gba"), body, rom_file=ra_dirs / "Game.gba")
+
+    assert result.refusals == ()
+    assert [p.dest for p in result.placements] == [PurePosixPath("saves/mGBA/Game.srm")]
+
+
 @pytest.mark.parametrize(
     ("platform", "reason", "expected", "detail", "suggest"),
     [
