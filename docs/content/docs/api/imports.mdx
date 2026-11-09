@@ -160,6 +160,9 @@ is placed as the `.srm`, and discovery lists `<name>.sav` there
 ([RetroArch cores](/docs/emulators/retroarch-cores#saves-states-and-imports)
 lists them). A `.sav` and a `.srm` in the same archive would both become that
 one file, so both get `destination_conflict`.
+Only a raw `.sav` is taken: one that opens with a known container header
+(no$gba, SharkPort or Xploder, GameShark Advance, Action Replay DS) is
+`needs_conversion`, so export a raw save from that tool and send it instead.
 `wii` and `3ds` take folders instead, described below the list. It refuses these:
 
 - On `psp`: `destination_unresolvable`, with `suggest_emulator: "ppsspp"`.
