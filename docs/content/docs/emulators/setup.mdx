@@ -19,6 +19,44 @@ covers where this fits in the rest of the setup, and
 [Troubleshooting](/docs/troubleshooting) covers what a missing BIOS or key
 actually looks like when a game refuses to launch.
 
+## Firmware from your RomM library
+
+If you've uploaded BIOS files to a platform in RomM, the broker copies them
+into place each time a game from that platform launches. For RetroArch,
+DuckStation and Flycast that covers the BIOS step below, as long as the files
+are in RomM.
+
+| Emulator | Where the files go | Under what name |
+| --- | --- | --- |
+| RetroArch | `RETROARCH_SYSTEM_DIR`, in the subfolder the running core reads (`dc/` for Dreamcast, for example) | The name the core expects for that file's contents, taken from libretro's core info, whatever you called it on upload. A file the core info doesn't recognise keeps its uploaded name, and so does one uploaded under the running core's own name for it (cores name some BIOS differently; yabasanshiro reads the US Saturn BIOS only as `saturn_bios.bin`). |
+| DuckStation | Its BIOS folder: `bios` under DuckStation's data folder, or the folder `SearchDirectory` names in the `[BIOS]` section of its `settings.ini` | As uploaded. DuckStation tells BIOS images apart by their contents, not their names. |
+| Flycast | `/config/.local/share/flycast` | `dc_boot.bin` and `dc_flash.bin`, recognised by their contents or by those names. Other files are skipped. |
+
+The broker never overwrites a file it didn't put there:
+
+- If the file is missing, it's copied in.
+- If a file with the same contents is already there, it's left alone.
+- If a different file is already there, such as your own dump, it's kept. The
+  broker logs the path, and the launch response lists it under `kept`.
+- A file the broker placed itself is replaced when you upload a new version
+  to RomM, unless something has changed it in the meantime, in which case
+  it counts as yours. (Standalone Flycast keeps your date and language
+  settings in a separate `dc_nvmem.bin` and leaves `dc_flash.bin` as it
+  is.) The broker keeps track of what it placed in
+  `/config/broker-firmware.json`.
+- Nothing is ever deleted. Removing a file from RomM leaves the copy where it
+  is.
+
+A file that can't be copied doesn't stop the launch. The game starts anyway,
+and the emulator's own missing-BIOS message tells you what's wrong.
+
+The other emulators (PCSX2, Dolphin, xemu, Azahar, Eden, RPCS3 and the rest)
+either choose their BIOS in their own settings or install firmware from one
+of their menus, so they still need the desktop visit described below. The
+desktop session gets no copies. If your RomM version doesn't send a firmware
+list, nothing changes. To turn the feature off, set
+`FIRMWARE_SYNC_ENABLED=false` (see [Broker settings](/docs/configuration)).
+
 ## Getting files into the container
 
 Firmware blobs, decryption keys, BIOS images, and system modules can be dragged
@@ -150,7 +188,10 @@ created in that same folder to be the one games boot with.
 ## DuckStation
 
 DuckStation runs a setup wizard the first time you launch it. Upload your
-BIOS, select it for the BIOS folder, and skip the game directory step. For
+BIOS, select it for the BIOS folder, and skip the game directory step. If your
+PlayStation BIOS is uploaded to the platform in RomM, you can skip the BIOS
+step: the broker copies it into DuckStation's BIOS folder whenever a game
+launches. The controller setup below still applies. For
 controller setup, make sure you pick the right SDL devices: SDL 0 for player
 1 and SDL 1 for player 2.
 
@@ -354,7 +395,10 @@ interface, and pick `retroarch` otherwise.
 
 Flycast needs the Dreamcast BIOS pair: `dc_boot.bin` and `dc_flash.bin`.
 Upload them and place them in `/config/.local/share/flycast`, the same flat
-directory that VMU (Dreamcast memory card) saves and save states live in.
+directory that VMU (Dreamcast memory card) saves and save states live in. If
+the pair is uploaded to the Dreamcast platform in RomM, the broker places it
+for you when a game launches (see
+[Firmware from your RomM library](#firmware-from-your-romm-library)).
 
 Controllers are pre-configured. Set your graphics and audio preferences from
 the desktop and test a game.

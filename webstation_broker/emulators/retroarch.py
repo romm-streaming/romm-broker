@@ -76,7 +76,7 @@ from typing import Any, Callable, Optional, Union
 
 import httpx
 
-from .. import imports, settings
+from .. import firmware, imports, settings
 from . import extraction_cache, retroarch_cores, rom_cache, wii_nand
 from .base import Emulator, _record_pid, base_launch_env, disc_number, xdg_config_dir
 from .retroarch_cores import safe_dir_name
@@ -4285,6 +4285,38 @@ class Retroarch(Emulator):
         name = _state_name(self._rom_base, STATE_SLOT)
         lib = self.library_name()
         return STATE_DIR / lib / name if lib else STATE_DIR / name
+
+    def firmware_targets(self, source: "firmware.Source") -> list["firmware.Target"]:
+        """Where the booted core looks for a firmware file, under SYSTEM_DIR.
+
+        A file core info names by its hash goes to every path the core lists
+        under that name. When none of those names is one the core lists, the
+        uploaded name is matched instead: core info files one BIOS under a
+        different name per core (the US Saturn BIOS is `mpr-17933.bin` to
+        mednafen_saturn but `saturn_bios.bin` to yabasanshiro), so a file
+        uploaded under the booted core's name still lands where it looks.
+        Neither matching, it goes under its known names (else its uploaded
+        name) into the folder the core keeps all its firmware in (`dc/` for
+        flycast), or the system dir itself.
+
+        Args:
+            source: The firmware file.
+
+        Returns:
+            The targets, all under SYSTEM_DIR.
+        """
+        core = self.archive_core()
+        paths = retroarch_cores.firmware_paths(core) if core else ()
+        names = firmware.known_names(source)
+        wanted = {name.lower() for name in names}
+        matched = [path for path in paths if path.name.lower() in wanted]
+        if not matched:
+            matched = [path for path in paths if path.name.lower() == source.name.lower()]
+        if matched:
+            return [firmware.Target(SYSTEM_DIR, path) for path in matched]
+        folders = {path.parent for path in paths}
+        folder = folders.pop() if len(folders) == 1 else PurePosixPath()
+        return [firmware.Target(SYSTEM_DIR, folder / name) for name in sorted(names) or [source.name]]
 
     def import_spec(self) -> imports.ImportSpec:
         """Take one `.srm` (or `.sav`), NAND or SD files, or nothing; take states through the push routes.

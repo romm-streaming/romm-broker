@@ -645,7 +645,108 @@ def set_catalog(new: Catalog) -> None:
     _catalog = new
 
 
-ZIP_CAP = 5 * 1024 * 1024
+_FIRMWARE_PATH_RE = re.compile(r"^firmware\d+_path$")
+_FIRMWARE_NOTE_RE = re.compile(
+    r"\(!\)\s*([^|]+?)\s*\((md5|sha1)\)\s*:?\s*([0-9A-Fa-f]{40}|[0-9A-Fa-f]{32})\b"
+)
+
+
+def _safe_firmware_path(raw: str) -> Optional[PurePosixPath]:
+    """A core-info firmware path, if it stays inside the system dir it is joined under.
+
+    A refreshed catalog is downloaded, so its paths are not trusted.
+
+    Args:
+        raw: The `firmwareN_path` value.
+
+    Returns:
+        The relative path, or None when it is empty, absolute, holds a `..`,
+        a backslash or a NUL.
+    """
+    if not raw or "\\" in raw or "\0" in raw:
+        return None
+    path = PurePosixPath(raw)
+    if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts) or not path.parts:
+        return None
+    return path
+
+
+def firmware_paths(core: str) -> tuple[PurePosixPath, ...]:
+    """The firmware a core looks for, as paths relative to RetroArch's system dir.
+
+    Args:
+        core: The core name.
+
+    Returns:
+        Its `firmwareN_path` entries in the order the `.info` file lists them,
+        each one checked by `_safe_firmware_path`; none for a core the catalog
+        lacks.
+    """
+    raw = catalog().info_file(core)
+    if raw is None:
+        return ()
+    keys = _parse_info_text(raw.decode("utf-8", "replace"))
+    found: list[tuple[int, PurePosixPath]] = []
+    for key, value in keys.items():
+        if not _FIRMWARE_PATH_RE.match(key):
+            continue
+        path = _safe_firmware_path(value)
+        if path is None:
+            log.warning("retroarch: core info for %s lists an unsafe firmware path %r, skipped", core, value)
+            continue
+        found.append((int(key[len("firmware") : -len("_path")]), path))
+    return tuple(path for _, path in sorted(found))
+
+
+@functools.lru_cache(maxsize=2)
+def _firmware_hashes(zip_bytes: bytes) -> Mapping[str, frozenset[str]]:
+    """Every firmware hash any core's notes give, mapped to the file names noted for it.
+
+    Read from the bundled zip only (`Catalog.info_zip`), never a refresh, so a
+    download cannot rename a file. A hash several cores name differently
+    (`dc_boot.bin` and `boot.bin`) keeps every name.
+
+    Args:
+        zip_bytes: The core-info zip.
+
+    Returns:
+        Lower-case md5 or sha1 to file names as the notes spell them, without
+        any folder.
+    """
+    names: dict[str, set[str]] = {}
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        for member in zf.infolist():
+            if member.is_dir() or not member.filename.endswith(_INFO_SUFFIX) or _oversized(member):
+                continue
+            keys = _parse_info_text(zf.read(member).decode("utf-8", "replace"))
+            for name, _kind, digest in _FIRMWARE_NOTE_RE.findall(keys.get("notes", "")):
+                leaf = safe_dir_name(PurePosixPath(name.strip()).name)
+                if leaf:
+                    names.setdefault(digest.lower(), set()).add(leaf)
+    return MappingProxyType({digest: frozenset(leaves) for digest, leaves in names.items()})
+
+
+def firmware_names(md5: Optional[str], sha1: Optional[str]) -> frozenset[str]:
+    """The file names core info gives a firmware file with these hashes.
+
+    Args:
+        md5: The file's md5, any case, or None.
+        sha1: The file's sha1, any case, or None.
+
+    Returns:
+        File names as core info spells them, without any folder; none when no
+        core notes either hash. Compare them without regard to case: two cores
+        may spell one name differently.
+    """
+    table = _firmware_hashes(catalog().info_zip)
+    found: frozenset[str] = frozenset()
+    for digest in (md5, sha1):
+        if digest:
+            found |= table.get(digest.lower(), frozenset())
+    return found
+
+
+ZIP_CAP =5 * 1024 * 1024
 """Largest core-info zip a refresh accepts, 5 MiB."""
 INDEX_CAP = 256 * 1024
 """Largest buildbot index a refresh accepts, 256 KiB."""

@@ -65,7 +65,7 @@ import time
 from pathlib import Path, PurePosixPath
 from typing import Optional, Union
 
-from .. import imports
+from .. import firmware, imports
 from . import rom_cache
 from .base import Emulator, base_launch_env, disc_number, xdg_data_dir
 
@@ -143,7 +143,10 @@ path, and rides the save archive with it. It does not match `*.state`, so it
 is never mistaken for a state.
 """
 
-CONTAINER_FILES = frozenset({"dc_boot.bin", "dc_flash.bin", "emu.cfg"})
+BIOS_FILES = ("dc_boot.bin", "dc_flash.bin")
+"""The Dreamcast BIOS pair Flycast reads from DATA_DIR, which firmware sync places."""
+
+CONTAINER_FILES = frozenset({*BIOS_FILES, "emu.cfg"})
 """DATA_DIR entries that belong to the container rather than to a session.
 
 The Dreamcast BIOS pair is uploaded once during setup and every session needs
@@ -606,6 +609,22 @@ class Flycast(Emulator):
             `state` for the savestate, `save` for everything else.
         """
         return "state" if rel.lower().endswith(".state") else "save"
+
+    def firmware_targets(self, source: "firmware.Source") -> list["firmware.Target"]:
+        """The Dreamcast BIOS pair, in DATA_DIR, where Flycast looks for it.
+
+        A file is matched by the names its hash is known by, else by its
+        uploaded name, and only `dc_boot.bin` and `dc_flash.bin` are taken.
+        Both are in `CONTAINER_FILES`, so `clear_working_slot` keeps them.
+
+        Args:
+            source: The firmware file.
+
+        Returns:
+            The target, or none for any other file.
+        """
+        wanted = {name.lower() for name in firmware.known_names(source)} or {source.name.lower()}
+        return [firmware.Target(DATA_DIR, PurePosixPath(name)) for name in BIOS_FILES if name in wanted]
 
     def import_spec(self) -> imports.ImportSpec:
         """Declare what Flycast takes: VMU and flash saves, raw VMU cards, and one resume state.

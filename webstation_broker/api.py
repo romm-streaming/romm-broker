@@ -25,7 +25,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
-from . import callback, imports, memcard, saves, screenshot, selkies, session, settings
+from . import callback, firmware, imports, memcard, saves, screenshot, selkies, session, settings
 from .emulators import get_emulator, retroarch, retroarch_cores, rom_cache
 from .emulators.base import STATE_HEAD_BYTES, CoreRejectedError, Emulator, reap_orphan
 
@@ -208,6 +208,25 @@ class CallbackIn(BaseModel):
     token: Optional[str] = None
 
 
+class FirmwareIn(BaseModel):
+    """One firmware file RomM holds for the launched game's platform.
+
+    Attributes:
+        file_name: The file's name as uploaded to RomM.
+        path: Absolute container path to the file, validated against ROM_ROOT on activate.
+        size: The file's size in bytes, if RomM knows it.
+        md5: The file's md5, if RomM knows it.
+        sha1: The file's sha1, if RomM knows it.
+    """
+
+    file_name: str
+    path: str
+    size: Optional[int] = None
+    md5: Optional[str] = None
+    """The file's md5, which names it for the emulators and checks the copy."""
+    sha1: Optional[str] = None
+
+
 class JoinIn(BaseModel):
     """A user RomM is seating in the running session.
 
@@ -274,6 +293,7 @@ class ActivateIn(BaseModel):
         save: Save data to restore before launch, if any.
         callback: Where the exit save archive goes, if not derived from the request.
         multiplayer: Whether RomM advertises the session for joining.
+        firmware: The BIOS and firmware RomM holds for the rom's platform, if it sent any.
     """
 
     session_id: Optional[str] = None
@@ -299,6 +319,12 @@ class ActivateIn(BaseModel):
     Fixed for the life of the session. It governs whether RomM advertises this
     session for joining and whether the room shows its comms surface while the
     host is alone. The invite route ignores it: a link always works.
+    """
+    firmware: Optional[list[FirmwareIn]] = None
+    """The BIOS and firmware uploaded to the rom's platform in RomM, placed before launch.
+
+    Absent from an older RomM, which leaves firmware exactly as the player
+    set it up. See `firmware.place` for what is copied and what is kept.
     """
 
 
@@ -638,8 +664,10 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
         restore report, its `imported` a list of `{member, dest, sidecars}`
         for each placed import, or None when nothing was restored),
         `save_restore_skipped`, `selkies_tokens_pushed`, the controller's
-        landing `url`, `core` (the resolved libretro core, for RetroArch) and
-        `core_tier` when the emulator identifies one.
+        landing `url`, `core` (the resolved libretro core, for RetroArch),
+        `core_tier` when the emulator identifies one, and `firmware` (the
+        report from `firmware.place`, or None when RomM sent no firmware list
+        or `FIRMWARE_SYNC_ENABLED` is off).
 
     Raises:
         HTTPException: 409 when a session is already active; 422 for an unknown
@@ -649,7 +677,9 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
             declared imports cannot be placed; 500 with
             `import_preflight_failed` when placing them crashed; 400 for a rom
             path that cannot be resolved or lies outside ROM_ROOT; 404 for a
-            rom path or save archive that does not exist.
+            rom path or save archive that does not exist. A firmware entry
+            outside ROM_ROOT or not named by one file name never refuses the
+            launch: it is skipped and listed under the report's `failed`.
     """
     started = time.monotonic()
     if session.SESSION is not None and session.SESSION.get("active"):
@@ -730,6 +760,22 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
                     "extensions": list(emulator.rom_extensions),
                 },
             )
+
+    # Checked with the rom, before the slot is touched. An entry outside the
+    # library (RomM can keep BIOS outside a narrowed ROM_ROOT) or with a bad
+    # name is skipped and reported as failed, never read; the launch goes on.
+    firmware_sources: Optional[list[firmware.Source]] = None
+    firmware_refused: list[str] = []
+    if body.firmware is not None and settings.FIRMWARE_SYNC_ENABLED:
+        firmware_sources = []
+        for entry in body.firmware:
+            try:
+                firmware_sources.append(
+                    firmware.resolve_source(entry.file_name, entry.path, entry.md5, entry.sha1, entry.size)
+                )
+            except ValueError as exc:
+                log.warning("activate: skipping firmware %r: %s", entry.file_name, exc)
+                firmware_refused.append(entry.file_name)
 
     save = body.save
     subtrees, excluded = _archive_subtrees(
@@ -950,6 +996,16 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     if content is not None:
         await anyio.to_thread.run_sync(emulator.carry_save_across_cores, archive_identity, rom_file)
 
+    firmware_report = None
+    if firmware_sources is not None:
+        try:
+            firmware_report = await anyio.to_thread.run_sync(firmware.place, emulator, firmware_sources)
+        except Exception:  # noqa: BLE001 - a missing BIOS shows in the emulator; a refused launch shows nothing
+            log.exception("activate: firmware placement crashed, launching without it")
+            firmware_report = firmware.empty_report()
+            firmware_report["failed"] = [s.name for s in firmware_sources]
+        firmware_report["failed"].extend(firmware_refused)
+
     payload = body.model_dump()
     payload["callback"] = _resolve_callback(body.callback, request)
     sess = session.new_session(
@@ -1016,6 +1072,7 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
         "url": _landing_url(sess["controller_token"]),
         "core": emulator.archive_core(),
         **{key: value for key, value in reported.items() if value},
+        "firmware": firmware_report,
     }
 
 
