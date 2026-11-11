@@ -36,7 +36,7 @@ from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional, Union
 
-from .. import imports
+from .. import firmware, imports
 from . import rom_cache
 from .base import Emulator, base_launch_env, disc_number
 
@@ -247,6 +247,37 @@ def _patch_ini() -> None:
         raise RuntimeError(
             f"could not apply broker settings to {INI_PATH}: {exc}"
         ) from exc
+
+
+
+def _bios_dir() -> Path:
+    """The folder DuckStation searches for BIOS images.
+
+    The setup wizard writes the folder the player picked to `[BIOS]
+    SearchDirectory`; a relative one resolves against DATA_DIR, as DuckStation
+    resolves it.
+
+    Returns:
+        That folder, or DuckStation's default `bios` under DATA_DIR when
+        settings.ini names none or cannot be read.
+    """
+    try:
+        lines = INI_PATH.read_text().splitlines()
+    except (OSError, UnicodeDecodeError):
+        lines = []
+    section = ""
+    folder = ""
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1]
+        elif section == "BIOS" and "=" in stripped:
+            key, _, value = stripped.partition("=")
+            if key.strip() == "SearchDirectory":
+                folder = value.strip()
+    if not folder:
+        return DATA_DIR / "bios"
+    return DATA_DIR / folder
 
 
 def _migrate_memory_card() -> None:
@@ -741,6 +772,19 @@ class Duckstation(Emulator):
         if rel.lower().endswith((OWNER_SUFFIX, UNTRUSTED_SUFFIX)):
             return "save"
         return super().save_file_kind(rel)
+
+    def firmware_targets(self, source: "firmware.Source") -> list["firmware.Target"]:
+        """The BIOS folder, under the file's own name.
+
+        DuckStation identifies a BIOS by its hash, so the name does not matter.
+
+        Args:
+            source: The firmware file.
+
+        Returns:
+            One target in `_bios_dir()`.
+        """
+        return [firmware.Target(_bios_dir(), PurePosixPath(source.name))]
 
     def import_spec(self) -> imports.ImportSpec:
         """Declare what DuckStation takes: a raw memory card, and one resume state.

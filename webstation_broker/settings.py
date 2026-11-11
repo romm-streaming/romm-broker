@@ -223,6 +223,22 @@ disk, so a zip handed to RetroArch boots without them. Off, the zip boots as
 is, without its MSU-1 audio and video.
 """
 
+FIRMWARE_SYNC_ENABLED = truthy(os.environ.get("FIRMWARE_SYNC_ENABLED", "true"))
+"""Whether activate places the firmware RomM sends, from `FIRMWARE_SYNC_ENABLED` (default on).
+
+RomM lists the BIOS and firmware uploaded to the game's platform, and the
+broker copies each file to where the launched emulator looks for it. Off, the
+list is ignored and firmware is set up by hand, as before.
+"""
+
+FIRMWARE_RECORD = Path(os.environ.get("FIRMWARE_RECORD", "/config/broker-firmware.json"))
+"""Which firmware files the broker placed, from `FIRMWARE_RECORD` (default `/config/broker-firmware.json`).
+
+Only a file this record names, and whose bytes still match it, is ever
+replaced. Losing the record is safe: every placed file then counts as the
+user's and is left alone.
+"""
+
 ROM_CACHE_ENABLED = truthy(os.environ.get("ROM_CACHE_ENABLED"))
 """Whether ROMs are copied to local disk and booted from there, from `ROM_CACHE_ENABLED` (default off).
 

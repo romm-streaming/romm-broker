@@ -18,6 +18,8 @@ container somewhere other than `/streaming/`.
 | `BROKER_EXPORT_DIR` | `/config/broker-exports` | Where exit writes save archives to disk. In dev mode it always writes here; otherwise only if uploading the save fails. |
 | `BROKER_IMPORT_DIR` | `/config/broker-imports` | Where uploaded save archives land, ready for activate to load them via `save.archive`. |
 | `BROKER_FRONTEND_DIST` | `/usr/share/webstation-broker/www` | Where the built room UI is served from outside dev mode. |
+| `FIRMWARE_SYNC_ENABLED` | `true` | Copy the BIOS files RomM holds for a platform into place at launch, for RetroArch, DuckStation and Flycast. Set `false` to leave firmware as you set it up by hand. See [Firmware from your RomM library](/docs/emulators/setup#firmware-from-your-romm-library). |
+| `FIRMWARE_RECORD` | `/config/broker-firmware.json` | The broker's record of the firmware files it placed. It only ever replaces files listed here whose contents haven't changed since. Deleting the record is safe: the broker just stops replacing the files it placed before. |
 | `BROKER_PID_FILE` | `/config/broker-emulator.json` | Where the running emulator's process ID is recorded, so if the broker restarts it can still find and stop that emulator. |
 | `BROKER_SAVE_UPLOAD_PATH` | `/api/webstation/saves` | The path added to the callback URL when exit uploads the save archive. |
 | `BROKER_SAVE_UPLOAD_TIMEOUT` | `30` | How many seconds exit is allowed to spend uploading the save. |

@@ -48,6 +48,7 @@ The payload fields:
 | `session_id` | no | An id you supply, cleaned up so it's safe to use in a filename. The broker generates one itself if you leave this out. |
 | `save` | no | See below. |
 | `callback` | no | `base_url` and `token` for the exit upload; see [Exit](/docs/api/exit). |
+| `firmware` | no | The BIOS and firmware files uploaded to the rom's platform in RomM. See [Launch with firmware](#launch-with-firmware). |
 | `multiplayer` | no | Set once on RomM's launch screen. It decides whether RomM advertises the session so others can join, and whether the room shows its chat, webcam and mic controls while the host is playing alone. |
 
 ## Launch a game with save data
@@ -99,6 +100,50 @@ booting, and the broker's deferred resume load waits for it.
 An archive can also carry saves the broker did not write, declared under
 `.import/`; see [Declared imports](/docs/api/imports). Each is checked before
 the working slot is cleared, and a refused import leaves the slot as it was.
+
+## Launch with firmware
+
+Add a `firmware` list with the files uploaded to the rom's platform, and the
+broker copies each one to where the launching emulator looks for it, before
+the emulator starts. RetroArch, DuckStation and Flycast use these files.
+Every other emulator ignores the list. [Firmware from your RomM library](/docs/emulators/setup#firmware-from-your-romm-library)
+explains where each file goes, and why a file already in place is never
+overwritten.
+
+```json
+"firmware": [
+  {
+    "file_name": "dc_boot.bin",
+    "path": "/romm/library/bios/dc/dc_boot.bin",
+    "size": 2097152,
+    "md5": "e10c53c2f8b90bab96ead2d368858623",
+    "sha1": "8951d1bb219ab2ff8583033d2119c899cc81f18c"
+  }
+]
+```
+
+| Field | Required | Purpose |
+| --- | --- | --- |
+| `file_name` | yes | The uploaded file name. It has to be one name, with no `/` and no `..`; otherwise the entry is skipped and listed under `failed`. |
+| `path` | yes | The file's container path. It has to resolve inside `ROM_ROOT`; otherwise the file is never read, the entry is skipped and listed under `failed`, and the game still launches. Mount your RomM library so its `bios` folder is under `ROM_ROOT`. |
+| `size` | no | The size in bytes. |
+| `md5`, `sha1` | no | Used to recognise the file and name it for the core, and to check the copy. A copy whose md5 doesn't match isn't placed. Without an md5, the broker reads the file to work it out. A value that isn't a hex hash is ignored. |
+
+The response then carries a `firmware` report. `placed`, `unchanged` and
+`kept` list the target paths. `failed` lists the file names that couldn't be
+copied:
+
+```json
+"firmware": {
+  "placed": ["/config/.local/share/flycast/dc_boot.bin"],
+  "unchanged": [],
+  "kept": ["/config/.local/share/flycast/dc_flash.bin"],
+  "failed": []
+}
+```
+
+A file that fails doesn't stop the launch. The report is `null` when the
+request had no `firmware` list or when `FIRMWARE_SYNC_ENABLED` is off.
 
 ## Launch the desktop
 
@@ -170,6 +215,12 @@ card sitting in an older archive gets skipped, along with RPCS3's
 A `save.archive` path that doesn't exist answers `404`. If checking the
 imports against the emulator crashes outright, activate answers `500` with
 `{"error": "import_preflight_failed"}` instead of launching.
+</Step>
+<Step>
+Copies the `firmware` files, if any were sent, to where the emulator looks
+for them. The paths were already checked against `ROM_ROOT` before step 2;
+an entry outside it, or one that fails to copy, is reported under `failed`
+and skipped.
 </Step>
 <Step>
 Launches the emulator in its own process group, with its output captured to

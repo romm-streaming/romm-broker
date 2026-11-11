@@ -15,9 +15,12 @@ import subprocess
 import time
 from collections.abc import Callable, Collection, Mapping
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 from .. import imports, memcard
+
+if TYPE_CHECKING:
+    from .. import firmware
 
 log = logging.getLogger(__name__)
 
@@ -1477,6 +1480,23 @@ class Emulator:
     Preflight sets it when the archive has imports; `resolve_activate_identity`
     sets it when it has none. The push route's identity checks read it.
     """
+
+    def firmware_targets(self, source: "firmware.Source") -> list["firmware.Target"]:
+        """Where this emulator looks for one firmware file RomM holds for the platform.
+
+        Called on activate, after the working slot is restored and before
+        launch, for each file RomM sends. `firmware.place` does the copying
+        and checks every target stays under its root.
+
+        Args:
+            source: The firmware file.
+
+        Returns:
+            Every place the file should be copied to. The default is none, for
+            an emulator that needs no firmware or has to be pointed at it in
+            its own settings.
+        """
+        return []
 
     def import_spec(self) -> imports.ImportSpec:
         """What this emulator accepts as a declared import, on `self.platform`.
