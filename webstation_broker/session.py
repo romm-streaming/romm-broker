@@ -10,7 +10,7 @@ import logging
 import re
 import secrets
 import time
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 from starlette.websockets import WebSocket
 
@@ -559,85 +559,167 @@ async def broadcast_state() -> None:
     )
 
 
-async def handle_assign_slot(viewer_token: Optional[str], slot: Optional[int]) -> None:
-    """Assign a gamepad slot to a room member, or take theirs away.
+def held_slots(value: Any) -> list[int]:
+    """List the gamepad slots a seat's `slot` holds.
 
-    A slot can only be held by one member, so whoever held it before is
-    unassigned first. The new token map is pushed to selkies and a
+    A seat holds none (None), one (a number), or several (a list), which
+    selkies gives the seat's local pads in turn, the first pad the first slot.
+
+    Args:
+        value: A seat's `slot`, or the session's `controller_slot`.
+
+    Returns:
+        The slot numbers in order, empty for none.
+    """
+    items = value if isinstance(value, list) else [value]
+    # bool is an int subclass, and True would otherwise read as gamepad 1.
+    return [s for s in items if isinstance(s, int) and not isinstance(s, bool)]
+
+
+def slot_value(slots: list[int]) -> Union[int, list[int], None]:
+    """Shape `slots` the way a seat and the token map keep them.
+
+    Args:
+        slots: Slot numbers, as `held_slots` returns them.
+
+    Returns:
+        None for none, the number for one (what selkies has always read), and
+        the list for several.
+    """
+    if not slots:
+        return None
+    return slots[0] if len(slots) == 1 else list(slots)
+
+
+def gamepads_text(slots: list[int]) -> str:
+    """Name slots for a room notice: "Gamepad 3", "Gamepads 3 and 4".
+
+    Args:
+        slots: One or more slot numbers.
+
+    Returns:
+        The phrase naming them.
+    """
+    if len(slots) == 1:
+        return f"Gamepad {slots[0]}"
+    return f"Gamepads {', '.join(str(s) for s in slots[:-1])} and {slots[-1]}"
+
+
+def _slot_holders() -> list[tuple[dict[str, Any], str, str, str]]:
+    """List every member that can hold gamepad slots.
+
+    Returns:
+        `(record, key, name, token)` for each: the controller's slots live
+        under the session's `controller_slot`, a viewer's under its own
+        `slot`. Empty when there is no session.
+    """
+    if SESSION is None:
+        return []
+    holders = [(SESSION, "controller_slot", "Controller", SESSION["controller_token"])]
+    for v in SESSION.get("viewers", []):
+        holders.append((v, "slot", v.get("username", "Unnamed"), v["token"]))
+    return holders
+
+
+def _take_slot(slot: int, keep: Optional[str] = None) -> list[str]:
+    """Take a gamepad slot from whoever holds it, other than the member `keep`.
+
+    Args:
+        slot: The slot to free.
+        keep: Token of a member to leave it with, or None.
+
+    Returns:
+        The room notices saying who lost it.
+    """
+    notices = []
+    for record, key, name, token in _slot_holders():
+        held = held_slots(record.get(key))
+        if slot in held and token != keep:
+            held.remove(slot)
+            record[key] = slot_value(held)
+            notices.append(f"{name} was unassigned from Gamepad {slot}.")
+    return notices
+
+
+async def _tell_room_slots(notices: list[str]) -> None:
+    """Broadcast a `gamepad_change` notification for each change, then the state.
+
+    The room is told even after a push selkies refused: the notification
+    describes what the session now holds, and the next successful push carries
+    the whole map, so nothing here is worth leaving the room's view of itself
+    out of step with the broker's over.
+
+    Args:
+        notices: The messages to broadcast.
+    """
+    for msg in notices:
+        await broadcast_to_room(
+            {"type": "gamepad_change", "message": msg, "timestamp": int(time.time() * 1000)}
+        )
+    await broadcast_state()
+
+
+async def handle_assign_slot(viewer_token: Optional[str], slot: Optional[int]) -> None:
+    """Give a room member a gamepad slot beside those it holds, or take them all away.
+
+    A slot can only be held by one member, so whoever held it before loses it
+    first. A member holding several plays one with each of its local
+    controllers, in slot order: selkies gives a token's list of slots to the
+    page's pads in turn. The new token map is pushed to selkies and a
     `gamepad_change` notification is broadcast for every change made, followed
     by a state update. Unknown tokens are logged and ignored.
-
-    A push selkies refuses is logged and the room is still told: the
-    notification describes what the session now holds, and the next successful
-    push carries the whole map, so nothing here is worth leaving the room's
-    view of itself out of step with the broker's over.
 
     Args:
         viewer_token: The token of the member to change; the controller's own
             token targets the controller.
-        slot: The gamepad slot to assign, or None to unassign.
+        slot: The gamepad slot to add, or None to take every slot away.
     """
-    if SESSION is None:
+    target = next((h for h in _slot_holders() if h[3] == viewer_token), None)
+    if target is None:
+        if SESSION is not None:
+            log.warning("assign_slot for unknown token")
         return
-    target_user = None
-    target_username = "Unknown"
-    old_slot = None
-    if viewer_token == SESSION["controller_token"]:
-        target_user = SESSION
-        target_username = "Controller"
-        old_slot = SESSION.get("controller_slot")
-    else:
-        for v in SESSION.get("viewers", []):
-            if v["token"] == viewer_token:
-                target_user = v
-                target_username = v.get("username", "Unnamed")
-                old_slot = v.get("slot")
-                break
-    if not target_user:
-        log.warning("assign_slot for unknown token")
-        return
+    record, key, name, _ = target
+    held = held_slots(record.get(key))
 
-    notifications = []
-    if slot is not None:
-        cleared = False
-        if (
-            SESSION.get("controller_slot") == slot
-            and SESSION["controller_token"] != viewer_token
-        ):
-            SESSION["controller_slot"] = None
-            notifications.append(f"Controller was unassigned from Gamepad {slot}.")
-            cleared = True
-        if not cleared:
-            for v in SESSION.get("viewers", []):
-                if v.get("slot") == slot and v.get("token") != viewer_token:
-                    v["slot"] = None
-                    notifications.append(
-                        f"{v.get('username', 'Unnamed')} was unassigned from Gamepad {slot}."
-                    )
-                    break
-
-    if target_user is SESSION:
-        SESSION["controller_slot"] = slot
-    else:
-        target_user["slot"] = slot
-
-    if slot is not None and old_slot != slot:
-        notifications.append(f"Gamepad {slot} was assigned to {target_username}.")
-    elif slot is None and old_slot is not None:
-        notifications.append(f"{target_username} was unassigned from Gamepad {old_slot}.")
-
+    notices = []
+    if slot is None:
+        record[key] = None
+        if held:
+            notices.append(f"{name} was unassigned from {gamepads_text(held)}.")
+    elif slot not in held:
+        notices = _take_slot(slot, keep=viewer_token)
+        record[key] = slot_value(sorted(held + [slot]))
+        notices.append(f"Gamepad {slot} was assigned to {name}.")
     if not await selkies.push_tokens(SESSION):
         log.error(
             "session %s: selkies kept the old token map, gamepad slot %s for %r is not live yet",
             SESSION["id"],
             slot,
-            target_username,
+            name,
         )
-    for msg in notifications:
-        await broadcast_to_room(
-            {"type": "gamepad_change", "message": msg, "timestamp": int(time.time() * 1000)}
+    await _tell_room_slots(notices)
+
+
+async def handle_release_slot(slot: int) -> None:
+    """Return a gamepad slot to the tray from whoever holds it.
+
+    Its holder keeps any other slot it has. Nothing is pushed when nobody held
+    it.
+
+    Args:
+        slot: The slot to free.
+    """
+    notices = _take_slot(slot)
+    if not notices:
+        return
+    if not await selkies.push_tokens(SESSION):
+        log.error(
+            "session %s: selkies kept the old token map, gamepad slot %s is still held",
+            SESSION["id"],
+            slot,
         )
-    await broadcast_state()
+    await _tell_room_slots(notices)
 
 
 async def handle_assign_mk(target_token: Optional[str]) -> None:
