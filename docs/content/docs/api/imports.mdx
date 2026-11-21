@@ -51,9 +51,9 @@ checking imports answers 500 with
 `{"detail": {"error": "import_preflight_failed"}}`, still before anything is
 cleared.
 
-**Fourteen emulators accept imports so far.** RetroArch, Flycast, DuckStation,
-PPSSPP, Dolphin, PCSX2, RPCS3, ScummVM, Cemu, Azahar, Eden, shadPS4, xemu and
-Xenia take the kinds listed under
+**Fifteen emulators accept imports so far.** RetroArch, Flycast, DuckStation,
+PPSSPP, Dolphin, PCSX2, RPCS3, ScummVM, Cemu, Azahar, Eden, Lichii, shadPS4,
+xemu and Xenia take the kinds listed under
 [What each emulator takes](#what-each-emulator-takes), and every other
 emulator refuses each import member with `kind_not_accepted`. The structural
 checks run first either way: a bad manifest answers `manifest_invalid` and a
@@ -141,6 +141,7 @@ through a symlink, or the member is refused.
 | `scummvm` | `<game>.NNN` and `<game>.sNN` save files | not taken | one `<game>.sNN` or `<game>.NNN` file; needs `save.resume_slot` |
 | `cemu` | Wii U save data for the game being launched: `usr/save/00050000/<title>/` | not taken | not taken |
 | `eden` | Switch NAND save folders, `nand/user/save/<space>/<user>/<title>/`, with the profile store an account save needs | not taken | not taken |
+| `lichii` | the same as `eden`, placed into Lichii's own NAND | not taken | not taken |
 | `azahar` | 3DS save data from an unencrypted SD card or NAND folder: `title/` and `extdata/` folders | not taken | not taken |
 | `xemu` | the launched game's `UDATA/<title id>/` and `TDATA/<title id>/` folders | not taken | not taken |
 | `xenia` | Xbox 360 save folders, `content/<XUID>/<title id>/00000001/`, with their `Headers/` file | not taken | not taken |

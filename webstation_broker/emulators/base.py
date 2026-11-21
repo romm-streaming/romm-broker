@@ -1074,6 +1074,12 @@ class Emulator:
                 proc.wait(timeout=self.term_timeout)
                 gone = True
             except subprocess.TimeoutExpired:
+                log.warning(
+                    "%s (pid %d) ignored SIGTERM for %.1fs, escalating to SIGKILL",
+                    self.name,
+                    proc.pid,
+                    self.term_timeout,
+                )
                 os.killpg(pgid, signal.SIGKILL)
                 try:
                     proc.wait(timeout=self.kill_timeout)

@@ -15,6 +15,7 @@ from .dolphin import Dolphin
 from .duckstation import Duckstation
 from .eden import Eden
 from .flycast import Flycast
+from .lichii import Lichii
 from .pcsx2 import Pcsx2
 from .ppsspp import Ppsspp
 from .retroarch import Retroarch
@@ -32,6 +33,7 @@ REGISTRY: dict[str, type[Emulator]] = {
     "cemu": Cemu,
     "azahar": Azahar,
     "eden": Eden,
+    "lichii": Lichii,
     "shadps4": Shadps4,
     "retroarch": Retroarch,
     "rpcs3": Rpcs3,

@@ -104,7 +104,8 @@ def _set_last_launched(cached: Path, when: float) -> None:
 
 
 _OPTED_IN = {
-    "azahar", "cemu", "dolphin", "duckstation", "eden", "flycast", "pcsx2", "retroarch", "xemu", "xenia",
+    "azahar", "cemu", "dolphin", "duckstation", "eden", "flycast", "lichii", "pcsx2", "retroarch", "xemu",
+    "xenia",
 }
 """The launchers checked against the `Emulator.rom_cacheable` checklist."""
 
@@ -160,6 +161,7 @@ class TestOffByDefault:
             "duckstation",
             "eden",
             "flycast",
+            "lichii",
             "pcsx2",
             "xemu",
             "xenia",
