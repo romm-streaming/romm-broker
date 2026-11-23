@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.16.0](https://github.com/romm-streaming/romm-broker/compare/v0.15.3...v0.16.0) (2026-11-23)
+
+
+### Features
+
+* **lichii:** add Lichii launcher for Switch and Switch 2 ([0f6ea9a](https://github.com/romm-streaming/romm-broker/commit/0f6ea9aa64160a9ec800917b10a5da7589b5ffcc))
+* **lichii:** add Lichii launcher for Switch and Switch 2 ([03f799c](https://github.com/romm-streaming/romm-broker/commit/03f799c388b5f51719d52bdc191b373766285ed5))
+
+
+### Bug Fixes
+
+* **retroarch:** refuse a .sav that is a container, not a raw save ([893c782](https://github.com/romm-streaming/romm-broker/commit/893c7827508b8335fe60dd4b13241860bc119d45))
+* **retroarch:** refuse a .sav that is a container, not a raw save ([9dd2ea7](https://github.com/romm-streaming/romm-broker/commit/9dd2ea72028fad6219f68131e409bcea8181220a))
+
+
+### Documentation
+
+* Add streaming enabled option to config.yml ([c3ebb43](https://github.com/romm-streaming/romm-broker/commit/c3ebb437ddbf4f4db7d696fbafbe7ec0aa69a983))
+* Add streaming enabled option to config.yml ([4d302d8](https://github.com/romm-streaming/romm-broker/commit/4d302d86639393040ba4059e2f8a10d59ebac682))
+
 ## [0.15.3](https://github.com/romm-streaming/romm-broker/compare/v0.15.2...v0.15.3) (2026-10-26)
 
 
