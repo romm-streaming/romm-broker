@@ -119,6 +119,19 @@ Eden's folders aren't configurable here either. Config (`qt-config.ini`)
 lives under `/config/.config/eden`, and data (the virtual NAND, `sdmc/`)
 lives under `/config/.local/share/eden`.
 
+## Lichii
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `LICHII_BIN` | `lichii` | Lichii binary. |
+| `LICHII_LOG_PATH` | `/config/lichii.log` | Where Lichii's stdout/stderr is captured. |
+| `LICHII_STOP_WAIT` | `15` | SIGTERM grace before SIGKILL; a running game takes longer than the base 5 s to tear down. |
+
+Lichii's folders aren't configurable here either. Config (`qt-config.ini`)
+lives under `/config/.config/lichii`, data (the virtual NAND, `sdmc/`) under
+`/config/.local/share/lichii`, and its profile import record under
+`/config/.local/share/lichii.migration`.
+
 ## shadPS4
 
 | Env var | Default | Purpose |

@@ -615,6 +615,44 @@ def test_stopping_clears_the_record_so_the_next_launch_reaps_nothing(
     assert not pid_record.exists()
 
 
+def test_a_sigkill_escalation_is_logged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A process that outlasts its SIGTERM grace gets SIGKILL, and the escalation is logged.
+
+    A modal holding SIGTERM off looks like a slow shutdown from the outside; the warning is the
+    only trace of why a stop took the whole grace period.
+    """
+
+    class _Stubborn:
+        pid = 4242
+
+        def __init__(self) -> None:
+            self.waits = 0
+
+        def poll(self) -> Optional[int]:
+            return None
+
+        def wait(self, timeout: Optional[float] = None) -> int:
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired(cmd="stubborn", timeout=timeout or 0)
+            return -9
+
+    sent: list[int] = []
+    monkeypatch.setattr(base.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(base.os, "killpg", lambda pgid, sig: sent.append(sig))
+    monkeypatch.setattr(base.Emulator, "_forget", lambda self: None)
+    emu = emulators.Emulator()
+    emu._proc = _Stubborn()  # type: ignore[assignment]
+
+    with caplog.at_level("WARNING"):
+        emu.stop()
+
+    assert sent == [signal.SIGTERM, signal.SIGKILL]
+    assert any("escalating to SIGKILL" in r.getMessage() for r in caplog.records)
+
+
 def test_an_emulator_does_not_support_disc_swap_by_default() -> None:
     """An emulator does not support disc swap by default."""
     assert base.Emulator.supports_disc_swap is False
@@ -682,6 +720,7 @@ _IMPORTING: frozenset[str] = frozenset(
         "duckstation",
         "eden",
         "flycast",
+        "lichii",
         "pcsx2",
         "ppsspp",
         "retroarch",
@@ -992,6 +1031,7 @@ _EXAMPLE_PLATFORM: dict[str, str] = {
     "duckstation": "psx",
     "eden": "switch",
     "flycast": "dc",
+    "lichii": "switch-2",
     "pcsx2": "ps2",
     "ppsspp": "psp",
     "retroarch": "gb",
@@ -1021,6 +1061,7 @@ _EXAMPLES: list[tuple[str, str, bytes]] = [
     ("duckstation", ".import/memcard/card.mcr", bytes(131072)),
     ("duckstation", ".import/state/SLUS-00594_resume.sav", b"progress"),
     ("eden", _EDEN_DEVICE_SAVE, b"save"),
+    ("lichii", _EDEN_DEVICE_SAVE, b"save"),
     ("flycast", ".import/save/vmu_save_B2.bin", bytes(131072)),
     ("flycast", ".import/save/dc_nvmem.bin", b"flash"),
     ("flycast", ".import/memcard/card.bin", bytes(131072)),
@@ -1057,6 +1098,7 @@ _EXAMPLE_ROM: dict[str, imports.RomRef] = {
     "azahar": imports.RomRef(1, "Game", "3ds", title_id="0004000000033500", save_target="00040000/00033500"),
     "cemu": imports.RomRef(1, "Game", "wiiu", title_id="1010EC00"),
     "eden": imports.RomRef(1, "Game", "switch", title_id="0100000000010000"),
+    "lichii": imports.RomRef(1, "Game", "switch-2", title_id="0100000000010000"),
     "xemu": imports.RomRef(1, "Game", "xbox", title_id="4D530064"),
     "xenia": imports.RomRef(1, "Game", "xbox360", title_id="4D5307E6"),
 }

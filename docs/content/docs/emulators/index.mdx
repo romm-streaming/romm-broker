@@ -22,6 +22,7 @@ and [wiring it into RomM](/docs/container#wiring-it-into-romm).
 | `cemu` | Wii U | no | no | `usr/save/` under the mlc01 tree |
 | `azahar` | 3DS | no | no | the SD `title/` and `extdata/` trees and the NAND `extdata/` and `sysdata/` trees |
 | `eden` | Switch | no | no | `nand/user/save/` plus the profile store under `nand/system/save/` |
+| `lichii` | Switch, Switch 2 (experimental) | no | no | `nand/user/save/` plus the profile store under `nand/system/save/`, in Lichii's own data folder |
 | `shadps4` | PlayStation 4 | no | no | `home/1000/savedata/` |
 | `rpcs3` | PlayStation 3 | no (a resume state is written at exit) | no | `home/00000001/savedata/` and `savestates/` under `dev_hdd0/` |
 | `xemu` | Xbox | no | no | extracted from the HDD image into a staging directory |
@@ -48,7 +49,7 @@ attribute of its class in the
 [Python reference](/docs/developer/reference/emulators).
 
 RetroArch, Flycast, DuckStation, PPSSPP, Dolphin, PCSX2, RPCS3, ScummVM, Cemu,
-Azahar, Eden, shadPS4, xemu and Xenia also take
+Azahar, Eden, Lichii, shadPS4, xemu and Xenia also take
 [declared imports](/docs/api/imports): save files made outside the broker,
 such as another emulator's, placed into the session at activate.
 [What each emulator takes](/docs/api/imports#what-each-emulator-takes) lists
@@ -349,6 +350,40 @@ which is why Eden gets its own
 A [declared import](/docs/api/imports#what-each-emulator-takes) can bring in
 Switch save folders from a NAND export. An account save has to come with the
 profile store it needs.
+
+## Lichii
+
+<Callout type="warn">
+Lichii support is experimental. Lichii publishes new builds almost daily,
+and the webstation image ships one build of it, so behaviour can change
+between image releases.
+</Callout>
+
+`emulator: "lichii"` launches Lichii, a fork of Eden that also runs Switch 2
+games. It's driven the same way as Eden: fullscreen with `-f -g`, the close
+confirmation turned off in its `qt-config.ini` before every launch, and a
+SIGTERM to stop it, never SIGINT. Lichii has no save states, so
+`resume_slot` is ignored and the game's own save data under
+`nand/user/save/` is what persists, with the profile store beside it.
+[`LICHII_STOP_WAIT`](/docs/configuration/emulators#lichii) is its shutdown
+grace period.
+
+Lichii keeps its own config, data and saves (`lichii/` beside `eden/`), so
+Eden and Lichii never share a save archive. A save made in one doesn't show
+up in the other.
+
+On startup, Lichii offers to import the profile of an older Switch emulator
+when it finds one's data folder next to its own. Eden's is always there once
+Eden has run in the container, and the offer is a dialog nobody in a streamed
+session can answer. So before every launch the broker records the same
+"start fresh" choice Lichii's own button makes (an empty `fresh` file in
+`/config/.local/share/lichii.migration/`), and nothing is imported from Eden.
+If that folder holds a `pending` or `journal` file, an import was interrupted
+part way: the broker refuses to launch and leaves it alone. Open Lichii in
+[desktop mode](/docs/emulators/setup#lichii) to finish or discard it.
+
+A [declared import](/docs/api/imports#what-each-emulator-takes) takes the same
+NAND export shapes as Eden, placed into Lichii's own NAND.
 
 ## shadPS4
 
