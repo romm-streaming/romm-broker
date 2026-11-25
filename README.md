@@ -57,6 +57,8 @@ Then point RomM at it: add a `webstation` container under
 `streaming.containers` in RomM's `config.yml`, using the same `SUBFOLDER` and
 `BROKER_SECRET` values you set above. Then open each emulator once from the
 desktop to install its BIOS/firmware and make sure your controllers work.
+BIOS files uploaded to a platform in RomM are copied into place at launch for
+RetroArch, DuckStation and Flycast.
 
 For the full walkthrough, including the `config.yml` example, NVIDIA GPU
 setup, reverse proxying the container behind RomM's own origin, and
