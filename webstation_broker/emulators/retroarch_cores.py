@@ -746,7 +746,7 @@ def firmware_names(md5: Optional[str], sha1: Optional[str]) -> frozenset[str]:
     return found
 
 
-ZIP_CAP =5 * 1024 * 1024
+ZIP_CAP = 5 * 1024 * 1024
 """Largest core-info zip a refresh accepts, 5 MiB."""
 INDEX_CAP = 256 * 1024
 """Largest buildbot index a refresh accepts, 256 KiB."""

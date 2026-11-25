@@ -30,7 +30,7 @@ are in RomM.
 | --- | --- | --- |
 | RetroArch | `RETROARCH_SYSTEM_DIR`, in the subfolder the running core reads (`dc/` for Dreamcast, for example) | The name the core expects for that file's contents, taken from libretro's core info, whatever you called it on upload. A file the core info doesn't recognise keeps its uploaded name, and so does one uploaded under the running core's own name for it (cores name some BIOS differently; yabasanshiro reads the US Saturn BIOS only as `saturn_bios.bin`). |
 | DuckStation | Its BIOS folder: `bios` under DuckStation's data folder, or the folder `SearchDirectory` names in the `[BIOS]` section of its `settings.ini` | As uploaded. DuckStation tells BIOS images apart by their contents, not their names. |
-| Flycast | `/config/.local/share/flycast` | `dc_boot.bin` and `dc_flash.bin`, recognised by their contents or by those names. Other files are skipped. |
+| Flycast | `/config/.local/share/flycast` | `dc_boot.bin` and `dc_flash.bin`, recognised by their contents or, when the contents don't name either one, by those names. Other files are skipped. |
 
 The broker never overwrites a file it didn't put there:
 
@@ -44,8 +44,18 @@ The broker never overwrites a file it didn't put there:
   settings in a separate `dc_nvmem.bin` and leaves `dc_flash.bin` as it
   is.) The broker keeps track of what it placed in
   `/config/broker-firmware.json`.
-- Nothing is ever deleted. Removing a file from RomM leaves the copy where it
-  is.
+- Nothing you put there is ever deleted. Removing a file from RomM leaves the
+  copy where it is. The only files the broker removes are its own leftover
+  temp copies (`.<name>.broker-fw-<8 characters>.tmp`) from a copy that was
+  cut short.
+- Nothing is ever written into the RomM library itself: an emulator folder,
+  or a subfolder of one, that points inside `ROM_ROOT` gets no copies. A file already there is
+  reported as kept; a missing one as failed.
+- Placement has a time budget, `FIRMWARE_PLACE_BUDGET` (120 seconds by
+  default). Smaller files go first. A file not finished in time is reported
+  as failed, the old copy stays, and it is tried again on the next launch. If
+  a read on the library mount hangs, the launch goes ahead a few seconds after
+  the budget without the firmware.
 
 A file that can't be copied doesn't stop the launch. The game starts anyway,
 and the emulator's own missing-BIOS message tells you what's wrong.

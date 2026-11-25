@@ -231,6 +231,41 @@ broker copies each file to where the launched emulator looks for it. Off, the
 list is ignored and firmware is set up by hand, as before.
 """
 
+_MAX_SECONDS = 86400.0
+"""Upper bound `_positive_seconds` accepts, a day; `inf` would turn every timeout off."""
+
+
+def _positive_seconds(name: str, default: float) -> float:
+    """A positive number of seconds from the environment.
+
+    Args:
+        name: The variable.
+        default: Used when it is unset, not a number, `0` or less, or a day
+            or more (`inf` included).
+
+    Returns:
+        The seconds.
+    """
+    try:
+        value = float(os.environ.get(name, default))
+    except ValueError:
+        return default
+    return value if 0 < value < _MAX_SECONDS else default
+
+
+FIRMWARE_PLACE_BUDGET = _positive_seconds("FIRMWARE_PLACE_BUDGET", 120.0)
+"""Seconds activate spends placing firmware, from `FIRMWARE_PLACE_BUDGET`.
+
+Default 120; a value that is not a number, `0` or less, or a day or more
+(`inf` included) uses the default.
+
+Every read stops once it is spent, and activate stops waiting a few seconds
+later even when a read on the library mount hangs. A file not finished in
+time is reported failed and tried again next launch; a file too large to copy
+within the budget never lands until it is raised. Together with the save
+restore it has to stay under RomM's `STREAMING_LAUNCH_TIMEOUT` (default 600).
+"""
+
 FIRMWARE_RECORD = Path(os.environ.get("FIRMWARE_RECORD", "/config/broker-firmware.json"))
 """Which firmware files the broker placed, from `FIRMWARE_RECORD` (default `/config/broker-firmware.json`).
 

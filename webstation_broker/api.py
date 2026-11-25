@@ -23,7 +23,7 @@ from urllib.parse import urlsplit
 import anyio
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from . import callback, firmware, imports, memcard, saves, screenshot, selkies, session, settings
 from .emulators import get_emulator, retroarch, retroarch_cores, rom_cache
@@ -320,12 +320,130 @@ class ActivateIn(BaseModel):
     session for joining and whether the room shows its comms surface while the
     host is alone. The invite route ignores it: a link always works.
     """
-    firmware: Optional[list[FirmwareIn]] = None
+    firmware: Optional[Any] = None
     """The BIOS and firmware uploaded to the rom's platform in RomM, placed before launch.
 
     Absent from an older RomM, which leaves firmware exactly as the player
-    set it up. See `firmware.place` for what is copied and what is kept.
+    set it up. The list and each entry are checked against `FirmwareIn` on
+    activate rather than here, so a malformed one is skipped instead of
+    refusing the launch. See `firmware.place` for what is copied and what is
+    kept.
     """
+
+
+_FIRMWARE_GRACE_S = 10.0
+"""Seconds past the placement budget activate waits for a read that does not return."""
+
+
+async def _place_firmware(
+    emulator: Emulator, sources: list[firmware.Source], budget: float
+) -> dict[str, list[str]]:
+    """Run `firmware.place` off the event loop, never past the shared budget.
+
+    The budget stops every read between chunks. A single read that hangs on
+    the library mount is not stopped by that, so activate stops waiting
+    `_FIRMWARE_GRACE_S` later, sets the stop flag so the abandoned call
+    starts and renames nothing more, and launches without the firmware.
+
+    Args:
+        emulator: The emulator about to launch.
+        sources: The checked firmware sources.
+        budget: Seconds this call has: `settings.FIRMWARE_PLACE_BUDGET` less
+            what checking the list used, so the two share one budget.
+
+    Returns:
+        The report. On a crash or a hang every source is listed as failed.
+    """
+    stop = threading.Event()
+    report: Optional[dict[str, list[str]]] = None
+    left = max(0.0, budget)
+    try:
+        with anyio.move_on_after(left + _FIRMWARE_GRACE_S):
+            report = await anyio.to_thread.run_sync(
+                functools.partial(firmware.place, emulator, sources, stop, left), abandon_on_cancel=True
+            )
+        if report is None:
+            log.error("activate: firmware placement did not finish in time, launching without it")
+    except Exception:  # noqa: BLE001 - a missing BIOS shows in the emulator; a refused launch shows nothing
+        log.exception("activate: firmware placement crashed, launching without it")
+    finally:
+        stop.set()
+    if report is None:
+        report = firmware.empty_report()
+        report["failed"] = [s.name for s in sources]
+    return report
+
+
+async def _check_firmware(entries: Any) -> tuple[list[firmware.Source], list[str]]:
+    """Run `_firmware_sources` off the event loop, never past the shared budget.
+
+    Resolving each path touches the library mount, which can hang as a read
+    can. `_FIRMWARE_GRACE_S` past `settings.FIRMWARE_PLACE_BUDGET` activate
+    stops waiting and launches without the firmware; whatever this takes is
+    then taken off the placement's share of the budget.
+
+    Args:
+        entries: The raw `firmware` value from the activate body.
+
+    Returns:
+        What `_firmware_sources` returns; on a hang, no sources and every
+        entry's name listed as refused.
+    """
+    with anyio.move_on_after(settings.FIRMWARE_PLACE_BUDGET + _FIRMWARE_GRACE_S):
+        return await anyio.to_thread.run_sync(_firmware_sources, entries, abandon_on_cancel=True)
+    log.error("activate: checking the firmware list did not finish in time, launching without it")
+    if not isinstance(entries, list):
+        return [], ["firmware"]
+    return [], [_firmware_label(index, raw) for index, raw in enumerate(entries)]
+
+
+def _firmware_label(index: int, raw: Any) -> str:
+    """The name an activate `firmware` entry is reported under.
+
+    Args:
+        index: Its place in the list.
+        raw: The entry as sent.
+
+    Returns:
+        Its string `file_name`, or `entry <index>` when it has none.
+    """
+    name = raw.get("file_name") if isinstance(raw, dict) else None
+    return name if isinstance(name, str) else f"entry {index}"
+
+
+def _firmware_sources(entries: Any) -> tuple[list[firmware.Source], list[str]]:
+    """Check RomM's firmware list, entry by entry, without ever refusing the launch.
+
+    Runs in a worker thread: resolving each path touches the library mount.
+
+    Args:
+        entries: The raw `firmware` value from the activate body.
+
+    Returns:
+        The sources to place, and the names of the entries skipped because
+        they are malformed, badly named or outside ROM_ROOT. An entry without
+        a string `file_name` is listed as `entry <index>`; a value that is not
+        a list at all, as `firmware`.
+    """
+    sources: list[firmware.Source] = []
+    refused: list[str] = []
+    if not isinstance(entries, list):
+        log.warning("activate: ignoring a firmware value that is not a list: %s", type(entries).__name__)
+        return sources, ["firmware"]
+    for index, raw in enumerate(entries):
+        label = _firmware_label(index, raw)
+        try:
+            entry = FirmwareIn.model_validate(raw)
+            sources.append(
+                firmware.resolve_source(entry.file_name, entry.path, entry.md5, entry.sha1, entry.size)
+            )
+        except (ValidationError, ValueError) as exc:
+            log.warning("activate: skipping firmware %r: %s", label, exc)
+            refused.append(label)
+        except Exception:  # noqa: BLE001 - a firmware entry must never refuse the launch
+            log.exception("activate: skipping firmware %r", label)
+            refused.append(label)
+    return sources, refused
 
 
 def _ct_eq(a: str, b: str) -> bool:
@@ -766,16 +884,17 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     # name is skipped and reported as failed, never read; the launch goes on.
     firmware_sources: Optional[list[firmware.Source]] = None
     firmware_refused: list[str] = []
+    # One budget covers checking the list and placing it; the save restore
+    # in between is not charged to it.
+    firmware_budget = settings.FIRMWARE_PLACE_BUDGET
     if body.firmware is not None and settings.FIRMWARE_SYNC_ENABLED:
-        firmware_sources = []
-        for entry in body.firmware:
-            try:
-                firmware_sources.append(
-                    firmware.resolve_source(entry.file_name, entry.path, entry.md5, entry.sha1, entry.size)
-                )
-            except ValueError as exc:
-                log.warning("activate: skipping firmware %r: %s", entry.file_name, exc)
-                firmware_refused.append(entry.file_name)
+        if firmware.places_firmware(emulator):
+            checked_at = time.monotonic()
+            firmware_sources, firmware_refused = await _check_firmware(body.firmware)
+            firmware_budget -= time.monotonic() - checked_at
+        else:
+            # Nothing would be copied, so nothing is read or reported failed.
+            firmware_sources = []
 
     save = body.save
     subtrees, excluded = _archive_subtrees(
@@ -998,13 +1117,10 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
 
     firmware_report = None
     if firmware_sources is not None:
-        try:
-            firmware_report = await anyio.to_thread.run_sync(firmware.place, emulator, firmware_sources)
-        except Exception:  # noqa: BLE001 - a missing BIOS shows in the emulator; a refused launch shows nothing
-            log.exception("activate: firmware placement crashed, launching without it")
-            firmware_report = firmware.empty_report()
-            firmware_report["failed"] = [s.name for s in firmware_sources]
-        firmware_report["failed"].extend(firmware_refused)
+        firmware_report = await _place_firmware(emulator, firmware_sources, firmware_budget)
+        for name in firmware_refused:
+            if name not in firmware_report["failed"]:
+                firmware_report["failed"].append(name)
 
     payload = body.model_dump()
     payload["callback"] = _resolve_callback(body.callback, request)

@@ -613,8 +613,9 @@ class Flycast(Emulator):
     def firmware_targets(self, source: "firmware.Source") -> list["firmware.Target"]:
         """The Dreamcast BIOS pair, in DATA_DIR, where Flycast looks for it.
 
-        A file is matched by the names its hash is known by, else by its
-        uploaded name, and only `dc_boot.bin` and `dc_flash.bin` are taken.
+        A file is matched by the names its hash is known by; when none of
+        those is one of the pair, by its uploaded name. Only `dc_boot.bin` and
+        `dc_flash.bin` are taken.
         Both are in `CONTAINER_FILES`, so `clear_working_slot` keeps them.
 
         Args:
@@ -623,8 +624,11 @@ class Flycast(Emulator):
         Returns:
             The target, or none for any other file.
         """
-        wanted = {name.lower() for name in firmware.known_names(source)} or {source.name.lower()}
-        return [firmware.Target(DATA_DIR, PurePosixPath(name)) for name in BIOS_FILES if name in wanted]
+        wanted = {name.lower() for name in firmware.known_names(source)}
+        matched = [name for name in BIOS_FILES if name in wanted]
+        if not matched:
+            matched = [name for name in BIOS_FILES if name == source.name.lower()]
+        return [firmware.Target(DATA_DIR, PurePosixPath(name)) for name in matched]
 
     def import_spec(self) -> imports.ImportSpec:
         """Declare what Flycast takes: VMU and flash saves, raw VMU cards, and one resume state.

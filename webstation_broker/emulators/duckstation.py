@@ -249,7 +249,6 @@ def _patch_ini() -> None:
         ) from exc
 
 
-
 def _bios_dir() -> Path:
     """The folder DuckStation searches for BIOS images.
 
@@ -263,7 +262,10 @@ def _bios_dir() -> Path:
     """
     try:
         lines = INI_PATH.read_text().splitlines()
-    except (OSError, UnicodeDecodeError):
+    except FileNotFoundError:
+        lines = []
+    except (OSError, UnicodeDecodeError) as exc:
+        log.warning("duckstation: cannot read %s (%s); BIOS goes to the default bios folder", INI_PATH, exc)
         lines = []
     section = ""
     folder = ""
